@@ -3,8 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <exception>
+#include <fstream>
+#include <functional>
+#include <limits>
+#include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -56,13 +62,117 @@ constexpr KnownFp8Volume kKnownFp8Volumes[] = {
     {{0x59, 0xE5, 0xD7, 0x7E, 0x80, 0x2A, 0xC9, 0x5D, 0x8F, 0xAF, 0x0A, 0x80, 0x0B, 0x8F, 0x23, 0x01}, 0x3951},
 };
 
+struct KnownNvfp4Volume {
+    std::array<std::uint8_t, 16> id;
+    std::uint32_t scale;
+};
+constexpr KnownNvfp4Volume kKnownNvfp4Volumes[] = {
+    // Local NVFP4 table (Qwen3.8-Flash-Next-Local-NVFP4.ngram, 29,127,258,112 bytes): 0x380B6DB7 = 3.3242362e-5.
+    {{0x22, 0xDF, 0x29, 0x67, 0x43, 0x6F, 0xB7, 0x72, 0xBD, 0xB5, 0xB7, 0xE8, 0x67, 0xBE, 0xAD, 0xB6}, 0x380B6DB7U},
+};
+
 } // namespace
 
-NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident)
+struct NgramVolume::ReaderPool {
+    std::mutex mutex;
+    std::condition_variable start_cv;
+    std::condition_variable done_cv;
+    std::vector<std::thread> workers;
+    std::vector<std::exception_ptr> errors;
+    const std::function<void(std::size_t, std::size_t)>* task = nullptr;
+    std::size_t active  = 0;
+    std::size_t pending = 0;
+    std::uint64_t epoch = 0;
+    bool stop           = false;
+
+    explicit ReaderPool(std::size_t total_threads) : errors(total_threads) {
+        if (total_threads <= 1) { return; }
+        workers.reserve(total_threads - 1);
+        for (std::size_t t = 1; t < total_threads; ++t) {
+            workers.emplace_back([this, t] {
+                std::uint64_t seen = 0;
+                for (;;) {
+                    const std::function<void(std::size_t, std::size_t)>* fn = nullptr;
+                    std::size_t n = 0;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        start_cv.wait(lock, [&] { return stop || epoch != seen; });
+                        if (stop) { return; }
+                        seen = epoch;
+                        if (t < active) {
+                            fn = task;
+                            n  = active;
+                        }
+                    }
+                    if (fn != nullptr) {
+                        try {
+                            (*fn)(t, n);
+                        } catch (...) { errors[t] = std::current_exception(); }
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (--pending == 0) { done_cv.notify_one(); }
+                    }
+                }
+            });
+        }
+    }
+
+    ~ReaderPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        start_cv.notify_all();
+        for (auto& w : workers) {
+            if (w.joinable()) { w.join(); }
+        }
+    }
+
+    void run(std::size_t threads, const std::function<void(std::size_t, std::size_t)>& fn) {
+        if (threads <= 1 || workers.empty()) {
+            fn(0, 1);
+            return;
+        }
+        for (std::size_t t = 0; t < threads; ++t) { errors[t] = nullptr; }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            task    = &fn;
+            active  = threads;
+            pending = threads - 1;
+            ++epoch;
+        }
+        start_cv.notify_all();
+        try {
+            fn(0, threads);
+        } catch (...) { errors[0] = std::current_exception(); }
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            done_cv.wait(lock, [&] { return pending == 0; });
+            task = nullptr;
+        }
+        for (std::size_t t = 0; t < threads; ++t) {
+            if (errors[t]) { std::rethrow_exception(errors[t]); }
+        }
+    }
+};
+
+NgramVolume::~NgramVolume()                                = default;
+NgramVolume::NgramVolume(NgramVolume&&) noexcept            = default;
+NgramVolume& NgramVolume::operator=(NgramVolume&&) noexcept = default;
+
+NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident,
+                         std::uint64_t requested_cache_bytes)
     : file_(path, FileMapping::None), table_(table) {
+    parallel_gather_ = !temporary_switches::value("INFERNIX_TMP_NGRAM_PARALLEL_GATHER").has_value() ||
+                       temporary_switches::flag("INFERNIX_TMP_NGRAM_PARALLEL_GATHER");
+    scatter_ = !temporary_switches::value("INFERNIX_TMP_NGRAM_SCATTER").has_value() ||
+               temporary_switches::flag("INFERNIX_TMP_NGRAM_SCATTER");
     if (!resident) {
-        tags_.assign(std::size_t{1} << kCacheBits, 0xFFFFFFFFU);
-        cache_.assign((std::size_t{1} << kCacheBits) * table.row_bytes, std::byte{0});
+        cache_bits_                  = cache_bits(table, requested_cache_bytes);
+        const unsigned set_bits      = cache_bits_ - kCacheWayBits;
+        cache_set_shift_             = 32U - set_bits;
+        tags_.assign(std::size_t{1} << cache_bits_, 0xFFFFFFFFU);
+        hand_.assign(std::size_t{1} << set_bits, 0);
+        cache_.assign((std::size_t{1} << cache_bits_) * table.row_bytes, std::byte{0});
     }
     if (table.block_bytes < 4096 || table.block_bytes % 4096 != 0 || table.header_bytes % 4096 != 0) {
         throw std::runtime_error(path.string() + ": n-gram blocks and header must be whole 4 KiB pages");
@@ -70,6 +180,13 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     ring_storage_.assign(kInFlight * table.block_bytes + 4096, std::byte{0});
     const auto base = reinterpret_cast<std::uintptr_t>(ring_storage_.data());
     ring_           = ring_storage_.data() + ((4096 - base % 4096) % 4096);
+    pool_           = std::make_unique<ReaderPool>(kReadThreads);
+    if (!resident) {
+        const std::size_t ring_bytes = kParallelInFlight * table.block_bytes;
+        parallel_storage_.assign(kReadThreads * ring_bytes + 4096, std::byte{0});
+        const auto pbase = reinterpret_cast<std::uintptr_t>(parallel_storage_.data());
+        parallel_ring_   = parallel_storage_.data() + ((4096 - pbase % 4096) % 4096);
+    }
     if (file_.current_bytes() != table.file_bytes) {
         throw std::runtime_error(path.string() + ": n-gram volume size differs from the artifact's table");
     }
@@ -88,21 +205,69 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     }
     static_assert(kHeaderSize == 60);
     if (resident) {
-        // The whole table in RAM: a block locked in the working set (only the CPU reads it), then 1 GiB
-        // unbuffered reads (each keeps 16 reads of 8 MiB in flight on Windows) straight into it.
+        // The whole table in RAM: unbuffered reads across kReadThreads threads straight into the
+        // block, which is then page-locked and mapped in one call.
         const auto start = std::chrono::steady_clock::now();
-        resident_ = std::make_unique<ResidentHostBuffer>(resident_bytes(table));
+        resident_        = std::make_unique<ResidentHostBuffer>(resident_bytes(table));
         constexpr std::size_t kPiece = std::size_t{1} << 30;
-        for (std::size_t at = 0; at < resident_->size(); at += kPiece) {
-            const std::size_t bytes = std::min(kPiece, resident_->size() - at);
-            if (file_.read_direct(table.header_bytes + at, std::span<std::byte>(resident_->data() + at, bytes)) != bytes) {
-                throw std::runtime_error(path.string() + ": short n-gram volume read");
+        const std::size_t total_blocks = static_cast<std::size_t>(table.blocks);
+        if (total_blocks >= kReadThreads) {
+            std::vector<std::exception_ptr> errors(kReadThreads);
+            std::vector<std::thread> threads;
+            threads.reserve(kReadThreads);
+            for (std::size_t t = 0; t < kReadThreads; ++t) {
+                const std::size_t b_lo = total_blocks * t / kReadThreads;
+                const std::size_t b_hi = total_blocks * (t + 1) / kReadThreads;
+                threads.emplace_back([&, t, b_lo, b_hi] {
+                    try {
+                        const std::size_t start_off = b_lo * table.block_bytes;
+                        const std::size_t end_off   = b_hi * table.block_bytes;
+                        for (std::size_t at = start_off; at < end_off; at += kPiece) {
+                            const std::size_t bytes = std::min(kPiece, end_off - at);
+                            if (file_.read_direct(table.header_bytes + at,
+                                                  std::span<std::byte>(resident_->data() + at, bytes)) != bytes) {
+                                throw std::runtime_error(path.string() + ": short n-gram volume read");
+                            }
+                        }
+                    } catch (...) { errors[t] = std::current_exception(); }
+                });
+            }
+            for (auto& thread : threads) { thread.join(); }
+            for (const auto& error : errors) {
+                if (error) { std::rethrow_exception(error); }
+            }
+        } else {
+            for (std::size_t at = 0; at < resident_->size(); at += kPiece) {
+                const std::size_t bytes = std::min(kPiece, resident_->size() - at);
+                if (file_.read_direct(table.header_bytes + at, std::span<std::byte>(resident_->data() + at, bytes)) != bytes) {
+                    throw std::runtime_error(path.string() + ": short n-gram volume read");
+                }
             }
         }
         counters_.reads   = table.blocks;
         counters_.read_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     }
+}
+
+std::size_t NgramVolume::find_slot(std::uint32_t row) const noexcept {
+    const std::size_t base = set_of(row) * kCacheWays;
+    for (std::size_t w = 0; w < kCacheWays; ++w) {
+        if (tags_[base + w] == row) { return base + w; }
+    }
+    return std::numeric_limits<std::size_t>::max();
+}
+
+void NgramVolume::insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) const noexcept {
+    const std::size_t set  = set_of(row);
+    const std::size_t base = set * kCacheWays;
+    for (std::size_t w = 0; w < kCacheWays; ++w) {
+        if (tags_[base + w] == row) { return; }
+    }
+    const std::size_t way = hand_[set] & (kCacheWays - 1);
+    hand_[set]            = static_cast<std::uint8_t>(way + 1);
+    tags_[base + way]     = row;
+    std::memcpy(cache_.data() + (base + way) * row_bytes, data, row_bytes);
 }
 
 void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) const {
@@ -112,15 +277,23 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
     const std::size_t row_bytes = table_.row_bytes;
     if (resident_) {
         const std::byte* blocks = resident_->data();
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-            if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
-        }
-        // One thread: gathering a prefill chunk's rows on kReadThreads threads (candidates §8.3 GX-08) measured
-        // flat (prefill is compute-bound; removed 2026-10-28).
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-            const std::uint64_t at = static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) * table_.block_bytes +
-                                     static_cast<std::uint64_t>(rows[i] % table_.rows_per_block) * row_bytes;
-            std::memcpy(out.data() + i * row_bytes, blocks + at, row_bytes);
+        const auto copy_range   = [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t i = lo; i < hi; ++i) {
+                if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
+                const std::uint64_t at =
+                    static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) * table_.block_bytes +
+                    static_cast<std::uint64_t>(rows[i] % table_.rows_per_block) * row_bytes;
+                std::memcpy(out.data() + i * row_bytes, blocks + at, row_bytes);
+            }
+        };
+        if (parallel_gather_ && rows.size() >= kParallelGatherRows) {
+            pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+                const std::size_t lo = rows.size() * t / n_threads;
+                const std::size_t hi = rows.size() * (t + 1) / n_threads;
+                copy_range(lo, hi);
+            });
+        } else {
+            copy_range(0, rows.size());
         }
         counters_.rows += rows.size();
         counters_.hits += rows.size();
@@ -129,8 +302,8 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
     misses_.clear();
     for (std::size_t i = 0; i < rows.size(); ++i) {
         if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
-        const std::size_t slot = slot_of(rows[i]);
-        if (tags_[slot] == rows[i]) {
+        const std::size_t slot = find_slot(rows[i]);
+        if (slot != std::numeric_limits<std::size_t>::max()) {
             std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
             ++counters_.hits;
         } else {
@@ -155,45 +328,40 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
     first_miss_.push_back(misses_.size());
     const std::size_t blocks = offsets_.size();
     if (blocks >= kParallelBlocks) {
-        // Each thread reads a contiguous range of the blocks into its own ring and copies their rows
-        // to `out` (distinct indices); the cache is filled afterwards on this thread, from `out`.
+        // Each thread reads a slice of the blocks into its own ring and copies their rows to `out`
+        // (distinct indices); the cache is filled afterwards on this thread, from `out`.
         const std::size_t ring_bytes = kParallelInFlight * table_.block_bytes;
-        if (parallel_ring_ == nullptr) {
-            parallel_storage_.assign(kReadThreads * ring_bytes + 4096, std::byte{0});
-            const auto base = reinterpret_cast<std::uintptr_t>(parallel_storage_.data());
-            parallel_ring_  = parallel_storage_.data() + ((4096 - base % 4096) % 4096);
+        const std::uint64_t* read_offsets = offsets_.data();
+        if (scatter_) {
+            std::size_t stride = 97;
+            while (std::gcd(stride, blocks) != 1) { stride += 2; }
+            scattered_offsets_.resize(blocks);
+            scattered_blocks_.resize(blocks);
+            for (std::size_t k = 0; k < blocks; ++k) {
+                const std::size_t b   = (k * stride) % blocks;
+                scattered_offsets_[k] = offsets_[b];
+                scattered_blocks_[k]  = b;
+            }
+            read_offsets = scattered_offsets_.data();
         }
-        // In sorted order, each thread one contiguous range: a scattered order (candidates BX-04) measured flat
-        // (removed 2026-10-28).
-        std::vector<std::exception_ptr> errors(kReadThreads);
-        std::vector<std::thread> threads;
-        threads.reserve(kReadThreads);
-        for (std::size_t t = 0; t < kReadThreads; ++t) {
-            const std::size_t lo = blocks * t / kReadThreads, hi = blocks * (t + 1) / kReadThreads;
-            threads.emplace_back([&, t, lo, hi] {
-                try {
-                    file_.read_direct_blocks(
-                        std::span<const std::uint64_t>(offsets_.data() + lo, hi - lo), table_.block_bytes,
-                        std::span<std::byte>(parallel_ring_ + t * ring_bytes, ring_bytes),
-                        [&](std::size_t b, std::span<const std::byte> block) {
-                            for (std::size_t m = first_miss_[lo + b]; m < first_miss_[lo + b + 1]; ++m) {
-                                const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
-                                std::memcpy(out.data() + i * row_bytes,
-                                            block.data() + (rows[i] % table_.rows_per_block) * row_bytes, row_bytes);
-                            }
-                        });
-                } catch (...) { errors[t] = std::current_exception(); }
-            });
-        }
-        for (auto& thread : threads) { thread.join(); }
-        for (const auto& error : errors) {
-            if (error) { std::rethrow_exception(error); }
-        }
+        const std::size_t active_threads = std::min<std::size_t>(kReadThreads, std::max<std::size_t>(2, blocks / 4));
+        pool_->run(active_threads, [&](std::size_t t, std::size_t n_threads) {
+            const std::size_t lo = blocks * t / n_threads, hi = blocks * (t + 1) / n_threads;
+            file_.read_direct_blocks(
+                std::span<const std::uint64_t>(read_offsets + lo, hi - lo), table_.block_bytes,
+                std::span<std::byte>(parallel_ring_ + t * ring_bytes, ring_bytes),
+                [&](std::size_t b, std::span<const std::byte> block) {
+                    const std::size_t idx = scatter_ ? scattered_blocks_[lo + b] : lo + b;
+                    for (std::size_t m = first_miss_[idx]; m < first_miss_[idx + 1]; ++m) {
+                        const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
+                        std::memcpy(out.data() + i * row_bytes,
+                                    block.data() + (rows[i] % table_.rows_per_block) * row_bytes, row_bytes);
+                    }
+                });
+        });
         for (const std::uint64_t miss : misses_) {
-            const auto i           = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
-            const std::size_t slot = slot_of(rows[i]);
-            tags_[slot]            = rows[i];
-            std::memcpy(cache_.data() + slot * row_bytes, out.data() + i * row_bytes, row_bytes);
+            const auto i = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
+            insert_cache(rows[i], out.data() + i * row_bytes, row_bytes);
         }
         counters_.reads += blocks;
         counters_.read_ns += static_cast<std::uint64_t>(
@@ -207,9 +375,7 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
                 const auto i         = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
                 const std::byte* row = block.data() + (rows[i] % table_.rows_per_block) * row_bytes;
                 std::memcpy(out.data() + i * row_bytes, row, row_bytes);
-                const std::size_t slot = slot_of(rows[i]);
-                tags_[slot]            = rows[i];
-                std::memcpy(cache_.data() + slot * row_bytes, row, row_bytes);
+                insert_cache(rows[i], row, row_bytes);
             }
         });
     counters_.reads += offsets_.size();
@@ -225,29 +391,39 @@ bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
         return true;
     }
     for (const std::uint32_t row : rows) {
-        if (row >= table_.rows || tags_[slot_of(row)] != row) { return false; }
+        if (row >= table_.rows || find_slot(row) == std::numeric_limits<std::size_t>::max()) { return false; }
     }
     return true;
 }
 
 NgramVolume::ReadProbe NgramVolume::probe_reads(std::size_t reads, double max_seconds) const {
     ReadProbe probe;
-    if (resident_ || table_.blocks == 0) { return probe; }
-    const std::span<std::byte> block(ring_, table_.block_bytes);
+    if (resident_ || table_.blocks == 0 || reads == 0) { return probe; }
     // A different set of blocks each start, so the drive's own cache cannot answer the same ones.
+    // Reads are issued through read_direct_blocks in waves of up to kInFlight blocks, matching how
+    // read_rows drives the volume on NVMe.
     std::uint64_t state = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) | 1U;
-    const auto start    = std::chrono::steady_clock::now();
-    for (; probe.reads < reads; ++probe.reads) {
-        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-        const std::uint64_t at = table_.header_bytes + (state >> 33U) % table_.blocks * table_.block_bytes;
-        if (file_.read_direct(at, block) != block.size()) {
+    std::array<std::uint64_t, kInFlight> batch_offsets{};
+    const auto start = std::chrono::steady_clock::now();
+    while (probe.reads < reads) {
+        const std::size_t batch = std::min<std::size_t>(kInFlight, reads - probe.reads);
+        for (std::size_t i = 0; i < batch; ++i) {
+            state            = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            batch_offsets[i] = table_.header_bytes + (state >> 33U) % table_.blocks * table_.block_bytes;
+        }
+        std::size_t completed = 0;
+        file_.read_direct_blocks(
+            std::span<const std::uint64_t>(batch_offsets.data(), batch), table_.block_bytes,
+            std::span<std::byte>(ring_, batch * table_.block_bytes),
+            [&](std::size_t, std::span<const std::byte> block) {
+                if (block.size() == table_.block_bytes) { ++completed; }
+            });
+        if (completed != batch) {
             throw std::runtime_error("short n-gram volume read in the read-rate probe");
         }
+        probe.reads += batch;
         probe.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        if (probe.seconds >= max_seconds) {
-            ++probe.reads;
-            break;
-        }
+        if (probe.seconds >= max_seconds) { break; }
     }
     return probe;
 }
@@ -287,7 +463,8 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
     std::memcpy(out.volume_id.data(), p + 44, 16);
     // The row format: the header's tag, or for a volume written before the tag, the row size: head_width
     // FP8 codes, IQ4_NL blocks of 32 (18 bytes each) or head_width BF16 values. NVFP4 rows (head_width / 2
-    // code bytes and head_width / 16 scales) have IQ4_NL's size, so they always carry the tag.
+    // code bytes and head_width / 16 scales) have IQ4_NL's size, so they carry the tag or match a known
+    // pre-tag NVFP4 volume id.
     const std::uint32_t width = ple.head_width();
     const auto row_bytes_of = [&](NgramRowFormat format) -> std::uint32_t {
         switch (format) {
@@ -298,6 +475,10 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
         }
         return 0;
     };
+    bool known_untagged_nvfp4 = false;
+    for (const KnownNvfp4Volume& known : kKnownNvfp4Volumes) {
+        if (known.id == out.volume_id) { known_untagged_nvfp4 = true; }
+    }
     const std::uint16_t tag = read_le<std::uint16_t>(p + kFormatOffset);
     if (tag != 0) {
         if (tag > 4) { fail("unknown n-gram row format tag " + std::to_string(tag)); }
@@ -311,6 +492,10 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
         out.format = NgramRowFormat::Bf16;
     } else if (out.row_bytes == row_bytes_of(NgramRowFormat::Fp8E4m3)) {
         out.format = NgramRowFormat::Fp8E4m3;
+    } else if ((ple.table.format == NgramRowFormat::Nvfp4 && out.volume_id == ple.table.volume_id &&
+                out.row_bytes == row_bytes_of(NgramRowFormat::Nvfp4)) ||
+               (known_untagged_nvfp4 && out.row_bytes == row_bytes_of(NgramRowFormat::Nvfp4))) {
+        out.format = NgramRowFormat::Nvfp4;
     } else if (out.row_bytes == row_bytes_of(NgramRowFormat::Iq4Nl)) {
         out.format = NgramRowFormat::Iq4Nl;
     } else {
@@ -341,7 +526,10 @@ NgramTableConfig resolve_ngram_volume(const std::filesystem::path& path, const P
         out.fp8_scale = scale;
     }
     if (out.format == NgramRowFormat::Nvfp4) {
-        const std::uint32_t scale = read_le<std::uint32_t>(p + kNvfp4ScaleOffset);
+        std::uint32_t scale = read_le<std::uint32_t>(p + kNvfp4ScaleOffset);
+        for (const KnownNvfp4Volume& known : kKnownNvfp4Volumes) {
+            if (scale == 0 && known.id == out.volume_id) { scale = known.scale; }
+        }
         if (!valid_nvfp4_scale(scale)) { fail("this NVFP4 n-gram volume records no valid multiplier"); }
         out.nvfp4_scale = scale;
     }

@@ -135,6 +135,7 @@ Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
 template <class Schedule, class Rows>
 struct Nvfp4A4TmaTensorStorage {
     static constexpr int kActivationRows = Schedule::kTerms * Schedule::kBlockTokens;
+    static constexpr int kScaleBoxRows   = 128;
     alignas(128)
         std::uint8_t a_codes[Schedule::kStages][kActivationRows * Schedule::kCodeRowBytes];
     alignas(128)
@@ -142,7 +143,7 @@ struct Nvfp4A4TmaTensorStorage {
     alignas(16) std::uint32_t
         a_scale4[Schedule::kScaleSlots][kActivationRows * Schedule::kScaleWordsPerRow];
     alignas(16) std::uint8_t b_scales[Schedule::kStages][Rows::kPaired ? 2 : 1]
-                                     [Schedule::kBlockRows * Schedule::kK64PerStage * 4];
+                                     [kScaleBoxRows * Schedule::kK64PerStage * 4];
 };
 
 template <class Schedule, class Rows, class Epilogue>
@@ -168,16 +169,24 @@ struct Nvfp4A4TmaSharedStorage {
 // The work distributor hands CTAs to SMs in linear order with blockIdx.x fastest, so the
 // stock grid -- x over weight-row tiles, y over token tiles -- puts a different weight tile
 // in every CTA that runs at the same time, and the whole weight matrix is re-read from
-// memory once per token tile. Walking the token index fastest instead makes the CTAs that
-// share a weight tile run together, and the matrix is read once. bf16_a16_mma_kernel
-// already makes this choice; Bf16MmaRaster::TokenFast is the default for every bf16
-// schedule in the tree.
-__device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y) {
-    const int rows = static_cast<int>(gridDim.y);
-    const int linear =
-        static_cast<int>(blockIdx.y) * static_cast<int>(gridDim.x) + static_cast<int>(blockIdx.x);
-    block_y = linear % rows;
-    block_x = linear / rows;
+// memory once per token tile. Grouping token tiles into L2-resident bands of `group_n`
+// (8 token tiles for K <= 6144, 4 token tiles for K = 17408) and walking token index fastest
+// within each band makes `active_n` SMs share each weight tile simultaneously while keeping
+// the active activation band (< 10 MiB) resident in GB10's 24 MiB L2 across all weight rows.
+__device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y, int token_count,
+                                                        int k) {
+    (void)token_count;
+    const int tiles_m    = static_cast<int>(gridDim.x);
+    const int tiles_n    = static_cast<int>(gridDim.y);
+    const int linear     = static_cast<int>(blockIdx.y) * tiles_m + static_cast<int>(blockIdx.x);
+    const int group_n    = k > 6144 ? 4 : 8;
+    const int group_span = tiles_m * group_n;
+    const int group      = linear / group_span;
+    const int first_n    = group * group_n;
+    const int active_n   = min(group_n, tiles_n - first_n);
+    const int within     = linear - group * group_span;
+    block_y              = first_n + within % active_n;
+    block_x              = within / active_n;
 }
 
 __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUtensorMap* descriptor,
@@ -228,11 +237,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     // ordinary by-value parameters: a grid-constant struct holding a sub-8-byte member mis-packs
     // under MSVC.
     const __grid_constant__ TmaDescriptorParameter<Nvfp4A4TmaDescriptors, InPlace> descriptors_pointer, float alpha,
-    const Epilogue epilogue,
-    const OutputPolicy output,
+    const float* __restrict__ row_scales, const Epilogue epilogue, const OutputPolicy output,
 #else
     const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
-    const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
+    const float* __restrict__ row_scales, const __grid_constant__ Epilogue epilogue,
+    const __grid_constant__ OutputPolicy output,
 #endif
     int token_count, int output_rows, int input_rows, int token_offset) {
 #ifdef _WIN32
@@ -248,7 +257,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
         *reinterpret_cast<Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>*>(shared_bytes);
     int block_x = 0;
     int block_y = 0;
-    nvfp4_tma_raster_blocks(block_x, block_y);
+    nvfp4_tma_raster_blocks(block_x, block_y, token_count - token_offset, K);
     const int token_begin = token_offset + block_y * Schedule::kBlockTokens;
     const int row_begin   = block_x * loaded_rows;
 
@@ -287,7 +296,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                 constexpr std::uint32_t kTransactionBytes =
                     Schedule::kTerms * Schedule::kBlockTokens * Schedule::kCodeRowBytes +
                     Schedule::kBlockRows * Schedule::kCodeRowBytes + kScaleBytes +
-                    branches * Schedule::kBlockRows * Schedule::kK64PerStage * 4;
+                    branches * 128 * Schedule::kK64PerStage * 4;
                 // A scale tile covers kNvfp4ScaleTileGroups groups, which is two K tiles, so the
                 // box is fetched on the even tile only and the odd tile expects that many bytes
                 // fewer.
@@ -447,27 +456,47 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     // Scale with an explicit rounded multiply: the residual add after it must not contract into one
     // FMA in the FullTokens instance only, or a column's bits would depend on whether its tile is
     // full (NInfer Neroued/ninfer#374). Every A4 route rounds the product, then the sum.
+    const int ar = lane >> 2;
     if constexpr (collective) {
 #pragma unroll
-        for (int mt = 0; mt < Schedule::kMmaTokens; ++mt)
+        for (int mt = 0; mt < Schedule::kMmaTokens; ++mt) {
+            const int t0 = warp_m * Schedule::kWarpTokens + mt * 16 + ar, t1 = t0 + 8;
+            const float alpha0 = (row_scales != nullptr && token_begin + t0 < token_count)
+                                     ? __fmul_rn(alpha, row_scales[token_begin + t0])
+                                     : alpha;
+            const float alpha1 = (row_scales != nullptr && token_begin + t1 < token_count)
+                                     ? __fmul_rn(alpha, row_scales[token_begin + t1])
+                                     : alpha;
 #pragma unroll
-            for (int mr = 0; mr < Schedule::kMmaRows; ++mr)
-#pragma unroll
-                for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] = __fmul_rn(accumulators[mt][mr][v], alpha);
+            for (int mr = 0; mr < Schedule::kMmaRows; ++mr) {
+                accumulators[mt][mr][0] = __fmul_rn(accumulators[mt][mr][0], alpha0);
+                accumulators[mt][mr][1] = __fmul_rn(accumulators[mt][mr][1], alpha0);
+                accumulators[mt][mr][2] = __fmul_rn(accumulators[mt][mr][2], alpha1);
+                accumulators[mt][mr][3] = __fmul_rn(accumulators[mt][mr][3], alpha1);
+            }
+        }
         epilogue.template finish_tile<Schedule, false>(
             output, shared_bytes, accumulators, row_begin, token_begin, output_rows, token_count);
     } else {
         constexpr int stride = Schedule::kBlockRows + 8;
         auto* tile           = shared.scratch.output;
-        const int ar = lane >> 2, ac = 2 * (lane & 3);
+        const int ac         = 2 * (lane & 3);
 #pragma unroll
         for (int mt = 0; mt < Schedule::kMmaTokens; ++mt) {
             const int t0 = warp_m * Schedule::kWarpTokens + mt * 16 + ar, t1 = t0 + 8;
+            const float alpha0 = (row_scales != nullptr && token_begin + t0 < token_count)
+                                     ? __fmul_rn(alpha, row_scales[token_begin + t0])
+                                     : alpha;
+            const float alpha1 = (row_scales != nullptr && token_begin + t1 < token_count)
+                                     ? __fmul_rn(alpha, row_scales[token_begin + t1])
+                                     : alpha;
 #pragma unroll
             for (int mr = 0; mr < Schedule::kMmaRows; ++mr) {
                 const int row = warp_n * Schedule::kWarpRows + mr * 8 + ac;
-                float a = __fmul_rn(accumulators[mt][mr][0], alpha), b = __fmul_rn(accumulators[mt][mr][1], alpha);
-                float c = __fmul_rn(accumulators[mt][mr][2], alpha), d = __fmul_rn(accumulators[mt][mr][3], alpha);
+                float a       = __fmul_rn(accumulators[mt][mr][0], alpha0),
+                      b       = __fmul_rn(accumulators[mt][mr][1], alpha0);
+                float c       = __fmul_rn(accumulators[mt][mr][2], alpha1),
+                      d       = __fmul_rn(accumulators[mt][mr][3], alpha1);
                 if (token_begin + t0 < token_count) {
                     a = epilogue.apply(row_begin + row, token_begin + t0, a);
                     b = epilogue.apply(row_begin + row + 1, token_begin + t0, b);
@@ -483,12 +512,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             }
         }
         asm volatile("bar.sync 1, %0;" ::"r"(Schedule::kConsumerThreads) : "memory");
+        const auto tile_output = linear_output_tile<Schedule::kBlockRows>(output, row_begin);
         for (int item = consumer_thread; item < Schedule::kBlockTokens * (Schedule::kBlockRows / 8);
              item += Schedule::kConsumerThreads) {
             const int t = item / (Schedule::kBlockRows / 8),
                       r = (item % (Schedule::kBlockRows / 8)) * 8;
             if (token_begin + t < token_count)
-                linear_store_bf16_vector(output, row_begin + r, token_begin + t,
+                linear_store_bf16_vector(tile_output, row_begin + r, token_begin + t,
                                          load_vec<uint4>(tile + t * stride + r));
         }
     }
@@ -524,7 +554,7 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
         (void)nvfp4_prepare_shared<bytes, kernel, true>();
         for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
             const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(parameter, p.alpha, epilogue, output,
+            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(parameter, p.alpha, p.row_scales, epilogue, output,
                                                                 offset + count, p.rows, p.k, offset);
             CUDA_CHECK(cudaGetLastError());
         });

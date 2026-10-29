@@ -8,10 +8,12 @@ void launch_nvfp4_a4_tma_attention(const Nvfp4A4Operands& p, __nv_bfloat16* quer
                                    cudaStream_t stream) {
     const Nvfp4AttentionInputOutput output{query, key, gate, value};
     if (p.scale_layout == Nvfp4ScaleLayout::Tiled128)
-        launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<128, 4, 1>, 5120>>(
+        launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
+            Nvfp4A4TmaMmaSchedule<128, 3, 2, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, 1, 64>, 5120>>(
             p, output, LinearIdentityEpilogue{}, stream);
     else
-        launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1>, 5120>>(
+        launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
+            Nvfp4A4TmaMmaSchedule<256, 3, 1, CU_TENSOR_MAP_L2_PROMOTION_L2_128B>, 5120>>(
             p, output, LinearIdentityEpilogue{}, stream);
 }
 } // namespace infernix::ops::detail

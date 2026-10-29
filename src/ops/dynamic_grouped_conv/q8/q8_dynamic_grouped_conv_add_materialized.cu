@@ -114,6 +114,12 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
     case Q8DynamicConvAddSchedule::MmaK128:
         launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
         break;
+    case Q8DynamicConvAddSchedule::MmaT96:
+        launch_q8_a16_mma_r64_t96(flat, weight, result, stream);
+        break;
+    case Q8DynamicConvAddSchedule::MmaT128:
+        launch_q8_a16_mma_r64_t128(flat, weight, result, stream);
+        break;
     }
     if (rows == 5120) {
         finish<5120>(projected, base, delta, residual, x.ne[1], tokens, stream);

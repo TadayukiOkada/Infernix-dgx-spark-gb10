@@ -8,10 +8,15 @@
 namespace infernix::ops::detail {
 namespace {
 DynamicConvPrepareRoute resolve_route(int tokens) {
-    // Complete cold-cache Graph timings favor split-8 R16 through 48 columns.
-    // R32 halves split scratch and avoids the repeated wide tile above that range.
-    if (tokens <= 48) return {16, tokens <= 8 ? 8 : tokens <= 16 ? 16 : tokens <= 32 ? 32 : 48, 8};
-    return {32, tokens <= 96 ? 32 : 64, 4};
+    // GB10 tuning (#132): full cold-cache graph timings across every legal W x B
+    // show the R16/split-8 family only leads for the very smallest token counts
+    // (draft steps <= 4). From 5 tokens upward R32/split-4 wins everywhere and
+    // halves the split scratch. Within R32 the wide tile (columns 64) wins for the
+    // mid-range (13..64) and again above 96; the narrow tile (columns 32) wins in
+    // 5..12 and 65..96. Paired interleaved A/B confirmed each band every rep.
+    if (tokens <= 4) return {16, 8, 8};
+    const int columns = ((tokens >= 13 && tokens <= 64) || tokens > 96) ? 64 : 32;
+    return {32, columns, 4};
 }
 
 // The split partials of every coefficient row (H / 4 of them).

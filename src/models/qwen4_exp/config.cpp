@@ -93,7 +93,7 @@ NgramTableConfig ngram_table(const Json& value, std::uint64_t hash_rows, std::ui
         // The unquantized table's BF16 words (an exact conversion bound to a BF16 volume).
         out.format = NgramRowFormat::Bf16;
         head_width = 2 * head_width;
-    } else if (value.at("format") == "nvfp4") {
+    } else if (value.at("format") == "nvfp4" || value.at("format") == "nvfp4_e2m1_e4m3_g16") {
         // NVIDIA FP4-Local's rows verbatim: W / 2 E2M1 code bytes, then W / 16 E4M3FN block scales.
         out.format = NgramRowFormat::Nvfp4;
         if (head_width % 16) { throw ArtifactError("an NVFP4 n-gram row must be whole 16-element blocks"); }
@@ -327,7 +327,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             // +1.9 %; 128 -0.5 %). At least top_k + 2 (a swap holds a slot out of the route, two at a time at most).
             const std::uint32_t experts = out.text.moe.experts;
             const std::uint32_t slots   = out.text.ggml_weights ? 128U : 256U;
-            if (out.mtp && options.mtp_expert_pool && slots < experts) {
+            if (out.mtp && options.mtp_expert_pool && !options.device_experts && slots < experts) {
                 out.mtp_expert_slots = std::min(experts - 1, std::max(slots, out.text.moe.top_k + 2U));
             }
             if (options.proposal_head == ProposalHead::Optimized) {

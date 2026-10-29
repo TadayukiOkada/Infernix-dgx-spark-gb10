@@ -39,16 +39,18 @@ struct HcCollapseEpilogue {
     bf16* x;                // [H, T]
     int hidden;
 
-    // The tile of BF16-rounded u values, token-major with a padded pitch: [BlockTokens][BlockRows + 1].
+    // The tile of BF16-rounded u values, token-major with a padded pitch: [BlockTokens][BlockRows + 8].
     template <class Cfg>
-    static constexpr int kSharedBytes = Cfg::kBlockTokens * (Cfg::kBlockRows + 1) * 4;
+    static constexpr int kSharedBytes = Cfg::kBlockTokens * (Cfg::kBlockRows + 8) * 2;
 
     template <class Cfg, bool Full, class Tile, class Acc>
     __device__ __forceinline__ void finish_tile(const Tile&, unsigned char* scratch, const Acc& acc, int m0, int n0,
                                                 int, int n) const {
-        constexpr int BM = Cfg::kBlockRows, BN = Cfg::kBlockTokens, Pitch = BM + 1;
+        constexpr int BM = Cfg::kBlockRows, BN = Cfg::kBlockTokens, Pitch = BM + 8;
         constexpr int Features = BM / kStreams;
-        auto* u = reinterpret_cast<float*>(scratch);
+        static_assert(Features % 4 == 0);
+        constexpr int Quads = Features / 4;
+        auto* u = reinterpret_cast<bf16*>(scratch);
         const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
         const int wm = warp / Cfg::kWarpGridTokens, wn = warp % Cfg::kWarpGridTokens;
         const int gid = lane >> 2, lid = lane & 3;
@@ -60,25 +62,40 @@ struct HcCollapseEpilogue {
             for (int ni = 0; ni < Cfg::kMmaTokens; ++ni) {
                 const int c0 = wn * Cfg::kWarpTokens + ni * 8 + 2 * lid;
                 // u as the composed route stores it: one BF16 rounding of the FP32 accumulator.
-                u[c0 * Pitch + r0]           = __bfloat162float(__float2bfloat16_rn(acc[mi][ni][0]));
-                u[(c0 + 1) * Pitch + r0]     = __bfloat162float(__float2bfloat16_rn(acc[mi][ni][1]));
-                u[c0 * Pitch + r0 + 8]       = __bfloat162float(__float2bfloat16_rn(acc[mi][ni][2]));
-                u[(c0 + 1) * Pitch + r0 + 8] = __bfloat162float(__float2bfloat16_rn(acc[mi][ni][3]));
+                u[c0 * Pitch + r0]           = __float2bfloat16_rn(acc[mi][ni][0]);
+                u[(c0 + 1) * Pitch + r0]     = __float2bfloat16_rn(acc[mi][ni][1]);
+                u[c0 * Pitch + r0 + 8]       = __float2bfloat16_rn(acc[mi][ni][2]);
+                u[(c0 + 1) * Pitch + r0 + 8] = __float2bfloat16_rn(acc[mi][ni][3]);
             }
         }
         __syncthreads();
+        const bool full_tokens  = Full || (n0 + BN <= n);
         const std::size_t width = static_cast<std::size_t>(kStreams) * hidden;
-        for (int item = tid; item < Features * BN; item += Cfg::kThreads) {
-            const int j = item % Features, c = item / Features;
+        for (int item = tid; item < Quads * BN; item += Cfg::kThreads) {
+            const int j = (item % Quads) * 4, c = item / Quads;
             const int t = n0 + c, d = m0 + j;
-            if (!Full && t >= n) { continue; }
-            float sum = 0.0F;
+            if (!full_tokens && t >= n) { continue; }
+            float sum0 = 0.0F, sum1 = 0.0F, sum2 = 0.0F, sum3 = 0.0F;
 #pragma unroll
             for (int s = 0; s < kStreams; ++s) {
+                const uint2 uv      = *reinterpret_cast<const uint2*>(&u[c * Pitch + s * Features + j]);
                 const std::size_t i = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
-                sum += hc_sigmoid(u[c * Pitch + s * Features + j]) * __bfloat162float(normalized[i]);
+                const uint2 nv      = *reinterpret_cast<const uint2*>(&normalized[i]);
+                const __nv_bfloat162 u01 = *reinterpret_cast<const __nv_bfloat162*>(&uv.x);
+                const __nv_bfloat162 u23 = *reinterpret_cast<const __nv_bfloat162*>(&uv.y);
+                const __nv_bfloat162 n01 = *reinterpret_cast<const __nv_bfloat162*>(&nv.x);
+                const __nv_bfloat162 n23 = *reinterpret_cast<const __nv_bfloat162*>(&nv.y);
+                sum0 += hc_sigmoid(__bfloat162float(u01.x)) * __bfloat162float(n01.x);
+                sum1 += hc_sigmoid(__bfloat162float(u01.y)) * __bfloat162float(n01.y);
+                sum2 += hc_sigmoid(__bfloat162float(u23.x)) * __bfloat162float(n23.x);
+                sum3 += hc_sigmoid(__bfloat162float(u23.y)) * __bfloat162float(n23.y);
             }
-            x[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum / static_cast<float>(kStreams));
+            const __nv_bfloat162 out01 =
+                __floats2bfloat162_rn(sum0 / static_cast<float>(kStreams), sum1 / static_cast<float>(kStreams));
+            const __nv_bfloat162 out23 =
+                __floats2bfloat162_rn(sum2 / static_cast<float>(kStreams), sum3 / static_cast<float>(kStreams));
+            *reinterpret_cast<uint2*>(&x[static_cast<std::size_t>(t) * hidden + d]) =
+                uint2{*reinterpret_cast<const unsigned*>(&out01), *reinterpret_cast<const unsigned*>(&out23)};
         }
     }
 };
@@ -97,9 +114,9 @@ void launch(const Tensor& m, const Weight& up, const Tensor& normalized, Tensor&
 
 bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams,
                               std::int32_t columns) noexcept {
-    // Up to 96 columns the separate linear and collapse measured as fast or faster (+0.5-2 %). Q8 W_up only: a BF16
-    // W_up's fused tile lost to the composed route's TMA tiles (IQ3_S pp16384 -2.9 %, decode flat; removed 2026-10-28).
-    if (streams != kStreams || hidden <= 0 || hidden % 16 != 0 || columns <= 96 || up.qdata == nullptr ||
+    // Beyond the fused decode route (kHcMixFusedMaxColumns = 16), fuse up + collapse so u stays in
+    // shared memory instead of round-tripping [streams * hidden, T] through global memory.
+    if (streams != kStreams || hidden <= 0 || hidden % 16 != 0 || columns <= 16 || up.qdata == nullptr ||
         up.n != streams * hidden) {
         return false;
     }
@@ -114,9 +131,19 @@ void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized,
         normalized.ne[0] != up.n || x.ne[1] != T) {
         throw std::invalid_argument("hyper_connection: fused up + collapse shapes disagree");
     }
-    // Tiles by width from the sweep of 2026-10-14 (whole mixer, 8 Q8 layers, RTX 5090); every tile
-    // gives the same bits.
-    if (T <= 128) return launch<q8_instances::MmaR32T64>(m, up, normalized, x, stream);
+    // Tiles by width from the GB10 sweep (whole mixer, Q8 layers); every tile gives the same bits.
+    // The BF16 fused route was removed once the admission above became Q8-only (upstream 2026-10-28).
+    const int hidden = x.ne[0];
+    if (T <= 48) return launch<q8_instances::MmaR64x16T48K128A1>(m, up, normalized, x, stream);
+    if (T <= 128) {
+        if (hidden % 32 == 0) {
+            return launch<q8_instances::MmaR128x32T64K64A2>(m, up, normalized, x, stream);
+        }
+        return launch<q8_instances::MmaR32T64>(m, up, normalized, x, stream);
+    }
+    if (hidden % 32 == 0) {
+        return launch<q8_instances::MmaR128x64T128K64A1>(m, up, normalized, x, stream);
+    }
     return launch<q8_instances::MmaR64T128>(m, up, normalized, x, stream);
 }
 

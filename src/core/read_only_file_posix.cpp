@@ -35,6 +35,10 @@ struct ReadOnlyFile::Impl {
     struct AioContext {
         aio_context_t id = 0;
         unsigned slots   = 0; // reads it can hold in flight; 0: none (io_setup failed)
+        std::vector<iocb> blocks;
+        std::vector<iocb*> submit_batch;
+        std::vector<io_event> events;
+        std::vector<std::size_t> idle;
     };
     static constexpr unsigned kMinAioSlots = 64;
     std::mutex aio_mutex;
@@ -46,7 +50,7 @@ struct ReadOnlyFile::Impl {
             const std::lock_guard<std::mutex> lock(aio_mutex);
             for (auto it = aio_idle.begin(); it != aio_idle.end(); ++it) {
                 if (it->slots >= slots) {
-                    const AioContext context = *it;
+                    AioContext context = std::move(*it);
                     aio_idle.erase(it);
                     return context;
                 }
@@ -54,18 +58,24 @@ struct ReadOnlyFile::Impl {
         }
         AioContext context;
         const unsigned want = static_cast<unsigned>(std::max<std::size_t>(slots, kMinAioSlots));
-        if (::syscall(SYS_io_setup, want, &context.id) == 0) { context.slots = want; }
+        if (::syscall(SYS_io_setup, want, &context.id) == 0) {
+            context.slots = want;
+            context.blocks.resize(want);
+            context.submit_batch.resize(want);
+            context.events.resize(want);
+            context.idle.reserve(want);
+        }
         return context;
     }
 
     // A context with no read in flight goes back to the pool; one that may still have reads in
     // flight is destroyed (io_destroy waits for them).
-    void put_aio(AioContext context, bool idle) noexcept {
+    void put_aio(AioContext&& context, bool idle) noexcept {
         if (context.slots == 0) { return; }
         if (idle) {
             try {
                 const std::lock_guard<std::mutex> lock(aio_mutex);
-                aio_idle.push_back(context);
+                aio_idle.push_back(std::move(context));
                 return;
             } catch (...) {}
         }
@@ -156,14 +166,15 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
         Impl& impl;
         Impl::AioContext context;
         bool idle = false;
-        ~Lease() { impl.put_aio(context, idle); }
+        ~Lease() { impl.put_aio(std::move(context), idle); }
     } lease{*impl_, impl_->take_aio(slots)};
     if (lease.context.slots != 0) {
         const aio_context_t context = lease.context.id;
-        std::vector<iocb> blocks(slots);
-        std::vector<io_event> events(slots);
-        std::vector<std::size_t> idle;
-        idle.reserve(slots);
+        auto& blocks                = lease.context.blocks;
+        auto& submit_batch          = lease.context.submit_batch;
+        auto& events                = lease.context.events;
+        auto& idle                  = lease.context.idle;
+        idle.clear();
         for (std::size_t s = slots; s-- > 0;) { idle.push_back(s); }
         std::size_t next = 0, in_flight = 0;
         int failure      = 0;
@@ -171,34 +182,42 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
         std::exception_ptr consume_error;
         const auto failed = [&] { return failure != 0 || short_read || consume_error; };
         while (in_flight > 0 || (next < offsets.size() && !failed())) {
-            while (next < offsets.size() && !idle.empty() && !failed()) {
-                const std::size_t slot = idle.back();
-                if (offsets[next] > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+            std::size_t batch_count = 0;
+            while (next + batch_count < offsets.size() && batch_count < idle.size() && !failed()) {
+                const std::size_t idx = next + batch_count;
+                if (offsets[idx] > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
                     failure = EOVERFLOW;
                     break;
                 }
-                iocb& block          = blocks[slot];
-                block                = iocb{};
-                block.aio_fildes     = static_cast<std::uint32_t>(impl_->fd);
-                block.aio_lio_opcode = IOCB_CMD_PREAD;
-                block.aio_buf        = reinterpret_cast<std::uint64_t>(ring.data() + slot * block_bytes);
-                block.aio_nbytes     = block_bytes;
-                block.aio_offset     = static_cast<std::int64_t>(offsets[next]);
-                block.aio_data       = (static_cast<std::uint64_t>(next) << 16U) | slot;
-                iocb* submit         = &block;
-                const long submitted = ::syscall(SYS_io_submit, context, 1L, &submit);
-                if (submitted != 1) {
-                    if (submitted < 0 && errno == EAGAIN && in_flight > 0) { break; } // reap first
-                    if (submitted < 0 && errno == EINTR) { continue; }
+                const std::size_t slot = idle[idle.size() - 1 - batch_count];
+                iocb& block            = blocks[slot];
+                block                  = iocb{};
+                block.aio_fildes       = static_cast<std::uint32_t>(impl_->fd);
+                block.aio_lio_opcode   = IOCB_CMD_PREAD;
+                block.aio_buf          = reinterpret_cast<std::uint64_t>(ring.data() + slot * block_bytes);
+                block.aio_nbytes       = block_bytes;
+                block.aio_offset       = static_cast<std::int64_t>(offsets[idx]);
+                block.aio_data         = (static_cast<std::uint64_t>(idx) << 16U) | slot;
+                submit_batch[batch_count++] = &block;
+            }
+            if (batch_count > 0 && !failed()) {
+                const long submitted =
+                    ::syscall(SYS_io_submit, context, static_cast<long>(batch_count), submit_batch.data());
+                if (submitted > 0) {
+                    idle.resize(idle.size() - static_cast<std::size_t>(submitted));
+                    next += static_cast<std::size_t>(submitted);
+                    in_flight += static_cast<std::size_t>(submitted);
+                } else if (submitted < 0 && errno == EINTR) {
+                    continue;
+                } else if (!(submitted < 0 && errno == EAGAIN && in_flight > 0)) {
                     failure = submitted < 0 ? errno : EIO;
-                    break;
                 }
-                idle.pop_back();
-                ++next;
-                ++in_flight;
             }
             if (in_flight == 0) { continue; }
-            const long done = ::syscall(SYS_io_getevents, context, 1L, static_cast<long>(slots), events.data(), nullptr);
+            const long min_wait = static_cast<long>(
+                (next >= offsets.size() || failed()) ? in_flight
+                                                     : std::min<std::size_t>(in_flight, std::max<std::size_t>(1, slots / 4)));
+            const long done = ::syscall(SYS_io_getevents, context, min_wait, static_cast<long>(slots), events.data(), nullptr);
             if (done < 0) {
                 if (errno == EINTR) { continue; }
                 // The kernel still owns the buffers of reads in flight: they must land before the

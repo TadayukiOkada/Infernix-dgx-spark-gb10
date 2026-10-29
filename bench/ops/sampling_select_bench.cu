@@ -29,7 +29,7 @@ namespace {
 constexpr std::int32_t kPhysicalRows      = 248320;
 constexpr std::int32_t kTokenDomain       = 248077;
 constexpr std::int32_t kDFlash2Candidates = 16;
-constexpr std::size_t kFlushBytes         = std::size_t{256} << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
 
 enum class Mode {
     Greedy,
@@ -440,8 +440,10 @@ int main(int argc, char** argv) {
             cudaDeviceProp properties{};
             CUDA_CHECK(cudaGetDevice(&device));
             CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-            std::printf("# gpu=%s cuda_runtime=%d cache_flush_mib=256 warmup=%d repeat=%d\n",
-                        properties.name, CUDART_VERSION, options.warmup, options.repeat);
+            std::printf("# gpu=%s cuda_runtime=%d cache_flush_mib=%zu warmup=%d repeat=%d\n",
+                        properties.name, CUDART_VERSION,
+                        static_cast<std::size_t>(kFlushBytes) >> 20, options.warmup,
+                        options.repeat);
         }
         const int max_cols =
             options.matrix

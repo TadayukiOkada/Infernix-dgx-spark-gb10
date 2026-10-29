@@ -19,6 +19,13 @@
 namespace infernix::runtime::expert_offload {
 
 inline constexpr std::uint64_t kLedgerGiB = 1ULL << 30;
+// The ceiling on the expert-frame pool of an integrated (unified-memory) GPU in full mode, where
+// the pinned expert banks draw the same physical pool and cudaMemGetInfo cannot be trusted to see
+// them. Measured: one 128-token generation touches ~7,800 distinct experts (~20 GiB); beyond that
+// the extra frames only duplicate records the GPU can read straight from the banks. 32 GiB ~=
+// 12,400 frames ~= 1.6x the measured working set, and keeps the worst-case draw -- weights +
+// banks + cap + everything else -- at <= ~112 GiB of the 128 GiB physical pool.
+inline constexpr std::uint64_t kIntegratedFramePoolCapBytes = 32 * kLedgerGiB;
 
 struct HostMemoryDemand {
     // Physical memory left free for the OS and other programs (--ram-free-mib).
@@ -117,6 +124,20 @@ struct ExclusiveTier {
 [[nodiscard]] ExclusiveTier plan_exclusive_tier(std::uint64_t keys, std::uint64_t frames, std::uint64_t loan_frames,
                                                 std::uint64_t kv_frames, double seed_share);
 
+// Whether the snapshot leaves room for full mode once everything else planned is subtracted (the
+// physical term of plan_host_memory alone -- commit limits cannot apply to a decision about
+// physical DRAM). Exported for the engine's integrated-device choice between full mode and the
+// capped fallback.
+[[nodiscard]] bool fits_full(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);
+
+// What this process's Host side draws from a unified (integrated GPU) pool: every allocation the RAM
+// ledger plans -- its pins with their lock overhead, the pageable caches, the load staging, the
+// process's growth and the RAM reserve that must stay free on both sides -- plus `host_expert_bytes`,
+// the expert bytes it actually pins there (the ledger's expert share: the banks in full mode, the RAM
+// slots in the SSD tier; 0 with the banks on device). The frames are sized from the same physical
+// pool, so they subtract exactly this; otherwise the two ledgers spend the pool twice.
+[[nodiscard]] std::uint64_t shared_host_claim(const HostMemoryDemand& demand, std::uint64_t host_expert_bytes);
+
 // ---------------------------------------------------------------- device memory
 
 inline constexpr std::uint64_t kLedgerMiB = 1ULL << 20;
@@ -139,9 +160,26 @@ struct VramDemand {
     std::uint64_t graph_bytes = kGraphExecutableBytes;
     // Device allocations still to be made besides the frames (taken from free memory and budget).
     std::uint64_t fixed = 0;
+    // Pinned host memory already held by this process (the Full-mode expert banks and embedding).
+    // On a discrete GPU it lives in a different pool and is ignored; on an integrated (unified
+    // memory) GPU every byte of it draws on the same pool the frames come from, so the frames must
+    // not be sized as if it were absent.
+    std::uint64_t pinned_banks = 0;
+    // Integrated GPUs only: the rest of this process's claim on the one physical pool -- its Host-side
+    // allocations that are not part of `fixed` (its pins, the n-gram row cache, the SSD tier's RAM
+    // slots, its heap growth) plus the RAM reserve (--ram-headroom-mib) that must stay free on both
+    // sides. The RAM ledger charges these against MemAvailable; the frames are sized from the same
+    // number, so without this term the two ledgers spend the pool twice. 0 on a discrete GPU, where
+    // Host memory is a different pool.
+    std::uint64_t shared_host_bytes = 0;
     // One expert frame, and the most frames the residency uses.
     std::uint64_t frame_bytes = 0;
     std::uint32_t max_frames  = 0;
+    // An absolute ceiling on what the frames may take, regardless of the reported free memory.
+    // Integrated GPUs need it: cudaMemGetInfo under-reports the pool there (it counts only the
+    // device-side share, while the pinned banks draw the same physical pages through the host side),
+    // so sizing off the report would let the pool overshoot the pool itself. 0: no ceiling.
+    std::uint64_t frame_pool_cap = 0;
 };
 
 struct VramSizing {

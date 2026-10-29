@@ -136,4 +136,18 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);
 
+/**
+ * Six-output Qwen3.8-Flash-Next QSA input projection specialization. The NVFP4
+ * BlockScaleK16M128x4 [13952,2560] parent stores rows in order [query 6144, gate 6144, key 512,
+ * value 512, index_query 512, index_key 128]. x is contiguous BF16 [2560,T]; every route writes the
+ * six independent final allocations directly without materializing a packed parent output.
+ */
+void attn_input_proj(const Tensor& x, const Weight& projection_weight, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, Tensor& iq, Tensor& ik, cudaStream_t stream);
+
+void attn_input_proj(const Tensor& x, const Weight& projection_weight, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, Tensor& iq, Tensor& ik, LinearPolicy policy,
+                     WorkspaceArena& workspace, cudaStream_t stream,
+                     LinearRoutes routes = LinearRoutes::Exact);
+
 } // namespace infernix::ops

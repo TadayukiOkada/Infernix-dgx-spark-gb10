@@ -33,6 +33,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--model-id"},
     ServeOptionArity{"--ngram-volume"},
     ServeOptionArity{"--ngram-residency"},
+    ServeOptionArity{"--ngram-cache-mib"},
     ServeOptionArity{"--expert-stripe"},
     ServeOptionArity{"--expert-state"},
     ServeOptionArity{"--chat-template"},
@@ -41,7 +42,6 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--max-context"},
     ServeOptionArity{"--kv-capacity"},
     ServeOptionArity{"--vram-headroom-mib"},
-    ServeOptionArity{"--vram-past-budget", false},
     ServeOptionArity{"--expert-tail-skip"},
     ServeOptionArity{"--max-concurrency"},
     ServeOptionArity{"--max-pending-requests"},
@@ -370,6 +370,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             on demand;\n"
            "                             auto (default) takes RAM while every expert still\n"
            "                             fits in RAM beside it\n"
+           "  --ngram-cache-mib MIB      host row cache size in MiB when reading the n-gram\n"
+           "                             table from its volume (0: default 2^20 rows)\n"
            "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
            "                             startup to fill the VRAM expert cache, written at\n"
            "                             stop and every 10 minutes between requests\n"
@@ -410,16 +412,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             offloaded experts:\n"
            "                             auto = --max-context x --max-concurrency)\n"
            "  --vram-headroom-mib N|auto VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
-           "                             after --kv-capacity auto (auto " +
+           "                             after --kv-capacity auto (auto: 0 on unified\n"
+           "                             memory, else " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           "); Qwen3.8-Flash-\n"
-           "                             Next, after the expert cache, for the display and\n"
-           "                             other programs (auto: 1024 with a display on the\n"
-           "                             GPU, else 256)\n"
-           "  --vram-past-budget         Qwen3.8-Flash-Next on Windows: also use the VRAM\n"
-           "                             the OS budget withholds (~0.6 GiB more expert\n"
-           "                             cache on an RTX 5090; may move to system memory\n"
-           "                             if another program needs VRAM)\n"
+           "); Qwen3.8-Flash-Next, after\n"
+           "                             the expert cache, for the display and other\n"
+           "                             programs (auto: 0 on unified memory, 1024 with a\n"
+           "                             display on the GPU, else 256)\n"
            "  --expert-tail-skip R       Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B):\n"
            "                             trade quality for decode speed by skipping a routed\n"
            "                             expert missing from VRAM that every token of a decode\n"
@@ -513,7 +512,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --draft-model FILE         Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
            "                             drafter's companion artifact (Qwen3.5/3.6 artifacts\n"
            "                             bundle theirs)\n"
-           "  --lm-head-draft            use the optimized proposal head\n"
+           "  --lm-head-draft            use the optimized proposal head: validated\n"
+           "                               +9.540% decode on Qwen3.8-Flash-Next\n"
+           "                               artifacts carrying a proposal head,\n"
+           "                               with byte-identical greedy output;\n"
+           "                               startup fails without that component\n"
            "  --spec-min-p P             mtp (on Qwen3.8-Flash-Next with a fixed\n"
            "                             --draft-tokens N only) and Qwen3.8-Flash-Next dflash2:\n"
            "                             one-request rounds verify drafts only up to the\n"
@@ -699,6 +702,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.ngram_volume_path = require_value("--ngram-volume");
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = parse_ngram_residency(require_value("--ngram-residency"));
+        } else if (arg == "--ngram-cache-mib") {
+            const std::uint64_t mib   = parse_u64(require_value("--ngram-cache-mib"), "--ngram-cache-mib");
+            options.ngram_cache_bytes = mib << 20;
         } else if (arg == "--expert-state") {
             const std::string path = require_value("--expert-state");
             options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
@@ -730,8 +736,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--vram-headroom-mib") {
             options.vram_headroom_bytes =
                 parse_vram_headroom(require_value("--vram-headroom-mib"));
-        } else if (arg == "--vram-past-budget") {
-            options.vram_past_budget = true;
         } else if (arg == "--expert-tail-skip") {
             options.expert_tail_skip = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--expert-tail-skip"), "expert-tail-skip"));

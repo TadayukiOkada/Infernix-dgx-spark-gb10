@@ -66,22 +66,20 @@ sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens,
     const int direct_context_limit = window == 2048 && tokens > 8 && batch >= 6 ? 128 : 96;
     const bool direct = envelope.max_context <= static_cast<std::uint32_t>(direct_context_limit);
     constexpr int key_block          = 32;
-    const int reduce_warps           = window == 2048 ? 4 : 1;
+    const int reduce_warps           = 4;
     const std::uint32_t context_rows = std::min(envelope.max_context, window - 1u);
     const std::int32_t context_tiles = (context_rows + key_block - 1u) / key_block;
     int split_limit                  = 32;
-    if (window == 2048) {
-        if (tokens <= 4) {
-            split_limit = batch <= 2 ? 32 : batch <= 6 ? 16 : 8;
-        } else if (tokens <= 8) {
-            split_limit = batch == 1 ? 32 : batch == 2 ? 16 : 8;
-            if (batch >= 6) split_limit = std::min(split_limit, std::max(4, context_tiles / 4));
-        } else {
-            split_limit = batch <= 2 ? 16 : batch <= 5 ? 8 : 4;
-            if (batch >= 2) {
-                const int tiles_per_split = batch == 2 ? 2 : 4;
-                split_limit = std::min(split_limit, std::max(4, context_tiles / tiles_per_split));
-            }
+    if (tokens <= 4) {
+        split_limit = batch <= 2 ? 32 : batch <= 6 ? 16 : 8;
+    } else if (tokens <= 8) {
+        split_limit = batch == 1 ? 32 : batch == 2 ? 16 : 8;
+        if (batch >= 6) split_limit = std::min(split_limit, std::max(4, context_tiles / 4));
+    } else {
+        split_limit = batch <= 2 ? 16 : batch <= 5 ? 8 : 4;
+        if (batch >= 2) {
+            const int tiles_per_split = batch == 2 ? 2 : 4;
+            split_limit = std::min(split_limit, std::max(4, context_tiles / tiles_per_split));
         }
     }
     return {
@@ -117,7 +115,7 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
     const bool direct = plan.route == SlidingWindowAttentionRoute::Direct;
     if ((plan.window != 2048 && plan.window != 4096) ||
         context.capacity != static_cast<std::uint32_t>(plan.window) ||
-        plan.key_block != 32 || plan.reduce_warps != (plan.window == 2048 ? 4 : 1) ||
+        plan.key_block != 32 || plan.reduce_warps != 4 ||
         plan.split_capacity < 1 || plan.split_capacity > kSlidingWindowMaxSplits ||
         (direct && plan.split_capacity != 1))
         throw std::invalid_argument("sliding_window_attention: inconsistent plan");

@@ -170,7 +170,7 @@ __device__ __forceinline__ void compute(Shared& sm, const std::uint8_t* const (&
     const auto issue = [&](int st, int buf) {
         for (int i = static_cast<int>(threadIdx.x); i < 2 * (kImage / 16); i += kThreads) {
             const int h = i / (kImage / 16), c = i % (kImage / 16);
-            tile::cp_async16(&sm.image[buf][h][16 * c], images[h] + st * kStride + 16 * c, 16);
+            tile::cp_async16(&sm.image[buf][h][16 * c], (h == 0 ? images[0] : images[1]) + st * kStride + 16 * c, 16);
         }
         for (int i = static_cast<int>(threadIdx.x); i < kSlices * kColumns * 8; i += kThreads) {
             const int j = i / (kColumns * 8), c = (i / 8) % kColumns, u = i % 8;

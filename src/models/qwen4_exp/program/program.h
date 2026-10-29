@@ -358,6 +358,8 @@ struct ProgramOptions {
     // The whole n-gram table read into RAM locked for the CPU at startup (EngineOptions::ngram_residency,
     // resolved by the RAM ledger); rows are then never read from the volume.
     bool ngram_in_ram = false;
+    // Host row cache budget when reading from the volume (EngineOptions::ngram_cache_bytes; 0: 2^20 rows).
+    std::uint64_t ngram_cache_bytes = 0;
     // The expert cache's saved state (design §19.3.5 S4b): read at startup to fill the frames, written
     // at stop and every 10 minutes between requests. Empty: no file. The identity names the artifact the
     // state belongs to.
@@ -371,9 +373,14 @@ struct ProgramOptions {
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
-    bool vram_past_budget = false; // EngineOptions::vram_past_budget
+    bool vram_past_budget = false;
     // EngineOptions::expert_tail_skip (approximate, 0: off): execution::ForwardExperts::tail_skip_rank.
     std::uint32_t expert_tail_skip = 0;
+    // Integrated GPUs only: this process's Host-side claim on the one physical pool (the RAM ledger's
+    // terms except the expert banks, plus their RAM slots and the RAM reserve), computed once by the
+    // engine. The expert frames are sized from the same pool, so they subtract it (memory_plan.h
+    // shared_host_claim); 0 on a discrete GPU.
+    std::uint64_t shared_host_bytes = 0;
     bool expert_cache = true;
     // SSD expert tier (design §19.3.7): pinned RAM for expert slots when the model's banks are
     // streamed from the artifact (LoadOptions::stream_experts; the RAM ledger's pinned expert
@@ -395,7 +402,7 @@ struct ProgramOptions {
     // allowance): when the OS refuses a slot chunk, the tier leaves this much below the limit.
     std::uint64_t later_pinned_bytes = 0;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
-    // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
+    // draft tokens per round (0 disables, at most 31), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
@@ -525,6 +532,24 @@ struct ProgramOptions {
     // graph executable's device memory are appended to this file for the expert-cache replay and
     // the graph-memory measurement (program/route_trace.h). Changes no result.
     std::filesystem::path route_trace;
+    // EXPERIMENTAL (env-gated): the expert banks live in DEVICE memory (the load bound them
+    // Residency::Device), one draw per byte on unified DRAM. With every record already where the
+    // kernels run, nothing needs framing, streaming, staging or CPU service -- the frame tables
+    // stay -1 and every read goes straight to the bank. Implies `integrated`.
+    bool device_experts = false;
+    // The GPU draws on the same physical memory as the host (GB10 / Grace: `integrated`). The CPU
+    // miss-service exists to take compute off a link that has to carry the record: a discrete card
+    // reads it over PCIe, so the CPU's own DRAM read is the cheaper of the two. With one pool there
+    // is no such trade -- the CPU's read costs the same DRAM the GPU's would -- and serving misses
+    // measured strictly slower at every split and every worker count (2026-10-21, IQ3_S, pinned
+    // experts, three interleaved rounds: 0 served 35.8 tok/s; d = 2 26.5, 3 24.3, 4 23.7, 6 23.2;
+    // 16 workers 26.7 against 2/4/8 workers 35.7-35.9, which stay below the split threshold). So the
+    // service stays off here and the GPU serves every miss, as it did before the route existed.
+    bool unified_memory = false;
+    // Whether decode/MTP/verify rounds are captured into CUDA graphs after their first eager round.
+    // False runs every round eagerly and never captures (EngineOptions::use_cuda_graph /
+    // --no-cuda-graph). Previously dropped here, which made the switch label-only on this path.
+    bool use_cuda_graph = true;
 };
 
 class Program {

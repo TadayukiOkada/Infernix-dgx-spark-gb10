@@ -33,10 +33,18 @@ __global__ void split_kernel(const __nv_bfloat16* __restrict__ in, int rows, Spl
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (r >= rows) { return; }
-    int i = 0;
-    while (r >= targets.begin[i + 1]) { ++i; }
-    const int width = targets.begin[i + 1] - targets.begin[i];
-    targets.data[i][static_cast<std::size_t>(t) * width + (r - targets.begin[i])] =
+    int begin = targets.begin[0];
+    int width = targets.begin[1] - targets.begin[0];
+    auto* out = targets.data[0];
+#pragma unroll
+    for (int k = 1; k < kMaxOutputs; ++k) {
+        if (k < targets.count && r >= targets.begin[k]) {
+            begin = targets.begin[k];
+            width = targets.begin[k + 1] - targets.begin[k];
+            out   = targets.data[k];
+        }
+    }
+    out[static_cast<std::size_t>(t) * width + (r - begin)] =
         in[static_cast<std::size_t>(t) * rows + r];
 }
 
@@ -48,11 +56,18 @@ __global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, Spl
     const int t = blockIdx.y;
     if (r >= rows8) { return; }
     const int row = r * 8;
-    int i         = 0;
-    while (row >= targets.begin[i + 1]) { ++i; }
-    const int width = targets.begin[i + 1] - targets.begin[i];
-    auto* out       = reinterpret_cast<uint4*>(targets.data[i]);
-    out[(static_cast<std::size_t>(t) * width + (row - targets.begin[i])) / 8] = in[static_cast<std::size_t>(t) * rows8 + r];
+    int begin = targets.begin[0];
+    int width = targets.begin[1] - targets.begin[0];
+    auto* out = reinterpret_cast<uint4*>(targets.data[0]);
+#pragma unroll
+    for (int k = 1; k < kMaxOutputs; ++k) {
+        if (k < targets.count && row >= targets.begin[k]) {
+            begin = targets.begin[k];
+            width = targets.begin[k + 1] - targets.begin[k];
+            out   = reinterpret_cast<uint4*>(targets.data[k]);
+        }
+    }
+    out[(static_cast<std::size_t>(t) * width + (row - begin)) / 8] = in[static_cast<std::size_t>(t) * rows8 + r];
 }
 
 __global__ void gather_kernel(const __nv_bfloat16* __restrict__ in, int rows,

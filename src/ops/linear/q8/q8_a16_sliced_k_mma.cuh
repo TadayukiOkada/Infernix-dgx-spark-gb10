@@ -96,14 +96,16 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     // dependents launch once that loop is done.
     pdl::enter_streaming();
     constexpr int ActiveCols        = Schedule::kTokenCapacity;
+    constexpr bool kRuntimeActive   = Schedule::kActivationStage == Q8ActivationStage::RuntimeActive;
     const auto* __restrict__ x      = operands.x;
     const auto* __restrict__ codes  = operands.codes;
     const auto* __restrict__ scales = operands.scales;
-    const int columns               = Schedule::kExactTokens ? ActiveCols : operands.tokens;
+    const int columns =
+        (Schedule::kExactTokens && !kRuntimeActive) ? ActiveCols : operands.tokens;
     const int column_offset =
         Schedule::kExactTokens ? 0 : token_begin + static_cast<int>(blockIdx.y) * ActiveCols;
     const int live_columns =
-        Schedule::kExactTokens ? ActiveCols : min(ActiveCols, columns - column_offset);
+        Schedule::kExactTokens ? columns : min(ActiveCols, columns - column_offset);
     const int kHidden             = Schedule::kStaticK > 0 ? Schedule::kStaticK : operands.k;
     const int padded_k            = Schedule::kStaticK > 0 ? Schedule::kStaticK : operands.padded_k;
     constexpr int kTileK          = Schedule::kWarpK;
@@ -113,7 +115,6 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     constexpr int kGroupK         = Schedule::kBlockK;
     const int kGroups             = (kHidden + kGroupK - 1) / kGroupK;
     constexpr int kTileCols       = Schedule::kBlockTokens;
-    constexpr bool kRuntimeActive = Schedule::kActivationStage == Q8ActivationStage::RuntimeActive;
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
     constexpr int kNt        = kTileCols / 8;

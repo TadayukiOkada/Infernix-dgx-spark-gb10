@@ -17,11 +17,7 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#    include <process.h>
-#else
 #    include <unistd.h>
-#endif
 
 namespace infernix::test::artifact_fixture {
 
@@ -54,11 +50,7 @@ struct Fixture {
 
     Fixture() : payload(1344) {
         static std::atomic<std::uint64_t> counter{0};
-#ifdef _WIN32
-        const long long process = ::_getpid();
-#else
         const long long process = static_cast<long long>(::getpid());
-#endif
         const std::string name =
             "infernix-artifact-" + std::to_string(process) + "-" + std::to_string(counter.fetch_add(1));
         directory = std::filesystem::temp_directory_path() / name;

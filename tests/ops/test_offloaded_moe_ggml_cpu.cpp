@@ -170,7 +170,7 @@ void run(QType gu, QType down, std::mt19937& rng) {
     x[static_cast<std::size_t>(7) * H + 123] = 0x7F80; // +inf: column 7's outputs are NaN
     std::vector<std::vector<std::uint16_t>> expected;
     for (int c = 0; c < moe::kMaxColumns; ++c) { expected.push_back(oracle(record.data(), f, x.data() + static_cast<std::size_t>(c) * H)); }
-    const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni};
+    const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kNeon};
     for (const auto isa : isas) {
         if (!moe::cpu_isa_supported(isa) || (!g_only_isa.empty() && g_only_isa != moe::cpu_isa_name(isa))) { continue; }
         // The 256-bit ISAs' tiled rows have a kernel per width 1-8; the other ISAs and FP8 take fewer.
@@ -385,7 +385,7 @@ void columns() {
         std::normal_distribution<float> normal(0.0F, 1.0F);
         for (auto& v : x) { v = bf16(normal(rng)); }
         std::vector<std::uint16_t> y(static_cast<std::size_t>(H) * moe::kMaxColumns);
-        for (const auto isa : {moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+        for (const auto isa : {moe::CpuIsa::kNeon}) {
             if (!moe::cpu_isa_supported(isa)) { continue; }
             for (int ncols = 1; ncols <= moe::kMaxColumns; ++ncols) {
                 const std::uint16_t* xp[moe::kMaxColumns];
@@ -418,8 +418,8 @@ INFERNIX_OP_TEST(offloaded_moe_ggml_cpu) {
         columns();
         return 0;
     }
-    // --isa NAME (cpu_isa_name, e.g. avx512-vnni): only that ISA's kernels against the oracle and the
-    // worker team, for a run under an emulator (Intel SDE) on a CPU without it.
+    // --isa NAME (cpu_isa_name, e.g. neon): only that ISA's kernels against the oracle and the
+    // worker team, for a run on a CPU without the optional extension.
     if (argc > 2 && std::string(argv[1]) == "--isa") {
         g_only_isa = argv[2];
         if (!moe::cpu_isa_supported(moe::best_cpu_isa()) || moe::cpu_isa_name(moe::best_cpu_isa()) != g_only_isa) {

@@ -12,27 +12,26 @@
 namespace infernix::ops::detail {
 namespace {
 
-// Up to 64 tokens the N=5120 projections are one wave of 80 CTAs, so their time is the weight
-// stream per CTA. A third stage keeps more of it in flight: measured on RTX 5090 (cold weights),
-// the K=17408 down projection takes 45.5-47.7 us instead of 57.7-60.0 and K=6144 21.1 us instead
-// of 27.2, bit-identically.
+// GB10 (sm_121a, 48 SMs) cold-weight sweeps over every A4 schedule candidate, quantize included.
+// These replace the earlier RTX 5090 fit, which mis-picked the mid- and high-token bands here.
+// Up to ~32 tokens the N=5120 projections are one wave of CTAs, so their time is the weight stream
+// per CTA; a third stage keeps more of it in flight (K=17408 221-232 us, K=6144 85-90 us).
 using M32N64            = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
-// At 8 tokens the K=17408 down projection streams 512 K per stage over 160 CTAs: 36.6 instead of
-// 37.6 us (RTX 5090, cold weights, six interleaved passes), the same K order per output. Other
-// widths, K=6144 and 32-row variants with 256 K per stage measured no faster.
+// On GB10 the K=17408 down projection prefers the 32x32/512-K-per-stage shape out to 32 tokens
+// (221-232 us vs 230-240 for M32N64), a much wider window than the RTX 5090 needed.
 using M32N32K512        = Nvfp4A4MmaSchedule<32, 32, 512, 2, 2, 3, 2>;
 using M32N128           = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using M64N128           = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+// Pipelined wins the 49..128 band on GB10 (K6144 91-99 us, K17408 244-267 us); the resident variant
+// only takes over once the wave spills past what pipelining can hide (~129..256 tokens).
 using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
+using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 1>;
 
 // This projection selects its own route, so the layout the quantizer writes below must be derived
-// from the same predicate; the two are read together at the call site for that reason. Past 512
-// tokens the TMA route is faster than the resident 128x128 tile (RTX 5090, cold weights): 513 tokens
-// take 144.7 instead of 187.7 us at K=17408 and 62.0 instead of 70.9 us at K=6144, 640-1000 tokens
-// 17-26 % less; at 512 and below the MMA tiles stay faster (114.0 against 133.7 us at K=17408).
-// Both routes give the same bits (27B top-32 logprobs over 640-token chunks are byte-identical).
-constexpr bool uses_tma(std::int32_t tokens) { return tokens > 512; }
+// from the same predicate; the two are read together at the call site for that reason.
+// GB10 reaches the DRAM roof sooner than the RTX 5090: the TMA path beats the resident MMA from
+// ~288 tokens (K6144 143 us vs 189; K17408 375 us vs 540), whereas resident still wins at 256.
+constexpr bool uses_tma(std::int32_t tokens) { return tokens >= 288; }
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
@@ -47,18 +46,29 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace worksp
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    if (Geometry::kInputRows == 17408 && tokens <= 8) {
-        launch_gemm<Geometry, M32N32K512>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 64) {
-        launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 128) {
-        launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 192) {
-        launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 384) {
-        launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
-    } else { // at most 512 tokens: larger calls take the TMA route
-        launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
+    // Band boundaries are the per-token cold-weight winners on GB10 (see the schedule notes above).
+    // Within each band the neighbours are within measurement noise; the boundaries themselves are
+    // separated by >5%, so they are the ones that matter.
+    if constexpr (Geometry::kInputRows == 17408) {
+        if (tokens <= 32) {
+            launch_gemm<Geometry, M32N32K512>(weight, residual, workspace, tokens, stream);
+        } else if (tokens <= 48) {
+            launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
+        } else if (tokens <= 128) {
+            launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
+        } else {
+            launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
+        }
+    } else {
+        if (tokens <= 16) {
+            launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
+        } else if (tokens <= 48) {
+            launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
+        } else if (tokens <= 128) {
+            launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
+        } else {
+            launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
+        }
     }
 }
 

@@ -31,11 +31,10 @@ struct Nvfp4TiledKeys {
 // Values selects the stored V representation; split outputs remain FP32 with
 // maxima in natural scaled-score units for the final merge.
 //
-// PV accumulates each 64-key tile on FP16 Tensor Cores (FP32 accumulation runs at half
-// their rate on RTX 5090) and promotes the partial into the FP32 output once per tile.
-// Every probability is at most one, so a partial is bounded by 64 * max |V|;
-// Values::tile_shift picks the exact power of two that V is decoded down by to keep that
-// bound inside FP16, and the partial is multiplied back in FP32.
+// PV accumulates directly into the FP32 output on FP16 Tensor Cores (FP32 accumulation runs at
+// the FP16-accumulation rate on GB10; measured 125.3 vs 125.4 TFLOP/s). V stays an FP16 operand:
+// Values::tile_shift picks the exact power of two that V is decoded down by when needed to keep
+// decoded FP16 V finite, and the accumulator is scaled back in FP32.
 //
 // The 8-bit PV form (Pv8: NVFP4-G16 V, that is K8V4 and NVFP4 KV;
 // CausalAttentionExecutionEnvelope::fast_prompt_pv8) decodes V once per tile to E4M3 under
@@ -592,11 +591,20 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                                     p_frag[step][2], p_frag[step][3], odd0, odd1, 0x7FU, sfb);
             }
         } else {
-            // O = alpha O + P V, contracting over the Bc keys. The (n, k) iteration space is
-            // flattened n-major and software-pipelined: the transposed ldmatrix for the next
-            // V fragment is issued while the current MMA runs. Each x4.trans load covers 2
-            // output n-tiles (16 dims), whose FP16 partials over the tile's keys stay in four
-            // registers until their FP32 promotion.
+            // O = alpha O + P V, contracting over the Bc keys directly into the FP32 output
+            // accumulator. The (n, k) iteration space is flattened n-major and software-pipelined:
+            // the transposed ldmatrix for the next V fragment is issued while the current MMA runs.
+            const float a_scale0 =
+                (!Values::kE4m3Values && v_shift != 0) ? ldexpf(alpha0, -v_shift) : alpha0;
+            const float a_scale1 =
+                (!Values::kE4m3Values && v_shift != 0) ? ldexpf(alpha1, -v_shift) : alpha1;
+#pragma unroll
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                acc[n][0] *= a_scale0;
+                acc[n][1] *= a_scale0;
+                acc[n][2] *= a_scale1;
+                acc[n][3] *= a_scale1;
+            }
             constexpr int PVHalf  = PVNtPerWarp / 2; // 16 n-tile pairs
             constexpr int PVLoads = PVKs * PVHalf;   // 64 x4.trans loads
             // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
@@ -605,47 +613,34 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                 ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
                               causal_swizzle_address(v_lane_base, 0u, v_as, v_r));
             }
-            unsigned partial_h[2][2];
 #pragma unroll
             for (int li = 0; li < PVLoads; ++li) {
-                const int n2  = (li / PVKs) * 2;
-                const int k   = li % PVKs;
+                const int k   = li / PVHalf;
+                const int n2  = (li % PVHalf) * 2;
                 const int cur = li & 1;
                 const int nxt = cur ^ 1;
                 if (li + 1 < PVLoads) {
-                    const int n2b      = ((li + 1) / PVKs) * 2;
-                    const int k2       = (li + 1) % PVKs;
+                    const int k2       = (li + 1) / PVHalf;
+                    const int n2b      = ((li + 1) % PVHalf) * 2;
                     const unsigned ckv = static_cast<unsigned>(n2b << 4);
                     ldmatrix_x4_t(
                         vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
                         causal_swizzle_address(v_lane_base + static_cast<unsigned>(k2 * (16 * D * 2)),
                                                ckv, v_as, v_r));
                 }
-                if (k == 0) {
-                    partial_h[0][0] = partial_h[0][1] = 0U;
-                    partial_h[1][0] = partial_h[1][1] = 0U;
-                }
-                mma_f16_f16acc(partial_h[0][0], partial_h[0][1], p_frag[k][0], p_frag[k][1],
-                               p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-                mma_f16_f16acc(partial_h[1][0], partial_h[1][1], p_frag[k][0], p_frag[k][1],
-                               p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
-                if (k == PVKs - 1) {
+                mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
+                        p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
+                mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                        p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2],
+                        vf[cur][3]);
+            }
+            if (!Values::kE4m3Values && v_shift != 0) {
 #pragma unroll
-                    for (int t = 0; t < 2; ++t) {
-                        float2 r0 = __half22float2(load_vec<__half2>(&partial_h[t][0]));
-                        float2 r1 = __half22float2(load_vec<__half2>(&partial_h[t][1]));
-                        if (v_shift != 0) {
-                            r0.x *= v_unscale;
-                            r0.y *= v_unscale;
-                            r1.x *= v_unscale;
-                            r1.y *= v_unscale;
-                        }
-                        float (&a)[4] = acc[n2 + t];
-                        a[0]          = __fmaf_rn(a[0], alpha0, r0.x);
-                        a[1]          = __fmaf_rn(a[1], alpha0, r0.y);
-                        a[2]          = __fmaf_rn(a[2], alpha1, r1.x);
-                        a[3]          = __fmaf_rn(a[3], alpha1, r1.y);
-                    }
+                for (int n = 0; n < PVNtPerWarp; ++n) {
+                    acc[n][0] *= v_unscale;
+                    acc[n][1] *= v_unscale;
+                    acc[n][2] *= v_unscale;
+                    acc[n][3] *= v_unscale;
                 }
             }
         }

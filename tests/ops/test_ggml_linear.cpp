@@ -654,7 +654,14 @@ std::vector<BenchCall> bench_calls() {
             {"ssm_out (perm)", 6144, {{QType::GGML_Q6_K, 2560}}, false, true},
             {"attn_qkv Q5_K", 2560, {{QType::GGML_Q5_K, 10240}}},
             {"attn_gate Q4_K", 2560, {{QType::GGML_Q4_K, 6144}}},
-            {"lm_head (FP32)", 2560, {{QType::GGML_Q6_K, 248320}}, true}};
+            {"lm_head (FP32)", 2560, {{QType::GGML_Q6_K, 248320}}, true},
+            // IQ3_S dense projections (the import's formats run the narrow rows/mma route only: IQ3_S is
+            // not ggml_tiles16_supported, so no wide tile/plane). Covers the three widths each takes --
+            // one-column decode, multi-column MTP verify, and a prefill-ish group -- over the same K.
+            {"iq3_s head (decode)", 2560, {{QType::GGML_IQ3_S, 248320}}},
+            {"iq3_s head (MTP verify)", 2560, {{QType::GGML_IQ3_S, 248320}}},
+            {"iq3_s attn", 2560, {{QType::GGML_IQ3_S, 3072}}},
+            {"iq3_s gate/up", 2560, {{QType::GGML_IQ3_S, 640}}}};
 }
 
 // A call's device buffers at `columns` columns, in one layout; time() captures and times it under
@@ -833,7 +840,234 @@ void run_ple(int heads, int width, int columns, Scales scales, std::mt19937& rng
 
 } // namespace
 
+// --iq3s-probe <T> [repeats]: build ONE IQ3_S dense projection (the import's LM head: k=2560,
+// rows=248320, BF16 weights, BF16 outputs) from synthetic random blocks and replay it `repeats`
+// times in a CUDA Graph. Guarded behind INFERNIX_IQ3S_PROBE so it never runs during normal test
+// passes. Lets NCU isolate exactly the IQ3_S kernels at any column count T without touching real
+// model weights (matches AGENTS.md's requirement that NCU use isolated synthetic-data harnesses).
+static int iq3s_probe_columns = -1;  // set by main() below; read by ckt.cli profiler if needed
+// ------------------------------------------------------------------------------------- ckt harness
+//
+// --ckt: the cuda-kernel-toolkit's harness contract (cuda-kernel-toolkit/kernels/harness.h) over the
+// production ggml_linear route. One IQ3_S segment of `n` rows at k = 2560 and INFERNIX_CKT_COLUMNS
+// columns (16: the dead zone past the MMA band) over synthetic random blocks, launched through
+// ops::ggml_linear exactly as the model calls it. The workload label names the kernel the toolkit
+// disassembles and profiles (rows_kernel, encode_kernel, tile_kernel); every label runs the same
+// production call, and the label plus the width select the route. Records are the harness's
+// key<TAB>value form. --verify is one fresh launch compared to the bit-exact oracle on a row sample,
+// and blocks/threads/smem are what the production dispatch derives from the shape (the harness's
+// launch arguments are accepted and reported, not honoured: the route owns them).
+void emit_kv(const std::string& key, const std::string& value) { std::printf("%s\t%s\n", key.c_str(), value.c_str()); }
+void emit_kv(const std::string& key, long long value) { std::printf("%s\t%lld\n", key.c_str(), value); }
+void emit_kv(const std::string& key, double value, int digits) { std::printf("%s\t%.*f\n", key.c_str(), digits, value); }
+
+int ckt_mode(int argc, char** argv) {
+    std::string workload;
+    int n = -1, blocks_in = -1, threads_in = -1, smem_in = -1, iters = 30, warmup = 5;
+    bool do_verify = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--ckt") { continue; }
+        auto next = [&](const char* flag) -> const char* {
+            if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", flag); std::exit(2); }
+            return argv[++i];
+        };
+        if (a == "--list") {
+            for (const char* wl : {"rows_kernel", "encode_kernel", "mma_rows_kernel", "tile_kernel"}) {
+                std::printf("workload\t%s\tn\t%s\tblocks\t0\tthreads\t0\tsmem\t0\n", wl,
+                            std::string(wl) == "tile_kernel" ? "3072" : "24576");
+            }
+            return 0;
+        } else if (a == "--workload") {
+            workload = next("--workload");
+        } else if (a == "--n") {
+            n = std::atoi(next("--n"));
+        } else if (a == "--blocks") {
+            blocks_in = std::atoi(next("--blocks"));
+        } else if (a == "--threads") {
+            threads_in = std::atoi(next("--threads"));
+        } else if (a == "--smem") {
+            smem_in = std::atoi(next("--smem"));
+        } else if (a == "--iters") {
+            iters = std::atoi(next("--iters"));
+        } else if (a == "--warmup") {
+            warmup = std::atoi(next("--warmup"));
+        } else if (a == "--repeat") {
+            (void)next("--repeat");
+        } else if (a == "--verify") {
+            do_verify = true;
+        } else {
+            std::fprintf(stderr, "ckt: unknown argument %s\n", a.c_str());
+            return 2;
+        }
+    }
+    (void)blocks_in; (void)threads_in; (void)smem_in;
+    const QType q = QType::GGML_IQ3_S;
+    const int k       = 2560;
+    // The route the production dispatch selects for the label and width (as of the 2026-10-22
+    // batched-mma change): one and two columns the rows kernel, three to 63 the mma rows kernel
+    // (beyond eight in batches of eight), and 64 and above the prefill planes and tiles.
+    const bool wide_route = workload == "tile_kernel";
+    const bool mma_route  = workload == "mma_rows_kernel";
+    const int columns = [&] {
+        const char* e = std::getenv("INFERNIX_CKT_COLUMNS");
+        if (e && *e) { return std::max(1, std::atoi(e)); }
+        if (wide_route) { return 64; }
+        if (mma_route)  { return 16; }
+        return 2;  // the rows route's decode width
+    }();
+    if (wide_route && columns < 64) {
+        std::fprintf(stderr, "ckt: tile_kernel needs INFERNIX_CKT_COLUMNS >= 64\n");
+        return 2;
+    }
+    if (mma_route && (columns < 3 || columns >= 64)) {
+        std::fprintf(stderr, "ckt: mma_rows_kernel needs INFERNIX_CKT_COLUMNS in [3, 64)\n");
+        return 2;
+    }
+    if (workload == "rows_kernel" && columns > 2) {
+        std::fprintf(stderr, "ckt: rows_kernel needs INFERNIX_CKT_COLUMNS <= 2 (the mma route takes 3+)\n");
+        return 2;
+    }
+    const int rows = n > 0 ? n : (wide_route ? 3072 : 24576);
+
+    const std::size_t row_bytes = ops::ggml_row_bytes(q, k);
+    std::mt19937 rng(2);
+    const auto weights = random_blocks(q, rows, k, rng, Scales::Narrow);
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(k) * columns);
+    std::normal_distribution<float> normal(0.0F, 1.0F);
+    for (auto& v : x) { v = bf16_rne(normal(rng)); }
+
+    DeviceBuffer dw(weights.size()), dx(x.size() * 2), dout(static_cast<std::size_t>(rows) * columns * 2);
+    dw.copy_from_host(weights.data(), weights.size(), 0);
+    dx.copy_from_host(x.data(), x.size() * 2, 0);
+    WorkspaceArena work(ops::ggml_linear_workspace_bytes(k, columns) + (1 << 20));
+    Tensor tx(dx.p, DType::BF16, {k, columns});
+    Tensor tout(dout.p, DType::BF16, {rows, columns});
+    const ops::GgmlSegment segments[] = {{q, static_cast<const std::uint8_t*>(dw.p), rows, 0}};
+    const std::vector<Tensor*> out_ptrs{&tout};
+    const auto run = [&] { ops::ggml_linear(tx, std::span<const ops::GgmlSegment>(segments, 1), out_ptrs, nullptr, 0, work, nullptr); };
+
+    // The production launch geometry, for the toolkit's occupancy and wave models: the rows route's
+    // lanes and rows-per-CTA, the tiles' 64 x 64 tiles at 512 threads, one CTA per encoded column.
+    const int slices = k / 32;
+    int lanes = 4;
+    while (lanes < 32 && slices / (2 * lanes) >= 4) { lanes *= 2; }
+    long long blocks = 0, threads = 0, smem = 0;
+    if (workload == "encode_kernel") {
+        blocks = columns;
+        threads = 256;
+    } else if (wide_route) {
+        blocks  = static_cast<long long>((columns + 63) / 64) * ((rows + 63) / 64);
+        threads = 512;
+    } else if (mma_route) {
+        // One launch per batch of at most eight columns, each over the whole row set: 16 rows and
+        // four warps (128 threads) per CTA, the grid per batch.
+        blocks  = (rows + 15) / 16;
+        threads = 128;
+    } else {
+        const int per_cta = 4 * (32 / lanes);
+        blocks            = (rows + per_cta - 1) / per_cta;
+        threads           = 128;
+    }
+
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    emit_kv("device.name", std::string(prop.name));
+    emit_kv("device.sms", static_cast<long long>(prop.multiProcessorCount));
+    emit_kv("workload", workload);
+    emit_kv("kernel", workload);
+    emit_kv("config.n", static_cast<long long>(rows));
+    emit_kv("config.blocks", blocks);
+    emit_kv("config.threads", threads);
+    emit_kv("config.smem", smem);
+    emit_kv("config.k", static_cast<long long>(k));
+    emit_kv("config.columns", static_cast<long long>(columns));
+
+    if (do_verify) {
+        run();
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            emit_kv("verify.status", "fail");
+            emit_kv("verify.detail", "launch error");
+            return 3;
+        }
+        std::vector<std::uint16_t> actual(static_cast<std::size_t>(rows) * columns);
+        dout.copy_to_host(actual.data(), actual.size() * 2, 0);
+        // The bit-exact oracle over a stride-64 row sample: every output column of 1.5k+ rows
+        // compared exactly, while the 273 MB-class matrices stay inside the gate's time budget.
+        std::size_t mismatches = 0, compared = 0;
+        for (int r0 = 0; r0 < rows; r0 += 64) {
+            const int take = std::min(64, rows - r0);
+            const auto bits = oracle_bits(q,
+                                          std::vector<std::uint8_t>(weights.data() + static_cast<std::size_t>(r0) * row_bytes,
+                                                                    weights.data() + static_cast<std::size_t>(r0 + take) * row_bytes),
+                                          take, k, x, columns, nullptr, 0, false);
+            for (int t = 0; t < columns; ++t) {
+                for (int r = 0; r < take; ++r) {
+                    ++compared;
+                    mismatches += actual[static_cast<std::size_t>(t) * rows + r0 + r] != bits[static_cast<std::size_t>(t) * take + r];
+                }
+            }
+        }
+        emit_kv("verify.status", mismatches == 0 ? "pass" : "fail");
+        emit_kv("verify.detail", "bit-exact on " + std::to_string(compared) + " sampled outputs");
+        return mismatches == 0 ? 0 : 3;
+    }
+
+    for (int i = 0; i < warmup; ++i) { run(); }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaEvent_t a, b;
+    CUDA_CHECK(cudaEventCreate(&a));
+    CUDA_CHECK(cudaEventCreate(&b));
+    std::vector<double> samples;
+    for (int i = 0; i < iters; ++i) {
+        CUDA_CHECK(cudaEventRecord(a));
+        run();
+        CUDA_CHECK(cudaEventRecord(b));
+        CUDA_CHECK(cudaEventSynchronize(b));
+        float ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+        samples.push_back(ms * 1000.0);
+    }
+    std::sort(samples.begin(), samples.end());
+    const double median = samples[samples.size() / 2];
+    const double mean   = std::accumulate(samples.begin(), samples.end(), 0.0) / static_cast<double>(samples.size());
+    double var = 0;
+    for (const double v : samples) { var += (v - mean) * (v - mean); }
+    const double sd = std::sqrt(var / static_cast<double>(samples.size()));
+    emit_kv("timing.median_us", median, 4);
+    emit_kv("timing.p10_us", samples[static_cast<std::size_t>(samples.size() * 0.1)], 4);
+    emit_kv("timing.p90_us", samples[static_cast<std::size_t>(samples.size() * 0.9)], 4);
+    emit_kv("timing.min_us", samples.front(), 4);
+    emit_kv("timing.max_us", samples.back(), 4);
+    emit_kv("timing.cv", mean > 0.0 ? sd / mean : 0.0, 6);
+    emit_kv("timing.samples", static_cast<long long>(samples.size()));
+
+    // Unique bytes the call moves (weights, the encoded columns, x, outputs) and its FLOPs: the
+    // toolkit's roofline needs the absolute traffic and operation counts, not a rounded rate.
+    const double encoded = static_cast<double>(slices) * 25.0 * 4.0 * columns;  // k/32 * (kSliceWords + 1) words
+    const double bytes   = static_cast<double>(weights.size()) + encoded + static_cast<double>(x.size()) * 2.0 +
+                           static_cast<double>(rows) * columns * 2.0;
+    const double flops = 2.0 * static_cast<double>(rows) * k * columns;
+    emit_kv("derived.bytes_moved", static_cast<long long>(bytes));
+    emit_kv("derived.flops", static_cast<long long>(flops));
+    emit_kv("derived.effective_bandwidth_gbps", bytes / (median * 1e-6) / 1e9, 2);
+    emit_kv("derived.tflops", flops / (median * 1e-6) / 1e12, 4);
+    return 0;
+}
+
 INFERNIX_OP_TEST(ggml_linear) {
+    // The cuda-kernel-toolkit harness contract (kernels/harness.h) is driven by --ckt, but the
+    // toolkit's analyzer builds its own argument vector, so also enter the harness when it appears
+    // anywhere in the command line.
+    const bool ckt = [&] {
+        for (int i = 1; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "--ckt" || a == "--workload" || a == "--list") { return true; }
+        }
+        return false;
+    }();
+    if (ckt) { return ckt_mode(argc, argv); }
+    const bool probe = argc > 1 && std::string(argv[1]) == "--iq3s-probe";
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         bool tiled = false, bf16 = false;
         for (int i = 3; i < argc; ++i) {
@@ -841,6 +1075,39 @@ INFERNIX_OP_TEST(ggml_linear) {
             bf16  = bf16 || std::string(argv[i]) == "bf16";
         }
         bench(argc > 2 ? std::atoi(argv[2]) : 1, tiled, bf16);
+        return 0;
+    }
+    if (probe || std::getenv("INFERNIX_IQ3S_PROBE")) {
+        const int T = argc > 2 ? std::atoi(argv[2]) : 1;
+        const int repeats = argc > 3 ? std::atoi(argv[3]) : 50;
+        const QType q = QType::GGML_IQ3_S;
+        const int k = 2560, rows = 248320;
+        const int row_bytes = k / ggml_block_elems(q) * ggml_block_bytes(q);
+        std::mt19937 rng(20261010);
+        auto weights = random_blocks(q, rows, k, rng, Scales::Wide);
+        std::vector<std::uint16_t> x(static_cast<std::size_t>(k) * T);
+        std::normal_distribution<float> normal(0.0F, 1.0F);
+        for (auto& v : x) { v = bf16_rne(normal(rng)); }
+        DeviceBuffer dw(weights.size()), dx(x.size() * 2), dout(static_cast<std::size_t>(rows) * T * 2);
+        dw.copy_from_host(weights.data(), weights.size(), 0);
+        dx.copy_from_host(x.data(), x.size() * 2, 0);
+        const std::size_t ws = ops::ggml_linear_workspace_bytes(k, T) + (1 << 20);
+        WorkspaceArena work(ws);
+        Tensor tx(dx.p, DType::BF16, {k, T});
+        Tensor tout(dout.p, DType::BF16, {rows, T});
+        const ops::GgmlSegment segments[] = {{q, static_cast<const std::uint8_t*>(dw.p), rows, 0}};
+        cudaStream_t stream;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        auto run = [&](int i, cudaStream_t s) {
+            (void)i;
+            ops::ggml_linear(tx, segments, tout, nullptr, 0, work, s);
+        };
+        const double us = time_calls(run, repeats, stream);
+        // Effective bandwidth over the weight matrix read once per column batch (single-pass decode).
+        const double bytes_read = static_cast<double>(weights.size());
+        const double bw_gbps = bytes_read / us / 1e3;
+        std::printf("iq3s_probe T=%d rows=%d k=%d: %.2f us/call  %.1f GB/s\n", T, rows, k, us, bw_gbps);
+        CUDA_CHECK(cudaDeviceSynchronize());
         return 0;
     }
     try {

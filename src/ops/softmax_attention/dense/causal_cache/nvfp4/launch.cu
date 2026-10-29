@@ -145,7 +145,7 @@ void nvfp4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
         auto view = make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(cache, &valid, &rows);
         view.tree_masks = tree;
         if (plan.family == Nvfp4KvFamily::Tiled && envelope.fast_prompt_kernel &&
-            nvfp4_fast_prompt_applies(envelope.max_visible_keys))
+            nvfp4_fast_prompt_applies(envelope.max_visible_keys, p.width))
             nvfp4_kv_fast_prompt_attention(p, view, envelope, workspace, execution);
         else if (plan.family == Nvfp4KvFamily::Tiled)
             nvfp4_kv_tiled_attention(p, view, stream);
@@ -167,18 +167,19 @@ void nvfp4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
     const auto plan =
         make_nvfp4_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
+    const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
     if (plan.family == Nvfp4KvFamily::Tiled && envelope.fast_prompt_kernel &&
-        nvfp4_fast_prompt_applies(envelope.max_visible_keys))
+        nvfp4_fast_prompt_applies(envelope.max_visible_keys, p.width))
         nvfp4_kv_fast_prompt_attention(
-            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
+            p,
             make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), envelope, workspace,
             execution);
     else if (plan.family == Nvfp4KvFamily::Tiled)
         nvfp4_kv_tiled_attention(
-            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
+            p,
             make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), stream);
     else if (plan.family == Nvfp4KvFamily::ParallelGrouped)
-        execute_parallel(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
+        execute_parallel(p,
                          make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), plan,
                          workspace, stream);
     else

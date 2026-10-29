@@ -196,16 +196,36 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         const execution::VisionInput* vision     = stage_vision(lane, static_cast<std::uint32_t>(b), w);
         std::byte* host_slot = host_area + c * walk_.io_stride;
         std::byte* slot      = area + walk_.residual_bytes + c * walk_.io_stride;
+        const std::size_t prefix = io_prefix(w);
+        const bool has_tail      = chunk.has_value() || vision != nullptr;
         if (prefetched) {
-            const std::size_t rows = static_cast<std::size_t>(w) * hash_.heads() * ngram_table().row_bytes;
-            const std::size_t tail = io_layout_.ngram + rows;
             std::memcpy(host_slot, io_host_.data(), io_layout_.ngram);
-            std::memcpy(host_slot + tail, static_cast<const std::byte*>(io_host_.data()) + tail, io_layout_.bytes - tail);
+            if (has_tail) {
+                std::memcpy(host_slot + io_layout_.mtp_ids,
+                            static_cast<const std::byte*>(io_host_.data()) + io_layout_.mtp_ids,
+                            io_layout_.bytes - io_layout_.mtp_ids);
+            }
             ++walk_prefetched_chunks_;
-        } else {
+        } else if (has_tail && prefix == io_layout_.mtp_ids) {
             std::memcpy(host_slot, io_host_.data(), io_layout_.bytes);
+        } else {
+            std::memcpy(host_slot, io_host_.data(), prefix);
+            if (has_tail) {
+                std::memcpy(host_slot + io_layout_.mtp_ids,
+                            static_cast<const std::byte*>(io_host_.data()) + io_layout_.mtp_ids,
+                            io_layout_.bytes - io_layout_.mtp_ids);
+            }
         }
-        upload_pinned(slot, host_slot, io_layout_.bytes, s); // not behind the ring's copies (W7)
+        if (has_tail && prefix == io_layout_.mtp_ids) {
+            CUDA_CHECK(cudaMemcpyAsync(slot, host_slot, io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(slot, host_slot, prefix, cudaMemcpyHostToDevice, s));
+            if (has_tail) {
+                CUDA_CHECK(cudaMemcpyAsync(slot + io_layout_.mtp_ids, host_slot + io_layout_.mtp_ids,
+                                           io_layout_.bytes - io_layout_.mtp_ids, cudaMemcpyHostToDevice, s));
+            }
+        }
+
         if (chunk) {
             chunk->ids              = rebase_tensor(chunk->ids, slot);
             chunk->positions        = rebase_tensor(chunk->positions, slot);
@@ -513,7 +533,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     const bool last          = walk_.end_call == lane.calls.size();
     lane.state_tokens = lane.calls[walk_.end_call - 1];
     lane.next_call    = walk_.end_call;
-    residency_->enqueue_route_download(device_.stream, width);
+    if (track_routes()) { residency_->enqueue_route_download(device_.stream, width); }
     expert_stream_->end();
     if (dflash2_) { dflash2_walk_context(lane, index); }
     walk_.active   = false;
@@ -531,11 +551,13 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             device_.synchronize();
         }
         check_expert_error();
-        const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
-                                                static_cast<std::uint64_t>(width));
-        // The route log holds the span's last chunk (every chunk routes nearly every expert).
-        trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, 0, static_cast<std::uint32_t>(begin));
-        apply_prompt_routes(lane, width, 0);
+        if (track_routes()) {
+            const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
+                                                    static_cast<std::uint64_t>(width));
+            // The route log holds the span's last chunk (every chunk routes nearly every expert).
+            trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, 0, static_cast<std::uint32_t>(begin));
+            apply_prompt_routes(lane, width, 0);
+        }
         apply_vram_target(false);
     }
     // A walk promotes no experts (its routes still count toward the cache's scores). Between spans

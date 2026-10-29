@@ -18,8 +18,12 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
                 "Q8 sliced-K static K requires matching, padding-free operands");
     }
     if constexpr (Schedule::kExactTokens) {
-        if (operands.tokens != Schedule::kTokenCapacity)
+        if constexpr (Schedule::kActivationStage == Q8ActivationStage::RuntimeActive) {
+            if (operands.tokens > Schedule::kTokenCapacity)
+                throw std::invalid_argument("Q8 sliced-K tokens exceed the schedule capacity");
+        } else if (operands.tokens != Schedule::kTokenCapacity) {
             throw std::invalid_argument("Q8 sliced-K exact tokens differ from the schedule");
+        }
     }
     // Row tiles cover consecutive identity rows; a paired row policy maps each CTA's weight rows
     // onto fewer output rows.
@@ -40,11 +44,17 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
                 {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(shared), stream}, kernel,
                 operands, output, epilogue, row_policy, offset));
         };
-        if (operands.rows % Schedule::kBlockRows == 0 && operands.k == operands.padded_k &&
-            operands.k % Schedule::kBlockK == 0)
+        if constexpr (Schedule::kStaticK > 0) {
+            if (operands.rows % Schedule::kBlockRows != 0)
+                throw std::invalid_argument(
+                    "Q8 sliced-K static K requires rows aligned to BlockRows");
             launch.template operator()<true>();
-        else
+        } else if (operands.rows % Schedule::kBlockRows == 0 && operands.k == operands.padded_k &&
+                   operands.k % Schedule::kBlockK == 0) {
+            launch.template operator()<true>();
+        } else {
             launch.template operator()<false>();
+        }
     });
 }
 } // namespace infernix::ops::detail

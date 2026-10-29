@@ -1,14 +1,19 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace infernix::models::qwen4_exp {
 namespace {
 
-constexpr std::uint64_t kGamma  = 0x9E3779B97F4A7C15ULL;
-constexpr std::uint64_t kPrime1 = 10007;
+constexpr std::uint64_t kGamma            = 0x9E3779B97F4A7C15ULL;
+constexpr std::uint64_t kPrime1           = 10007;
+constexpr std::size_t kParallelRowTokens  = 512;
+constexpr std::size_t kParallelHashThreads = 8;
 
 std::uint64_t splitmix64(std::uint64_t x) {
     x += kGamma;
@@ -59,26 +64,52 @@ NgramHash::NgramHash(const NgramConfig& config, std::uint32_t layer) : config_(c
 void NgramHash::row_ids(std::span<const std::int32_t> history, std::size_t count, std::uint32_t* out) const {
     const std::size_t n_ctx = config_.ngram_size;
     if (history.size() < count + n_ctx - 1) { throw std::invalid_argument("n-gram history too short"); }
-    std::uint64_t context[32];
     if (n_ctx > 32) { throw std::invalid_argument("ngram_size above 32"); }
-    for (std::size_t p = history.size() - count; p < history.size(); ++p) {
-        bool closed = false; // an EOS among history[p - s .. p - 1]
-        for (std::size_t s = 0; s < n_ctx; ++s) {
-            if (s > 0 && history[p - s] == config_.eos_token_id) { closed = true; }
-            const std::int32_t token = closed ? config_.eos_token_id : history[p - s];
-            if (token < 0 || static_cast<std::uint32_t>(token) >= config_.vocab_size) {
-                throw std::invalid_argument("n-gram token outside the vocabulary");
+    const std::size_t start_pos  = history.size() - count;
+    const std::size_t head_count = sizes_.size();
+    const auto compute_range     = [&](std::size_t lo, std::size_t hi) {
+        std::uint64_t context[32];
+        std::uint32_t* dst = out + lo * head_count;
+        for (std::size_t idx = lo; idx < hi; ++idx) {
+            const std::size_t p = start_pos + idx;
+            bool closed         = false; // an EOS among history[p - s .. p - 1]
+            for (std::size_t s = 0; s < n_ctx; ++s) {
+                if (s > 0 && history[p - s] == config_.eos_token_id) { closed = true; }
+                const std::int32_t token = closed ? config_.eos_token_id : history[p - s];
+                if (token < 0 || static_cast<std::uint32_t>(token) >= config_.vocab_size) {
+                    throw std::invalid_argument("n-gram token outside the vocabulary");
+                }
+                context[s] = static_cast<std::uint64_t>(token);
             }
-            context[s] = static_cast<std::uint64_t>(token);
-        }
-        std::uint64_t mixed = context[0] * multipliers_[0];
-        for (std::size_t n = 2; n <= n_ctx; ++n) {
-            mixed ^= context[n - 1] * multipliers_[n - 1];
-            const std::size_t base = (n - 2) * config_.heads_per_ngram;
-            for (std::size_t j = base; j < base + config_.heads_per_ngram; ++j) {
-                *out++ = static_cast<std::uint32_t>(mixed % sizes_[j] + offsets_[j]);
+            std::uint64_t mixed = context[0] * multipliers_[0];
+            for (std::size_t n = 2; n <= n_ctx; ++n) {
+                mixed ^= context[n - 1] * multipliers_[n - 1];
+                const std::size_t base = (n - 2) * config_.heads_per_ngram;
+                for (std::size_t j = base; j < base + config_.heads_per_ngram; ++j) {
+                    *dst++ = static_cast<std::uint32_t>(mixed % sizes_[j] + offsets_[j]);
+                }
             }
         }
+    };
+    if (count < kParallelRowTokens) {
+        compute_range(0, count);
+        return;
+    }
+    std::vector<std::exception_ptr> errors(kParallelHashThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(kParallelHashThreads);
+    for (std::size_t t = 0; t < kParallelHashThreads; ++t) {
+        const std::size_t lo = count * t / kParallelHashThreads;
+        const std::size_t hi = count * (t + 1) / kParallelHashThreads;
+        threads.emplace_back([&, t, lo, hi] {
+            try {
+                compute_range(lo, hi);
+            } catch (...) { errors[t] = std::current_exception(); }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    for (const auto& error : errors) {
+        if (error) { std::rethrow_exception(error); }
     }
 }
 

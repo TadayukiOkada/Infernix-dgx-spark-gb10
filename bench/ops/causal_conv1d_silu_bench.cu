@@ -24,7 +24,7 @@ using namespace infernix::bench;
 
 namespace {
 
-constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
 
 struct Options {
     std::int32_t channels     = 8192;

@@ -33,7 +33,13 @@ Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 linear_swiglu admits only A16 or A8");
     }
-    return tokens >= 5 ? Fp8LinearSwiGluRoute::A8 : Fp8LinearSwiGluRoute::A16;
+    // GB10 (sm_121a, 48 SMs) crossover, re-measured with a cold-cache A16-vs-A8 sweep across token
+    // widths (bench/ops/fp8_linear_swiglu_bench, warmup 12 / repeat 60). A16 wins the small-token band
+    // (decode + MTP verification rounds, T=2-32) by 4-6%; A8 dominates from 34 up (e.g. T=1024:
+    // 2242 us A8 vs 8106 us A16). The previous threshold (5) was fitted on the RTX 5090 (170 SMs) and
+    // switched to A8 ~7x too early on 48 SMs, costing 4-6% across the 5-32 band. Keeping T<34 on A16
+    // also preserves the dedicated A16 decode/small-T kernels for the graph-captured decode path.
+    return tokens >= 34 ? Fp8LinearSwiGluRoute::A8 : Fp8LinearSwiGluRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -50,10 +56,15 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
         throw std::invalid_argument("fp8 linear_swiglu workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    if (resolve_route(policy, max_tokens) == Fp8LinearSwiGluRoute::A8Residual) {
+    // Reserve scratch exactly when the dispatcher would take an A8 path for this interval's widest
+    // token count. This must track resolve_route; a hardcoded A8 threshold here desyncs from the
+    // router once the crossover moves, over-reserving scratch for the A16 small-token band and
+    // breaking the query/execute workspace invariant.
+    const auto max_route = resolve_route(policy, max_tokens);
+    if (max_route == Fp8LinearSwiGluRoute::A8Residual) {
         return fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N34816K5120::kInputRows, 0, true);
     }
-    const bool interval_uses_a8 = allows_a8(policy) && max_tokens >= 5;
+    const bool interval_uses_a8 = max_route == Fp8LinearSwiGluRoute::A8;
     return interval_uses_a8 ? fp8_a8_workspace_capacity_bytes(
                                   max_tokens, Fp8N34816K5120::kInputRows,
                                   fp8_linear_swiglu_partial_capacity_bytes(max_tokens))

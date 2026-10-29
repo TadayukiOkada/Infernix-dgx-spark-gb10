@@ -64,7 +64,7 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
     Tensor ids_tensor(ids.p, DType::I32, {kTopK, columns});
     Tensor scores_tensor(scores.p, DType::FP32, {kTopK, columns});
     Tensor map_tensor(id_map.p, DType::I32, {rows});
-    bench::L2FlushBuffer flush(256ULL << 20);
+    bench::L2FlushBuffer flush(infernix::bench::default_cold_flush_bytes());
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 

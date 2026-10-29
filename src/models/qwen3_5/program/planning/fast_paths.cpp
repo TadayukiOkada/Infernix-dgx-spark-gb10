@@ -435,7 +435,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::IdleWidePrefill: return true;
     // The FP8 sites of the Qwen3.8-27B recipes already permit single-term A8 at prefill widths.
     case FastPath::Fp8A8Pair:
-    case FastPath::Fp8A8PairBlock32: return false;
+    case FastPath::Fp8A8PairBlock32:
+    case FastPath::Nvfp4A4Pair: return false;
     // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
     case FastPath::Q4W4A8: return configuration.q4_gate_up;
     // The offloaded experts' wide calls (Qwen3.5-122B-A10B: every offloaded bank is NVFP4 W4A16, its

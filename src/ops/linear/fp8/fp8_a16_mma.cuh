@@ -57,8 +57,26 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    const int row_begin   = static_cast<int>(blockIdx.x) * (BM / (RowPolicy::kPaired ? 2 : 1));
-    const int token_begin = token_offset + static_cast<int>(blockIdx.y) * BN;
+    const int tiles_m = static_cast<int>(gridDim.x);
+    const int tiles_n = static_cast<int>(gridDim.y);
+    const int linear  = static_cast<int>(blockIdx.y) * tiles_m + static_cast<int>(blockIdx.x);
+    int tile_m        = 0;
+    int tile_n        = 0;
+    if (static_cast<std::int64_t>(count) * K <= 6'000'000) {
+        tile_m = linear / tiles_n;
+        tile_n = linear - tile_m * tiles_n;
+    } else {
+        constexpr int kGroupRows = 8;
+        const int group_span     = kGroupRows * tiles_n;
+        const int group          = linear / group_span;
+        const int first_m        = group * kGroupRows;
+        const int active_m       = min(kGroupRows, tiles_m - first_m);
+        const int within         = linear - group * group_span;
+        tile_m                   = first_m + within % active_m;
+        tile_n                   = within / active_m;
+    }
+    const int row_begin   = tile_m * (BM / (RowPolicy::kPaired ? 2 : 1));
+    const int token_begin = token_offset + tile_n * BN;
 
     float accumulators[MT][NT][4] = {};
 

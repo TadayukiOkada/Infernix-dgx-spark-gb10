@@ -9,6 +9,7 @@
 
 #include "core/device.h"
 #include "infernix_bench_common.h"
+#include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -40,7 +41,7 @@ constexpr std::int32_t kExperts            = 256;
 constexpr std::int32_t kTopK               = 8;
 constexpr std::int32_t kIntermediate       = 512;
 constexpr std::int32_t kRouterRows         = kExperts + 1;
-constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kDefaultFlushBytes{};
 
 enum class CodecProfile : std::uint8_t {
     Q4Q5,
@@ -88,6 +89,7 @@ struct Options {
     int repeat                      = 50;
     std::uint64_t flush_bytes       = kDefaultFlushBytes;
     std::string csv_out;
+    bool candidates                 = false;
 };
 
 struct RoutePattern {
@@ -113,6 +115,7 @@ struct Result {
     CacheState cache;
     Stats stats;
     std::size_t workspace_bytes;
+    std::string schedule;
 };
 
 const char* codec_name(CodecProfile profile) {
@@ -168,6 +171,30 @@ const char* execution_name(Execution execution) {
 }
 
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
+
+const char* d3_name(ops::detail::SparseMoeSmallTD3Schedule d3) {
+    switch (d3) {
+    case ops::detail::SparseMoeSmallTD3Schedule::Paths1:
+        return "paths1";
+    case ops::detail::SparseMoeSmallTD3Schedule::Paths3:
+        return "paths3";
+    case ops::detail::SparseMoeSmallTD3Schedule::Paths9:
+        return "paths9";
+    }
+    return "unknown";
+}
+
+const char* d4_name(ops::detail::SparseMoeSmallTD4Schedule d4) {
+    switch (d4) {
+    case ops::detail::SparseMoeSmallTD4Schedule::Rows1:
+        return "rows1";
+    case ops::detail::SparseMoeSmallTD4Schedule::Rows2:
+        return "rows2";
+    case ops::detail::SparseMoeSmallTD4Schedule::Rows4:
+        return "rows4";
+    }
+    return "unknown";
+}
 
 std::uint64_t packed_weight_bytes(QType qtype, std::int32_t rows, std::int32_t columns) {
     const std::int32_t group   = qtype == QType::Q8_G32_FP16 ? 32 : 64;
@@ -296,7 +323,7 @@ void usage(const char* argv0) {
                  "  --cache cold|warm|both           Default both; cold is authoritative.\n"
                  "  --warmup N                       Warmup replays per point (default 5).\n"
                  "  --repeat N                       Measured samples per point (default 50).\n"
-                 "  --flush-mib N                    L2 eviction storage (default 256 MiB).\n"
+                 "  --flush-mib N                    L2 eviction storage (default: sized to device L2).\n"
                  "  --csv-out PATH                   Write result rows as CSV.\n"
                  "  -h, --help                       Show this text.\n",
                  argv0);
@@ -345,6 +372,8 @@ Options parse_options(int argc, char** argv) {
             options.flush_bytes = mib << 20;
         } else if (argument == "--csv-out") {
             options.csv_out = next("CSV output path");
+        } else if (argument == "--candidates") {
+            options.candidates = true;
         } else if (argument == "--help" || argument == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -552,7 +581,7 @@ public:
     BenchmarkState(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
                    ExpertDistribution distribution, std::uint32_t seed,
                    DeviceExecutionView execution)
-        : fixture_(fixture), execution_(execution),
+        : fixture_(fixture), execution_(execution), tokens_(tokens),
           route_pattern_(make_route_pattern(tokens, distribution, seed)),
           input_(static_cast<std::size_t>(tokens) * kHidden * 2),
           residual_(static_cast<std::size_t>(tokens) * kHidden * 2),
@@ -607,9 +636,21 @@ public:
                         destination_tensor_, workspace_, execution_.on_stream(stream));
     }
 
+    // Candidate path: bypass public dispatch and drive the small-T family directly with a
+    // forced (D3, D4) schedule pair so a sweep can re-measure the crossover bands on GB10.
+    void launch_candidate(ops::detail::SparseMoeSmallTD3Schedule d3,
+                         ops::detail::SparseMoeSmallTD4Schedule d4, cudaStream_t stream) {
+        workspace_.reset();
+        const auto ws = ops::detail::allocate_sparse_moe_small_t_workspace(workspace_, tokens_);
+        ops::detail::sparse_moe_small_t_execute_candidate(x_, fixture_.weights(),
+                                                          destination_tensor_, tokens_, d3, d4, ws,
+                                                          stream);
+    }
+
 private:
     BenchmarkWeights& fixture_;
     DeviceExecutionView execution_;
+    std::int32_t tokens_;
     RoutePattern route_pattern_;
     DeviceBuffer input_;
     DeviceBuffer residual_;
@@ -712,6 +753,75 @@ Stats measure_eager(BenchmarkState& state, CacheState cache, cudaStream_t stream
     return summarize(std::move(samples));
 }
 
+// Candidate sweep: drive the small-T family directly with every legal (D3, D4) pair so the
+// crossover bands can be re-measured on GB10 independent of resolve_sparse_moe_small_t_plan.
+void run_candidates(CodecProfile profile, const Options& options, BenchmarkWeights& fixture,
+                    DeviceExecutionView device_execution, std::vector<Result>& results) {
+    const cudaStream_t stream = device_execution.stream;
+    const QType gate           = gate_codec(profile);
+    const QType down           = down_codec(profile);
+
+    constexpr std::array<ops::detail::SparseMoeSmallTD3Schedule, 3> kD3{{
+        ops::detail::SparseMoeSmallTD3Schedule::Paths1,
+        ops::detail::SparseMoeSmallTD3Schedule::Paths3,
+        ops::detail::SparseMoeSmallTD3Schedule::Paths9,
+    }};
+    constexpr std::array<ops::detail::SparseMoeSmallTD4Schedule, 3> kD4{{
+        ops::detail::SparseMoeSmallTD4Schedule::Rows1,
+        ops::detail::SparseMoeSmallTD4Schedule::Rows2,
+        ops::detail::SparseMoeSmallTD4Schedule::Rows4,
+    }};
+
+    for (std::int32_t tokens : selected_tokens(options.tokens)) {
+        if (!ops::detail::sparse_moe_uses_small_t(tokens)) { continue; }
+        BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed,
+                             device_execution);
+        const RoutePattern& pattern = state.route_pattern();
+        for (auto d3 : kD3) {
+            for (auto d4 : kD4) {
+                if (!ops::detail::sparse_moe_small_t_candidate_is_legal(tokens, gate, down, d3, d4)) {
+                    continue;
+                }
+                cudaEvent_t start = nullptr;
+                cudaEvent_t stop  = nullptr;
+                CUDA_CHECK(cudaEventCreate(&start));
+                CUDA_CHECK(cudaEventCreate(&stop));
+                for (int index = 0; index < options.warmup; ++index) {
+                    state.prepare(CacheState::Cold, stream);
+                    state.launch_candidate(d3, d4, stream);
+                }
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<double> samples;
+                samples.reserve(static_cast<std::size_t>(options.repeat));
+                for (int index = 0; index < options.repeat; ++index) {
+                    state.prepare(CacheState::Cold, stream);
+                    CUDA_CHECK(cudaEventRecord(start, stream));
+                    state.launch_candidate(d3, d4, stream);
+                    CUDA_CHECK(cudaEventRecord(stop, stream));
+                    CUDA_CHECK(cudaEventSynchronize(stop));
+                    float milliseconds = 0.0F;
+                    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+                    samples.push_back(static_cast<double>(milliseconds) * 1000.0);
+                }
+                CUDA_CHECK(cudaEventDestroy(start));
+                CUDA_CHECK(cudaEventDestroy(stop));
+                Result result{profile,
+                              tokens,
+                              options.distribution,
+                              options.seed,
+                              pattern.unique_experts,
+                              pattern.adjacent_overlap,
+                              Execution::Eager,
+                              CacheState::Cold,
+                              summarize(std::move(samples)),
+                              state.workspace_bytes(),
+                              std::string(d3_name(d3)) + "." + d4_name(d4)};
+                results.push_back(std::move(result));
+            }
+        }
+    }
+}
+
 Stats measure_graph(BenchmarkState& state, const BodyTimedGraph& graph, CacheState cache,
                     cudaStream_t stream, int warmup, int repeat) {
     for (int index = 0; index < warmup; ++index) {
@@ -797,7 +907,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
               "timed_scope,cache,median_us,min_us,p95_us,unique_weight_gbps,"
               "unique_weight_peak_percent,logical_tflops,workspace_bytes,warmup,repeat,"
-              "flush_bytes,build_type,gpu,cuda_runtime\n";
+              "flush_bytes,build_type,gpu,cuda_runtime,schedule\n";
     for (const Result& result : results) {
         const double seconds            = result.stats.median_us * 1.0e-6;
         const double useful_weight_gbps = unique_weight_bytes(result) / seconds / 1.0e9;
@@ -816,7 +926,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
 #else
                << "Debug"
 #endif
-               << ',' << context.props.name << ',' << runtime << '\n';
+               << ',' << context.props.name << ',' << runtime << ',' << result.schedule << '\n';
     }
 }
 
@@ -839,6 +949,10 @@ int main(int argc, char** argv) {
         for (CodecProfile profile : selected_profiles(options.codec)) {
             BenchmarkWeights fixture(profile, options.seed,
                                      static_cast<std::size_t>(options.flush_bytes));
+            if (options.candidates) {
+                run_candidates(profile, options, fixture, context.execution_view(), results);
+                continue;
+            }
             for (std::int32_t tokens : selected_tokens(options.tokens)) {
                 std::vector<Result> point =
                     run_point(fixture, profile, tokens, options, context.execution_view());

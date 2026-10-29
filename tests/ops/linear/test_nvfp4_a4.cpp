@@ -46,6 +46,21 @@ int run_nvfp4_a4() {
                           {5120, 6144, 723U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                           {5120, 17408, 725U, Comparison::Sampled, true, invocations});
+    // Two-term row-scaled A4 TMA route (Nvfp4A4Pair) on Qwen3.8-Flash-Next W4Dense shapes.
+    const std::vector<Invocation> pair_invocations{
+        {127, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {128, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {129, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {256, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {512, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+    };
+    for (auto [n, k, seed] : {std::tuple{16384, 2560, 731U}, std::tuple{13952, 2560, 733U},
+                              std::tuple{12800, 2560, 739U}, std::tuple{10240, 2560, 743U},
+                              std::tuple{6144, 2560, 751U}, std::tuple{2560, 6144, 757U},
+                              std::tuple{2560, 2560, 761U}, std::tuple{2048, 2560, 769U}}) {
+        failures += run_shape("NVFP4_A4_PAIR", ActivationCompute::A4, make_nvfp4_weight,
+                              {n, k, seed, Comparison::Sampled, true, pair_invocations});
+    }
     return failures;
 }
 

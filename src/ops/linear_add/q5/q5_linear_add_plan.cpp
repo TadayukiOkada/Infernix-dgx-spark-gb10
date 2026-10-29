@@ -37,34 +37,39 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-constexpr std::array<RouteSpec, 13> kK6144Routes{{
+// Band boundaries re-fitted on GB10 (sm_121a, 48 SMs) with the --candidates cold sweep: every
+// public schedule launcher was timed independently per token count and the fastest admitted kernel
+// chosen per band. The prior 5090-fitted bands regressed badly here: the pairwise/w4_s1 schedules
+// cost 20-38% more than SlicedR32T64W2S1 across cols 33-64, and the narrow-MMA/w2_s2 schedules
+// cost 25-52% more than MmaResidualR64T128 across cols 65-128 and 161-256.
+constexpr std::array<RouteSpec, 12> kK6144Routes{{
     {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
     {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
-    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
+    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
     {{49, 64}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
-    {{65, 96}, Q5LinearAddScheduleId::MmaResidualR32T32K128},
-    {{97, 128}, Q5LinearAddScheduleId::SlicedR32T32W2S2},
+    {{65, 128}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
-    {{161, 256}, Q5LinearAddScheduleId::MmaResidualR32T128},
+    {{161, 256}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
 }};
 
-constexpr std::array<RouteSpec, 13> kK17408Routes{{
+// Retuned to the same GB10 winners as K6144; the measured per-band champion was identical for both
+// K values on sm_121a. See the kK6144Routes comment for the candidate-sweep evidence.
+constexpr std::array<RouteSpec, 12> kK17408Routes{{
     {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
     {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
-    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T24W4S2Pairwise},
+    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
     {{49, 64}, Q5LinearAddScheduleId::SlicedR32T32W4S1},
-    {{65, 96}, Q5LinearAddScheduleId::SlicedR32T32W4S1},
-    {{97, 128}, Q5LinearAddScheduleId::SlicedR32T32W2S2},
+    {{65, 128}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
-    {{161, 256}, Q5LinearAddScheduleId::MmaResidualR32T128},
+    {{161, 256}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
 }};

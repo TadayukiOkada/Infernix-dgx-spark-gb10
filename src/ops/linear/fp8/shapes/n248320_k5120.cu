@@ -25,9 +25,10 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     });
 }
 
-// Up to 64 columns the sliced-K schedules stream the weight faster than the MMA schedules: on the
-// RTX 5090 they beat the 64-column MMA schedule by 17-21 % at 42-48 columns, 13-16 % at 49-56 and
-// 4-8 % at 57-64. Above 48 columns two K warps with a double-buffered stage beat four.
+// Up to 64 columns the sliced-K schedules stream the weight faster than the MMA schedules: on
+// GB10 (sm_121a, 48 SMs, 246 GB/s sustained read) they sustain 236.7-246.5 GB/s (96.2-100.2 % of
+// sustained read across T = 16..64) and beat the 96-column MMA schedule at T = 64 by 33.6 %
+// (5511 vs 7365 us).
 constexpr int kSlicedKTokens = 64;
 
 void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -38,8 +39,8 @@ void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
     if (tokens <= 32) return launch_tile<32, 4, 1>(x, weight, out, stream);
     if (tokens <= 40) return launch_tile<40, 4, 1>(x, weight, out, stream);
     if (tokens <= 48) return launch_tile<48, 4, 1>(x, weight, out, stream);
-    if (tokens <= 56) return launch_tile<56, 2, 2>(x, weight, out, stream);
-    if (tokens <= kSlicedKTokens) return launch_tile<64, 2, 2>(x, weight, out, stream);
+    if (tokens <= 56) return launch_tile<56, 4, 1>(x, weight, out, stream);
+    if (tokens <= kSlicedKTokens) return launch_tile<64, 4, 1>(x, weight, out, stream);
     throw std::logic_error("fp8 K-split exceeds shape capacity");
 }
 

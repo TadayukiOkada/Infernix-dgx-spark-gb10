@@ -405,7 +405,7 @@ private:
                const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
                Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
-    void mtp_block(const MtpCall& call, Tensor& residual);
+    void mtp_block(const MtpCall& call, const Tensor& residual);
     // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes
     // (ggml-bf16-prefill, f16-accumulate-prefill, --a8-activations' prefill routes) only in eager calls
     // (prefill chunks, forced tokens), so decode and verification rounds keep their routes whatever their

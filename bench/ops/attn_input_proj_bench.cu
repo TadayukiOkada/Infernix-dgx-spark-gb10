@@ -5,6 +5,12 @@
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/linear.h"
 
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+#include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
+#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
+#include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
+
 #include "core/device.h"
 #include "core/temporary_switches.h"
 #include "direct_bf16_weight.cuh"
@@ -16,6 +22,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -33,7 +40,7 @@ using namespace infernix;
 
 namespace {
 
-constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
 
 
 enum class Format : std::uint8_t { Q4Q5, Q8Qgkv, Q8Qkv, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
@@ -49,8 +56,9 @@ struct Options {
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
     int repeat   = 30;
-    bool profile = false;
-    bool graph   = false;
+    bool profile     = false;
+    bool graph       = false;
+    bool candidates  = false;
     std::string csv_out;
 };
 
@@ -193,6 +201,8 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value(next("--execution requires a value"));
             if (value != "eager" && value != "graph") usage("--execution expects eager or graph");
             options.graph = value == "graph";
+        } else if (argument == "--candidates") {
+            options.candidates = true;
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -460,11 +470,385 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden,
     }
 }
 
+void run_nvfp4_candidates(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
+                          std::vector<Result>& results) {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQueryRows  = 6144;
+    constexpr std::int32_t kKvRows     = 1024;
+    constexpr std::int32_t kOutputRows = 2 * kQueryRows + 2 * kKvRows;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::PackedQuantizedWeight parent = bench::make_nvfp4_weight(kOutputRows, kHidden);
+    const std::size_t maximum_workspace =
+        ops::detail::nvfp4_a4_workspace_capacity_bytes(max_tokens, kHidden);
+    WorkspaceArena workspace(std::max<std::size_t>(maximum_workspace, 256));
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 105U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Nvfp4AttnInputA4ScheduleId, 7> kSchedules{{
+        ops::detail::Nvfp4AttnInputA4ScheduleId::M32N64,
+        ops::detail::Nvfp4AttnInputA4ScheduleId::M32N128,
+        ops::detail::Nvfp4AttnInputA4ScheduleId::M64N128,
+        ops::detail::Nvfp4AttnInputA4ScheduleId::M128N128Pipelined,
+        ops::detail::Nvfp4AttnInputA4ScheduleId::M128N128Resident,
+        ops::detail::Nvfp4AttnInputA4ScheduleId::Tma128,
+        ops::detail::Nvfp4AttnInputA4ScheduleId::Tma256,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Nvfp4AttnInputA4Problem problem{kHidden, kQueryRows, kKvRows, kOutputRows,
+                                                           kHidden, tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::nvfp4_attn_input_a4_candidate_is_legal(schedule, problem)) {
+                continue;
+            }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {kHidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tg(gate.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::nvfp4_attn_input_a4_execute_candidate(schedule, x, parent.weight, tq,
+                                                                    tg, tk, tv, workspace,
+                                                                    launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = parent.model_weight_bytes() + tensor_bytes(kHidden, tokens) +
+                                          tensor_bytes(kOutputRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kOutputRows) * kHidden * tokens;
+            append_result(results, "nvfp4",
+                          ops::detail::nvfp4_attn_input_a4_schedule_name(schedule), tokens,
+                          CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
+}
+
 void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
              std::vector<Result>& results) {
     auto weight = bench::make_fp8_weight(14336, 5120);
     run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16, options.fp8_policy, false, 5120,
                     6144, 1024, 14336, weight, flush, stream, results);
+}
+
+void run_fp8_candidates(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
+                        std::vector<Result>& results) {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQueryRows  = 6144;
+    constexpr std::int32_t kKvRows     = 1024;
+    constexpr std::int32_t kOutputRows = 2 * kQueryRows + 2 * kKvRows;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::PackedQuantizedWeight parent = bench::make_fp8_weight(kOutputRows, kHidden);
+    const std::size_t candidate_partials =
+        ops::detail::fp8_attn_input_candidate_partial_capacity_bytes();
+    const std::size_t maximum_workspace =
+        ops::detail::fp8_a8_workspace_capacity_bytes(max_tokens, kHidden, candidate_partials);
+    WorkspaceArena workspace(std::max<std::size_t>(maximum_workspace, 256));
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 107U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Fp8AttnInputScheduleId, 6> kSchedules{{
+        ops::detail::Fp8AttnInputScheduleId::A8T32R32K128,
+        ops::detail::Fp8AttnInputScheduleId::A8T32R128K128,
+        ops::detail::Fp8AttnInputScheduleId::A8Tma64x128,
+        ops::detail::Fp8AttnInputScheduleId::A8Tma64x256,
+        ops::detail::Fp8AttnInputScheduleId::A8Tma96x256,
+        ops::detail::Fp8AttnInputScheduleId::A8Bulk,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Fp8AttnInputProblem problem{kHidden, kQueryRows, kKvRows, kOutputRows,
+                                                       kHidden, tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::fp8_attn_input_candidate_is_legal(schedule, problem)) {
+                continue;
+            }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {kHidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tg(gate.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::fp8_attn_input_execute_candidate(schedule, x, parent.weight, tq, tg, tk,
+                                                              tv, workspace, launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = parent.model_weight_bytes() + tensor_bytes(kHidden, tokens) +
+                                          tensor_bytes(kOutputRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kOutputRows) * kHidden * tokens;
+            append_result(results, "fp8", ops::detail::fp8_attn_input_schedule_name(schedule), tokens,
+                          CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
+}
+
+// Q8 candidate sweep: for each shape (target four-output, companion three-output, dflash2
+// three-output) drive every legal schedule directly so the bench sees per-schedule timings.
+void run_q8_target_candidates(const Options& options, bench::L2FlushBuffer& flush,
+                              cudaStream_t stream, std::vector<Result>& results) {
+    constexpr std::int32_t kHidden      = 2048;
+    constexpr std::int32_t kQueryRows   = 4096;
+    constexpr std::int32_t kKvRows      = 512;
+    constexpr std::int32_t kParentRows  = 9216;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::PackedQuantizedWeight parent =
+        bench::make_row_split_weight(QType::Q8_G32_FP16, kParentRows, kHidden, kHidden, 507U);
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 109U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 6> kSchedules{{
+        ops::detail::Q8AttnInputScheduleId::DecodeR8Direct,
+        ops::detail::Q8AttnInputScheduleId::SplitKMmaDirect,
+        ops::detail::Q8AttnInputScheduleId::SimtR8C4,
+        ops::detail::Q8AttnInputScheduleId::MmaR32C128,
+        ops::detail::Q8AttnInputScheduleId::MmaR32C64,
+        ops::detail::Q8AttnInputScheduleId::MmaR64C128,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Q8AttnInputProblem problem{kHidden, kQueryRows, kKvRows, kParentRows,
+                                                      kHidden, tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::q8_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {kHidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tg(gate.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::q8_attn_input_execute_candidate(schedule, x, parent.weight, tq, tg, tk,
+                                                             tv, launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = parent.model_weight_bytes() + tensor_bytes(kHidden, tokens) +
+                                          tensor_bytes(kParentRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kParentRows) * kHidden * tokens;
+            append_result(results, "q8-qgkv", ops::detail::q8_attn_input_schedule_name(schedule),
+                          tokens, CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
+}
+
+void run_q8_qkv_candidates(const Options& options, const char* label, std::int32_t hidden,
+                           bench::L2FlushBuffer& flush, cudaStream_t stream,
+                           std::vector<Result>& results) {
+    constexpr std::int32_t kQueryRows  = 4096;
+    constexpr std::int32_t kKvRows     = 1024;
+    constexpr std::int32_t kParentRows = 6144;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::PackedQuantizedWeight parent =
+        bench::make_row_split_weight(QType::Q8_G32_FP16, kParentRows, hidden, hidden, 505U);
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens, 111U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 10> kSchedules{{
+        ops::detail::Q8AttnInputScheduleId::DecodeR8Direct,
+        ops::detail::Q8AttnInputScheduleId::SplitKMmaDirect,
+        ops::detail::Q8AttnInputScheduleId::MmaR32C64,
+        ops::detail::Q8AttnInputScheduleId::MmaR32C128,
+        ops::detail::Q8AttnInputScheduleId::MmaR64C64,
+        ops::detail::Q8AttnInputScheduleId::MmaR64C96,
+        ops::detail::Q8AttnInputScheduleId::MmaR64C128,
+        ops::detail::Q8AttnInputScheduleId::MmaR128C64,
+        ops::detail::Q8AttnInputScheduleId::MmaR128C80,
+        ops::detail::Q8AttnInputScheduleId::SimtR8C4,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Q8AttnInputProblem problem{hidden, kQueryRows, kKvRows, kParentRows,
+                                                      hidden, tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::q8_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {hidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::q8_attn_input_execute_candidate(schedule, x, parent.weight, tq, tk, tv,
+                                                             launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = parent.model_weight_bytes() + tensor_bytes(hidden, tokens) +
+                                          tensor_bytes(kQueryRows + 2 * kKvRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kParentRows) * hidden * tokens;
+            append_result(results, label, ops::detail::q8_attn_input_schedule_name(schedule), tokens,
+                          CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
+}
+
+void run_q8_dflash2_candidates(const Options& options, bench::L2FlushBuffer& flush,
+                               cudaStream_t stream, std::vector<Result>& results) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kQueryRows   = 4096;
+    constexpr std::int32_t kKvRows      = 1024;
+    constexpr std::int32_t kParentRows  = 6144;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::PackedQuantizedWeight parent =
+        bench::make_row_split_weight(QType::Q8_G32_FP16, kParentRows, kHidden, kHidden, 509U);
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 113U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 6> kSchedules{{
+        ops::detail::Q8AttnInputScheduleId::DFlash2SmallT,
+        ops::detail::Q8AttnInputScheduleId::DFlash2MmaR16C64K128,
+        ops::detail::Q8AttnInputScheduleId::DFlash2MmaR32C32K128,
+        ops::detail::Q8AttnInputScheduleId::DFlash2MmaR32C64K128,
+        ops::detail::Q8AttnInputScheduleId::DFlash2MmaR32C64,
+        ops::detail::Q8AttnInputScheduleId::DFlash2MmaR64C128,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Q8AttnInputProblem problem{kHidden, kQueryRows, kKvRows, kParentRows,
+                                                      kHidden, tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::q8_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {kHidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::q8_attn_input_execute_candidate(schedule, x, parent.weight, tq, tk, tv,
+                                                             launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = parent.model_weight_bytes() + tensor_bytes(kHidden, tokens) +
+                                          tensor_bytes(kQueryRows + 2 * kKvRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kParentRows) * kHidden * tokens;
+            append_result(results, "q8-dflash2-qkv",
+                          ops::detail::q8_attn_input_schedule_name(schedule), tokens,
+                          CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
+}
+
+// Q4/Q5 candidate sweep: drive every legal schedule directly on the four-output target shape so
+// the bench sees per-schedule timings for crossover retuning. Uses the same two-weight layout as
+// run_q4q5 (Q4_G64_FP16 query_key + Q5_G64_FP16 gate_value).
+void run_q4q5_candidates(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
+                         std::vector<Result>& results) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kQueryRows   = 6144;
+    constexpr std::int32_t kKvRows      = 1024;
+    constexpr std::int32_t kParentRows  = kQueryRows + kKvRows;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::PackedQuantizedWeight qk =
+        bench::make_row_split_weight(QType::Q4_G64_FP16, kParentRows, kHidden, kHidden, 501U);
+    bench::PackedQuantizedWeight gv =
+        bench::make_row_split_weight(QType::Q5_G64_FP16, kParentRows, kHidden, kHidden, 503U);
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 199U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Q4Q5AttnInputScheduleId, 6> kSchedules{{
+        ops::detail::Q4Q5AttnInputScheduleId::ParentSplitFixed,
+        ops::detail::Q4Q5AttnInputScheduleId::MixedR32C32S2,
+        ops::detail::Q4Q5AttnInputScheduleId::MixedR32C64S3,
+        ops::detail::Q4Q5AttnInputScheduleId::PairR32C64S3,
+        ops::detail::Q4Q5AttnInputScheduleId::MixedR64C128S2,
+        ops::detail::Q4Q5AttnInputScheduleId::PairR32C64S4,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Q4Q5AttnInputProblem problem{kHidden, kQueryRows, kKvRows, kHidden,
+                                                        tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::q4_q5_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {kHidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tg(gate.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::q4_q5_attn_input_execute_candidate(schedule, x, qk.weight, gv.weight,
+                                                                tq, tg, tk, tv, launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = qk.model_weight_bytes() + gv.model_weight_bytes() +
+                                          tensor_bytes(kHidden, tokens) +
+                                          tensor_bytes(2 * kQueryRows + 2 * kKvRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kParentRows) * kHidden * tokens;
+            append_result(results, "q4q5", ops::detail::q4_q5_attn_input_schedule_name(schedule),
+                          tokens, CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
+}
+
+// BF16 candidate sweep: drive every legal schedule directly on the four-output target shape so the
+// bench sees per-schedule timings for crossover retuning.
+void run_bf16_candidates(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
+                         std::vector<Result>& results) {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQueryRows  = 6144;
+    constexpr std::int32_t kKvRows     = 1024;
+    constexpr std::int32_t kParentRows = 14336;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::DirectBf16Weight weight = bench::make_direct_bf16_weight(kParentRows, kHidden);
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 101U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Bf16AttnInputScheduleId, 7> kSchedules{{
+        ops::detail::Bf16AttnInputScheduleId::Decode,
+        ops::detail::Bf16AttnInputScheduleId::SimtSmall,
+        ops::detail::Bf16AttnInputScheduleId::SlicedR32T16W4,
+        ops::detail::Bf16AttnInputScheduleId::MmaR32T32K128S3,
+        ops::detail::Bf16AttnInputScheduleId::TmaR64T64K64S3,
+        ops::detail::Bf16AttnInputScheduleId::MmaR64T32K64S3,
+        ops::detail::Bf16AttnInputScheduleId::TmaR64T128K64S2,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Bf16AttnInputProblem problem{kHidden, kQueryRows, kKvRows, kParentRows,
+                                                        kHidden, tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::bf16_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {kHidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tg(gate.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::bf16_attn_input_execute_candidate(schedule, x, weight.weight, tq, tg,
+                                                               tk, tv, launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = weight.model_weight_bytes() + tensor_bytes(kHidden, tokens) +
+                                          tensor_bytes(2 * kQueryRows + 2 * kKvRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kParentRows) * kHidden * tokens;
+            append_result(results, "bf16", ops::detail::bf16_attn_input_schedule_name(schedule),
+                          tokens, CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -512,29 +896,62 @@ int main(int argc, char** argv) {
         bench::L2FlushBuffer flush(kFlushBytes);
         std::vector<Result> results;
 
-        if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
+        if (selected(options.format, Format::Q4Q5)) {
+            if (options.candidates) {
+                run_q4q5_candidates(options, flush, stream, results);
+            } else {
+                run_q4q5(options, flush, stream, results);
+            }
+        }
         if (selected(options.format, Format::Q8Qgkv)) {
-            auto weight = bench::make_row_split_weight(QType::Q8_G32_FP16, 9216, 2048, 2048, 507U);
-            run_four_output(options, "q8-qgkv", QType::Q8_G32_FP16, ops::LinearPolicy::A16Only,
-                            true, 2048, 4096, 512, 9216, weight, flush, stream, results);
+            if (options.candidates) {
+                run_q8_target_candidates(options, flush, stream, results);
+            } else {
+                auto weight =
+                    bench::make_row_split_weight(QType::Q8_G32_FP16, 9216, 2048, 2048, 507U);
+                run_four_output(options, "q8-qgkv", QType::Q8_G32_FP16, ops::LinearPolicy::A16Only,
+                                true, 2048, 4096, 512, 9216, weight, flush, stream, results);
+            }
         }
         if (selected(options.format, Format::Q8Qkv)) {
-            run_q8_qkv(options, "q8-qkv", 2048, flush, stream, results);
+            if (options.candidates) {
+                run_q8_qkv_candidates(options, "q8-qkv", 2048, flush, stream, results);
+            } else {
+                run_q8_qkv(options, "q8-qkv", 2048, flush, stream, results);
+            }
         }
         if (selected(options.format, Format::Q8DFlash2Qkv)) {
-            run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, stream, results);
+            if (options.candidates) {
+                run_q8_dflash2_candidates(options, flush, stream, results);
+            } else {
+                run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, stream, results);
+            }
         }
         if (selected(options.format, Format::Bf16)) {
-            auto weight = bench::make_direct_bf16_weight(14336, 5120);
-            run_four_output(options, "bf16", QType::BF16, ops::LinearPolicy::A16Only, false, 5120,
-                            6144, 1024, 14336, weight, flush, stream, results);
+            if (options.candidates) {
+                run_bf16_candidates(options, flush, stream, results);
+            } else {
+                auto weight = bench::make_direct_bf16_weight(14336, 5120);
+                run_four_output(options, "bf16", QType::BF16, ops::LinearPolicy::A16Only, false, 5120,
+                                6144, 1024, 14336, weight, flush, stream, results);
+            }
         }
         if (selected(options.format, Format::Nvfp4)) {
-            auto weight = bench::make_nvfp4_weight(14336, 5120);
-            run_four_output(options, "nvfp4", QType::NVFP4, options.nvfp4_policy, false, 5120, 6144,
-                            1024, 14336, weight, flush, stream, results);
+            if (options.candidates) {
+                run_nvfp4_candidates(options, flush, stream, results);
+            } else {
+                auto weight = bench::make_nvfp4_weight(14336, 5120);
+                run_four_output(options, "nvfp4", QType::NVFP4, options.nvfp4_policy, false, 5120,
+                                6144, 1024, 14336, weight, flush, stream, results);
+            }
         }
-        if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results); }
+        if (selected(options.format, Format::Fp8)) {
+            if (options.candidates) {
+                run_fp8_candidates(options, flush, stream, results);
+            } else {
+                run_fp8(options, flush, stream, results);
+            }
+        }
         write_csv(options, results);
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

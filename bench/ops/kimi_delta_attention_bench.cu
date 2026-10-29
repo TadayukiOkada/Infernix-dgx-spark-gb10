@@ -38,7 +38,7 @@ struct Options {
     int qk = 96, value = 96, tokens = 1024, batch = 1, warmup = 20, repeat = 100;
     bool custom = false, sweep = false, breakdown = false;
     bool batch_update = false, batch_sweep = false, csv = false, help = false;
-    std::size_t flush = 256ULL << 20;
+    std::size_t flush = infernix::bench::default_cold_flush_bytes();
 };
 
 int integer(const char* flag, const char* value, int minimum) {
@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
                 "  --sweep             T=1,8,11,12,13,16,32,64,128,256,512,1024,2048,4096,8192\n"
                 "  --breakdown         also time the two chunked stages separately\n"
                 "  --batch-update --batch B | --batch-sweep   selected-slot T=1, B=1..8\n"
-                "  --warmup N --repeat N --flush-mib M        defaults 20,100,256\n"
+                "  --warmup N --repeat N --flush-mib M        defaults 20,100,device-L2-sized\n"
                 "  --csv               report timing and algorithm/CTA-request traffic (not "
                 "measured DRAM bytes)\n");
             return 0;

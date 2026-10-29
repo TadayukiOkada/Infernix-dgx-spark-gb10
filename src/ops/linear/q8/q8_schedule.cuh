@@ -68,7 +68,7 @@ struct Q8A16StreamSchedule {
     static_assert(KSplit == 1 || KSplit == 2 || KSplit == 4 || KSplit == 8);
     static_assert(K % (64 * KSplit) == 0, "every K warp owns the same whole scale pairs");
     static_assert(RowsPerWarp > 0 && Warps > 0 && Warps % KSplit == 0);
-    static_assert(ColsPerPass > 0 && ColsPerPass <= 8 && MaxCols % ColsPerPass == 0 && MaxCols <= 16);
+    static_assert(ColsPerPass > 0 && ColsPerPass <= 8 && MaxCols % ColsPerPass == 0 && MaxCols <= 64);
     static_assert(MinBlocksPerSm > 0);
     static constexpr int kK              = K;
     static constexpr int kRowsPerWarp    = RowsPerWarp;
@@ -89,6 +89,9 @@ struct Q8A16StreamSchedule {
     static constexpr int kSharedBytes    = (kXTileBytes + kPartialBytes + 15) / 16 * 16 > 0
                                                ? (kXTileBytes + kPartialBytes + 15) / 16 * 16
                                                : 16;
+    template <int ExactCols>
+    using with_cols = Q8A16StreamSchedule<K, RowsPerWarp, KSplit, Warps, ExactCols, ExactCols,
+                                          XStage, MinBlocksPerSm>;
     static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
 };
 

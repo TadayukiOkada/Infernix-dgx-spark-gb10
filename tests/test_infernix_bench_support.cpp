@@ -313,6 +313,10 @@ int test_cli_contract() {
         failures += expect(automatic.speculative.draft_tokens_auto && automatic.speculative.draft_tokens == 0,
                            "automatic MTP draft length");
     }
+    failures += expect(parse_for_test({"infernix_bench", "--weights", "model.ninfer", "--spec", "mtp",
+                                       "--draft-tokens", "7"})
+                           .speculative.draft_tokens == 7,
+                       "supported deep MTP window");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(

@@ -1,7 +1,7 @@
 // Standalone sustained device-memory bandwidth probe.
 //
 // Build:
-//   nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu -o hbm_bandwidth_probe
+//   nvcc -O3 -std=c++17 -arch=sm_121a tools/hbm_bandwidth_probe.cu -o hbm_bandwidth_probe
 //
 // The "bus GB/s" column counts logical streaming traffic: N bytes for a
 // read or write and 2N bytes for a copy (N read + N written). This is the
@@ -34,7 +34,10 @@
 namespace {
 
 constexpr int kThreads                 = 256;
-constexpr double kDefaultPeakGBps      = 1792.0;
+// Published GB10 system-memory specification (DGX Spark Hardware Overview). This
+// is the ADVERTISED figure the probe reports percentages against; the measured
+// sustained ceiling on this unit is ~246 GB/s (see bench/gb10_peak_bw.cu).
+constexpr double kDefaultPeakGBps      = 273.0;
 constexpr double kDefaultTrialSeconds  = 0.25;
 constexpr int kDefaultTrials           = 5;
 constexpr std::size_t kDefaultMaxBytes = std::size_t{4} << 30;

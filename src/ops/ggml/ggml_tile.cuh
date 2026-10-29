@@ -47,19 +47,31 @@ namespace infernix::ggml::tile {
 constexpr int kThreads      = 256;
 constexpr int kTileRows     = 64;  // two warp rows of 32 (two m16 tiles each)
 constexpr int kTileColumns  = 64;  // four warp columns of 16 (two n8 tiles each)
-constexpr int kMTiles       = 2;   // m16 tiles per warp
+template <int Threads = kThreads>
+inline constexpr int kMTilesOf = Threads == 256 ? 2 : 1;
+constexpr int kMTiles       = 2;   // m16 tiles per warp (max across configs)
 constexpr int kNTiles       = 2;   // n8 tiles per warp
 constexpr int kStageSlices  = 2;   // 64 elements of K per stage
 constexpr int kUnitSlices   = 8;   // 256 elements of K per raw unit
 constexpr int kBWords       = 28;  // shared column pitch of a slice's 24 limb words
-// 16-byte chunks of one row's raw unit: at most 225 bytes (a 210-byte Q6_K block from a 16-byte
-// aligned start, so at most 15 bytes before it).
-constexpr int kRawChunks    = 15;
 
 // Elements per block of F (the period of the int128 flush).
 template <QType F>
 inline constexpr int kBlockSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 8;
 static_assert(kUnitSlices % kStageSlices == 0);
+
+// 16-byte chunks of one row's raw unit. The unit is kUnitSlices * 32 elements of whole blocks
+// (kUnitSlices / kBlockSlices of them), read from the row's 16-byte aligned start, so its first block
+// may begin up to 15 bytes past it; ceil((unit_bytes + 15) / 16) chunks always cover it. Per format,
+// so a format's rows do not reserve shared memory for a wider block than they read: IQ2_S 7,
+// IQ3_XXS/IQ3_S 8, IQ4_XS/Q4_K 10, Q5_K 12, Q6_K 15. (15 was used for every format; it is the
+// bound only for Q6_K's 210-byte block, and 4 formats the MoE gate/up path runs need at most 8.)
+template <QType F>
+inline constexpr int kRawChunksOf =
+    static_cast<int>(kUnitSlices / kBlockSlices<F> * ggml_block_bytes(F) + 30) / 16;
+constexpr int kRawChunks = kRawChunksOf<QType::GGML_Q6_K>; // the widest format's bound
+static_assert(kRawChunksOf<QType::GGML_Q6_K> == 15, "Q6_K needs 15 chunks");
+static_assert(kRawChunksOf<QType::GGML_IQ3_S> == 8, "IQ3_S needs 8 chunks");
 
 // log2 of a bound on one block's term |mant(d) * P| (with the K-quants' min term): elements x
 // |sub| x |code| x |X| (< 2^21) x mant (< 2^11). Q6_K 2^8 2^7 2^5; Q5_K 2^8 2^6 2^5 (+ the min term
@@ -150,16 +162,22 @@ inline constexpr int kImageBytes = fast::kMin<F> ? static_cast<int>(sizeof(CodeS
 static_assert(offsetof(CodeStage, dmin) % 16 == 0);
 
 // Dynamic shared memory of a tile CTA that decodes its raw units (the kernels declare it extern;
-// launchers pass sizeof).
-struct Shared {
-    static constexpr int kBufs = 2;                            // limb buffers
+// launchers pass sizeof). RawChunks is the format's kRawChunksOf<F>: a format never reserves rows
+// for a wider block than it reads.
+template <int RawChunks = kRawChunks>
+struct SharedT {
+    static constexpr int kBufs      = 2; // limb buffers
+    static constexpr int kRawChunks = RawChunks;
     CodeStage code;                                            // the current stage's codes
     alignas(16) int b[2][kStageSlices][kTileColumns][kBWords]; // limbs a, b, c (8 words each), two stages
     int xsum[2][kStageSlices][kTileColumns];
-    alignas(16) std::uint8_t raw[2][kTileRows][kRawChunks * 16]; // raw units, two
+    alignas(16) std::uint8_t raw[2][kTileRows][RawChunks * 16]; // raw units, two
     int raw_offset[2][kTileRows]; // where row r's unit bytes start in raw[.][r]
     int base[kTileRows];          // row r's smallest scale shift (the int64 accumulators' unit)
 };
+// The widest format's layout: callers that do not name a format (or that serve several) size theirs
+// with Shared::kRawChunks.
+using Shared = SharedT<>;
 
 // Dynamic shared memory of a tile CTA that reads decoded planes: stage images and limbs by cp.async
 // in a ring of kBufs stages (the K loop copies kBufs - 1 stages ahead).
@@ -174,8 +192,9 @@ struct PlaneShared {
 // A tile's exact outputs: thread (warp, lane) holds, for its warp tile's m16 tiles mi < mtiles and
 // n8 tiles nt < ntiles, rows row0 + 16 mi + g (+ 8 for q >= 2) and columns col0 + 8 nt + 2t + (q & 1),
 // with g = lane / 4, t = lane % 4.
+template <int Threads = kThreads>
 struct Accumulators {
-    I128 r[kMTiles][kNTiles][4];
+    I128 r[kMTilesOf<Threads>][kNTiles][4];
 };
 
 // The warps' share of a tile with `columns` valid columns (the CTA's count, the same for every warp),
@@ -232,15 +251,19 @@ __device__ __forceinline__ int out_column(const WarpTile& w, int lane, int nt, i
 }
 
 // Issues the cp.async copies of raw unit `unit` (slices 8 unit .. of K = 32 slices) into buffer `buf`.
-template <QType F, int Threads, class Sm, class RowOf>
+// `Sm::kRawChunks` chunks of a row cover its unit: ceil((unit_bytes + 15) / 16) at most, and the
+// format's own count.
+template <QType F, int Threads, int Stride = 1, class Sm, class RowOf>
 __device__ __forceinline__ void issue_unit(Sm& sm, int buf, int unit, int slices, RowOf row_of) {
     constexpr int kBlockElems = static_cast<int>(ggml_block_elems(F));
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
+    constexpr int kChunks     = Sm::kRawChunks;
+    static_assert(kChunks >= (kUnitSlices / kBlockSlices<F> * kBlockBytes + 30) / 16, "a row's unit fits its chunks");
     const int elems         = 32 * min(kUnitSlices, slices - unit * kUnitSlices);
     const int bytes         = elems / kBlockElems * kBlockBytes;
-    const std::size_t begin = static_cast<std::size_t>(unit) * kUnitSlices * 32 / kBlockElems * kBlockBytes;
-    for (int i = threadIdx.x; i < kTileRows * kRawChunks; i += Threads) {
-        const int r = i / kRawChunks, chunk = i % kRawChunks;
+    const std::size_t begin = static_cast<std::size_t>(unit) * (kUnitSlices * 32 / kBlockElems) * Stride * kBlockBytes;
+    for (int i = threadIdx.x; i < kTileRows * kChunks; i += Threads) {
+        const int r = i / kChunks, chunk = i % kChunks;
         const std::uint8_t* src = row_of(r) + begin;
         const auto* aligned     = reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{15});
         const int offset        = static_cast<int>(src - aligned);
@@ -265,19 +288,30 @@ struct LimbCopies {
     int xdst;                  // word offset in sm.xsum[buf]
 };
 
+// Columns the warp layout actually reads for a tile of `columns` valid columns: layout 0 (columns
+// > 32) reads [0, 64), layout 1 (16 < columns <= 32) reads [0, 32), layout 2 (columns <= 16) reads
+// [0, 16). A partial tile whose valid columns fall below a layout's full width never touches the
+// columns past its width, so their limbs (a clamped re-read of a valid column) and slice sums are
+// staged but never ldmatrix'd -- the padding-column traffic NCU counts as excessive sectors. Copying
+// only [0, limb_columns(columns)> leaves every value an active warp reads identical, so the outputs
+// are bit-exact: the discarded columns were already masked out by the epilogue.
+__device__ __forceinline__ int limb_columns(int columns) {
+    return columns > 32 ? kTileColumns : (columns > 16 ? 32 : 16);
+}
+
 template <QType F, int Threads, class ColumnLimbs>
-__device__ __forceinline__ LimbCopies<Threads> limb_copies(ColumnLimbs limbs, int xsum_offset) {
+__device__ __forceinline__ LimbCopies<Threads> limb_copies(ColumnLimbs limbs, int xsum_offset, int copy_columns) {
     LimbCopies<Threads> lc{};
 #pragma unroll
     for (int k = 0; k < kLimbCopies<Threads>; ++k) {
         const int i = static_cast<int>(threadIdx.x) + Threads * k;
         const int j = i / (kTileColumns * 6), c = (i / 6) % kTileColumns, u = i % 6;
-        lc.src[k] = i < kStageCopies ? limbs(c) + j * fast::kSliceWords + 4 * u : nullptr;
+        lc.src[k] = (i < kStageCopies && c < copy_columns) ? limbs(c) + j * fast::kSliceWords + 4 * u : nullptr;
         lc.dst[k] = (j * kTileColumns + c) * kBWords + 4 * u;
     }
     if constexpr (fast::kMin<F>) {
         const int i = static_cast<int>(threadIdx.x);
-        if (i < kStageSlices * kTileColumns) {
+        if (i < kStageSlices * kTileColumns && (i % kTileColumns) < copy_columns) {
             const int j = i / kTileColumns, c = i % kTileColumns;
             lc.xsum = limbs(c) + xsum_offset + j;
             lc.xdst = i;
@@ -286,12 +320,14 @@ __device__ __forceinline__ LimbCopies<Threads> limb_copies(ColumnLimbs limbs, in
     return lc;
 }
 
-// Issues the cp.async copies of stage s0's limbs (and slice sums) into buffer `buf`.
+// Issues the cp.async copies of stage s0's limbs (and slice sums) into buffer `buf`. A copy whose
+// source is null (a column past the tile's read width, see limb_columns) is skipped; the null guard
+// is unconditional because a narrow tile's copy set no longer fills every slot for any Threads.
 template <QType F, int Threads, class Sm>
 __device__ __forceinline__ void issue_limbs(Sm& sm, int buf, int s0, const LimbCopies<Threads>& lc) {
 #pragma unroll
     for (int k = 0; k < kLimbCopies<Threads>; ++k) {
-        if (kStageCopies % Threads != 0 && lc.src[k] == nullptr) { continue; }
+        if (lc.src[k] == nullptr) { continue; }
         cp_async16(&sm.b[buf][0][0][0] + lc.dst[k], lc.src[k] + s0 * fast::kSliceWords, 16);
     }
     if constexpr (fast::kMin<F>) {
@@ -302,8 +338,7 @@ __device__ __forceinline__ void issue_limbs(Sm& sm, int buf, int s0, const LimbC
 // One 8-element chunk of a block as the stage stores it: two code words (byte j of word h is element
 // 4h + j), its sub-scale and scale words. The integers of chunk<F> (ggml_exact.h), decoded with
 // word operations (ggml_dp4a.cuh's byte tricks) for every ggml format. `b` is the block in the
-// stage's raw copy (shared memory at any byte alignment, so words are read byte by byte); `cb` the
-// format's codebook (fast::DeviceCodebook or a CTA's fast::SharedCodebook: the same values).
+// stage's raw copy (shared memory at any byte alignment, so words are read byte by byte).
 struct TileChunk {
     int w[2];
     int sub;
@@ -439,10 +474,11 @@ enum class Accum {
     kLimbs,  // one int64 per output and limb plane, in units of 2^base(row) (kLimbsMode)
 };
 
-// Tiles whose int64 mode is kLimbs (else kNarrow): formats without a min term and CTAs of 512
-// threads (8 outputs per thread; 256-thread tiles' 16 would need 96 registers for them).
+// Tiles whose int64 mode is kLimbs (else kNarrow). Disabled because 3 limb plane accumulators
+// (48 registers) exceed the 128-register budget of 512-thread CTAs, causing local stack spills.
+// kNarrow uses a single int64 accumulator per output (16 registers), fitting within 128 registers.
 template <QType F, int Threads>
-inline constexpr bool kLimbsMode = !fast::kMin<F> && Threads == 512;
+inline constexpr bool kLimbsMode = false;
 
 // log2 of a bound on one limb plane's block sum |sum of sub * code * limb| (kTermLog2 with the limb's
 // 2^7 for X's 2^21 and without the mantissa's 2^11); formats without a min term.
@@ -509,8 +545,7 @@ __device__ __forceinline__ void store_chunk(Stage& cs, int dr, int dj, int dp, i
 }
 
 // Decodes stage st (slices kStageSlices st ..) of tile rows row_of(0 .. kTileRows - 1) from global
-// memory into a stage (fast::chunk: the same integers as tile_chunk), with codebook `cb`. Every
-// thread calls it.
+// memory into a stage (fast::chunk: the same integers as tile_chunk). Every thread calls it.
 template <QType F, int Threads = kThreads, class RowOf, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void decode_stage(CodeStage& cs, RowOf row_of, int st, const Codebook& cb = Codebook{}) {
     constexpr int kChunks = kTileRows * kStageSlices * 4 / Threads; // 8-element chunks per thread
@@ -558,6 +593,9 @@ enum class StageSource {
 };
 
 __device__ __forceinline__ CodeStage& stage_of(Shared& sm, int, int) { return sm.code; }
+// A format's own raw-buffer layout (SharedT<kRawChunksOf<F>>).
+template <int RawChunks>
+__device__ __forceinline__ CodeStage& stage_of(SharedT<RawChunks>& sm, int, int) { return sm.code; }
 __device__ __forceinline__ CodeStage& stage_of(PlaneShared& sm, int buf, int) { return sm.code[buf]; }
 template <int Stages, class Stage>
 __device__ __forceinline__ Stage& stage_of(ResidentShared<Stages, Stage>& sm, int, int st) { return sm.code[st]; }
@@ -565,10 +603,10 @@ __device__ __forceinline__ Stage& stage_of(ResidentShared<Stages, Stage>& sm, in
 // The K loop of compute, accumulating by Mode (Accum; the rows' bases in sm.base for kNarrow and
 // kLimbs); the warps' tiles are warp_tile<Threads>'s layout `Layout`, a warp of an inactive layout
 // slot (512 threads, layout 2) copying and decoding but computing nothing. Source says where the
-// stages come from (StageSource; `plane` for kPlane); kDecode reads codebook `cb`.
-template <QType F, Accum Mode, int Layout, StageSource Source, int Threads, class Sm, class RowOf, class Codebook>
+// stages come from (StageSource; `plane` for kPlane).
+template <QType F, Accum Mode, int Layout, StageSource Source, int Threads, int Stride = 1, class Sm, class RowOf, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, const LimbCopies<Threads>& copies,
-                                             Accumulators& acc, const std::uint8_t* plane, const Codebook& cb) {
+                                             Accumulators<Threads>& acc, const std::uint8_t* plane, const Codebook& cb = Codebook{}) {
     constexpr bool Narrow = Mode == Accum::kNarrow;
     constexpr bool Limbs  = Mode == Accum::kLimbs;
     static_assert(!Limbs || kLimbsMode<F, Threads>, "per-limb accumulators: kLimbsMode tiles only");
@@ -578,20 +616,21 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
     constexpr int kDecodeChunks = kTileRows * kStageSlices * 4 / Threads; // 8-element chunks per thread and stage
     static_assert(kDecodeChunks * Threads == kTileRows * kStageSlices * 4);
     constexpr int kM = kLayoutM<Threads, Layout>, kN = kLayoutN<Threads, Layout>;
+    constexpr int kMT = kMTilesOf<Threads>;
     const int lane = static_cast<int>(threadIdx.x) % 32;
     const int g = lane / 4, t = lane % 4;
     const WarpLayout<Threads> wl = warp_layout<Threads, Layout>();
     const int row0 = wl.row0, col0 = wl.col0;
     // Block sums of sub * (codes . limb) per limb plane (a, b, c): |sum| < 2^kSumLog2 <= 2^27.
-    int s[3][kMTiles][kNTiles][4];
-    long long mt[kMTiles][kNTiles][4];
+    int s[3][kMT][kNTiles][4];
+    [[maybe_unused]] long long mt[fast::kMin<F> ? kMT : 1][fast::kMin<F> ? kNTiles : 1][fast::kMin<F> ? 4 : 1];
     // Narrow: the outputs in units of 2^base of their rows (row ra = row0 + 16 mi + g, and ra + 8).
-    long long n64[kMTiles][kNTiles][4];
+    [[maybe_unused]] long long n64[Narrow ? kMT : 1][Narrow ? kNTiles : 1][Narrow ? 4 : 1];
     // Limbs: per limb plane l, the sum of M * block sum l in units of 2^base (row_bases' bound).
-    long long nl[3][kMTiles][kNTiles][4];
-    int base[kMTiles][2];
+    [[maybe_unused]] long long nl[Limbs ? 3 : 1][Limbs ? kMT : 1][Limbs ? kNTiles : 1][Limbs ? 4 : 1];
+    int base[kMT][2];
 #pragma unroll
-    for (int mi = 0; mi < kMTiles; ++mi) {
+    for (int mi = 0; mi < kMT; ++mi) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) { base[mi][h] = (Narrow || Limbs) && mi < kM ? sm.base[row0 + 16 * mi + g + 8 * h] : 0; }
 #pragma unroll
@@ -601,10 +640,10 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
 #pragma unroll
                 for (int l = 0; l < 3; ++l) {
                     s[l][mi][nt][q]  = 0;
-                    nl[l][mi][nt][q] = 0;
+                    if constexpr (Limbs) { nl[l][mi][nt][q] = 0; }
                 }
-                mt[mi][nt][q]    = 0;
-                n64[mi][nt][q]   = 0;
+                if constexpr (fast::kMin<F>) { mt[mi][nt][q] = 0; }
+                if constexpr (Narrow) { n64[mi][nt][q] = 0; }
                 acc.r[mi][nt][q] = I128{};
             }
         }
@@ -637,7 +676,7 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
             // Ahead: the next stage's limbs; at a unit's first stage, the next unit's raw bytes (their
             // buffer's last reader, unit - 1, finished at the previous stage's closing barrier).
             if (st + 1 < stages) { issue_limbs<F>(sm, buf ^ 1, s0 + kStageSlices, copies); }
-            if (st % kUnitStages == 0 && (unit + 1) * kUnitSlices < slices) { issue_unit<F, Threads>(sm, ubuf ^ 1, unit + 1, slices, row_of); }
+            if (st % kUnitStages == 0 && (unit + 1) * kUnitSlices < slices) { issue_unit<F, Threads, Stride>(sm, ubuf ^ 1, unit + 1, slices, row_of); }
             cp_async_commit();
             cp_async_wait<1>(); // everything but this stage's issues has landed
             __syncthreads();
@@ -679,7 +718,7 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
                 }
             }
 #pragma unroll
-            for (int mi = 0; mi < kMTiles; ++mi) {
+            for (int mi = 0; mi < kMT; ++mi) {
                 if (mi >= kM) { continue; }
                 const int ra = row0 + 16 * mi + g, grp = row0 / 16 + mi;
                 // Rows ra and ra + 8: a = (row ra word t, row ra + 8 word t, the same of word 4 + t),
@@ -808,7 +847,8 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
     }
     if constexpr (Narrow || Limbs) {
 #pragma unroll
-        for (int mi = 0; mi < kMTiles; ++mi) {
+        for (int mi = 0; mi < kMT; ++mi) {
+            if (mi >= kM) { continue; }
 #pragma unroll
             for (int nt = 0; nt < kNTiles; ++nt) {
 #pragma unroll
@@ -816,7 +856,7 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
                     const int b = base[mi][q >> 1];
                     if constexpr (Narrow) {
                         add_shifted(acc.r[mi][nt][q], n64[mi][nt][q], b);
-                    } else { // limb planes a, b, c weigh 2^16, 2^8, 1
+                    } else if constexpr (Limbs) { // limb planes a, b, c weigh 2^16, 2^8, 1
                         add_shifted(acc.r[mi][nt][q], nl[0][mi][nt][q], b + 16);
                         add_shifted(acc.r[mi][nt][q], nl[1][mi][nt][q], b + 8);
                         add_shifted(acc.r[mi][nt][q], nl[2][mi][nt][q], b);
@@ -828,15 +868,15 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
 }
 
 // compute_loop for the CTA's accumulator mode and warp layout (the same for every warp).
-template <QType F, StageSource Source, int Threads, class Sm, class RowOf, class Codebook = fast::DeviceCodebook<F>>
+template <QType F, StageSource Source, int Threads, int Stride = 1, class Sm, class RowOf, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, const LimbCopies<Threads>& copies,
-                                              int columns, Accum mode, Accumulators& acc, const std::uint8_t* plane,
+                                              int columns, Accum mode, Accumulators<Threads>& acc, const std::uint8_t* plane,
                                               const Codebook& cb = Codebook{}) {
     const auto run = [&](auto layout) {
         constexpr int kLayout = decltype(layout)::value;
         constexpr Accum kInt64 = kLimbsMode<F, Threads> ? Accum::kLimbs : Accum::kNarrow; // row_bases' int64 mode
-        mode == kInt64 ? compute_loop<F, kInt64, kLayout, Source, Threads>(sm, row_of, slices, copies, acc, plane, cb)
-                       : compute_loop<F, Accum::kWide, kLayout, Source, Threads>(sm, row_of, slices, copies, acc, plane, cb);
+        mode == kInt64 ? compute_loop<F, kInt64, kLayout, Source, Threads, Stride>(sm, row_of, slices, copies, acc, plane, cb)
+                       : compute_loop<F, Accum::kWide, kLayout, Source, Threads, Stride>(sm, row_of, slices, copies, acc, plane, cb);
     };
     if (columns > 32) {
         run(std::integral_constant<int, 0>{});
@@ -854,18 +894,16 @@ __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, 
 // tile's valid columns: the thread's outputs (Accumulators) are those of its warp tile
 // (warp_tile<Threads>(columns)); columns past the valid ones are computed on padding (column limbs
 // that the caller clamps to a valid column) and ignored. Every thread of the CTA (Threads of them)
-// calls it. The outputs are the same integers whichever accumulator the rows' scales allow. The
-// decode reads codebook `cb`: a fast::SharedCodebook the caller loaded before the call is published
-// by row_bases' barrier, before the first decode.
-template <QType F, int Threads = kThreads, class RowOf, class ColumnLimbs, class Codebook = fast::DeviceCodebook<F>>
-__device__ __forceinline__ void compute(Shared& sm, RowOf row_of, int slices, ColumnLimbs limbs, int xsum_offset,
-                                        int columns, Accumulators& acc, const Codebook& cb = Codebook{}) {
-    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset);
-    issue_unit<F, Threads>(sm, 0, 0, slices, row_of);
+// calls it. The outputs are the same integers whichever accumulator the rows' scales allow.
+template <QType F, int Threads = kThreads, int Stride = 1, class RowOf, class ColumnLimbs, int RawChunks = kRawChunksOf<F>, class Codebook = fast::DeviceCodebook<F>>
+__device__ __forceinline__ void compute(SharedT<RawChunks>& sm, RowOf row_of, int slices, ColumnLimbs limbs, int xsum_offset,
+                                        int columns, Accumulators<Threads>& acc, const Codebook& cb = Codebook{}) {
+    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, limb_columns(columns));
+    issue_unit<F, Threads, Stride>(sm, 0, 0, slices, row_of);
     issue_limbs<F>(sm, 0, 0, copies);
     cp_async_commit();
-    const Accum mode = row_bases<F, Threads>(sm, row_of, slices);
-    dispatch_loop<F, StageSource::kDecode>(sm, row_of, slices, copies, columns, mode, acc, nullptr, cb);
+    const Accum mode = row_bases<F, Threads, Stride>(sm, row_of, slices);
+    dispatch_loop<F, StageSource::kDecode, Threads, Stride>(sm, row_of, slices, copies, columns, mode, acc, nullptr, cb);
 }
 
 // compute over a decoded plane: stage st's image at plane + st * sizeof(CodeStage) (decode_planes);
@@ -873,8 +911,8 @@ __device__ __forceinline__ void compute(Shared& sm, RowOf row_of, int slices, Co
 // kBlockBytes apart: row_bases).
 template <QType F, int Threads = kThreads, int Stride = 1, class RowOf, class ColumnLimbs>
 __device__ __forceinline__ void compute_plane(PlaneShared& sm, RowOf row_of, const std::uint8_t* plane, int slices,
-                                              ColumnLimbs limbs, int xsum_offset, int columns, Accumulators& acc) {
-    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset);
+                                              ColumnLimbs limbs, int xsum_offset, int columns, Accumulators<Threads>& acc) {
+    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, limb_columns(columns));
     const int stages = slices / kStageSlices;
 #pragma unroll
     for (int k = 0; k < PlaneShared::kBufs - 1; ++k) { // the first kBufs - 1 stages, one group each
@@ -932,9 +970,9 @@ __device__ __forceinline__ Accum decode_resident(ResidentShared<Stages, Stage>& 
 
 template <QType F, int Stages, int Threads = kThreads, class Stage, class ColumnLimbs>
 __device__ __forceinline__ void compute_resident(ResidentShared<Stages, Stage>& sm, Accum mode, ColumnLimbs limbs,
-                                                 int xsum_offset, int columns, Accumulators& acc) {
+                                                 int xsum_offset, int columns, Accumulators<Threads>& acc) {
     using Sm = ResidentShared<Stages, Stage>;
-    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset);
+    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, limb_columns(columns));
 #pragma unroll
     for (int k = 0; k < Sm::kBufs - 1; ++k) { // the first kBufs - 1 stages' limbs, one group each
         if (k < Stages) { issue_limbs<F>(sm, k, k * kStageSlices, copies); }

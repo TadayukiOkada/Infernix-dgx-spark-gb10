@@ -82,13 +82,17 @@ struct Q6A16MmaSchedule {
     static constexpr int kGroupsPerK     = kBlockK / Q6RowSplitStorage::kGroupK;
     static constexpr int kScaleBytes =
         kScaleLoadMode == Q6ScaleLoad::Pair32 ? 4 : Q6RowSplitStorage::kScaleBytesPerGroup;
+    static constexpr int kScaleRowBytes =
+        (kScaleLoadMode == Q6ScaleLoad::Pair32 && (kGroupsPerK % 2 == 0))
+            ? kGroupsPerK * Q6RowSplitStorage::kScaleBytesPerGroup
+            : kGroupsPerK * kScaleBytes;
 
     static constexpr int kSharedBytes =
         kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
         kActivationStages * kBlockTokens * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
         kStages * kBlockRows * kGroupsPerK * Q6RowSplitStorage::kCodeBytesPerGroup +
         kStages * kBlockRows * kGroupsPerK * Q6RowSplitStorage::kHighBytesPerGroup +
-        kStages * kBlockRows * kGroupsPerK * kScaleBytes;
+        kStages * kBlockRows * kScaleRowBytes;
 
     static_assert(kBlockRows > 0 && kBlockTokens > 0 && kBlockK > 0);
     static_assert(kBlockK % Q6RowSplitStorage::kGroupK == 0,
@@ -102,8 +106,8 @@ struct Q6A16MmaSchedule {
                   "Q6 MMA activation staging is single-buffered or follows the quant pipeline");
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 48 * 1024,
-                  "Q6 MMA staged shared memory exceeds the static 48 KiB budget");
+    static_assert(kSharedBytes <= 99 * 1024,
+                  "Q6 MMA staged shared memory exceeds the 99 KiB budget");
 };
 
 template <int BlockRows, int BlockTokens, int KWarps, int Stages, Cache WeightCache,
@@ -124,7 +128,6 @@ struct Q6A16SlicedKMmaSchedule {
     static constexpr int kStages            = Stages;
     static constexpr Cache kWeightCache     = WeightCache;
     static constexpr Cache kActivationCache = ActivationCache;
-    static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
     static constexpr int kMmaRows           = BlockRows / 16;
     static constexpr int kMmaTokens         = BlockTokens / 8;
     // Code/high/scale planes and BF16 activations. Partial results reuse this storage.
@@ -136,6 +139,11 @@ struct Q6A16SlicedKMmaSchedule {
     static constexpr int kPartialBytes = KWarps * BlockRows * BlockTokens * sizeof(float);
     static constexpr int kSharedBytes =
         ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;
+    static constexpr int kMaxBlocksBySmem = (99 * 1024) / kSharedBytes;
+    static constexpr int kMinBlocksPerSm =
+        MinBlocksPerSm < kMaxBlocksBySmem
+            ? MinBlocksPerSm
+            : (kMaxBlocksBySmem > 1 ? kMaxBlocksBySmem : 1);
     static_assert(kSharedBytes <= 48 * 1024, "Q6 sliced-K shared memory exceeds 48 KiB");
 };
 

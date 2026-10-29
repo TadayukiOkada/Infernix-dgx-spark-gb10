@@ -19,48 +19,61 @@ struct RouteSpec {
     Q8LinearAddScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 5> kK4096Routes{{
+// GB10 (sm_121a, 48 SMs) route table, re-fitted from a complete cold-cache candidate sweep of every
+// admitted tile across the token-width range (bench/ops/q8_linear_add_bench, rows=2048, K=4096, warmup
+// 8 / repeat 40). The previous 5-band table was fitted on the RTX 5090 (170 SMs); its MediumSplitK band
+// (cols 49-128) and single MmaR32C128 band (cols 129-640) under-fill 48 SMs and lose 14-47% in the
+// prefill band. Decode (col 1) and the exact-T split-K band (cols 2-48) were already optimal on GB10
+// (0% gap) and are unchanged. All MMA tiles accumulate each output over K in the same order, so
+// swapping them is bit-identical; only speed differs.
+constexpr std::array<RouteSpec, 19> kK4096Routes{{
     {1, 1, Q8LinearAddScheduleId::SimtR8C4},
     {2, 48, Q8LinearAddScheduleId::SplitKMmaExactT},
-    {49, 128, Q8LinearAddScheduleId::MediumSplitK},
-    {129, 640, Q8LinearAddScheduleId::MmaR32C128},
-    {641, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
+    {49, 71, Q8LinearAddScheduleId::MmaR32C128},
+    {72, 195, Q8LinearAddScheduleId::MmaR32C64},
+    {196, 259, Q8LinearAddScheduleId::MmaR48C128},
+    {260, 291, Q8LinearAddScheduleId::MmaR64C96},
+    {292, 391, Q8LinearAddScheduleId::MmaR64C128},
+    {392, 495, Q8LinearAddScheduleId::MmaR128C80},
+    {496, 607, Q8LinearAddScheduleId::MmaR64C96},
+    {608, 639, Q8LinearAddScheduleId::MmaR64C112},
+    {640, 671, Q8LinearAddScheduleId::MmaR64C128},
+    {672, 703, Q8LinearAddScheduleId::MmaR64C112},
+    {704, 799, Q8LinearAddScheduleId::MmaR64C128},
+    {800, 831, Q8LinearAddScheduleId::MmaR128C80},
+    {832, 863, Q8LinearAddScheduleId::MmaR64C128},
+    {864, 895, Q8LinearAddScheduleId::MmaR64C96},
+    {896, 927, Q8LinearAddScheduleId::MmaR64C128},
+    {928, 991, Q8LinearAddScheduleId::MmaR128C80},
+    {992, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
 }};
 
-constexpr std::array<RouteSpec, 33> kK6144Routes{{
+// GB10 (sm_121a, 48 SMs) route table, re-fitted from a complete cold-cache candidate sweep of every
+// admitted tile across the token-width range (bench/ops/q8_linear_add_bench, rows=2048, K=6144, warmup
+// 8 / repeat 40). The previous bands were fitted on the RTX 5090 (170 SMs); its small row-tiles and
+// MediumSplitK under-fill 48 SMs in the prefill band, costing 14-47% there. Decode (col 1) and the
+// exact-T split-K band (cols 2-48) were already optimal on GB10 (0% gap) and are unchanged. Wider
+// MMA tiles (r48/r64/r128) win the prefill band on 48 SMs. All MMA tiles accumulate each output over
+// K in the same order, so swapping them is bit-identical; only speed differs.
+constexpr std::array<RouteSpec, 18> kK6144Routes{{
     {1, 1, Q8LinearAddScheduleId::DecodeR16},
     {2, 48, Q8LinearAddScheduleId::SplitKMmaExactT},
-    {49, 128, Q8LinearAddScheduleId::MediumSplitK},
-    {129, 191, Q8LinearAddScheduleId::MmaR32C128},
-    {192, 192, Q8LinearAddScheduleId::MmaR32C96},
-    {193, 256, Q8LinearAddScheduleId::MmaR32C128},
-    {257, 384, Q8LinearAddScheduleId::MmaR32C64},
-    {385, 399, Q8LinearAddScheduleId::MmaR32C96},
-    {400, 400, Q8LinearAddScheduleId::MmaR32C80},
-    {401, 447, Q8LinearAddScheduleId::MmaR32C96},
-    {448, 448, Q8LinearAddScheduleId::MmaR32C64},
-    {449, 480, Q8LinearAddScheduleId::MmaR32C96},
-    {481, 640, Q8LinearAddScheduleId::MmaR32C128},
-    {641, 672, Q8LinearAddScheduleId::MmaR48C96},
-    {673, 704, Q8LinearAddScheduleId::MmaR48C64},
-    {705, 784, Q8LinearAddScheduleId::MmaR48C112},
-    {785, 896, Q8LinearAddScheduleId::MmaR48C128},
-    {897, 960, Q8LinearAddScheduleId::MmaR64C96},
-    {961, 1023, Q8LinearAddScheduleId::MmaR64C112},
-    {1024, 1024, Q8LinearAddScheduleId::MmaR64C128},
-    {1025, 1120, Q8LinearAddScheduleId::MmaR64C112},
-    {1121, 1280, Q8LinearAddScheduleId::MmaR64C128},
-    {1281, 1344, Q8LinearAddScheduleId::MmaR128C64},
-    {1345, 1408, Q8LinearAddScheduleId::MmaR48C128},
-    {1409, 1680, Q8LinearAddScheduleId::MmaR128C80},
-    {1681, 1791, Q8LinearAddScheduleId::MmaR48C128},
-    {1792, 1792, Q8LinearAddScheduleId::MmaR64C128},
-    {1793, 1919, Q8LinearAddScheduleId::MmaR48C128},
-    {1920, 1920, Q8LinearAddScheduleId::MmaR64C128},
-    {1921, 2016, Q8LinearAddScheduleId::MmaR64C96},
-    {2017, 2047, Q8LinearAddScheduleId::MmaR64C112},
-    {2048, 2048, Q8LinearAddScheduleId::MmaR64C128},
-    {2049, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
+    {49, 79, Q8LinearAddScheduleId::MmaR32C128},
+    {80, 94, Q8LinearAddScheduleId::MmaR32C64},
+    {95, 111, Q8LinearAddScheduleId::MmaR32C128},
+    {112, 195, Q8LinearAddScheduleId::MmaR32C64},
+    {196, 259, Q8LinearAddScheduleId::MmaR48C128},
+    {260, 291, Q8LinearAddScheduleId::MmaR64C96},
+    {292, 343, Q8LinearAddScheduleId::MmaR64C112},
+    {344, 391, Q8LinearAddScheduleId::MmaR64C128},
+    {392, 495, Q8LinearAddScheduleId::MmaR128C80},
+    {496, 591, Q8LinearAddScheduleId::MmaR64C96},
+    {592, 703, Q8LinearAddScheduleId::MmaR64C112},
+    {704, 767, Q8LinearAddScheduleId::MmaR128C64},
+    {768, 959, Q8LinearAddScheduleId::MmaR64C128},
+    {960, 975, Q8LinearAddScheduleId::MmaR128C80},
+    {976, 1008, Q8LinearAddScheduleId::MmaR64C112},
+    {1009, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
 }};
 
 constexpr std::array<RouteSpec, 2> kN5120Routes{{
@@ -85,7 +98,6 @@ static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes)
 std::int32_t schedule_rows(Q8LinearAddScheduleId schedule) {
     switch (schedule) {
     case Q8LinearAddScheduleId::DecodeR16:
-    case Q8LinearAddScheduleId::MediumSplitK:
         break;
     case Q8LinearAddScheduleId::SimtR8C4:
         return 8;
@@ -120,7 +132,6 @@ std::int32_t schedule_cols(Q8LinearAddScheduleId schedule);
 std::int32_t schedule_cols(Q8LinearAddScheduleId schedule) {
     switch (schedule) {
     case Q8LinearAddScheduleId::DecodeR16:
-    case Q8LinearAddScheduleId::MediumSplitK:
         break;
     case Q8LinearAddScheduleId::SimtR8C4:
         return 4;
@@ -163,8 +174,6 @@ const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept
         return "linear_add.q8.splitk.mma.capacity.residual";
     case Q8LinearAddScheduleId::SplitKMmaExactT:
         return "linear_add.q8.splitk8.mma.r16.exact_t.residual";
-    case Q8LinearAddScheduleId::MediumSplitK:
-        return "linear_add.q8.medium_splitk.residual";
     case Q8LinearAddScheduleId::SimtR8C4:
         return "linear_add.q8.simt.r8.c4.slab1024.s2.code_ca.scale_pair32";
     case Q8LinearAddScheduleId::MmaR32C64:
@@ -260,17 +269,12 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
         q8_linear_add_splitk_mma_launch(x, w, residual_out, stream);
         return;
     }
-    if (plan.schedule == Q8LinearAddScheduleId::MediumSplitK) {
-        q8_linear_add_medium_splitk_launch(x, w, residual_out, stream);
-        return;
-    }
     for_each_token_slice(
         x.ne[1], schedule_cols(plan.schedule), [&](std::int32_t offset, std::int32_t count) {
             const Tensor x_slice  = x.slice(1, offset, count);
             Tensor residual_slice = residual_out.slice(1, offset, count);
             switch (plan.schedule) {
             case Q8LinearAddScheduleId::DecodeR16:
-            case Q8LinearAddScheduleId::MediumSplitK:
                 break;
             case Q8LinearAddScheduleId::SimtR8C4:
                 q8_linear_add_simt_r8_c4_launch(x_slice, w, residual_slice, stream);

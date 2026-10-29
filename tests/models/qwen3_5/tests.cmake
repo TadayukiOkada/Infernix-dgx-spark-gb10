@@ -7,9 +7,11 @@ infernix_add_test(infernix_ngram_archive_test SOURCES
 
 # Fast-path selection rules: where each path applies and which configurations qualify it, and the routes
 # --a8-activations gives each configuration.
+# The planning header reaches core/device.h, which includes <cuda_runtime.h>; infernix_engine
+# links the runtime privately, so this C++ translation unit names it directly.
 infernix_add_test(infernix_qwen3_5_fast_paths_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
-  LIBRARIES infernix_engine infernix_model_runtime infernix::json)
+  LIBRARIES infernix_engine infernix_model_runtime infernix::json infernix_cuda_runtime)
 
 # The Qwen3.5-122B-A10B's calibrated expert order (offload design §9.2.1): its shape guard and conversion, the
 # built-in table, and a saved state's precedence over it at the warm start (host only).

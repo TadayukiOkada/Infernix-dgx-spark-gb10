@@ -9,10 +9,6 @@
 #include <stdexcept>
 #include <utility>
 
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-#include <xmmintrin.h>
-#endif
-
 namespace infernix::models::qwen3_5 {
 namespace {
 
@@ -80,9 +76,7 @@ std::uint64_t hash(std::span<const TokenId> tokens, std::uint64_t salt) {
 }
 
 void prefetch(const void* address) {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-    _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
-#elif defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
     __builtin_prefetch(address);
 #else
     (void)address;

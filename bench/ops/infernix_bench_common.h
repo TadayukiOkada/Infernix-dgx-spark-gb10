@@ -14,7 +14,7 @@
 #include "../common/fixture_data.cuh"
 #include "core/arena.h"
 #include "core/device.h"
-#include "roofline.h"
+#include "gpu_reference.h"
 
 #include <cuda_runtime.h>
 
@@ -29,6 +29,11 @@
 #include <vector>
 
 namespace infernix::bench {
+
+// Bandwidth roofline denominator for this tree. GB10 measured sustained read
+// (see gpu_reference.h for provenance); the previous 1792.0 was RTX 5090 GDDR7
+// and made every GB10 kernel look ~6.5x worse than it is.
+constexpr double kRooflineGBs = kSustainedReadGBs;
 
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;
@@ -77,9 +82,10 @@ inline DeviceBuffer make_zeros(std::size_t bytes) {
 }
 
 // cudaDeviceProp memory-clock fields were removed in CUDA 13; the in-process
-// GB/s is informational anyway (ncu is the acceptance gate), so report against
-// the known RTX 5090 roofline constant.
-inline double device_peak_bw_gbs(int /*dev*/ = 0) { return roofline::kDramSpecGBs; }
+// GB/s is informational anyway (ncu is the acceptance gate). Report against the
+// measured GB10 sustained-read ceiling so the percentage means something on the
+// machine this tree is tuned for.
+inline double bench_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
 
 struct ColdTiming {
     double median_us = 0.0;
@@ -238,6 +244,56 @@ static __global__ void read_eviction_buffer(const uint4* input, std::size_t vect
     }
 }
 } // namespace detail
+
+// Cold-L2 eviction storage sized to the device present, not to the RTX 5090's 96 MiB L2. The fixed
+// 256 MiB default spent ~2.1 ms of pure flush traffic per repeat on GB10 (24 MiB L2, ~246 GB/s
+// sustained read), making default cold sweeps far slower than their own measurement needs; an
+// explicit --flush-mib still overrides this.
+//
+// Measured on GB10 (3 interleaved passes, infernix_linear_bench, T=1, BF16): an under-complete
+// flush leaves operand weights partly resident and reads *faster* than the true cold plateau, so
+// the floor must exceed 1x L2. At 7.6 MiB weights: 1 MiB (warm) 8.00 us, 24 MiB (1.0x L2) 33.63 us,
+// and 32/48/64/96/256 MiB all 35.8-36.7 us; at 22.4 MiB weights 24 MiB and 32 MiB agree (98.1 us).
+// 32 MiB (1.33x L2) is therefore the smallest fully-cold setting, and it is what the whole Phase 1
+// corpus and ckt's optimal_flush_mib were measured with, so it stays the default for comparison.
+//
+// Resolve on use, never in a namespace-scope initializer: a dynamic initializer here would run
+// cudaGetDeviceProperties before main(), even for `--help` or on a host with no usable device.
+inline std::uint64_t default_cold_flush_bytes(int device = -1) {
+    if (device < 0) {
+        if (cudaGetDevice(&device) != cudaSuccess) {
+            cudaGetLastError(); // No current device yet (e.g. --help): size for device 0.
+            device = 0;
+        }
+    }
+    cudaDeviceProp props{};
+    if (cudaGetDeviceProperties(&props, device) != cudaSuccess || props.l2CacheSize <= 0) {
+        cudaGetLastError(); // Clear the probe error: fall back to the smallest cold flush.
+        return std::uint64_t{32} << 20;
+    }
+    const std::uint64_t l2 = static_cast<std::uint64_t>(props.l2CacheSize);
+    if (l2 <= (std::uint64_t{24} << 20)) { return std::uint64_t{32} << 20; }
+    return std::max<std::uint64_t>(std::uint64_t{32} << 20, 2 * l2);
+}
+
+// Resolved cold-flush size, cached per process after the first call inside main().
+inline std::uint64_t resolved_cold_flush_bytes() {
+    static const std::uint64_t value = default_cold_flush_bytes();
+    return value;
+}
+
+inline std::uint64_t default_cold_flush_mib(int device = -1) {
+    return default_cold_flush_bytes(device) >> 20;
+}
+
+// A cold-L2 flush size resolved when a benchmark asks for it, never during dynamic initialization:
+// a namespace-scope `const` initialized from default_cold_flush_bytes() would run CUDA before
+// main(), including on `--help` and on a host with no usable device. Objects of this empty class
+// are trivially initialized, so each benchmark keeps its own named flush constant.
+class ColdFlushBytes {
+public:
+    operator std::size_t() const { return static_cast<std::size_t>(resolved_cold_flush_bytes()); }
+};
 
 // Reading a preinitialized buffer evicts cache lines without leaving an L2-sized dirty
 // working set whose writeback would become part of the next measured Op's traffic.
@@ -522,8 +578,7 @@ inline void print_result(const char* tag, const Result& r) {
     std::printf(
         "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (%.1f%% of %.0f GB/s "
         "roofline)\n",
-        tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / roofline::kDramSpecGBs * 100.0,
-        roofline::kDramSpecGBs);
+        tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0, kRooflineGBs);
 }
 
 } // namespace infernix::bench

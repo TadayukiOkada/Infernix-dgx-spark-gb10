@@ -615,7 +615,18 @@ __device__ __forceinline__ void route_pooled_column(const float* __restrict__ lo
 // The drafter pool: the pool's slot-table writes and demand drain (moe_pool_write, moe_pool_drain).
 __global__ void pool_write_kernel(std::int32_t* __restrict__ slot_of, MoePoolWrites writes) {
     const int i = static_cast<int>(threadIdx.x);
-    if (i < writes.count) { slot_of[writes.expert[i]] = writes.value[i]; }
+    // Each thread reads its write through loop-index-constant accesses only: dynamic indexing
+    // into the by-value kernel-parameter struct makes ptxas stage the whole struct (72 B) into a
+    // local-memory frame.
+    std::int32_t expert = 0, value = 0;
+#pragma unroll
+    for (int j = 0; j < kMoePoolWrites; ++j) {
+        if (j == i) {
+            expert = writes.expert[j];
+            value  = writes.value[j];
+        }
+    }
+    if (i < writes.count) { slot_of[expert] = value; }
 }
 
 __global__ void pool_drain_kernel(std::int32_t* __restrict__ demand, std::int32_t* __restrict__ host, int n) {
@@ -841,11 +852,14 @@ __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries
 // P_b of design §16.2, an integer of at most 576: (P_q * Sw) * Sa summed over the four lanes of a
 // row equals (P_b * Sw) * Sa, so the int64 row sums are exactly the CPU engine's.
 
-// One column's A4 block: in byte j of dup[q] the E2M1 code of element
-// 4q + j in both nibbles, and the block's e4m3_scaled scale.
+// One or two columns' A4 block: for one column, byte j of dup[q] holds the E2M1 code of element
+// 4q + j in both nibbles and scale holds e4m3_scaled; for two columns, byte j of dup[q] holds
+// column 0's code in the low nibble and column 1's code in the high nibble, with their scales in
+// scale and scale1.
 struct ActCodes {
     std::uint32_t dup[4];
     std::int32_t scale;
+    std::int32_t scale1;
 };
 
 __device__ __forceinline__ std::uint32_t dup_nibbles(std::uint32_t codes) { return codes | (codes << 4); }
@@ -866,7 +880,25 @@ __device__ __forceinline__ ActCodes act_codes_of(const canon::A4Block& a) {
         for (int j = 0; j < 4; ++j) { w |= e2m1_code_of_x2(a.c2[4 * q + j]) << (8 * j); }
         out.dup[q] = dup_nibbles(w);
     }
-    out.scale = a.scale_scaled;
+    out.scale  = a.scale_scaled;
+    out.scale1 = 0;
+    return out;
+}
+
+__device__ __forceinline__ ActCodes act_codes_pair_of(const canon::A4Block& a0, const canon::A4Block& a1) {
+    ActCodes out;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        std::uint32_t w0 = 0, w1 = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            w0 |= e2m1_code_of_x2(a0.c2[4 * q + j]) << (8 * j);
+            w1 |= e2m1_code_of_x2(a1.c2[4 * q + j]) << (8 * j);
+        }
+        out.dup[q] = w0 | (w1 << 4);
+    }
+    out.scale  = a0.scale_scaled;
+    out.scale1 = a1.scale_scaled;
     return out;
 }
 
@@ -883,10 +915,8 @@ __device__ __forceinline__ void e2m1x2_word_to_half2(std::uint32_t word, std::ui
 }
 
 // Lane l = 8q + i's integer shares (P_q of rows i and i + 8) of one unit against one activation word.
-__device__ __forceinline__ void unit_shares(std::uint32_t code_word, std::uint32_t act_word, int& lo, int& hi) {
-    std::uint32_t w[4], a[4];
-    e2m1x2_word_to_half2(code_word, w);
-    e2m1x2_word_to_half2(act_word, a);
+__device__ __forceinline__ void unit_shares_half2(const std::uint32_t (&w)[4], const std::uint32_t (&a)[4], int& lo,
+                                                  int& hi) {
     __half2 acc = __hmul2(*reinterpret_cast<const __half2*>(&w[0]), *reinterpret_cast<const __half2*>(&a[0]));
 #pragma unroll
     for (int j = 1; j < 4; ++j) {
@@ -897,7 +927,7 @@ __device__ __forceinline__ void unit_shares(std::uint32_t code_word, std::uint32
     hi = __half2int_rn(__high2half(four));
 }
 
-// Compact activations (the two-term kernels): a 16-element block's E2M1
+// Compact activations (for the two-term kernels): a 16-element block's E2M1
 // codes with element j at nibble j % 8 of word j / 8.
 
 // Lane q's activation word of a block (ActCodes::dup's layout): byte j holds the code of element
@@ -965,12 +995,16 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
         const ActCodes& a = acts[b];
         const std::uint32_t act_word = a.dup[q];
         const std::int32_t sa        = a.scale;
+        std::uint32_t ah[4];
+        e2m1x2_word_to_half2(act_word, ah);
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
             const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
+            std::uint32_t wh[4];
+            e2m1x2_word_to_half2(code_word, wh);
             int p_lo, p_hi;
-            unit_shares(code_word, act_word, p_lo, p_hi);
+            unit_shares_half2(wh, ah, p_lo, p_hi);
             // |P_q| <= 576 and Sw < 2^18: P_q * Sw fits int32.
             lo[g] += static_cast<std::int64_t>(p_lo * canon::e4m3_scaled(unit[128 + i])) * sa;
             hi[g] += static_cast<std::int64_t>(p_hi * canon::e4m3_scaled(unit[136 + i])) * sa;
@@ -987,12 +1021,71 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
     }
 }
 
+template <int Groups>
+__device__ void unit_sums_pair(const std::uint8_t* matrix, int blocks, const ActCodes* acts, std::int64_t (&s0)[Groups],
+                               std::int64_t (&s1)[Groups]) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int q = lane >> 3, i = lane & 7;
+    std::int64_t lo0[Groups], hi0[Groups], lo1[Groups], hi1[Groups];
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) { lo0[g] = hi0[g] = lo1[g] = hi1[g] = 0; }
+    for (int b = warp; b < blocks; b += kWarps) {
+        const ActCodes& a            = acts[b];
+        const std::uint32_t packed   = a.dup[q];
+        const std::int32_t sa0       = a.scale;
+        const std::int32_t sa1       = a.scale1;
+        std::uint32_t ah0[4], ah1[4];
+        e2m1x2_word_to_half2(dup_nibbles(packed & 0x0F0F0F0FU), ah0);
+        e2m1x2_word_to_half2(dup_nibbles((packed >> 4) & 0x0F0F0F0FU), ah1);
+#pragma unroll
+        for (int g = 0; g < Groups; ++g) {
+            const std::uint8_t* unit      = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
+            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
+            std::uint32_t wh[4];
+            e2m1x2_word_to_half2(code_word, wh);
+            const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]);
+            const std::int32_t sw_hi = canon::e4m3_scaled(unit[136 + i]);
+            int p0_lo, p0_hi, p1_lo, p1_hi;
+            unit_shares_half2(wh, ah0, p0_lo, p0_hi);
+            unit_shares_half2(wh, ah1, p1_lo, p1_hi);
+            lo0[g] += static_cast<std::int64_t>(p0_lo * sw_lo) * sa0;
+            hi0[g] += static_cast<std::int64_t>(p0_hi * sw_hi) * sa0;
+            lo1[g] += static_cast<std::int64_t>(p1_lo * sw_lo) * sa1;
+            hi1[g] += static_cast<std::int64_t>(p1_hi * sw_hi) * sa1;
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+#pragma unroll
+        for (int offset = 8; offset <= 16; offset <<= 1) {
+            lo0[g] += __shfl_xor_sync(0xFFFFFFFFU, lo0[g], offset);
+            hi0[g] += __shfl_xor_sync(0xFFFFFFFFU, hi0[g], offset);
+            lo1[g] += __shfl_xor_sync(0xFFFFFFFFU, lo1[g], offset);
+            hi1[g] += __shfl_xor_sync(0xFFFFFFFFU, hi1[g], offset);
+        }
+        s0[g] = (lane & 8) != 0 ? hi0[g] : lo0[g];
+        s1[g] = (lane & 8) != 0 ? hi1[g] : lo1[g];
+    }
+}
+
 // Quantizes column x[:, t] of entry `first` to A4 codes of blocks [0, blocks) with `scale` into smem.
+// Each block's sixteen BF16 values are contiguous, so they arrive as two 16-byte vector loads:
+// reading them as sixteen 2-byte loads cost one 32-byte sector each (ncu: 59% of this kernel's
+// global sectors were excessive), which is what exposed the fabric latency on `stall_long_sb`.
+// The unpacked values are identical, so every quantized block keeps its bits.
 __device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
                                       int top_k, float scale, ActCodes* acts, int blocks) {
     const int t = entries[first] / top_k;
     for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const auto* v = reinterpret_cast<const std::uint16_t*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
+        const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
+        const uint4 lo = source[0], hi = source[1];
+        const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        std::uint16_t v[16];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
+            v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
+        }
         const canon::A4Codes c = canon::quantize_a4_codes(v, scale);
         ActCodes out;
 #pragma unroll
@@ -1003,9 +1096,103 @@ __device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, co
                                     (static_cast<std::uint32_t>(c.code[4 * q + 3]) << 24);
             out.dup[q] = dup_nibbles(w);
         }
-        out.scale = canon::e4m3_scaled(c.scale_word);
-        acts[b]   = out;
+        out.scale  = canon::e4m3_scaled(c.scale_word);
+        out.scale1 = 0;
+        acts[b]    = out;
     }
+}
+
+__device__ void quantize_pair_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
+                                    int top_k, float scale, ActCodes* acts, int blocks) {
+    const int t0 = entries[first] / top_k;
+    const int t1 = entries[first + 1] / top_k;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const auto* src0 = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t0) * hidden + 16 * b);
+        const auto* src1 = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t1) * hidden + 16 * b);
+        const uint4 lo0 = src0[0], hi0 = src0[1];
+        const uint4 lo1 = src1[0], hi1 = src1[1];
+        const std::uint32_t words0[8] = {lo0.x, lo0.y, lo0.z, lo0.w, hi0.x, hi0.y, hi0.z, hi0.w};
+        const std::uint32_t words1[8] = {lo1.x, lo1.y, lo1.z, lo1.w, hi1.x, hi1.y, hi1.z, hi1.w};
+        std::uint16_t v0[16], v1[16];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            v0[2 * w]     = static_cast<std::uint16_t>(words0[w] & 0xFFFFU);
+            v0[2 * w + 1] = static_cast<std::uint16_t>(words0[w] >> 16);
+            v1[2 * w]     = static_cast<std::uint16_t>(words1[w] & 0xFFFFU);
+            v1[2 * w + 1] = static_cast<std::uint16_t>(words1[w] >> 16);
+        }
+        const canon::A4Codes c0 = canon::quantize_a4_codes(v0, scale);
+        const canon::A4Codes c1 = canon::quantize_a4_codes(v1, scale);
+        ActCodes out;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const std::uint32_t w0 = static_cast<std::uint32_t>(c0.code[4 * q]) |
+                                     (static_cast<std::uint32_t>(c0.code[4 * q + 1]) << 8) |
+                                     (static_cast<std::uint32_t>(c0.code[4 * q + 2]) << 16) |
+                                     (static_cast<std::uint32_t>(c0.code[4 * q + 3]) << 24);
+            const std::uint32_t w1 = static_cast<std::uint32_t>(c1.code[4 * q]) |
+                                     (static_cast<std::uint32_t>(c1.code[4 * q + 1]) << 8) |
+                                     (static_cast<std::uint32_t>(c1.code[4 * q + 2]) << 16) |
+                                     (static_cast<std::uint32_t>(c1.code[4 * q + 3]) << 24);
+            out.dup[q] = w0 | (w1 << 4);
+        }
+        out.scale  = canon::e4m3_scaled(c0.scale_word);
+        out.scale1 = canon::e4m3_scaled(c1.scale_word);
+        acts[b]    = out;
+    }
+}
+
+// Parallel warp-level exact implementation of canon::quantize_a4_block for a 16-element BF16 block
+// held in `h_bf16` on lanes 0..15 of the calling warp: 1 fdiv.rn.f32 per lane instead of 16 serial
+// divisions on lane 0.
+__device__ __forceinline__ void quantize_a4_block_warp(std::uint16_t h_bf16, float input_scale,
+                                                       canon::A4Block* dst) {
+    const int lane   = threadIdx.x & 31;
+    const float v    = lane < 16 ? canon::bf16_to_f32(h_bf16) : 0.0F;
+    float amax       = (v == v) ? canon::f32_from_bits(canon::f32_bits(v) & 0x7FFFFFFFU) : 0.0F;
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
+        amax              = other > amax ? other : amax;
+    }
+    const std::uint8_t s            = canon::e4m3_rn_satfinite(canon::div_rn(amax, canon::mul_rn(6.0F, input_scale)));
+    const std::int32_t scale_scaled = canon::e4m3_scaled(s);
+    int c                           = 0;
+    if (lane < 16 && scale_scaled != 0) {
+        const float d = canon::mul_rn(canon::e4m3_value(s), input_scale);
+        c             = canon::e2m1_x2(canon::e2m1_rn_satfinite(canon::div_rn(v, d)));
+    }
+    std::uint32_t packed =
+        static_cast<std::uint32_t>(static_cast<std::uint8_t>(static_cast<std::int8_t>(c))) << (8 * (lane & 3));
+    packed |= __shfl_xor_sync(0xFFFFFFFFU, packed, 1);
+    packed |= __shfl_xor_sync(0xFFFFFFFFU, packed, 2);
+    const std::uint32_t w0 = __shfl_sync(0xFFFFFFFFU, packed, 0);
+    const std::uint32_t w1 = __shfl_sync(0xFFFFFFFFU, packed, 4);
+    const std::uint32_t w2 = __shfl_sync(0xFFFFFFFFU, packed, 8);
+    const std::uint32_t w3 = __shfl_sync(0xFFFFFFFFU, packed, 12);
+    int sum = c;
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset);
+    }
+    if (lane == 0) {
+        canon::A4Block out{};
+        *reinterpret_cast<uint4*>(out.c2) = make_uint4(w0, w1, w2, w3);
+        out.scale_word                    = s;
+        out.scale_scaled                  = scale_scaled;
+        out.c2_sum                        = sum;
+        *dst                              = out;
+    }
+}
+
+// Whether jobs of two or more columns take the column pairs in the two-term A4r narrow route
+// (enabled by default on GB10; set INFERNIX_TMP_NARROW_PAIRS=0 to disable).
+bool narrow_pairs() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("INFERNIX_TMP_NARROW_PAIRS");
+        return env == nullptr || std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
 }
 
 constexpr int kGateUpSliceBytes = kGateUpGroups * moe::kGateUpBlocks * static_cast<int>(moe::kUnitBytes); // 46,080
@@ -1014,15 +1201,15 @@ static_assert(kGateUpSliceBytes % 16 == 0 && kDownSliceBytes % 16 == 0);
 
 struct GateUpShared {
     alignas(16) std::uint8_t stage[kGateUpSliceBytes];
-    // The activations are read only by unit_sums and the partial sums are written
-    // only after the barrier that follows it, so they share storage. That keeps the CTA (50,112 B)
-    // under half of an SM's 100 KB, so two of them fit per SM.
+    // The activations are read only by unit_sums and the partial sums are written only after the
+    // barrier that follows it, so they share storage. Warp 0 holds its own partial sums in
+    // registers, so only warps 1..kWarps-1 write to partial. That keeps the CTA under
+    // half of an SM's 100 KB, so two of them fit per SM.
     union {
         ActCodes acts[moe::kGateUpBlocks];
-        std::int64_t partial[kWarps][16 * kGateUpGroups];
+        std::int64_t partial[kWarps - 1][2][16 * kGateUpGroups];
     };
-    std::uint16_t y[16 * kGateUpGroups];
-    std::uint16_t h[16];
+    std::uint16_t y[2][16 * kGateUpGroups];
 };
 
 static_assert(sizeof(GateUpShared) + 1024 <= 102400 / 2, "two gate/up CTAs must fit an SM");
@@ -1047,7 +1234,44 @@ __global__ void __launch_bounds__(kThreads, 2)
     const bool split_input = scales.input_up != scales.input_gate;
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
                 sm.stage, kGateUpSliceBytes);
-    for (int c = 0; c < count; ++c) { // one pass per column of the job
+
+    int c = 0;
+    if (!split_input) {
+        for (; c + 1 < count; c += 2) {
+            __syncthreads();
+            quantize_pair_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts,
+                                moe::kGateUpBlocks);
+            stage_wait();
+            pdl::trigger_dependents();
+            __syncthreads();
+            std::int64_t s0[kGateUpGroups], s1[kGateUpGroups];
+            unit_sums_pair<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s0, s1);
+            __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
+            if (lane < 16) {
+#pragma unroll
+                for (int g = 0; g < kGateUpGroups; ++g) {
+                    if (warp > 0) { sm.partial[warp - 1][0][g * 16 + lane] = s0[g]; }
+                    if (warp != 1) { sm.partial[warp == 0 ? 0 : warp - 1][1][g * 16 + lane] = s1[g]; }
+                }
+            }
+            __syncthreads();
+            if (warp < 2) {
+                const int col   = warp;
+                const int row   = lane;
+                const bool gate = (row & 1) == 0;
+                std::int64_t total = col == 0 ? (row < 16 ? s0[0] : s0[1]) : (row < 16 ? s1[0] : s1[1]);
+#pragma unroll
+                for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][col][row]; }
+                sm.y[col][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+                __syncwarp();
+                const std::uint16_t h_val =
+                    lane < 16 ? canon::swiglu_bf16(sm.y[col][2 * lane], sm.y[col][2 * lane + 1]) : 0;
+                quantize_a4_block_warp(h_val, scales.input_down,
+                                       &h_blocks[static_cast<std::size_t>(first + c + col) * kHBlocks + slice]);
+            }
+        }
+    }
+    for (; c < count; ++c) { // one pass per remaining column of the job
         // Gate rows are even, up rows odd; with distinct input scales the up rows use their own A4.
         for (int parity = 0; parity < (split_input ? 2 : 1); ++parity) {
             __syncthreads();
@@ -1062,27 +1286,28 @@ __global__ void __launch_bounds__(kThreads, 2)
             std::int64_t s[kGateUpGroups];
             unit_sums<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
             __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
-            if (lane < 16) {
+            if (warp > 0 && lane < 16) {
 #pragma unroll
-                for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp][g * 16 + lane] = s[g]; }
+                for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp - 1][0][g * 16 + lane] = s[g]; }
             }
             __syncthreads();
-            for (int row = threadIdx.x; row < 16 * kGateUpGroups; row += blockDim.x) {
+            if (warp == 0) {
+                const int row   = lane;
                 const bool gate = (row & 1) == 0;
-                if (split_input && gate != (parity == 0)) { continue; }
-                std::int64_t total = 0;
-                for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row]; }
-                sm.y[row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+                if (!split_input || gate == (parity == 0)) {
+                    std::int64_t total = row < 16 ? s[0] : s[1];
+#pragma unroll
+                    for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][0][row]; }
+                    sm.y[0][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+                }
             }
         }
-        __syncthreads();
-        for (int k = threadIdx.x; k < 16; k += blockDim.x) {
-            sm.h[k] = canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + slice] =
-                canon::quantize_a4_block(sm.h, scales.input_down);
+        if (warp == 0) {
+            __syncwarp();
+            const std::uint16_t h_val =
+                lane < 16 ? canon::swiglu_bf16(sm.y[0][2 * lane], sm.y[0][2 * lane + 1]) : 0;
+            quantize_a4_block_warp(h_val, scales.input_down,
+                                   &h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + slice]);
         }
     }
 }
@@ -1090,10 +1315,12 @@ __global__ void __launch_bounds__(kThreads, 2)
 struct DownShared {
     alignas(16) std::uint8_t stage[kDownSliceBytes];
     ActCodes acts[kHBlocks];
-    std::int64_t partial[kWarps][16 * kDownGroups];
+    std::int64_t partial[kWarps][2][16 * kDownGroups];
 };
 
-__global__ void __launch_bounds__(kThreads)
+static_assert(3 * (sizeof(DownShared) + 1024) <= 101376, "three down CTAs must fit an SM");
+
+__global__ void __launch_bounds__(kThreads, 3)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                 const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                 int job_base, const canon::A4Block* __restrict__ h_blocks, int columns_out,
@@ -1127,7 +1354,38 @@ __global__ void __launch_bounds__(kThreads)
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    for (int c = 0; c < count; ++c) { // one pass per column of the job
+    int c = 0;
+    for (; c + 1 < count; c += 2) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < kHBlocks; i += blockDim.x) {
+            sm.acts[i] = act_codes_pair_of(h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + i],
+                                           h_blocks[static_cast<std::size_t>(first + c + 1) * kHBlocks + i]);
+        }
+        stage_wait();
+        __syncthreads();
+        std::int64_t s0[kDownGroups], s1[kDownGroups];
+        unit_sums_pair<kDownGroups>(sm.stage, moe::kDownBlocks, sm.acts, s0, s1);
+        if (lane < 16) {
+#pragma unroll
+            for (int g = 0; g < kDownGroups; ++g) {
+                sm.partial[warp][0][g * 16 + lane] = s0[g];
+                sm.partial[warp][1][g * 16 + lane] = s1[g];
+            }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < 2 * 16 * kDownGroups; i += blockDim.x) {
+            const int col    = i / (16 * kDownGroups);
+            const int row    = i % (16 * kDownGroups);
+            const int column = dispatch.entries[first + c + col];
+            std::int64_t total = 0;
+#pragma unroll
+            for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][col][row]; }
+            const std::uint16_t y = canon::a4_row_output(total, scales.alpha_down);
+            reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden +
+                                                      16 * kDownGroups * tile + row] = y;
+        }
+    }
+    for (; c < count; ++c) { // one pass per remaining column of the job
         __syncthreads();
         for (int i = threadIdx.x; i < kHBlocks; i += blockDim.x) {
             sm.acts[i] = act_codes_of(h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + i]);
@@ -1138,13 +1396,13 @@ __global__ void __launch_bounds__(kThreads)
         unit_sums<kDownGroups>(sm.stage, moe::kDownBlocks, sm.acts, s);
         if (lane < 16) {
 #pragma unroll
-            for (int g = 0; g < kDownGroups; ++g) { sm.partial[warp][g * 16 + lane] = s[g]; }
+            for (int g = 0; g < kDownGroups; ++g) { sm.partial[warp][0][g * 16 + lane] = s[g]; }
         }
         __syncthreads();
         const int column = dispatch.entries[first + c];
         for (int row = threadIdx.x; row < 16 * kDownGroups; row += blockDim.x) {
             std::int64_t total = 0;
-            for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row]; }
+            for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][0][row]; }
             const std::uint16_t y = canon::a4_row_output(total, scales.alpha_down);
             reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden +
                                                       16 * kDownGroups * tile + row] = y;
@@ -1192,14 +1450,12 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
 // its own column exponent.
 
 constexpr int kA16PassColumns = 4; // columns per pass of the multi-column A16 kernels
-// Calls of at most this many columns take the one-column A16 kernels. They are faster only for an
-// expert of one column (op level, frames, cold L2, uniform routing: 18-22 % at one column, 8-34 %
-// slower at 2-8), and a call wider than four columns mostly holds experts of several (an MTP row's
-// drafts route alike): C = 2 MTP decode measured 0.8 % faster at 4 than at 8 (C = 8 plain decode,
-// independent rows, 1.7 % slower; C = 1 equal), 2026-10-11.
-constexpr int kA16OneColumnCalls = 4;
+// Single-column calls (columns == 1) take the <1> specialization; any multi-column call (columns >= 2)
+// takes <4>, which has a fast `n == 1` path for single-token experts and reuses staged weights across
+// 2..4 columns in a single pass for multi-token experts (MTP draft chains and multi-row decode).
+constexpr int kA16OneColumnCalls = 1;
 
-// An encoded A16 block in the layout the dp4a loop reads: four elements' bytes per word.
+// An encoded A16 block in the layout the narrow ring's dp4a loop reads: four elements' bytes per word.
 struct A16Act {
     std::uint32_t lo[4];
     std::uint32_t mid[4];
@@ -1228,9 +1484,7 @@ struct CtaGroup {
 };
 
 // Encodes `n` <= Columns BF16 columns of `length` elements, column c at base(c), into acts
-// [c][length / 16] with their exponents in emax[c]. Every thread of `Group` (kWarps warps) calls it;
-// it ends with the group's barrier. kL2 reads the columns through L2 (written by other CTAs of this
-// kernel).
+// [c][length / 16] with their exponents in emax[c] (used by narrow_ring_a16.cuh).
 template <int Columns, bool kL2 = false, class Group = CtaGroup, class Base>
 __device__ void encode_a16_columns(Base base, int n, int length, A16Act* acts, int* emax,
                                    unsigned (&key)[kWarps][Columns]) {
@@ -1287,37 +1541,144 @@ __device__ void encode_a16_columns(Base base, int n, int length, A16Act* acts, i
     Group::sync();
 }
 
+// Computes the column exponents emax[0..n-1] for `n` <= Columns BF16 columns of `Blocks * 16`
+// elements, column c at base(c). Every thread of the CTA calls it; it ends with a barrier.
+template <int Columns, int Blocks, class Base>
+__device__ void encode_a16_emax(Base base, int n, int* emax, unsigned (&key)[kWarps][Columns]) {
+    static_assert(Blocks <= kThreads, "Blocks must fit in one CTA pass");
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int tid = static_cast<int>(threadIdx.x);
+    if (n == 1) {
+        unsigned mm = 0;
+        if (tid < Blocks) {
+            const auto* src = reinterpret_cast<const uint4*>(base(0) + 16 * tid);
+            const uint4 v0 = src[0], v1 = src[1];
+            const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                mm = max(mm, max(words[w] & 0x7FFFU, (words[w] >> 16) & 0x7FFFU));
+            }
+        }
+        mm = __reduce_max_sync(0xFFFFFFFFU, mm);
+        if (lane == 0) { key[warp][0] = mm; }
+        __syncthreads();
+        if (tid == 0) {
+            unsigned k = 0;
+#pragma unroll
+            for (int w = 0; w < kWarps; ++w) { k = max(k, key[w][0]); }
+            emax[0] = k >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(k >> 7), 1);
+        }
+        __syncthreads();
+        return;
+    }
+    unsigned m[Columns];
+#pragma unroll
+    for (int c = 0; c < Columns; ++c) { m[c] = 0; }
+
+    if constexpr (Columns * Blocks <= kThreads) {
+        const int c = (Columns == 1) ? 0 : (tid / Blocks);
+        const int b = (Columns == 1) ? tid : (tid % Blocks);
+        if (tid < n * Blocks) {
+            const auto* src = reinterpret_cast<const uint4*>(base(c) + 16 * b);
+            const uint4 v0 = src[0], v1 = src[1];
+            const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            unsigned mm = 0;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                mm = max(mm, max(words[w] & 0x7FFFU, (words[w] >> 16) & 0x7FFFU));
+            }
+#pragma unroll
+            for (int cc = 0; cc < Columns; ++cc) {
+                if (cc == c) { m[cc] = mm; }
+            }
+        }
+    } else {
+        constexpr int vectors = Blocks * 2; // uint4 loads of 8 elements
+        for (int i = tid; i < n * vectors; i += blockDim.x) {
+            const int c   = i / vectors;
+            const uint4 v = reinterpret_cast<const uint4*>(base(c))[i % vectors];
+            const unsigned words[4] = {v.x, v.y, v.z, v.w};
+            unsigned mm = 0;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) { mm = max(mm, max(words[w] & 0x7FFFU, (words[w] >> 16) & 0x7FFFU)); }
+#pragma unroll
+            for (int cc = 0; cc < Columns; ++cc) {
+                if (cc == c) { m[cc] = max(m[cc], mm); }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < Columns; ++c) {
+        if (c < n) {
+            m[c] = __reduce_max_sync(0xFFFFFFFFU, m[c]);
+            if (lane == 0) { key[warp][c] = m[c]; }
+        }
+    }
+    __syncthreads();
+    if (tid < n) {
+        unsigned k = 0;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) { k = max(k, key[w][tid]); }
+        emax[tid] = k >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(k >> 7), 1);
+    }
+    __syncthreads();
+}
+
 // Exact sums S[g][c] of row (lane & 15) of `Groups` row groups, A16 activations (§16.2.1). P is
-// assembled in wrapping arithmetic: its true value fits int32.
-template <int Groups, int Columns>
-__device__ void unit_sums_a16(const std::uint8_t* matrix, int blocks, const A16Act* acts, int n,
+// assembled in wrapping arithmetic: its true value fits int32. Each warp encodes its assigned
+// blocks `b = warp, warp + kWarps, ...` directly in registers and reuses them across `Groups`.
+template <int Groups, int Columns, int Blocks, class Base>
+__device__ void unit_sums_a16(const std::uint8_t* matrix, Base base, const int* emax, int n,
                               std::int64_t (&s)[Groups][Columns]) {
+    static_assert(Blocks % kWarps == 0, "Blocks must be a multiple of kWarps");
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int r = lane & 15, half = lane >> 4;
+    const int shift = 8 * (lane & 3);
+    const int src0  = 8 * half, src1 = 8 * half + 4;
 #pragma unroll
     for (int g = 0; g < Groups; ++g) {
 #pragma unroll
         for (int c = 0; c < Columns; ++c) { s[g][c] = 0; }
     }
-    for (int u = warp; u < Groups * blocks; u += kWarps) {
-        const int g = u / blocks, b = u % blocks;
-        const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
-        const int w0 = row_quad(unit, r, 2 * half);
-        const int w1 = row_quad(unit, r, 2 * half + 1);
-        const int sw = canon::e4m3_scaled(unit[128 + r]);
+    for (int b = warp; b < Blocks; b += kWarps) {
+        int w0[Groups], w1[Groups], sw[Groups];
+#pragma unroll
+        for (int g = 0; g < Groups; ++g) {
+            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * Blocks + b) * moe::kUnitBytes;
+            w0[g] = row_quad(unit, r, 2 * half);
+            w1[g] = row_quad(unit, r, 2 * half + 1);
+            sw[g] = canon::e4m3_scaled(unit[128 + r]);
+        }
 #pragma unroll
         for (int c = 0; c < Columns; ++c) {
             if (c < n) { // n is uniform across the warp
-                const A16Act& a = acts[c * blocks + b];
-                const int lo  = dp4a_su(w1, a.lo[2 * half + 1], dp4a_su(w0, a.lo[2 * half], 0));
-                const int mid = dp4a_su(w1, a.mid[2 * half + 1], dp4a_su(w0, a.mid[2 * half], 0));
-                const int hi  = __dp4a(w1, a.hi[2 * half + 1], __dp4a(w0, a.hi[2 * half], 0));
-                unsigned p = static_cast<unsigned>(lo) + (static_cast<unsigned>(mid) << 8) + (static_cast<unsigned>(hi) << 16);
-                p += static_cast<unsigned>(__shfl_xor_sync(0xFFFFFFFFU, static_cast<int>(p), 16));
-                const std::int64_t term = static_cast<std::int64_t>(static_cast<int>(p)) * sw;
+                const int e           = emax[c];
+                const std::uint16_t h = base(c)[16 * b + r];
+                const auto xv = static_cast<std::uint32_t>(e == canon::kA16NonFinite ? 0 : canon::a16_value(h, e));
+                std::uint32_t lo_pack  = (xv & 0xFFU) << shift;
+                std::uint32_t mid_pack = ((xv >> 8) & 0xFFU) << shift;
+                std::uint32_t hi_pack  = ((xv >> 16) & 0xFFU) << shift;
+                lo_pack  |= __shfl_xor_sync(0xFFFFFFFFU, lo_pack, 1);
+                mid_pack |= __shfl_xor_sync(0xFFFFFFFFU, mid_pack, 1);
+                hi_pack  |= __shfl_xor_sync(0xFFFFFFFFU, hi_pack, 1);
+                lo_pack  |= __shfl_xor_sync(0xFFFFFFFFU, lo_pack, 2);
+                mid_pack |= __shfl_xor_sync(0xFFFFFFFFU, mid_pack, 2);
+                hi_pack  |= __shfl_xor_sync(0xFFFFFFFFU, hi_pack, 2);
+                const std::uint32_t a_lo0  = __shfl_sync(0xFFFFFFFFU, lo_pack, src0);
+                const std::uint32_t a_lo1  = __shfl_sync(0xFFFFFFFFU, lo_pack, src1);
+                const std::uint32_t a_mid0 = __shfl_sync(0xFFFFFFFFU, mid_pack, src0);
+                const std::uint32_t a_mid1 = __shfl_sync(0xFFFFFFFFU, mid_pack, src1);
+                const std::int32_t  a_hi0  = static_cast<std::int32_t>(__shfl_sync(0xFFFFFFFFU, hi_pack, src0));
+                const std::int32_t  a_hi1  = static_cast<std::int32_t>(__shfl_sync(0xFFFFFFFFU, hi_pack, src1));
 #pragma unroll
-                for (int gg = 0; gg < Groups; ++gg) {
-                    if (gg == g) { s[gg][c] += term; }
+                for (int g = 0; g < Groups; ++g) {
+                    const int lo  = dp4a_su(w1[g], a_lo1, dp4a_su(w0[g], a_lo0, 0));
+                    const int mid = dp4a_su(w1[g], a_mid1, dp4a_su(w0[g], a_mid0, 0));
+                    const int hi  = __dp4a(w1[g], a_hi1, __dp4a(w0[g], a_hi0, 0));
+                    unsigned p = static_cast<unsigned>(lo) + (static_cast<unsigned>(mid) << 8) +
+                                 (static_cast<unsigned>(hi) << 16);
+                    p += static_cast<unsigned>(__shfl_xor_sync(0xFFFFFFFFU, static_cast<int>(p), 16));
+                    s[g][c] += static_cast<std::int64_t>(static_cast<int>(p)) * sw[g];
                 }
             }
         }
@@ -1333,14 +1694,16 @@ inline constexpr int kDownSliceBytesOf = kDownGroups * G::kDownBlocks * static_c
 template <class G, int Columns>
 struct GateUpShared16 {
     alignas(16) std::uint8_t stage[kGateUpSliceBytesOf<G>];
-    union { // acts are read only before the barrier that precedes the partial sums
-        A16Act acts[Columns * G::kGateUpBlocks];
-        std::int64_t partial[kWarps][16 * kGateUpGroups][Columns];
-    };
+    std::int64_t partial[kWarps][16 * kGateUpGroups];
     std::uint16_t y[Columns][16 * kGateUpGroups];
     int emax[Columns];
     unsigned key[kWarps][Columns];
 };
+
+template <class G, int Columns>
+inline constexpr int kGateUpMinBlocksOf = (2 * (sizeof(GateUpShared16<G, Columns>) + 1024) <= 101376) ? 2 : 1;
+static_assert(kGateUpMinBlocksOf<moe::FlashNextExperts, kA16PassColumns> == 2,
+              "two Flash-Next A16 gate/up CTAs must fit an SM");
 
 template <class G, int Columns>
 __device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int hidden, const MoeDispatch& dispatch,
@@ -1371,29 +1734,29 @@ __device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int
                                                                     dispatch.shared_first)) *
                        hidden;
         };
-        encode_a16_columns<Columns>(column, n, G::kHidden, sm.acts, sm.emax, sm.key);
+        encode_a16_emax<Columns, static_cast<int>(G::kGateUpBlocks)>(column, n, sm.emax, sm.key);
         stage_wait();
         // The down pass (a programmatic dependent in captured graphs) may launch once every CTA has
         // its slice.
         pdl::trigger_dependents();
         __syncthreads();
         std::int64_t s[kGateUpGroups][Columns];
-        unit_sums_a16<kGateUpGroups, Columns>(sm.stage, G::kGateUpBlocks, sm.acts, n, s);
-        __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
-        if (lane < 16) {
+        unit_sums_a16<kGateUpGroups, Columns, static_cast<int>(G::kGateUpBlocks)>(sm.stage, column, sm.emax, n, s);
+        for (int c = 0; c < n; ++c) {
+            if (c > 0) { __syncthreads(); }
+            if (lane < 16) {
 #pragma unroll
-            for (int g = 0; g < kGateUpGroups; ++g) {
-#pragma unroll
-                for (int c = 0; c < Columns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
+                for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp][g * 16 + lane] = s[g][c]; }
             }
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < 16 * kGateUpGroups * n; i += blockDim.x) {
-            const int row = i % (16 * kGateUpGroups), c = i / (16 * kGateUpGroups);
-            const bool gate = (row & 1) == 0;
-            std::int64_t total = 0;
-            for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row][c]; }
-            sm.y[c][row] = canon::a16_row_output(total, sm.emax[c], gate ? scales.alpha_gate : scales.alpha_up);
+            __syncthreads();
+            if (threadIdx.x < 16 * kGateUpGroups) {
+                const int row   = threadIdx.x;
+                const bool gate = (row & 1) == 0;
+                std::int64_t total = 0;
+#pragma unroll
+                for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row]; }
+                sm.y[c][row] = canon::a16_row_output(total, sm.emax[c], gate ? scales.alpha_gate : scales.alpha_up);
+            }
         }
         __syncthreads();
         for (int i = threadIdx.x; i < 16 * n; i += blockDim.x) {
@@ -1405,7 +1768,7 @@ __device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int
 }
 
 template <class G, int Columns>
-__global__ void __launch_bounds__(kThreads)
+__global__ void __launch_bounds__(kThreads, kGateUpMinBlocksOf<G, Columns>)
     gate_up_kernel_a16(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
                        int top_k, const std::uint8_t* const* __restrict__ job_records,
                        const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
@@ -1416,14 +1779,18 @@ __global__ void __launch_bounds__(kThreads)
 template <class G, int Columns>
 struct DownShared16 {
     alignas(16) std::uint8_t stage[kDownSliceBytesOf<G>];
-    A16Act acts[Columns * G::kHBlocks];
-    std::int64_t partial[kWarps][16 * kDownGroups][Columns];
+    std::int64_t partial[kWarps][16 * kDownGroups];
     int emax[Columns];
     unsigned key[kWarps][Columns];
 };
 
 template <class G, int Columns>
-__global__ void __launch_bounds__(kThreads)
+inline constexpr int kDownMinBlocksOf = (3 * (sizeof(DownShared16<G, Columns>) + 1024) <= 101376) ? 3 : 2;
+static_assert(kDownMinBlocksOf<moe::FlashNextExperts, kA16PassColumns> == 3,
+              "three Flash-Next A16 down CTAs must fit an SM");
+
+template <class G, int Columns>
+__global__ void __launch_bounds__(kThreads, kDownMinBlocksOf<G, Columns>)
     down_kernel_a16(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                     const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                     int job_base, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs,
@@ -1461,26 +1828,28 @@ __global__ void __launch_bounds__(kThreads)
         const auto column = [&](int c) {
             return h_plane + static_cast<std::size_t>(first + pass + c) * moe::wide::A16Planes<G>::kHRowElements;
         };
-        encode_a16_columns<Columns>(column, n, G::kIntermediate, sm.acts, sm.emax, sm.key);
+        encode_a16_emax<Columns, static_cast<int>(G::kHBlocks)>(column, n, sm.emax, sm.key);
         stage_wait();
         __syncthreads();
         std::int64_t s[kDownGroups][Columns];
-        unit_sums_a16<kDownGroups, Columns>(sm.stage, G::kDownBlocks, sm.acts, n, s);
-        if (lane < 16) {
+        unit_sums_a16<kDownGroups, Columns, static_cast<int>(G::kDownBlocks)>(sm.stage, column, sm.emax, n, s);
+        for (int c = 0; c < n; ++c) {
+            if (c > 0) { __syncthreads(); }
+            if (lane < 16) {
 #pragma unroll
-            for (int g = 0; g < kDownGroups; ++g) {
-#pragma unroll
-                for (int c = 0; c < Columns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
+                for (int g = 0; g < kDownGroups; ++g) { sm.partial[warp][g * 16 + lane] = s[g][c]; }
             }
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < 16 * kDownGroups * n; i += blockDim.x) {
-            const int row = i % (16 * kDownGroups), c = i / (16 * kDownGroups);
-            std::int64_t total = 0;
-            for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row][c]; }
-            const int column = dispatch.entries[first + pass + c];
-            reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden + 16 * kDownGroups * tile + row] =
-                canon::a16_row_output(total, sm.emax[c], scales.alpha_down);
+            __syncthreads();
+            if (threadIdx.x < 16 * kDownGroups) {
+                const int row = threadIdx.x;
+                std::int64_t total = 0;
+#pragma unroll
+                for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row]; }
+                const int col_idx = dispatch.entries[first + pass + c];
+                reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(col_idx) * hidden +
+                                                          16 * kDownGroups * tile + row] =
+                    canon::a16_row_output(total, sm.emax[c], scales.alpha_down);
+            }
         }
     }
 }
@@ -1536,7 +1905,8 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
 // products are the W4A4 kernels' half2 unit products, both terms against the same converted weight
 // word, and every block sum is the exact (P_1 Sa_1 + P_2 Sa_2) Sw in int64: the CPU engine's S
 // (a4r_expert.h) bit for bit, so a CPU-served miss changes no output. As the W4A4 kernels, one pass
-// per column over the staged weights, two gate/up CTAs per SM.
+// per column over the staged weights (or per pair of columns under INFERNIX_TMP_NARROW_PAIRS), two
+// gate/up CTAs per SM.
 //
 // Per 64-element unit run a lane does one weight-word conversion and two term products (eight HFMA2,
 // four conversions to int, two int32 and two int64 multiply-adds) against the W4A4 kernels' one;
@@ -1649,21 +2019,171 @@ __device__ void unit_sums_a4r(const std::uint8_t* matrix, int blocks, const A4rA
     }
 }
 
+// Column pairs of the two-term kernels (INFERNIX_TMP_NARROW_PAIRS; the W4A4 kernels' "column pairs"
+// above). A pair's row scales come first, over every block of both rows; its blocks are then encoded
+// a range at a time: a gate/up CTA stages each half of K for both columns (2 x 80 blocks) in the
+// storage of one column's 160, so two CTAs still fit an SM, and a down CTA both columns' 40 blocks.
+
+// The row scales of the n <= 2 rows row(c) of Blocks blocks each into row_scale[c], as encode_a4r_row
+// computes one. Every thread of the CTA calls it; it ends with a barrier.
+template <int Blocks, class Row>
+__device__ void a4r_pair_row_scales(Row row, int n, unsigned (&keys)[kWarps][2], float (&row_scale)[2]) {
+    const int tid = static_cast<int>(threadIdx.x), lane = tid % 32, warp = tid / 32;
+    unsigned key[2] = {0, 0};
+    for (int i = tid; i < n * Blocks; i += kThreads) {
+        const int c = i / Blocks;
+        std::uint16_t e[16];
+        const unsigned k = load_a4r_block(row(c) + 16 * (i % Blocks), e);
+#pragma unroll
+        for (int cc = 0; cc < 2; ++cc) {
+            if (cc == c) { key[cc] = max(key[cc], k); }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        key[c] = __reduce_max_sync(0xFFFFFFFFU, key[c]);
+        if (lane == 0) { keys[warp][c] = key[c]; }
+    }
+    __syncthreads();
+    if (tid < n) {
+        unsigned all = 0;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) { all = max(all, keys[w][tid]); }
+        row_scale[tid] = canon::a4r_row_scale(all);
+    }
+    __syncthreads();
+}
+
+// Encodes blocks [b0, b0 + len) of the n <= 2 rows row(c) under row_scale[c]: column c's block b into
+// acts[c * len + b - b0]. No barrier.
+template <class Row>
+__device__ void encode_a4r_pair_blocks(Row row, int n, int b0, int len, const float (&row_scale)[2], A4rAct* acts) {
+    for (int i = static_cast<int>(threadIdx.x); i < n * len; i += kThreads) {
+        const int c = i / len;
+        std::uint16_t e[16];
+        load_a4r_block(row(c) + 16 * (b0 + i % len), e);
+        acts[i] = encode_a4r_block(e, row_scale[c]);
+    }
+}
+
+// unit_sums_a4r for the n <= 2 columns of a pair over blocks [b0, b0 + len) (column c's block b at
+// acts[c * len + b - b0]), added to lo and hi (rows i and i + 8 of each lane) for reduce_row_sums.
+template <int Groups>
+__device__ void unit_sums_a4r_pair(const std::uint8_t* matrix, int blocks, int b0, int len, const A4rAct* acts, int n,
+                                   std::int64_t (&lo)[Groups][2], std::int64_t (&hi)[Groups][2]) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int q = lane >> 3, i = lane & 7;
+    for (int k = warp; k < len; k += kWarps) {
+        const int b = b0 + k;
+        __half2 a[2][kA4rTerms][4];
+        std::int32_t sa[2][kA4rTerms] = {};
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            if (c < n) { // n is uniform across the CTA
+                const A4rAct& x = acts[c * len + k];
+#pragma unroll
+                for (int t = 0; t < kA4rTerms; ++t) {
+                    act_half2_x4(compact_act_word(x.codes[t], q), a[c][t]);
+                    sa[c][t] = x.scale[t];
+                }
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < Groups; ++g) {
+            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
+            std::uint32_t w[4];
+            e2m1x2_word_to_half2(*reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i), w);
+            const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]), sw_hi = canon::e4m3_scaled(unit[136 + i]);
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                if (c < n) {
+                    int p0_lo, p0_hi, p1_lo, p1_hi;
+                    term_shares(w, a[c][0], p0_lo, p0_hi);
+                    term_shares(w, a[c][1], p1_lo, p1_hi);
+                    // As unit_sums_a4r: P_1 Sa_1 + P_2 Sa_2 < 2^28 fits int32.
+                    lo[g][c] += static_cast<std::int64_t>(p0_lo * sa[c][0] + p1_lo * sa[c][1]) * sw_lo;
+                    hi[g][c] += static_cast<std::int64_t>(p0_hi * sa[c][0] + p1_hi * sa[c][1]) * sw_hi;
+                }
+            }
+        }
+    }
+}
+
 struct GateUpSharedA4r {
     alignas(16) std::uint8_t stage[kGateUpSliceBytes];
-    // As in GateUpShared: the activations (one column's blocks) are read only
+    // As in GateUpShared: the activations (one column's blocks, or half of K of a pair's) are read only
     // by the unit sums and the partial sums written only after the barrier that follows them.
     union {
         A4rAct acts[moe::kGateUpBlocks];
         std::int64_t partial[kWarps][16 * kGateUpGroups];
     };
-    std::uint16_t y[16 * kGateUpGroups];
-    unsigned keys[kWarps];
-    float row_scale;
+    std::uint16_t y[2][16 * kGateUpGroups]; // per column of a pair; one column uses y[0]
+    unsigned keys[kWarps][2];
+    float row_scale[2];
 };
 
 static_assert(sizeof(GateUpSharedA4r) + 1024 <= 102400 / 2, "two two-term gate/up CTAs must fit an SM");
 
+// The column pairs of a two-term gate/up CTA's job (count >= 2 columns), as the one-column loop below
+// computes each column.
+__device__ void gate_up_pairs_a4r(const bf16* __restrict__ x, const MoeDispatch& dispatch, int top_k,
+                                  const moe::ExpertScales& scales, int first, int count, int slice,
+                                  std::uint16_t* __restrict__ h_plane, GateUpSharedA4r& sm) {
+    constexpr int kHalf = moe::kGateUpBlocks / 2;
+    static_assert(moe::kGateUpBlocks == 2 * kHalf, "a pair stages K in two halves");
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    for (int c0 = 0; c0 < count; c0 += 2) {
+        const int n   = min(2, count - c0);
+        const auto row = [&](int c) {
+            return reinterpret_cast<const std::uint16_t*>(x) +
+                   static_cast<std::size_t>(moe::wide::entry_column(dispatch.entries[first + c0 + c], top_k,
+                                                                    dispatch.shared_first)) *
+                       moe::kHidden;
+        };
+        __syncthreads(); // every thread is past the previous pair's reads of sm.y and sm.row_scale
+        a4r_pair_row_scales<moe::kGateUpBlocks>(row, n, sm.keys, sm.row_scale);
+        std::int64_t lo[kGateUpGroups][2] = {}, hi[kGateUpGroups][2] = {};
+        for (int half = 0; half < 2; ++half) {
+            if (half > 0) { __syncthreads(); } // every warp has read the first half's activations
+            encode_a4r_pair_blocks(row, n, half * kHalf, kHalf, sm.row_scale, sm.acts);
+            if (half == 0) {
+                stage_wait();
+                // The down pass (a programmatic dependent in captured graphs) may launch once every CTA
+                // has its slice.
+                pdl::trigger_dependents();
+            }
+            __syncthreads();
+            unit_sums_a4r_pair<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, half * kHalf, kHalf, sm.acts, n, lo, hi);
+        }
+        std::int64_t s[kGateUpGroups][2];
+        reduce_row_sums<kGateUpGroups, 2>(lo, hi, s);
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            if (c < n) {
+                __syncthreads(); // every warp has read sm.acts, or the previous column's partial sums
+                if (lane < 16) {
+#pragma unroll
+                    for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp][g * 16 + lane] = s[g][c]; }
+                }
+                __syncthreads();
+                for (int r = threadIdx.x; r < 16 * kGateUpGroups; r += blockDim.x) {
+                    const bool gate    = (r & 1) == 0;
+                    std::int64_t total = 0;
+                    for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][r]; }
+                    sm.y[c][r] = canon::a4r_row_output(total, sm.row_scale[c], gate ? scales.alpha_gate : scales.alpha_up);
+                }
+            }
+        }
+        __syncthreads();
+        for (int k = threadIdx.x; k < 16 * n; k += blockDim.x) {
+            const int c = k / 16, j = k % 16;
+            h_plane[static_cast<std::size_t>(first + c0 + c) * moe::wide::kA16HRowElements + 16 * slice + j] =
+                canon::swiglu_bf16(sm.y[c][2 * j], sm.y[c][2 * j + 1]);
+        }
+    }
+}
+
+template <bool Pairs>
 __global__ void __launch_bounds__(kThreads, 2)
     gate_up_kernel_a4r(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
                        const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
@@ -1682,13 +2202,19 @@ __global__ void __launch_bounds__(kThreads, 2)
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
                 sm.stage, kGateUpSliceBytes);
+    if constexpr (Pairs) {
+        if (count > 1) {
+            gate_up_pairs_a4r(x, dispatch, top_k, scales, first, count, slice, h_plane, sm);
+            return;
+        }
+    }
     for (int c = 0; c < count; ++c) { // one pass per column of the job
         __syncthreads();
         const auto* column = reinterpret_cast<const std::uint16_t*>(x) +
                              static_cast<std::size_t>(moe::wide::entry_column(dispatch.entries[first + c], top_k,
                                                                               dispatch.shared_first)) *
                                  moe::kHidden;
-        encode_a4r_row<moe::kGateUpBlocks>(column, sm.acts, sm.keys, &sm.row_scale);
+        encode_a4r_row<moe::kGateUpBlocks>(column, sm.acts, &sm.keys[0][0], &sm.row_scale[0]);
         stage_wait();
         // The down pass (a programmatic dependent in captured graphs) may launch once every CTA has
         // its slice.
@@ -1706,26 +2232,71 @@ __global__ void __launch_bounds__(kThreads, 2)
             const bool gate    = (row & 1) == 0;
             std::int64_t total = 0;
             for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row]; }
-            sm.y[row] = canon::a4r_row_output(total, sm.row_scale, gate ? scales.alpha_gate : scales.alpha_up);
+            sm.y[0][row] = canon::a4r_row_output(total, sm.row_scale[0], gate ? scales.alpha_gate : scales.alpha_up);
         }
         __syncthreads();
         if (threadIdx.x < 16) {
             const int k = static_cast<int>(threadIdx.x);
             h_plane[static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements + 16 * slice + k] =
-                canon::swiglu_bf16(sm.y[2 * k], sm.y[2 * k + 1]);
+                canon::swiglu_bf16(sm.y[0][2 * k], sm.y[0][2 * k + 1]);
         }
     }
 }
 
 struct DownSharedA4r {
     alignas(16) std::uint8_t stage[kDownSliceBytes];
-    A4rAct acts[kHBlocks];
+    A4rAct acts[2 * kHBlocks]; // one column's blocks, or both of a pair's
     std::int64_t partial[kWarps][16 * kDownGroups];
-    unsigned keys[kWarps];
-    float row_scale;
+    unsigned keys[kWarps][2];
+    float row_scale[2];
 };
 
-__global__ void __launch_bounds__(kThreads)
+// The column pairs of a two-term down CTA's job (count >= 2 columns), as the one-column loop below
+// computes each column.
+__device__ void down_pairs_a4r(const MoeDispatch& dispatch, const moe::ExpertScales& scales, int first, int count,
+                               int tile, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs,
+                               DownSharedA4r& sm) {
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    for (int c0 = 0; c0 < count; c0 += 2) {
+        const int n   = min(2, count - c0);
+        const auto row = [&](int c) {
+            return h_plane + static_cast<std::size_t>(first + c0 + c) * moe::wide::kA16HRowElements;
+        };
+        __syncthreads(); // every thread is past the previous pair's reads of sm.partial and sm.row_scale
+        a4r_pair_row_scales<kHBlocks>(row, n, sm.keys, sm.row_scale);
+        encode_a4r_pair_blocks(row, n, 0, kHBlocks, sm.row_scale, sm.acts);
+        stage_wait();
+        __syncthreads();
+        std::int64_t lo[kDownGroups][2] = {}, hi[kDownGroups][2] = {};
+        unit_sums_a4r_pair<kDownGroups>(sm.stage, moe::kDownBlocks, 0, kHBlocks, sm.acts, n, lo, hi);
+        std::int64_t s[kDownGroups][2];
+        reduce_row_sums<kDownGroups, 2>(lo, hi, s);
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            if (c < n) {
+                if (c > 0) { __syncthreads(); } // every thread has read the previous column's partial sums
+                if (lane < 16) {
+#pragma unroll
+                    for (int g = 0; g < kDownGroups; ++g) { sm.partial[warp][g * 16 + lane] = s[g][c]; }
+                }
+                __syncthreads();
+                const int column = dispatch.entries[first + c0 + c];
+                for (int r = threadIdx.x; r < 16 * kDownGroups; r += blockDim.x) {
+                    std::int64_t total = 0;
+                    for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][r]; }
+                    reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * moe::kHidden +
+                                                              16 * kDownGroups * tile + r] =
+                        canon::a4r_row_output(total, sm.row_scale[c], scales.alpha_down);
+                }
+            }
+        }
+    }
+}
+
+static_assert(3 * (sizeof(DownSharedA4r) + 1024) <= 101376, "three two-term down CTAs must fit an SM");
+
+template <bool Pairs>
+__global__ void __launch_bounds__(kThreads, Pairs ? 2 : 3)
     down_kernel_a4r(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
                     const std::int32_t* __restrict__ cpu_flags, int job_base, const std::uint16_t* __restrict__ h_plane,
                     bf16* __restrict__ outputs, PassPhase phase) {
@@ -1755,11 +2326,17 @@ __global__ void __launch_bounds__(kThreads)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
+    if constexpr (Pairs) {
+        if (count > 1) {
+            down_pairs_a4r(dispatch, scales, first, count, tile, h_plane, outputs, sm);
+            return;
+        }
+    }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int c = 0; c < count; ++c) { // one pass per column of the job
         __syncthreads();
         encode_a4r_row<kHBlocks>(h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements, sm.acts,
-                                 sm.keys, &sm.row_scale);
+                                 &sm.keys[0][0], &sm.row_scale[0]);
         stage_wait();
         __syncthreads();
         std::int64_t s[kDownGroups];
@@ -1775,9 +2352,39 @@ __global__ void __launch_bounds__(kThreads)
             for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row]; }
             reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * moe::kHidden +
                                                       16 * kDownGroups * tile + row] =
-                canon::a4r_row_output(total, sm.row_scale, scales.alpha_down);
+                canon::a4r_row_output(total, sm.row_scale[0], scales.alpha_down);
         }
     }
+}
+
+template <bool Pairs>
+void launch_expert_pass_a4r_as(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
+                               const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
+                               std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase,
+                               PassPart part) {
+    static const bool configured = [] {
+        cudaFuncSetAttribute(gate_up_kernel_a4r<Pairs>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(GateUpSharedA4r)));
+        cudaFuncSetAttribute(down_kernel_a4r<Pairs>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(DownSharedA4r)));
+        cudaFuncSetAttribute(gate_up_kernel_a4r<Pairs>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(down_kernel_a4r<Pairs>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        return true;
+    }();
+    (void)configured;
+    if (part != PassPart::Down) {
+        gate_up_kernel_a4r<Pairs><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpSharedA4r), stream>>>(
+            x, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
+        check_launch("A4 residual gate/up");
+    }
+    if (part == PassPart::GateUp) { return; }
+    // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
+    CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
+                                {dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownSharedA4r), stream},
+                                down_kernel_a4r<Pairs>, dispatch, source, job_records, flags, base,
+                                static_cast<const std::uint16_t*>(h_plane), outputs, phase));
 }
 
 // One pass of the two-term narrow kernels: a gate/up CTA per 16 intermediates and a down CTA per 64
@@ -1786,29 +2393,13 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
                             const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                             std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase,
                             PassPart part) {
-    static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpSharedA4r)));
-        cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownSharedA4r)));
-        cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
-    }();
-    (void)configured;
-    if (part != PassPart::Down) {
-        gate_up_kernel_a4r<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpSharedA4r), stream>>>(
-            x, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
-        check_launch("A4 residual gate/up");
+    if (narrow_pairs()) {
+        launch_expert_pass_a4r_as<true>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs,
+                                        stream, phase, part);
+    } else {
+        launch_expert_pass_a4r_as<false>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs,
+                                         stream, phase, part);
     }
-    if (part == PassPart::GateUp) { return; }
-    // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
-    CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
-                                {dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownSharedA4r), stream},
-                                down_kernel_a4r, dispatch, source, job_records, flags, base,
-                                static_cast<const std::uint16_t*>(h_plane), outputs, phase));
 }
 
 #include "ops/offloaded_sparse_moe/cuda/ggml_expert.cuh"
@@ -2912,6 +3503,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
                  cudaStream_t stream, bool wait_for_cpu, bool cpu_planned, bool x_prepared) {
     require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
+    require(reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0, "expert input must be 16-byte aligned");
     const bool ggml = ggml_bank(source);
     require(moe::wide::shape_supported(source.shape, source.activation, source.wide_a16,
                                        ggml || source.ggml.gate_up_format == QType::FP8_E4M3FN_B128),

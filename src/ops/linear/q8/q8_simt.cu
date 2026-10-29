@@ -11,6 +11,20 @@ void launch_q8_a16_simt_r8_t4(const Tensor& x, const Weight& w, Tensor& out, cud
     });
 }
 
+void launch_q8_a16_simt_r8_t5(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_q8_a16_simt<q8_instances::SimtR8T5>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q8_a16_simt_r8_t6(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_q8_a16_simt<q8_instances::SimtR8T6>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
 void launch_q8_a16_simt_r8_t8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     with_linear_output(out, out.ne[0], [&](auto output) {
         launch_q8_a16_simt<q8_instances::SimtR8T8>(q8_linear_operands(x, w), output, LinearIdentityEpilogue{},
@@ -37,6 +51,22 @@ void launch_q8_a16_simt_r1_t8_w8(const Tensor& x, const Weight& w, Tensor& out,
 void launch_q8_a16_simt_r4_t4_w2_g16_s2(const Tensor& x, const Weight& w, Tensor& out,
                                         cudaStream_t stream) {
     launch_q8_a16_simt<q8_instances::SimtR4T4W2G16S2>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q8_a16_simt_r4_t5_w2_g16_s2(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q8_a16_simt<q8_instances::SimtR4T5W2G16S2>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q8_a16_simt_r4_t8_w2_g16_s2(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q8_a16_simt<q8_instances::SimtR4T8W2G16S2>(
         q8_linear_operands(x, w),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
         LinearIdentityEpilogue{}, stream);

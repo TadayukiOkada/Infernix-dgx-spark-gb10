@@ -73,29 +73,9 @@ __device__ __forceinline__ void load_f16_b(const float* p, int k, int n, int lan
         pack_f16x2_sat(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
 }
 
-// The k16 products an FP16 partial sum spans before its FP32 carry (measured 2026-10-16 against
-// one: 1.205x the exact route's op time at the 27B's shapes for both, and the more accurate state).
-inline constexpr int kFp16Carry = 2;
-
-// One k16 step of an FP16 partial sum; every kFp16Carry steps the partial (row g's columns
-// {2t, 2t+1} in part[0], row g+8's in part[1]) is added to the FP32 accumulator in its C-fragment
-// order, and the next step starts from zero. The FP16 rounding spans at most 16 * kFp16Carry
-// products.
-__device__ __forceinline__ void mma_f16_partial(float (&acc)[4], unsigned (&part)[2], int step,
-                                                const unsigned (&a)[4], unsigned b0, unsigned b1) {
-    if (step % kFp16Carry == 0)
-        mma_f16_f16acc_zero(part[0], part[1], a[0], a[1], a[2], a[3], b0, b1);
-    else
-        mma_f16_f16acc(part[0], part[1], a[0], a[1], a[2], a[3], b0, b1);
-    if (step % kFp16Carry == kFp16Carry - 1) {
-        const float2 low  = __half22float2(half2_from_bits(part[0]));
-        const float2 high = __half22float2(half2_from_bits(part[1]));
-        acc[0] += low.x;
-        acc[1] += low.y;
-        acc[2] += high.x;
-        acc[3] += high.y;
-    }
-}
+// On GB10 (sm_121a), m16n8k16.row.col.f32.f16.f16.f32 runs at full FP16 Tensor Core throughput
+// (125.31 TFLOP/s, 1:1 with f16acc), so Fp16Accumulate accumulates directly in FP32 without
+// intermediate FP16 partial-sum rounding or half2-to-float2 unpacks.
 
 template <int DV>
 struct RecurrenceShared {
@@ -302,8 +282,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                     }
                 }
             } else {
-                // S is rounded to FP16 once per element for both products.
-                unsigned prediction_part[NPW][2]{}, history_part[NPW][2]{};
+                // S is rounded to FP16 once per element for both products, accumulated in FP32.
 #pragma unroll
                 for (int k = 0; k < kStateDim; k += 16) {
                     unsigned ka[4], qa[4];
@@ -317,8 +296,10 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                         const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
                         const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
                         const unsigned s0 = pack_f16x2_sat(b0, b1), s1 = pack_f16x2_sat(b2, b3);
-                        mma_f16_partial(prediction[ni], prediction_part[ni], k / 16, ka, s0, s1);
-                        mma_f16_partial(history[ni], history_part[ni], k / 16, qa, s0, s1);
+                        mma_f16(prediction[ni][0], prediction[ni][1], prediction[ni][2],
+                                prediction[ni][3], ka[0], ka[1], ka[2], ka[3], s0, s1);
+                        mma_f16(history[ni][0], history[ni][1], history[ni][2], history[ni][3],
+                                qa[0], qa[1], qa[2], qa[3], s0, s1);
                     }
                 }
             }
@@ -342,24 +323,24 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                                      af[0], af[1], af[2], af[3], b0, b1);
                         }
                     } else {
-                        unsigned part[2]{};
 #pragma unroll
                         for (int k = 0; k < kStateDim; k += 16) {
                             unsigned af[4], b0, b1;
                             load_vector_bf16_a(qk.q, k, lane, af);
                             load_f16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
-                            mma_f16_partial(history[0], part, k / 16, af, b0, b1);
+                            mma_f16(history[0][0], history[0][1], history[0][2], history[0][3],
+                                    af[0], af[1], af[2], af[3], b0, b1);
                         }
                     }
                 } else {
                     if constexpr (Fp16) {
-                        unsigned part[2]{};
 #pragma unroll
                         for (int k = 0; k < kStateDim; k += 16) {
                             unsigned af[4], b0, b1;
                             load_vector_bf16_a(qk.k, k, lane, af);
                             load_f16_b<DV>(sm.snapshot, k, n, lane, b0, b1);
-                            mma_f16_partial(history[0], part, k / 16, af, b0, b1);
+                            mma_f16(history[0][0], history[0][1], history[0][2], history[0][3],
+                                    af[0], af[1], af[2], af[3], b0, b1);
                         }
                     } else {
 #pragma unroll
@@ -470,15 +451,12 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                 load_transposed_bf16_a(qk.k, key - g, lane, af);
 #pragma unroll
                 for (int ni = 0; ni < NPW; ++ni) {
-                    unsigned part[2];
-                    mma_f16_f16acc_zero(part[0], part[1], af[0], af[1], af[2], af[3],
-                                        delta_b[ni][0], delta_b[ni][1]);
-                    const float2 low  = __half22float2(half2_from_bits(part[0]));
-                    const float2 high = __half22float2(half2_from_bits(part[1]));
-                    state[ni][mi][0]  = fmaf(state[ni][mi][0], decay, low.x);
-                    state[ni][mi][1]  = fmaf(state[ni][mi][1], decay, low.y);
-                    state[ni][mi][2]  = fmaf(state[ni][mi][2], decay, high.x);
-                    state[ni][mi][3]  = fmaf(state[ni][mi][3], decay, high.y);
+                    state[ni][mi][0] *= decay;
+                    state[ni][mi][1] *= decay;
+                    state[ni][mi][2] *= decay;
+                    state[ni][mi][3] *= decay;
+                    mma_f16(state[ni][mi][0], state[ni][mi][1], state[ni][mi][2], state[ni][mi][3],
+                            af[0], af[1], af[2], af[3], delta_b[ni][0], delta_b[ni][1]);
                 }
             }
         }
@@ -533,23 +511,22 @@ void dispatch(const Arguments& args, const QkChunk* qk, const ControlChunk* cont
 
 int value_tile(int value_heads, int multiprocessor_count) {
     // Small grids need the narrowest stripe. Otherwise use fixed relative tile costs
-    // to weight the SM-wave count. These are launch-heuristic weights, not measured latency.
+    // to weight the SM-wave count (verified on GB10 sm_121a, 48 SMs: picks tile=32 at Hv=32
+    // where tile=64 underfills wave 2, and tile=64 at Hv=48/64 where full waves avoid 2x packet reads).
     // Wider stripes reduce replicated packet reads but retain more state per CTA.
     if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
     int best               = 64;
-    std::int64_t best_work = INT64_MAX;
-
-    struct Choice {
-        int tile, cost;
-    };
-
-    for (const auto [tile, cost] : {Choice{64, 34}, Choice{32, 20}, Choice{16, 13}}) {
-        const auto blocks = static_cast<std::int64_t>(value_heads) * (kStateDim / tile);
-        const auto waves  = (blocks + multiprocessor_count - 1) / multiprocessor_count;
-        const auto work   = waves * cost;
-        if (work < best_work) {
-            best      = tile;
-            best_work = work;
+    double best_efficiency = 0.0;
+    for (int tile : {64, 32, 16}) {
+        const int blocks = (value_heads + tile - 1) / tile;
+        const double waves =
+            static_cast<double>(blocks) / static_cast<double>(multiprocessor_count);
+        const double efficiency = waves / std::ceil(waves);
+        constexpr double kTileRelativeCost[] = {1.0, 1.0, 1.0, 1.0, 1.0};
+        const double score = efficiency / kTileRelativeCost[tile / 16];
+        if (score > best_efficiency) {
+            best_efficiency = score;
+            best            = tile;
         }
     }
     return best;

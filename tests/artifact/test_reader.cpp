@@ -220,18 +220,10 @@ void invalid_directories() {
                 "foreign continuation accepted");
     }
     fixture.write();
-#ifdef _WIN32
-    std::filesystem::resize_file(fixture.entry, std::filesystem::file_size(fixture.entry) - 1);
-    rejects([&] {
-        Reader shortened(fixture.entry);
-        (void)shortened.read_range(499, 1);
-    }, "truncated entry was accepted");
-#else
     // POSIX permits resizing under an open mapping, so the read-time EOF check runs there.
     Reader shortened(fixture.entry);
     std::filesystem::resize_file(fixture.entry, std::filesystem::file_size(fixture.entry) - 1);
     rejects([&] { (void)shortened.read_range(499, 1); }, "premature EOF accepted");
-#endif
 }
 
 } // namespace

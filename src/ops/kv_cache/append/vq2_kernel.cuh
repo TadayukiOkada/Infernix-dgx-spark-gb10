@@ -434,11 +434,13 @@ __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_ke
 //
 // A scan keeps each word's minimum per chunk of 4 patterns and the first chunk that lowers it
 // (strict <), then takes that chunk's first pattern at the minimum: the first nearest pattern, as
-// the per-pattern strict < scan picks. Distances use the paired FP32 instructions; each component
-// rounds as the scalar instruction does (INFERNIX_VQ2_PAIRED_FP32=0 builds them as scalar pairs).
+// the per-pattern strict < scan picks. Even though paired FP32 intrinsics (__fmul2_rn/__fadd2_rn)
+// specify round-to-nearest-even, ptxas on sm_121a scalarizes them and contracts the Even-parity
+// path's mul+add into FFMA, breaking exact bit parity with the scalar settle check; default
+// INFERNIX_VQ2_PAIRED_FP32 to 0 so scalar __fmul_rn/__fadd_rn preserve exact rounding.
 
 #ifndef INFERNIX_VQ2_PAIRED_FP32
-#define INFERNIX_VQ2_PAIRED_FP32 1
+#define INFERNIX_VQ2_PAIRED_FP32 0
 #endif
 
 __device__ __forceinline__ float2 kv_cache_vq2_mul2(float2 a, float2 b) {

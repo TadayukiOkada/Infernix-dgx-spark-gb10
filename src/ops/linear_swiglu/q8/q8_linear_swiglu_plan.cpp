@@ -19,43 +19,32 @@ struct RouteSpec {
     Q8LinearSwiGluScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 18> kCompanionRoutes{{
+constexpr std::array<RouteSpec, 6> kCompanionRoutes{{
     {1, 1, Q8LinearSwiGluScheduleId::DecodePairR16},
     {2, 48, Q8LinearSwiGluScheduleId::SplitKMmaExactT},
-    {49, 64, Q8LinearSwiGluScheduleId::MmaR32C64},
-    {65, 80, Q8LinearSwiGluScheduleId::MmaR32C80},
-    {81, 96, Q8LinearSwiGluScheduleId::MmaR32C96},
-    {97, 128, Q8LinearSwiGluScheduleId::MmaR64C64},
-    {129, 192, Q8LinearSwiGluScheduleId::MmaR32C64},
-    {193, 240, Q8LinearSwiGluScheduleId::MmaR128C80},
-    {241, 255, Q8LinearSwiGluScheduleId::MmaR32C128},
-    {256, 256, Q8LinearSwiGluScheduleId::MmaR64C128},
-    {257, 264, Q8LinearSwiGluScheduleId::MmaR64C64},
-    {265, 288, Q8LinearSwiGluScheduleId::MmaR64C96},
-    {289, 320, Q8LinearSwiGluScheduleId::MmaR64C64},
-    {321, 384, Q8LinearSwiGluScheduleId::MmaR64C128},
-    {385, 448, Q8LinearSwiGluScheduleId::MmaR128C64},
-    {449, 512, Q8LinearSwiGluScheduleId::MmaR64C128},
-    {513, 560, Q8LinearSwiGluScheduleId::MmaR128C80},
-    {561, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
+    {49, 63, Q8LinearSwiGluScheduleId::MmaR128C64},
+    {64, 128, Q8LinearSwiGluScheduleId::MmaR64C128},
+    {129, 160, Q8LinearSwiGluScheduleId::MmaR128C80},
+    {161, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
 }};
 
 // Small-T K-split followed by row-tiled MMA; live columns do not select exact-T kernels.
-constexpr std::array<RouteSpec, 6> kDFlash2Routes{{
+constexpr std::array<RouteSpec, 7> kDFlash2Routes{{
     {1, 40, Q8LinearSwiGluScheduleId::DFlash2SmallT},
-    {41, 63, Q8LinearSwiGluScheduleId::DFlash2MmaR32C64K128},
-    {64, 64, Q8LinearSwiGluScheduleId::DFlash2MmaR64C64K128},
+    {41, 64, Q8LinearSwiGluScheduleId::DFlash2MmaR32C64K128},
     {65, 80, Q8LinearSwiGluScheduleId::DFlash2MmaR64C80K128},
     {81, 96, Q8LinearSwiGluScheduleId::DFlash2MmaR64C96K128},
-    {97, kAnyCols, Q8LinearSwiGluScheduleId::DFlash2MmaR64C128},
+    {97, 128, Q8LinearSwiGluScheduleId::DFlash2MmaR64C128},
+    {129, 160, Q8LinearSwiGluScheduleId::DFlash2MmaR64C80K128},
+    {161, kAnyCols, Q8LinearSwiGluScheduleId::DFlash2MmaR64C128},
 }};
 
 // Qwen3.8-Flash-Next's shared expert, gate/up [1280, 2560] -> [640]: the register-streamed pair
 // route while the weights dominate, then the paired-row MMA tiles.
 constexpr std::array<RouteSpec, 3> kFlashNextSharedRoutes{{
     {1, 16, Q8LinearSwiGluScheduleId::StreamPair},
-    {17, 64, Q8LinearSwiGluScheduleId::MmaR32C64},
-    {65, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
+    {17, 256, Q8LinearSwiGluScheduleId::MmaR32C64},
+    {257, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
 }};
 
 template <std::size_t N>

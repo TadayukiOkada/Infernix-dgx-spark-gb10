@@ -8,6 +8,8 @@ namespace {
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+using BulkG8 =
+    Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1, Fp8MmaRaster::Grouped, 8>, 170, 4, 8>;
 } // namespace
 
 std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
@@ -54,7 +56,8 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R128K128>();
     if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
-    if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
-    launch.template operator()<Bulk>();
+    if (x.ne[1] <= 256) return launch.template operator()<Tma64x256>();
+    if (x.ne[1] <= 3072) return launch.template operator()<Bulk>();
+    launch.template operator()<BulkG8>();
 }
 } // namespace infernix::ops::detail

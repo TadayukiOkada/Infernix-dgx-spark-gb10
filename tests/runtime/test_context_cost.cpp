@@ -11,22 +11,14 @@
 #include <stdexcept>
 #include <string>
 
-#ifdef _WIN32
-#include <process.h>
-#else
 #include <unistd.h>
-#endif
 
 namespace {
 
 using Json = nlohmann::json;
 
 long long test_process_id() {
-#ifdef _WIN32
-    return _getpid();
-#else
     return ::getpid();
-#endif
 }
 
 int failures = 0;
@@ -110,6 +102,9 @@ void test_hardware_class() {
     expect(infernix::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 5090", 12, 0) ==
                "nvidia-geforce-rtx-5090-sm120",
            "hardware class duplicated or lost the NVIDIA vendor");
+    expect(infernix::runtime::context_cost_hardware_class("NVIDIA GB10", 12, 1) ==
+               "nvidia-gb10-sm121",
+           "hardware class did not canonicalize NVIDIA GB10");
     expect(infernix::runtime::context_cost_hardware_class("Example Accelerator", 9, 0) ==
                "nvidia-example-accelerator-sm90",
            "hardware class did not canonicalize a vendorless CUDA device name");
@@ -187,6 +182,15 @@ void test_resolution_and_atomic_upserts() {
                        infernix::ContextCostPresetSource::CompiledDefault &&
                    measured.model.prefill.token_ns_q32 == 375'800'765'711'778,
                "measured bindings did not select their compiled prefill cost");
+
+        const auto gb10_compiled = infernix::runtime::resolve_context_machine_cost({
+            .hardware_class    = "nvidia-gb10-sm121",
+            .prefill_signature = "unmeasured-config-and-formats",
+        });
+        expect(gb10_compiled.summary.transfer_source ==
+                       infernix::ContextCostPresetSource::CompiledDefault &&
+                   gb10_compiled.model.transfer[0].ns_per_byte_q32 == 183'965'911,
+               "GB10 compiled transfer default did not resolve");
 
         const infernix::runtime::ContextCostIdentity unknown{
             .hardware_class    = "unmeasured-machine",

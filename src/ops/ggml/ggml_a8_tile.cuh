@@ -256,7 +256,7 @@ __device__ __forceinline__ void compute_plane(PlaneShared& sm, const std::uint8_
         for (int i = tid; i < kImageCopies; i += kThreads) {
             const int h = i / (kImage / 16), c = i % (kImage / 16);
             tile::cp_async16(reinterpret_cast<unsigned char*>(&sm.image[buf][h]) + 16 * c,
-                             images[h] + static_cast<std::size_t>(st) * sizeof(PlaneStage) + 16 * c, 16);
+                             (h == 0 ? images[0] : images[1]) + static_cast<std::size_t>(st) * sizeof(PlaneStage) + 16 * c, 16);
         }
 #pragma unroll
         for (int k = 0; k < 2; ++k) {

@@ -34,6 +34,7 @@ using SlicedK5120T24 = Q4A16SlicedKMmaSchedule<16, 24, 8, 1, Cache::cg, Cache::c
 using SlicedK2048T4  = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca, 6, 2048, 4>;
 
 using SlicedK5120T4 = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca, 6, 5120, 4>;
+using SlicedK5120T8 = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca, 6, 5120, 8>;
 
 using MmaR64T48K64Wr16Wt16S2A2B2 =
     Q4A16MmaSchedule<64, 48, 64, 16, 16, 2, 2, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
@@ -64,24 +65,39 @@ using MmaR64T128K64Wr64Wt32S2A2B1 =
     Q4A16MmaSchedule<64, 128, 64, 64, 32, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
                      Q4ScaleLoad::Pair32>;
 
-using SlicedR16T8W4S2      = Q4A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
-using SlicedR16T8Capacity4 = Q4A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2, 0, 4>;
-using SlicedR16T16W4S2     = Q4A16SlicedKMmaSchedule<16, 16, 4, 2, Cache::cg, Cache::ca, 2>;
-using SlicedR16T16W2S2     = Q4A16SlicedKMmaSchedule<16, 16, 2, 2, Cache::cg, Cache::ca, 2>;
+using SlicedR16T8W4S2      = Q4A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 3>;
+using SlicedR16T8Capacity4 = Q4A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 3, 0, 4>;
+using SlicedR16T16W4S2     = Q4A16SlicedKMmaSchedule<16, 16, 4, 2, Cache::cg, Cache::ca, 3>;
+using SlicedR16T16W2S2     = Q4A16SlicedKMmaSchedule<16, 16, 2, 2, Cache::cg, Cache::ca, 3>;
 using SlicedR16T32W4S2     = Q4A16SlicedKMmaSchedule<16, 32, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T8W4S2      = Q4A16SlicedKMmaSchedule<32, 8, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T16W4S2     = Q4A16SlicedKMmaSchedule<32, 16, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T16W4S1     = Q4A16SlicedKMmaSchedule<32, 16, 4, 1, Cache::cg, Cache::ca, 2>;
+using SlicedR32T24W4S2     = Q4A16SlicedKMmaSchedule<32, 24, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W4S1     = Q4A16SlicedKMmaSchedule<32, 32, 4, 1, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W4S2     = Q4A16SlicedKMmaSchedule<32, 32, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W2S2     = Q4A16SlicedKMmaSchedule<32, 32, 2, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T64W2S1     = Q4A16SlicedKMmaSchedule<32, 64, 2, 1, Cache::cg, Cache::ca, 2>;
 using MmaR32T32K128S2A2 = Q4A16MmaSchedule<32, 32, 128, 16, 16, 2, 2, Q4MmaFragmentPipeline::Serial,
                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 2>;
+using MmaR32T64K128S2A1 = Q4A16MmaSchedule<32, 64, 128, 16, 16, 2, 2, Q4MmaFragmentPipeline::Serial,
+                                           Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
 using MmaR64T64K128S2A1 = Q4A16MmaSchedule<64, 64, 128, 16, 32, 2, 2, Q4MmaFragmentPipeline::Serial,
                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
-using MmaR32T128K64S2A2 = Q4A16MmaSchedule<32, 128, 64, 32, 32, 2, 2, Q4MmaFragmentPipeline::Serial,
-                                           Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 2>;
+using MmaR64T72K128S2A1 = Q4A16MmaSchedule<64, 72, 128, 32, 24, 2, 2, Q4MmaFragmentPipeline::Serial,
+                                           Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
+using MmaR64T80K128S2A1 = Q4A16MmaSchedule<64, 80, 128, 16, 40, 2, 2, Q4MmaFragmentPipeline::Serial,
+                                           Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
+using MmaR64T96K128S2A1 = Q4A16MmaSchedule<64, 96, 128, 16, 48, 1, 2, Q4MmaFragmentPipeline::Serial,
+                                           Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
+using MmaR64T112K128S2A1 = Q4A16MmaSchedule<64, 112, 128, 16, 56, 1, 2, Q4MmaFragmentPipeline::Serial,
+                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
+using MmaR64T120K128S2A1 = Q4A16MmaSchedule<64, 120, 128, 32, 24, 1, 2, Q4MmaFragmentPipeline::Serial,
+                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
+using MmaR64T128K128S2A1 = Q4A16MmaSchedule<64, 128, 128, 16, 64, 1, 2, Q4MmaFragmentPipeline::Serial,
+                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
+using MmaR32T128K64S2A2 = Q4A16MmaSchedule<32, 128, 128, 16, 32, 2, 2, Q4MmaFragmentPipeline::Serial,
+                                           Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 1>;
 using SimtR4T4W2G8S2    = Q4A16SimtSchedule<4, 4, 2, 8, 2, Cache::ca, 1>;
 using SimtR4T1W2G8S2    = Q4A16SimtSchedule<4, 1, 2, 8, 2, Cache::ca, 1>;
 } // namespace infernix::ops::detail::q4_instances

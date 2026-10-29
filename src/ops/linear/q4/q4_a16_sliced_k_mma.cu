@@ -42,6 +42,11 @@ void launch_q4_a16_sliced_r32_t16_w4_s1(const Tensor& x, const Weight& w, Tensor
     launch_q4_a16_sliced_instance<q4_instances::SlicedR32T16W4S1>(x, w, out, stream);
 }
 
+void launch_q4_a16_sliced_r32_t24_w4_s2(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q4_a16_sliced_instance<q4_instances::SlicedR32T24W4S2>(x, w, out, stream);
+}
+
 void launch_q4_a16_sliced_r32_t32_w4_s1(const Tensor& x, const Weight& w, Tensor& out,
                                         cudaStream_t stream) {
     launch_q4_a16_sliced_instance<q4_instances::SlicedR32T32W4S1>(x, w, out, stream);
@@ -75,6 +80,11 @@ void launch_q4_a16_sliced_k5120_t24(const Tensor& x, const Weight& w, Tensor& ou
 void launch_q4_a16_sliced_k5120_t4(const Tensor& x, const Weight& w, Tensor& out,
                                    cudaStream_t stream) {
     launch_q4_a16_sliced_instance<q4_instances::SlicedK5120T4>(x, w, out, stream);
+}
+
+void launch_q4_a16_sliced_k5120_t8(const Tensor& x, const Weight& w, Tensor& out,
+                                   cudaStream_t stream) {
+    launch_q4_a16_sliced_instance<q4_instances::SlicedK5120T8>(x, w, out, stream);
 }
 
 void launch_q4_a16_sliced_k2048_t4(const Tensor& x, const Weight& w, Tensor& out,

@@ -76,12 +76,16 @@ struct Q4A16MmaSchedule {
     static constexpr int kGroupsPerK     = kBlockK / Q4RowSplitStorage::kGroupK;
     static constexpr int kScaleBytes =
         kScaleLoadMode == Q4ScaleLoad::Pair32 ? 4 : Q4RowSplitStorage::kScaleBytesPerGroup;
+    static constexpr int kScaleRowBytes =
+        (kScaleLoadMode == Q4ScaleLoad::Pair32 && (kGroupsPerK % 2 == 0))
+            ? (kGroupsPerK / 2) * 4
+            : kGroupsPerK * kScaleBytes;
 
     static constexpr int kSharedBytes =
         kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
         kActivationStages * kBlockTokens * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
         kStages * kBlockRows * kGroupsPerK * Q4RowSplitStorage::kCodeBytesPerGroup +
-        kStages * kBlockRows * kGroupsPerK * kScaleBytes;
+        kStages * kBlockRows * kScaleRowBytes;
 
     static_assert(kBlockRows > 0 && kBlockTokens > 0 && kBlockK > 0);
     static_assert(kBlockK % Q4RowSplitStorage::kGroupK == 0,
@@ -97,8 +101,8 @@ struct Q4A16MmaSchedule {
                   "Q4 single-buffered activations need a separate async group");
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 48 * 1024,
-                  "Q4 MMA staged shared memory exceeds the static 48 KiB budget");
+    static_assert(kSharedBytes <= 99 * 1024,
+                  "Q4 MMA staged shared memory exceeds the 99 KiB opt-in budget");
 };
 
 enum class Q4SlicedKReduction {
@@ -132,7 +136,6 @@ struct Q4A16SlicedKMmaSchedule {
     static constexpr int kStages            = Stages;
     static constexpr Cache kWeightCache     = WeightCache;
     static constexpr Cache kActivationCache = ActivationCache;
-    static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
     static constexpr int kMmaRows           = BlockRows / 16;
     static constexpr int kMmaTokens         = BlockTokens / 8;
     // Code/scale planes and BF16 activations. Partial results reuse this storage.
@@ -145,6 +148,12 @@ struct Q4A16SlicedKMmaSchedule {
     static constexpr int kSharedBytes =
         ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;
     static_assert(kSharedBytes <= 48 * 1024, "Q4 sliced-K shared memory exceeds 48 KiB");
+    // Clamp __launch_bounds__ minBlocksPerMultiprocessor to the shared-memory residency limit
+    // so wider tiles (T=16, 24, 32 with KWarps=8) do not force artificial register spills.
+    static constexpr int kMaxBlocksBySmem =
+        102400 / (((kSharedBytes + 127) / 128 * 128) + 1024);
+    static constexpr int kMinBlocksPerSm =
+        MinBlocksPerSm < kMaxBlocksBySmem ? MinBlocksPerSm : kMaxBlocksBySmem;
 };
 
 enum class Q4GemvActivationAccess {

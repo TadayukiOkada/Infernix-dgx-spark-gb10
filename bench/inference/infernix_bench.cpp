@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -265,6 +266,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_split_workspace_mib       = options.prefill_split_workspace_mib;
         engine_options.ngram_volume_path = options.ngram_volume_path;
         engine_options.ngram_residency   = options.ngram_residency;
+        engine_options.ngram_cache_bytes = options.ngram_cache_bytes;
         engine_options.expert_stripe_path = options.expert_stripe_path;
         engine_options.expert_state_path  = options.expert_state_path;
         engine_options.expert_state_off   = options.expert_state_off;
@@ -273,7 +275,6 @@ int main(int argc, char** argv) {
         engine_options.expert_ram_layout  = options.expert_ram_layout;
         engine_options.expert_pin_bytes   = options.expert_pin_bytes;
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
-        engine_options.vram_past_budget    = options.vram_past_budget;
         engine_options.expert_tail_skip    = options.expert_tail_skip;
         engine_options.expert_a4_activations = options.expert_a4_activations;
         engine_options.a8_activations        = options.a8_activations;
@@ -288,6 +289,21 @@ int main(int argc, char** argv) {
         engine_options.diagnostic_observer.callback = [](const infernix::Diagnostic& diagnostic) {
             std::fprintf(stderr, "[engine] %s\n", diagnostic.message.c_str());
         };
+
+        // Measurement-only hook: with INFERNIX_DIAG set, surface the engine's Debug diagnostics
+        // (n-gram row traffic, gated rounds, GPU-wait time) that are otherwise dropped. Does not
+        // change execution; only forwards diagnostics to stderr for profiling.
+        if (const char* diag = std::getenv("INFERNIX_DIAG")) {
+            const bool all = std::string(diag) == "all";
+            engine_options.diagnostic_observer.callback = [all](const infernix::Diagnostic& d) {
+                const bool interesting = d.message.find("n-gram") != std::string::npos ||
+                                         d.message.find("gate") != std::string::npos ||
+                                         d.message.find("expert cache") != std::string::npos;
+                if (all || interesting) {
+                    std::cerr << "[diag] " << d.message << '\n';
+                }
+            };
+        }
 
         infernix::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;

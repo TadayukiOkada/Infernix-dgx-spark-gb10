@@ -4,6 +4,38 @@
 
 namespace infernix::ops::detail {
 
+void launch_q6_a16_mma_r32_t64_k128_s2_a1(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream) {
+    with_linear_output(out, weight.n, [&](auto output) {
+        launch_q6_a16_mma<q6_instances::MmaR32T64K128S2A1>(q6_linear_operands(x, weight), output,
+                                                           LinearIdentityEpilogue{}, stream);
+    });
+}
+
+void launch_q6_a16_mma_r32_t128_k64_s2_a2(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream) {
+    with_linear_output(out, weight.n, [&](auto output) {
+        launch_q6_a16_mma<q6_instances::MmaR32T128K64S2A2>(q6_linear_operands(x, weight), output,
+                                                           LinearIdentityEpilogue{}, stream);
+    });
+}
+
+void launch_q6_a16_mma_r32_t128_k128_s2_a1(const Tensor& x, const Weight& weight, Tensor& out,
+                                           cudaStream_t stream) {
+    with_linear_output(out, weight.n, [&](auto output) {
+        launch_q6_a16_mma<q6_instances::MmaR32T128K128S2A1>(q6_linear_operands(x, weight), output,
+                                                            LinearIdentityEpilogue{}, stream);
+    });
+}
+
+void launch_q6_a16_mma_r64_t128_k128_s1_a1(const Tensor& x, const Weight& weight, Tensor& out,
+                                           cudaStream_t stream) {
+    with_linear_output(out, weight.n, [&](auto output) {
+        launch_q6_a16_mma<q6_instances::MmaR64T128K128S1A1>(q6_linear_operands(x, weight), output,
+                                                            LinearIdentityEpilogue{}, stream);
+    });
+}
+
 void launch_q6_a16_mma_r64_t40_k128(const Tensor& x, const Weight& weight, Tensor& out,
                                     cudaStream_t stream) {
     with_linear_output(out, weight.n, [&](auto output) {

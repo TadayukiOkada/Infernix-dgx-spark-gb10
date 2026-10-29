@@ -1,32 +1,31 @@
 #include "core/cpu_topology.h"
 
-#if defined(_WIN32)
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#elif defined(__linux__)
-#    include <pthread.h>
-#    include <sched.h>
+#include <pthread.h>
+#include <sched.h>
 
-#    include <fstream>
-#    include <map>
-#    include <sstream>
-#    include <string>
-#    include <utility>
-#endif
-
+#include <algorithm>
 #include <bit>
+#include <charconv>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 namespace infernix {
 namespace {
 
-#if defined(__linux__)
-// A sysfs CPU list ("0-7,16,18-19") as a mask; CPUs past 63 make the list unusable (returns false).
-bool parse_cpu_list(const std::string& text, std::uint64_t& out) {
+bool read_text(const std::string& path, std::string& out) {
+    std::ifstream file(path);
+    if (!file) { return false; }
+    std::getline(file, out);
+    return true;
+}
+
+bool parse_cpu_mask(const std::string& text, std::uint64_t& out) {
     out = 0;
     std::stringstream in(text);
     std::string part;
@@ -41,40 +40,25 @@ bool parse_cpu_list(const std::string& text, std::uint64_t& out) {
     return true;
 }
 
-bool read_text(const std::string& path, std::string& out) {
-    std::ifstream file(path);
-    if (!file) { return false; }
-    std::getline(file, out);
-    return true;
-}
-#endif
-
 } // namespace
 
 std::vector<PhysicalCore> physical_cores() {
     std::vector<PhysicalCore> cores;
-#if defined(_WIN32)
-    if (GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) > 64) { return cores; }
-    DWORD bytes = 0;
-    (void)GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
-    if (bytes == 0) { return cores; }
-    std::vector<std::uint8_t> buffer(bytes);
-    auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &bytes)) { return cores; }
-    for (DWORD at = 0; at < bytes;) {
-        const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + at);
-        if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount == 1 &&
-            entry->Processor.GroupMask[0].Group == 0) {
-            cores.push_back({static_cast<std::uint64_t>(entry->Processor.GroupMask[0].Mask), entry->Processor.EfficiencyClass});
-        }
-        at += entry->Size;
-    }
-#elif defined(__linux__)
     std::uint64_t online = 0, performance = 0;
     std::string text;
-    if (!read_text("/sys/devices/system/cpu/online", text) || !parse_cpu_list(text, online)) { return cores; }
-    // Hybrid Intel CPUs list their P-cores here; elsewhere every core has the same class.
-    const bool hybrid = read_text("/sys/devices/cpu_core/cpus", text) && parse_cpu_list(text, performance);
+    if (!read_text("/sys/devices/system/cpu/online", text) || !parse_cpu_mask(text, online)) { return cores; }
+
+    bool hybrid = false;
+    if (core::hybrid_cpu()) {
+        hybrid = true;
+        const auto perf_list = core::performance_cpus();
+        for (int c : perf_list) {
+            if (c >= 0 && c < 64) { performance |= (std::uint64_t{1} << c); }
+        }
+    } else if (read_text("/sys/devices/cpu_core/cpus", text) && parse_cpu_mask(text, performance)) {
+        hybrid = true;
+    }
+
     std::map<std::pair<int, int>, std::size_t> index; // (package, core id) -> cores[i]
     for (int cpu = 0; cpu < 64; ++cpu) {
         if (((online >> cpu) & 1U) == 0) { continue; }
@@ -88,7 +72,6 @@ std::vector<PhysicalCore> physical_cores() {
         }
         cores[it->second].cpus |= std::uint64_t{1} << cpu;
     }
-#endif
     return cores;
 }
 
@@ -113,9 +96,6 @@ int first_cpu(std::uint64_t cpus) noexcept { return cpus == 0 ? -1 : std::countr
 
 std::uint64_t set_current_thread_cpus(std::uint64_t cpus) noexcept {
     if (cpus == 0) { return 0; }
-#if defined(_WIN32)
-    return static_cast<std::uint64_t>(SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(cpus)));
-#elif defined(__linux__)
     cpu_set_t before;
     CPU_ZERO(&before);
     std::uint64_t previous = 0;
@@ -130,9 +110,142 @@ std::uint64_t set_current_thread_cpus(std::uint64_t cpus) noexcept {
         if (((cpus >> c) & 1U) != 0) { CPU_SET(c, &set); }
     }
     return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0 ? previous : 0;
-#else
-    return 0;
-#endif
 }
 
+namespace core {
+namespace {
+
+// Reads one integer from a sysfs file; returns false when the file is absent or unreadable.
+bool read_sysfs_long(std::string_view path, long long& out) {
+    std::ifstream file{std::string(path)};
+    if (!file) { return false; }
+    std::string t;
+    if (!(file >> t)) { return false; }
+    const auto* begin = t.data();
+    const auto* end   = t.data() + t.size();
+    const auto result = std::from_chars(begin, end, out);
+    return result.ec == std::errc{} && result.ptr == end;
+}
+
+// Expands a Linux cpulist ("0-19", "0-7,16-23") into the logical CPU ids it names.
+std::vector<int> parse_cpu_list(std::string_view list) {
+    std::vector<int> ids;
+    std::size_t pos = 0;
+    while (pos < list.size()) {
+        const std::size_t comma = list.find(',', pos);
+        const std::string_view item = list.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+        const std::size_t dash    = item.find('-');
+        long long low = -1, high = -1;
+        if (dash == std::string_view::npos) {
+            const auto r = std::from_chars(item.data(), item.data() + item.size(), low);
+            if (r.ec == std::errc{}) { high = low; }
+        } else {
+            const std::string_view lo = item.substr(0, dash), hi = item.substr(dash + 1);
+            const auto rl = std::from_chars(lo.data(), lo.data() + lo.size(), low);
+            const auto rh = std::from_chars(hi.data(), hi.data() + hi.size(), high);
+            if (rl.ec != std::errc{} || rh.ec != std::errc{}) { low = -1; }
+        }
+        if (low >= 0 && high >= low) {
+            for (long long cpu = low; cpu <= high; ++cpu) { ids.push_back(static_cast<int>(cpu)); }
+        }
+        if (comma == std::string_view::npos) { break; }
+        pos = comma + 1;
+    }
+    return ids;
+}
+
+// The online logical CPUs, from sysfs; empty when the file cannot be read.
+std::vector<int> online_cpus() {
+    std::ifstream file("/sys/devices/system/cpu/online");
+    std::string t;
+    if (!file || !(file >> t)) { return {}; }
+    return parse_cpu_list(t);
+}
+
+// A capacity for each online CPU from one uniform source, so the values stay comparable: the
+// normalized cpu_capacity (0..1024) if present for every CPU, else the cpufreq ceiling.
+// Returns the per-CPU capacity in list order, or an empty vector if neither source covers all CPUs.
+std::vector<long long> read_capacities(const std::vector<int>& cpus) {
+    std::vector<long long> capacity(cpus.size(), 0);
+    bool complete = true;
+    for (std::size_t i = 0; i < cpus.size(); ++i) {
+        if (!read_sysfs_long("/sys/devices/system/cpu/cpu" + std::to_string(cpus[i]) + "/cpu_capacity", capacity[i])) {
+            complete = false;
+            break;
+        }
+    }
+    if (complete) { return capacity; }
+    complete = true;
+    for (std::size_t i = 0; i < cpus.size(); ++i) {
+        if (!read_sysfs_long("/sys/devices/system/cpu/cpu" + std::to_string(cpus[i]) + "/cpufreq/cpuinfo_max_freq",
+                             capacity[i])) {
+            complete = false;
+            break;
+        }
+    }
+    return complete ? capacity : std::vector<long long>{};
+}
+
+// Performance-class ARM Cortex part numbers (midr_EL1 bits [15:4]), used only when neither sysfs
+// capacity source is available. A core whose part is in this set counts as the big tier; a part not
+// listed is treated as the little tier. Cortex-X series (X925 = 0xd85) and the performance Cortex-A
+// cores; the observed Grace efficiency part (A725 = 0xd87) and Neoverse E cores are not listed.
+bool arm_performance_part(long long midr) {
+    const long long part = (midr >> 4) & 0xfff;
+    static constexpr long long kBig[] = {0xd85, 0xd83, 0xd82, 0xd46, 0xd8d, 0xd81, 0xd47, 0xd48,
+                                         0xd4d, 0xd41, 0xd42, 0xd0d, 0xd0e, 0xd0b, 0xd06};
+    return std::any_of(std::begin(kBig), std::end(kBig), [part](long long p) { return p == part; });
+}
+
+} // namespace
+
+bool hybrid_cpu() {
+    const std::vector<int> cpus = online_cpus();
+    if (cpus.size() < 2) { return false; }
+    const std::vector<long long> capacity = read_capacities(cpus);
+    if (!capacity.empty()) {
+        const long long max_capacity = *std::max_element(capacity.begin(), capacity.end());
+        const long long min_capacity = *std::min_element(capacity.begin(), capacity.end());
+        // A real tier gap: the big tier is at least 20% above the small tier. Grace reads 997/718.
+        return max_capacity >= min_capacity + min_capacity / 5;
+    }
+    // Fall back to the ARM part number for each CPU; hybrid when the set mixes big and small parts.
+    bool big = false, little = false;
+    for (const int cpu : cpus) {
+        long long midr = 0;
+        if (!read_sysfs_long("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/regs/identification/midr_el1",
+                             midr)) {
+            return false;
+        }
+        if (arm_performance_part(midr)) { big = true; } else { little = true; }
+    }
+    return big && little;
+}
+
+std::vector<int> performance_cpus() {
+    if (!hybrid_cpu()) { return {}; }
+    const std::vector<int> cpus = online_cpus();
+    const std::vector<long long> capacity = read_capacities(cpus);
+    std::vector<int> big;
+    if (!capacity.empty()) {
+        const long long max_capacity = *std::max_element(capacity.begin(), capacity.end());
+        for (std::size_t i = 0; i < cpus.size(); ++i) {
+            if (capacity[i] >= max_capacity - max_capacity / 10) { big.push_back(cpus[i]); }
+        }
+    } else {
+        for (const int cpu : cpus) {
+            long long midr = 0;
+            if (!read_sysfs_long("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/regs/identification/midr_el1",
+                                 midr) ||
+                !arm_performance_part(midr)) {
+                return {};
+            }
+            big.push_back(cpu);
+        }
+    }
+    std::sort(big.begin(), big.end());
+    return big;
+}
+
+} // namespace core
 } // namespace infernix

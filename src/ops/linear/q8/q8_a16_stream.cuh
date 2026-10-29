@@ -126,7 +126,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void q8_a16_stream
                 }
 #pragma unroll
                 for (int c = 0; c < CP; ++c) {
-                    if (c < pass_live) {
+                    if (S::kPasses == 1 && CP <= 2 ? true : c < pass_live) {
                         uint4 values;
                         if constexpr (S::kXStage == Q8StreamX::Shared) {
                             values = load_vec<uint4>(x_tile + static_cast<std::int64_t>(c) * K + k_begin + kk);

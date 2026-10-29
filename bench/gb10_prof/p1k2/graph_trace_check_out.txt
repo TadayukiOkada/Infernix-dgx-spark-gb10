@@ -1,0 +1,17 @@
+CUPTI_ACTIVITY_KIND_GRAPH_TRACE 171
+CUPTI_ACTIVITY_KIND_KERNEL 2088
+CUDA_GRAPH_EVENTS 40
+replays 171  min 0.29  median 7.69  max 53.03 ms
+duration bands: {'<1ms': 57, '1-10ms': 31, '10-20ms': 26, '>20ms': 57}
+distinct graphIds: 10
+  graphId 1  n=31  7.32-7.86 ms
+  graphId 16  n=26  11.02-11.82 ms
+  graphId 10  n=22  40.20-43.36 ms
+  graphId 13  n=22  0.35-0.54 ms
+  graphId 25  n=16  43.69-53.03 ms
+  graphId 28  n=16  0.38-0.55 ms
+  graphId 4  n=15  31.25-33.21 ms
+  graphId 7  n=15  0.29-0.40 ms
+  graphId 19  n=4  36.05-41.51 ms
+  graphId 22  n=4  0.32-0.40 ms
+kernel records inside any graph replay window: 0

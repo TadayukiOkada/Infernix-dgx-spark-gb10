@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
 
@@ -47,6 +48,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin,
     RowPolicy row_policy) {
+    pdl::enter_streaming();
     constexpr int R  = Schedule::kBlockRows;
     constexpr int T  = Schedule::kBlockTokens;
     constexpr int W  = Schedule::kKWarps;
@@ -128,17 +130,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
                                   valid ? 4 : 0);
             }
         }
-        for (int item = lane; item < Schedule::kTokenCapacity * 8; item += 32) {
-            const int token  = item / 8;
-            const int k8     = (item % 8) * 8;
-            const bool valid = (FullTokens || token0 + token < tokens) &&
-                               (Full || (first_group + warp) * 64 + k8 + 8 <= logical_k);
-            const std::int64_t index =
-                valid ? std::int64_t(token0 + token) * logical_k + (first_group + warp) * 64 + k8
-                      : 0;
-            cp_async_zfill<16, Schedule::kActivationCache>(
-                &shared.staging.x[slot][warp][token][q5_sliced_k_swizzle(token, k8)], x + index,
-                valid ? 16 : 0);
+        const int live_tokens =
+            FullTokens ? Schedule::kTokenCapacity : min(Schedule::kTokenCapacity, tokens - token0);
+        for (int item = lane; item < live_tokens * 8; item += 32) {
+            const int token = item / 8;
+            const int k8    = (item % 8) * 8;
+            if constexpr (Full) {
+                cp_async<16, Schedule::kActivationCache>(
+                    &shared.staging.x[slot][warp][token][q5_sliced_k_swizzle(token, k8)],
+                    x + std::int64_t(token0 + token) * logical_k + (first_group + warp) * 64 + k8);
+            } else {
+                const bool valid = (first_group + warp) * 64 + k8 + 8 <= logical_k;
+                const std::int64_t index =
+                    valid ? std::int64_t(token0 + token) * logical_k + (first_group + warp) * 64 + k8
+                          : 0;
+                cp_async_zfill<16, Schedule::kActivationCache>(
+                    &shared.staging.x[slot][warp][token][q5_sliced_k_swizzle(token, k8)], x + index,
+                    valid ? 16 : 0);
+            }
         }
         cp_commit();
     };
@@ -160,15 +169,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
         float group_acc[MT][NT][4] = {};
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
-#pragma unroll
-            for (int mi = 0; mi < MT; ++mi) {
-                const int r0      = mi * 16 + gid;
-                const int byte0   = ks * 8 + lid;
-                const auto decode = [&](int row, int byte) {
-                    return q5_sliced_k_integer_pair(shared.staging.codes[slot][row][warp][byte],
-                                                    shared.staging.high[slot][row][warp][byte / 4],
-                                                    byte % 4);
-                };
+            const int byte0   = ks * 8 + lid;
+            const auto decode = [&](int row, int byte) {
+                return q5_sliced_k_integer_pair(shared.staging.codes[slot][row][warp][byte],
+                                                shared.staging.high[slot][row][warp][byte / 4],
+                                                byte % 4);
+            };
+            if constexpr (MT == 1) {
+                const int r0      = gid;
                 const unsigned a0 = decode(r0, byte0);
                 const unsigned a1 = decode(r0 + 8, byte0);
                 const unsigned a2 = decode(r0, byte0 + 4);
@@ -181,8 +189,31 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
                     ldmatrix_x2(
                         b0, b1,
                         smem_addr(&shared.staging.x[slot][warp][br][q5_sliced_k_swizzle(br, bk)]));
-                    mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
-                             group_acc[mi][ni][3], a0, a1, a2, a3, b0, b1);
+                    mma_bf16(group_acc[0][ni][0], group_acc[0][ni][1], group_acc[0][ni][2],
+                             group_acc[0][ni][3], a0, a1, a2, a3, b0, b1);
+                }
+            } else {
+                unsigned b0[NT], b1[NT];
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const int br = ni * 8 + (lane & 7);
+                    const int bk = ks * 16 + (((lane >> 3) & 1) * 8);
+                    ldmatrix_x2(
+                        b0[ni], b1[ni],
+                        smem_addr(&shared.staging.x[slot][warp][br][q5_sliced_k_swizzle(br, bk)]));
+                }
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    const int r0      = mi * 16 + gid;
+                    const unsigned a0 = decode(r0, byte0);
+                    const unsigned a1 = decode(r0 + 8, byte0);
+                    const unsigned a2 = decode(r0, byte0 + 4);
+                    const unsigned a3 = decode(r0 + 8, byte0 + 4);
+#pragma unroll
+                    for (int ni = 0; ni < NT; ++ni) {
+                        mma_bf16(group_acc[mi][ni][0], group_acc[mi][ni][1], group_acc[mi][ni][2],
+                                 group_acc[mi][ni][3], a0, a1, a2, a3, b0[ni], b1[ni]);
+                    }
                 }
             }
         }

@@ -55,6 +55,7 @@ struct BenchOptions {
     std::string artifact_path;
     std::string ngram_volume_path;
     infernix::NgramResidency ngram_residency = infernix::NgramResidency::Auto;
+    std::uint64_t ngram_cache_bytes          = 0;
     std::string expert_stripe_path;
     // --expert-state FILE|off: the expert cache warm-starts from (and saves to) this file, as the server does from
     // <artifact>.expert-state; off: an empty cache (cold); absent: seeded from the built-in calibrated order, no file.
@@ -147,6 +148,7 @@ struct TestResult {
 struct Stats {
     double mean   = 0.0;
     double stddev = 0.0;
+    double median = 0.0; // reported alongside mean so skew is visible, not just spread
     int count     = 0;
 };
 

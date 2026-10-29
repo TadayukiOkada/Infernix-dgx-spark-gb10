@@ -209,11 +209,13 @@ void append_stat(std::ostringstream& out, std::string_view name, const std::vect
                  std::string_view indent) {
     out << indent << '"' << name << "_mean\": ";
     if (values.empty()) {
-        out << "null,\n" << indent << '"' << name << "_stddev\": null";
+        out << "null,\n" << indent << '"' << name << "_stddev\": null,\n"
+            << indent << '"' << name << "_median\": null";
     } else {
         const Stats stats = compute_stats(values);
         out << number(stats.mean) << ",\n"
-            << indent << '"' << name << "_stddev\": " << number(stats.stddev);
+            << indent << '"' << name << "_stddev\": " << number(stats.stddev) << ",\n"
+            << indent << '"' << name << "_median\": " << number(stats.median);
     }
 }
 
@@ -614,6 +616,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.ngram_volume_path = value("--ngram-volume");
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = infernix::parse_ngram_residency(value("--ngram-residency"));
+        } else if (arg == "--ngram-cache-mib") {
+            options.ngram_cache_bytes = parse_u64(value("--ngram-cache-mib"), "ngram-cache-mib") << 20;
         } else if (arg == "--expert-stripe") {
             options.expert_stripe_path = value("--expert-stripe");
         } else if (arg == "--expert-state") {
@@ -767,8 +771,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--spec-min-p") {
             options.speculative.draft_min_p = product::parse_draft_min_p(value("--spec-min-p"));
         } else if (arg == "--ngram-draft-tokens") {
-            options.speculative.ngram_draft_tokens =
-                parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);
+            product::apply_ngram_draft_tokens(options.speculative, value("--ngram-draft-tokens"));
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match =
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
@@ -969,6 +972,11 @@ Stats compute_stats(const std::vector<double>& values) {
         for (const double value : values) { out.stddev += (value - out.mean) * (value - out.mean); }
         out.stddev = std::sqrt(out.stddev / static_cast<double>(values.size() - 1));
     }
+    // Median needs an ordering copy; cheap for the small rep counts used here.
+    std::vector<double> ordered(values.begin(), values.end());
+    std::sort(ordered.begin(), ordered.end());
+    const auto n = ordered.size();
+    out.median = (n % 2 == 1) ? ordered[n / 2] : 0.5 * (ordered[n / 2 - 1] + ordered[n / 2]);
     return out;
 }
 

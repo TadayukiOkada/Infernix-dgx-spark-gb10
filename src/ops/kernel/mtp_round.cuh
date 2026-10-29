@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/infernix/ops/mtp_round.h
-// Match: request-major K=1..63 verification and N=1..5 next MTP proposals.
+// Match: request-major K=1..63 verification and N=1..7 next MTP proposals.
 
 #include <cstdint>
 

@@ -55,13 +55,11 @@ struct Q8PairExactTEpilogue {
     }
 };
 
-template <int ActiveCols>
-void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
-                        Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
-    constexpr int TileCols =
-        ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+template <int TileCols, Q8ScaleAccess ScaleAccess>
+void launch_exact_schedule(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
+                           Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
     using Geometry           = Q8LinearGeometry<2 * kRows, kHidden>;
-    using Schedule           = Q8SlicedKDefault<TileCols, ActiveCols>;
+    using Schedule           = Q8SlicedKRuntimeDefault<TileCols, ScaleAccess>;
     const auto* first_codes  = static_cast<const std::uint8_t*>(first_weight.qdata);
     const auto* first_scales = static_cast<const std::uint8_t*>(first_weight.scales);
     if (static_cast<const std::uint8_t*>(second_weight.qdata) != first_codes + kRows * kHidden ||
@@ -74,21 +72,12 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
     const Q8PairExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(first_out.data),
                                         static_cast<__nv_bfloat16*>(second_out.data)};
     launch_q8_a16_sliced_k_mma<
-        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>,
+        typename Schedule::template with_problem<Geometry::kInputRows, TileCols, true>,
         Q8PairExactTRows>(Q8LinearOperands{static_cast<const __nv_bfloat16*>(x.data), first_codes,
                                            first_scales, Geometry::kOutputRows,
-                                           Geometry::kInputRows, ActiveCols, Geometry::kInputRows},
+                                           Geometry::kInputRows, x.ne[1], Geometry::kInputRows},
                           ignored, epilogue, stream);
 }
-
-template <std::size_t... Offsets>
-constexpr auto make_launchers(std::index_sequence<Offsets...>) {
-    return std::array<PairLauncher, sizeof...(Offsets)>{
-        &launch_active_cols<kFirstExactT + static_cast<int>(Offsets)>...};
-}
-
-constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
@@ -114,13 +103,28 @@ void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& se
 void q8_pair_splitk_exact_t_launch(const Tensor& x, const Weight& first_weight,
                                    const Weight& second_weight, Tensor& first_out,
                                    Tensor& second_out, cudaStream_t stream) {
-    if (x.ne[0] != kHidden || x.ne[1] < kFirstExactT || x.ne[1] > kLastExactT ||
-        first_out.ne[0] != kRows || first_out.ne[1] != x.ne[1] || second_out.ne[0] != kRows ||
-        second_out.ne[1] != x.ne[1]) {
+    const std::int32_t cols = x.ne[1];
+    if (x.ne[0] != kHidden || cols < kFirstExactT || cols > kLastExactT ||
+        first_out.ne[0] != kRows || first_out.ne[1] != cols || second_out.ne[0] != kRows ||
+        second_out.ne[1] != cols) {
         throw std::invalid_argument("Q8 exact pair requires [1024,2048] and T=2..32");
     }
-    kLaunchers[x.ne[1] - kFirstExactT](x, first_weight, second_weight, first_out, second_out,
-                                       stream);
+    if (cols <= 4) {
+        launch_exact_schedule<8, Q8ScaleAccess::Direct>(x, first_weight, second_weight, first_out,
+                                                        second_out, stream);
+    } else if (cols <= 8) {
+        launch_exact_schedule<8, Q8ScaleAccess::Shared>(x, first_weight, second_weight, first_out,
+                                                        second_out, stream);
+    } else if (cols <= 16) {
+        launch_exact_schedule<16, Q8ScaleAccess::Shared>(x, first_weight, second_weight, first_out,
+                                                         second_out, stream);
+    } else if (cols <= 24) {
+        launch_exact_schedule<24, Q8ScaleAccess::Shared>(x, first_weight, second_weight, first_out,
+                                                         second_out, stream);
+    } else {
+        launch_exact_schedule<32, Q8ScaleAccess::Shared>(x, first_weight, second_weight, first_out,
+                                                         second_out, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

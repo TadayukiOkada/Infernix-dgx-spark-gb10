@@ -10,6 +10,7 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/nvfp4/nvfp4_shapes.h"
 
 #include <cmath>
 #include <cstddef>
@@ -210,6 +211,12 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return 0;
     case QType::NVFP4:
+        if (parent_rows == 13952 && input_rows == 2560 && !column_invariant(policy)) {
+            return max_tokens >= 128
+                       ? detail::nvfp4_a4_workspace_capacity_bytes(
+                             max_tokens, 2560, detail::kNvfp4A4ResidualTerms, true)
+                       : 0;
+        }
         if (parent_rows != detail::Nvfp4N14336K5120::kOutputRows ||
             input_rows != detail::Nvfp4N14336K5120::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
@@ -344,6 +351,60 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_q8_rowsplit(query_key_value_weight, kRows, hidden, "query/key/value weight");
 
     detail::q8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
+}
+
+void attn_input_proj(const Tensor& x, const Weight& projection_weight, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, Tensor& iq, Tensor& ik, cudaStream_t stream) {
+    constexpr std::int32_t kHidden = 2560;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 512;
+    constexpr std::int32_t kIqRows = 512;
+    constexpr std::int32_t kIkRows = 128;
+    constexpr std::int32_t kRows   = 2 * kQRows + 2 * kKvRows + kIqRows + kIkRows;
+    const std::int32_t cols        = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    require_matrix(iq, kIqRows, cols, "iq");
+    require_matrix(ik, kIkRows, cols, "ik");
+    detail::validate_nvfp4_weight(projection_weight, "nvfp4 attn_input_proj");
+    if (projection_weight.n != kRows || projection_weight.k != kHidden) {
+        throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
+    }
+    detail::launch_nvfp4_n13952_k2560_split(x, projection_weight, q, gate, k, v, iq, ik, stream);
+}
+
+void attn_input_proj(const Tensor& x, const Weight& projection_weight, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, Tensor& iq, Tensor& ik, LinearPolicy policy,
+                     WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
+    validate_policy(policy, projection_weight.qtype);
+    if (!valid_linear_routes(routes)) {
+        throw std::invalid_argument("attn_input_proj: unsupported route set");
+    }
+    constexpr std::int32_t kHidden = 2560;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 512;
+    constexpr std::int32_t kIqRows = 512;
+    constexpr std::int32_t kIkRows = 128;
+    constexpr std::int32_t kRows   = 2 * kQRows + 2 * kKvRows + kIqRows + kIkRows;
+    const std::int32_t cols        = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    require_matrix(iq, kIqRows, cols, "iq");
+    require_matrix(ik, kIkRows, cols, "ik");
+    detail::validate_nvfp4_weight(projection_weight, "nvfp4 attn_input_proj");
+    if (projection_weight.n != kRows || projection_weight.k != kHidden) {
+        throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
+    }
+    detail::launch_nvfp4_n13952_k2560_split(x, projection_weight, q, gate, k, v, iq, ik, stream,
+                                            policy, routes, &workspace);
 }
 
 } // namespace infernix::ops

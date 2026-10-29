@@ -20,11 +20,7 @@
 #include <system_error>
 #include <utility>
 
-#ifdef _WIN32
-#include <process.h>
-#else
 #include <unistd.h>
-#endif
 
 namespace infernix::serve {
 namespace {
@@ -32,11 +28,7 @@ namespace {
 using Json = nlohmann::json;
 
 // The log is a text-mode stream: each '\n' is written as "\r\n" on Windows.
-#ifdef _WIN32
-constexpr std::uint64_t kLineTerminatorBytes = 2;
-#else
 constexpr std::uint64_t kLineTerminatorBytes = 1;
-#endif
 
 template <class T>
 T monotonic_delta(T previous, T current) noexcept {
@@ -52,11 +44,7 @@ std::uint64_t unix_time_ms() {
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-#ifdef _WIN32
-    const auto process_id = ::_getpid();
-#else
     const auto process_id = ::getpid();
-#endif
     return "serve-" + std::to_string(static_cast<long long>(process_id)) + '-' +
            std::to_string(micros);
 }

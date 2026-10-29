@@ -9,25 +9,15 @@
 #include <stdexcept>
 #include <utility>
 
-#ifdef _WIN32
-#include <malloc.h>
-#endif
 
 namespace {
 
 // 256-byte aligned backing storage; std::aligned_alloc is C++26, so on MSVC use the
 // CRT's _aligned_malloc (which must be released with _aligned_free).
-#ifdef _WIN32
-inline void* aligned_backing_alloc(std::size_t bytes) {
-    return _aligned_malloc(bytes, 256);
-}
-inline void aligned_backing_free(void* data) { _aligned_free(data); }
-#else
 inline void* aligned_backing_alloc(std::size_t bytes) {
     return std::aligned_alloc(256, bytes);
 }
 inline void aligned_backing_free(void* data) { std::free(data); }
-#endif
 
 using AlignedBacking = std::unique_ptr<void, decltype(&aligned_backing_free)>;
 

@@ -2,9 +2,11 @@
 // dense projections NVIDIA stores in BF16 (Dense8 re-stores them in Q8) and the two BF16 groups both
 // recipes share.
 //
-// Decode widths (T = 1..8, the column-invariant skinny GEMV of the runtime-shape fallback): each shape's
-// time against its DRAM floor (weight bytes at --dram-gbps), so a shape whose skinny route is far from
-// the floor is visible. Prefill and verification widths (T >= 9): for each problem and T it times, with
+// Decode widths (T = 1..8): sweep skinny GEMV schedules alongside the fallback and registered routes,
+// checking column invariance and skinny-candidate bit equality against the fallback at T = 8.
+// Report time against the weight-byte DRAM floor (--dram-gbps; default is the
+// GB10 measured sustained-read ceiling, see gpu_reference.h).
+// Prefill and verification widths (T >= 9): for each problem and T it times, with
 // cold-L2 CUDA graphs:
 //   fallback    the runtime-shape GEMM the problems used before V0 (VM1 baseline),
 //   registered  the public ops::linear route that production dispatch selects now,
@@ -14,11 +16,11 @@
 // It then proposes, per problem, a selector body for src/ops/linear/bf16/shapes/n<N>_k<K>.cu: the
 // fastest candidate at each measured T, merged into intervals while the kept candidate stays
 // within --tolerance-pct of the fastest. A boundary sits on the last measured T of its interval;
-// refine a seam with --t-list. T <= 8 stays on the fallback's skinny GEMV and is not swept.
+// refine a seam with --t-list. Decode schedules are reported separately, without generated selectors.
 //
 // Usage:
 //   infernix_bf16_flash_next_sweep [--shape LABEL] [--t-list 9,16,...] [--warmup N] [--repeat N]
-//       [--tolerance-pct P] [--dram-gbps G] [--csv PATH]
+//       [--tolerance-pct P] [--dram-gbps G] [--csv PATH] [--decode-only]
 #include "core/device.h"
 #include "core/weight.h"
 #include "direct_bf16_weight.cuh"
@@ -32,7 +34,6 @@
 #include "ops/linear/bf16/bf16_launch.cuh"
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_skinny.cuh"
-#include "roofline.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -52,7 +53,6 @@
 #include <vector>
 
 using namespace infernix;
-namespace roofline = infernix::bench::roofline;
 using namespace infernix::ops::detail;
 
 namespace {
@@ -165,6 +165,21 @@ constexpr Shape kShapes[] = {
     {"hcup", 10240, 320, 8192},     // hyper-connection mixer up
     {"fmdown", 320, 10240, 64},     // final mixer down (the head's columns only)
     {"head", 248320, 2560, 64},     // lm_head (verification columns)
+    {"prophead", 131072, 2560, 64}, // the q4_g64_fp16 proposal head's production width
+    {"n48_k2560", 48, 2560, 8192},
+    {"n256_k5120", 256, 5120, 8192},
+    {"n1152_k1152", 1152, 1152, 8192},
+    {"n1152_k1536", 1152, 1536, 8192},
+    {"n1152_k4304", 1152, 4304, 8192},
+    {"n1664_k2560", 1664, 2560, 8192},
+    {"n2560_k2560", 2560, 2560, 8192},
+    {"n2560_k4608", 2560, 4608, 8192},
+    {"n3456_k1152", 3456, 1152, 8192},
+    {"n4304_k1152", 4304, 1152, 8192},
+    {"n4608_k4608", 4608, 4608, 8192},
+    {"n5120_k4608", 5120, 4608, 8192},
+    {"n5120_k6144", 5120, 6144, 8192},
+    {"n14336_k5120", 14336, 5120, 8192},
 };
 
 const std::vector<int> kDefaultTs{9,   12,  16,  24,   32,   48,   64,   96,   100,  128, 192,
@@ -180,9 +195,12 @@ struct Options {
     int warmup          = 2;
     int repeat          = 7;
     double tolerance    = 0.02;
-    double dram_gbps    = roofline::kDramSpecGBs;
+    double dram_gbps    = 0.0; // Resolve known devices at startup; explicit override otherwise.
     bool decode_only    = false;
     std::string csv;
+    std::uint64_t flush_mib = infernix::bench::default_cold_flush_mib(); // 1 MiB warm, cold-sized to device L2.
+    int custom_n        = 0;
+    int custom_k        = 0;
 };
 
 std::vector<int> parse_list(const char* text) {
@@ -215,6 +233,10 @@ Options parse(int argc, char** argv) {
         };
         if (arg == "--shape") {
             options.shape = next();
+        } else if (arg == "--n") {
+            options.custom_n = std::atoi(next());
+        } else if (arg == "--k") {
+            options.custom_k = std::atoi(next());
         } else if (arg == "--t-list") {
             options.ts = parse_list(next());
         } else if (arg == "--warmup") {
@@ -226,14 +248,22 @@ Options parse(int argc, char** argv) {
         } else if (arg == "--decode-only") {
             options.decode_only = true;
         } else if (arg == "--dram-gbps") {
-            options.dram_gbps = std::atof(next());
+            const std::string text = next();
+            std::size_t used = 0;
+            options.dram_gbps = std::stod(text, &used);
+            if (used != text.size() || !std::isfinite(options.dram_gbps) || options.dram_gbps <= 0)
+                throw std::invalid_argument("--dram-gbps must be finite and positive");
         } else if (arg == "--csv") {
             options.csv = next();
+        } else if (arg == "--flush-mib") {
+            options.flush_mib = std::stoull(next());
+            if (options.flush_mib == 0 || options.flush_mib > (1ULL << 17))
+                throw std::invalid_argument("--flush-mib must be between 1 and 131072");
         } else {
             throw std::invalid_argument("unknown argument " + arg);
         }
     }
-    if (options.warmup < 0 || options.repeat <= 0 || options.tolerance < 0)
+    if (options.warmup < 0 || options.repeat <= 0 || !std::isfinite(options.tolerance) || options.tolerance < 0)
         throw std::invalid_argument("invalid warmup/repeat/tolerance");
     return options;
 }
@@ -349,7 +379,14 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
     for (const int t : kVm1Ts)
         if (t <= shape.max_t && std::find(ts.begin(), ts.end(), t) == ts.end()) ts.push_back(t);
     std::sort(ts.begin(), ts.end());
-    const int max_t = ts.back();
+    // Decode always visits T=8, and the head always visits T=16 regardless of
+    // --t-list. Filtering prefill widths may also leave no entries at all.
+    const bool is_head = std::strcmp(shape.label, "head") == 0 ||
+                         std::strcmp(shape.label, "prophead") == 0;
+    if (ts.empty() && !options.decode_only && !is_head)
+        throw std::invalid_argument("no --t-list widths within range for " + std::string(shape.label));
+    const int max_t = std::max(is_head ? 16 : 8,
+                              options.decode_only || ts.empty() ? 0 : ts.back());
 
     auto weight = bench::make_direct_bf16_weight(shape.n, shape.k);
     DeviceBuffer x  = bench::make_bf16(static_cast<std::size_t>(shape.k) * max_t, 101U);
@@ -444,7 +481,7 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
     }
     std::fflush(stdout);
 
-    if (std::strcmp(shape.label, "head") == 0) {
+    if (is_head) {
         // The heads run on ops::projection_fp32 (FP32 logits) in production, not on ops::linear: the BF16
         // head (recipe A) and the q8_g32_fp16 head (Dense8), each on the narrow and the tall mapping, whose
         // outputs must be equal bit for bit.
@@ -453,6 +490,10 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
         const Tensor rows(weight.storage.p, DType::BF16, {shape.k, shape.n});
         const Tensor* head[] = {&rows};
         auto q8 = bench::make_row_split_weight(QType::Q8_G32_FP16, shape.n, shape.k, shape.k);
+        // The proposal head is a q4_g64_fp16 copy of the lm_head rows; the head bench builds the full
+        // vocabulary shape so the two forms run at the same N/K. Padded K must be a multiple of 64.
+        const std::int32_t q4_padded_k = (shape.k + 63) / 64 * 64;
+        auto q4 = bench::make_row_split_weight(QType::Q4_G64_FP16, shape.n, shape.k, q4_padded_k);
         struct HeadForm {
             const char* name;
             double bytes;
@@ -466,6 +507,10 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
             {"q8", static_cast<double>(q8.model_weight_bytes()),
              [&](const Tensor& xt, Tensor& lt, ProjectionRoute route, cudaStream_t s) {
                  ops::detail::projection_fp32_route(xt, q8.weight, lt, route, s);
+             }},
+            {"q4", static_cast<double>(q4.model_weight_bytes()),
+             [&](const Tensor& xt, Tensor& lt, ProjectionRoute route, cudaStream_t s) {
+                 ops::detail::projection_fp32_route(xt, q4.weight, lt, route, s);
              }},
         };
         for (const HeadForm& form : forms) {
@@ -484,6 +529,9 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
                 CUDA_CHECK(cudaMemcpy(a.data(), logits.p, a.size() * 4, cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(b.data(), other.p, b.size() * 4, cudaMemcpyDeviceToHost));
                 const bool same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+                if (!same)
+                    throw std::runtime_error(std::string("head ") + form.name +
+                                             " narrow/tall bit mismatch at T=" + std::to_string(t));
                 const auto narrow = time_route([&](cudaStream_t s) { form.run(xt, lt, ProjectionRoute::Narrow, s); },
                                                flush, stream, options);
                 const auto tall = time_route([&](cudaStream_t s) { form.run(xt, lt, ProjectionRoute::Tall, s); }, flush,
@@ -626,7 +674,21 @@ void sweep_shape(const Shape& shape, const Options& options, std::FILE* csv,
 
 int main(int argc, char** argv) {
     try {
-        const Options options = parse(argc, argv);
+        Options options = parse(argc, argv);
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+        if (options.dram_gbps == 0.0) {
+            // This tree is tuned for DGX Spark / GB10 only. Use the MEASURED
+            // sustained-read ceiling from bench/gb10_peak_bw.cu (see
+            // gpu_reference.h), not the 273 GB/s published specification: the
+            // spec is ~11% above what this unit actually sustains.
+            if (std::strstr(prop.name, "GB10")) options.dram_gbps = bench::kSustainedReadGBs;
+            else throw std::invalid_argument("this tree is tuned for GB10; supply --dram-gbps");
+        }
+        std::fprintf(stderr, "GPU=%s SMs=%d; measured sustained bandwidth=%.3f GB/s\n",
+                     prop.name, prop.multiProcessorCount, options.dram_gbps);
         std::FILE* csv        = stdout;
         if (!options.csv.empty()) {
             csv = std::fopen(options.csv.c_str(), "w");
@@ -635,12 +697,21 @@ int main(int argc, char** argv) {
         std::fprintf(csv, "shape,N,K,T,route,median_us,min_us,p95_us,tflops\n");
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        bench::L2FlushBuffer flush(256ULL << 20);
+        bench::L2FlushBuffer flush(options.flush_mib << 20);
         bool matched = false;
-        for (const Shape& shape : kShapes) {
-            if (!options.shape.empty() && options.shape != shape.label) continue;
+        if (options.custom_n > 0 && options.custom_k > 0) {
+            std::string label = "n" + std::to_string(options.custom_n) + "_k" + std::to_string(options.custom_k);
+            Shape custom_shape{label.c_str(), options.custom_n, options.custom_k, 8192};
+            sweep_shape(custom_shape, options, csv, flush, stream);
             matched = true;
-            sweep_shape(shape, options, csv, flush, stream);
+        } else {
+            for (const Shape& shape : kShapes) {
+                std::string alt_label = "n" + std::to_string(shape.n) + "_k" + std::to_string(shape.k);
+                if (!options.shape.empty() && options.shape != shape.label && options.shape != alt_label)
+                    continue;
+                matched = true;
+                sweep_shape(shape, options, csv, flush, stream);
+            }
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         if (csv != stdout) std::fclose(csv);

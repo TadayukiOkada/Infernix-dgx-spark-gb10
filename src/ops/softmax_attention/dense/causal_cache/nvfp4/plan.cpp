@@ -65,12 +65,12 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
     // The fast prompt kernel publishes FP32 split partials for the merge.
+    const int prompt_min_width = std::max(min_width, kGroupedPrefillMaxWidth + 1);
     if (envelope.fast_prompt_kernel && batch == 1 && max_width > kGroupedPrefillMaxWidth &&
-        nvfp4_fast_prompt_applies(envelope.max_visible_keys))
+        nvfp4_fast_prompt_applies(envelope.max_visible_keys, prompt_min_width))
         maximum = std::max(maximum, mxfp8_tiled_workspace_bytes(
-                                        heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
-                                        max_width, envelope.max_visible_keys,
-                                        multiprocessor_count,
+                                        heads, prompt_min_width, max_width,
+                                        envelope.max_visible_keys, multiprocessor_count,
                                         envelope.prompt_split_workspace_bytes));
     return maximum;
 }

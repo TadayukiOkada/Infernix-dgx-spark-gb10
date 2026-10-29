@@ -241,16 +241,21 @@ int main() {
         const FastPathConfiguration iq3s{kGgml, false, kv};
         const FastPathConfiguration fp8{kBf16, false, kv};
         const FastPathConfiguration recipe_a{kBf16, true, kv};
+        const FastPathConfiguration nvfp4{DenseKernels::Nvfp4, true, kv};
         // Sampled drafts change no logit: every configuration whose drafter they were timed on or by.
-        for (const FastPathConfiguration& config : {iq3s, fp8, recipe_a, FastPathConfiguration{DenseKernels::Fp8Row, false, kv}}) {
+        for (const FastPathConfiguration& config :
+             {iq3s, fp8, recipe_a, nvfp4, FastPathConfiguration{DenseKernels::Fp8Row, false, kv}}) {
             failures += check(q::fast_path_qualified(FastPath::SampledMtpDrafts, config),
                               "sampled-mtp-drafts is qualified on every Flash-Next configuration");
         }
-        for (const FastPathConfiguration& config : {iq3s, fp8, recipe_a, FastPathConfiguration{DenseKernels::Fp8Row, false, kv}}) {
+        for (const FastPathConfiguration& config : {iq3s, fp8, recipe_a, nvfp4, FastPathConfiguration{DenseKernels::Fp8Row, false, kv}}) {
             for (const FastPath path : {FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume, FastPath::Preemption}) {
                 failures += check(q::fast_path_qualified(path, config),
-                                  "the coupling paths are qualified on IQ3_S, FP8, recipe A and recipe C");
+                                  "the coupling paths are qualified on IQ3_S, FP8, recipe A, NVFP4 and recipe C");
             }
+            failures += check(q::fast_path_qualified(FastPath::QsaPrepareFused, config) ==
+                                  q::fast_path_applies(FastPath::QsaPrepareFused, config, options),
+                              "qsa-prepare-fused is qualified where its kernel runs");
         }
         // NVIDIA FP4-Local, both expert activation precisions: speculation and cache resume by its joint
         // gate, preemption by its increment.
@@ -260,12 +265,15 @@ int main() {
                                   "the coupling paths are qualified on NVIDIA FP4-Local");
             }
         }
-        // FP16 GDN: faster on IQ3_S and FP8 prefill, not on Dense8's (IQ3_S with BF16 KV since it passed
-        // its prefill gate against the precise reference).
+        failures += check(q::fast_path_applies(FastPath::Nvfp4A4Pair, nvfp4, options) &&
+                              q::fast_path_qualified(FastPath::Nvfp4A4Pair, nvfp4),
+                          "nvfp4-a4-pair applies and is qualified on NVFP4 dense");
         failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, iq3s) &&
                               q::fast_path_qualified(FastPath::GdnF16Accumulate, fp8) &&
-                              !q::fast_path_qualified(FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, kv}),
-                          "gdn-f16-accumulate is registered where it was measured faster and passed");
+                              q::fast_path_qualified(FastPath::GdnF16Accumulate, recipe_a) &&
+                              q::fast_path_qualified(FastPath::GdnF16Accumulate, nvfp4) &&
+                              q::fast_path_qualified(FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, kv}),
+                          "gdn-f16-accumulate is registered across Flash-Next configurations");
     }
     failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Exact,
                       "the exact route keeps the GDN prefill exact");

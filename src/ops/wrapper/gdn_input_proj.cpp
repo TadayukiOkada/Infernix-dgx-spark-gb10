@@ -12,6 +12,7 @@
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_plan.h"
 #include "ops/linear/q8/q8_shapes.h"
+#include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/mxfp8/mxfp8_dispatch.h"
@@ -336,6 +337,24 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     validate_policy(policy, weight.qtype);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+
+    if (weight.qtype == QType::NVFP4 && weight.k == 2560) {
+        constexpr std::int32_t kHidden  = 2560;
+        constexpr std::int32_t kQkvRows = 10240;
+        constexpr std::int32_t kZRows   = 6144;
+        constexpr std::int32_t kRows    = kQkvRows + kZRows;
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(qkv, kQkvRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_single_parent_nonoverlap(x, qkv, z);
+        detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
+        }
+        detail::launch_nvfp4_n16384_k2560_split(x, weight, qkv, z, stream, policy, routes,
+                                                workspace);
+        return;
+    }
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden  = 5120;
@@ -865,6 +884,12 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
     if (parent_qtype == QType::NVFP4) {
+        if (parent_rows == 16384 && input_rows == 2560 && !column_invariant(policy)) {
+            return max_tokens >= 128
+                       ? detail::nvfp4_a4_workspace_capacity_bytes(
+                             max_tokens, 2560, detail::kNvfp4A4ResidualTerms, true)
+                       : 0;
+        }
         if (parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
             input_rows != detail::Nvfp4N16384K5120::kInputRows) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
@@ -898,7 +923,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
 }
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
-                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes) {
+                    LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                    LinearRoutes routes) {
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("gdn_input_proj: unsupported route set");
     }
@@ -1241,7 +1267,15 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     if (!valid_linear_routes(routes)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: unsupported route set");
     }
-    require_q8_flash_next_parent(query_key_value_z_weight, kOperation);
+    if (query_key_value_z_weight.qtype == QType::NVFP4) {
+        detail::validate_nvfp4_weight(query_key_value_z_weight, kOperation);
+        if (query_key_value_z_weight.n != 16384 || query_key_value_z_weight.k != kHidden) {
+            throw std::invalid_argument(std::string(kOperation) +
+                                        ": invalid query/key/value/z weight");
+        }
+    } else {
+        require_q8_flash_next_parent(query_key_value_z_weight, kOperation);
+    }
     const std::int32_t batch = x.ne[2];
     if (x.ne[1] != 1 || batch <= 0 || batch > kMaxBatch) {
         throw std::invalid_argument(
@@ -1279,6 +1313,12 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     }
 
     const Tensor x_columns(x.data, x.dtype, {kHidden, batch});
+    if (parent.qtype == QType::NVFP4) {
+        detail::launch_nvfp4_n16384_k2560_conv_snapshot(
+            x_columns, parent, conv_weight, conv_states, initial_state_slots, snapshot_base_slots,
+            query, key, value, z, stream);
+        return;
+    }
     detail::launch_q8_n16384_k2560_conv_snapshot(x_columns, parent, conv_weight, conv_states,
                                                  initial_state_slots, snapshot_base_slots, query,
                                                  key, value, z, routes, stream);

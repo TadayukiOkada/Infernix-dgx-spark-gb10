@@ -155,7 +155,7 @@ enum class NarrowA16 : std::uint8_t { kExact, kA4Residual, kA8 };
 // the gate and up rows when every expert's two scales are equal, else one per scale (kA4SeparateUp).
 enum class LosslessExpertDesign : std::uint8_t { kNone, kA4, kA4SeparateUp };
 
-enum class CpuIsa { kScalar, kAvx2, kAvxVnni, kAvx512Vnni };
+enum class CpuIsa { kScalar, kNeon };
 
 const char* cpu_isa_name(CpuIsa isa);
 bool cpu_isa_supported(CpuIsa isa);

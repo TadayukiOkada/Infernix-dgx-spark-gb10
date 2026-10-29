@@ -36,9 +36,6 @@
 
 // The Windows SDK's minwindef.h (through runtime/contract/execution.h) defines `near` as an empty
 // legacy compatibility macro; drop it so the local helper below keeps its name.
-#ifdef _WIN32
-#undef near
-#endif
 
 namespace {
 
@@ -3764,6 +3761,12 @@ int test_ngram_proposal_only_sources() {
                               content_tokens("<|im_start|>user\n<think>plan</think>\n"
                                              "<|im_end|><|image_pad|>\n"),
                       "a control spelling in a derived ngram source became a control token");
+    auto taken = infernix::models::qwen3_5::PreparedPromptAccess::take_ngram_index(b);
+    failures += check(taken != nullptr &&
+                          infernix::models::qwen3_5::PreparedPromptAccess::take_ngram_index(b) ==
+                              nullptr &&
+                          !FrontendFactory::inspect(b).token_ids.empty(),
+                      "take_ngram_index must move the index once without consuming the prompt");
     options.ngram_archive_enabled            = true;
     const Frontend retaining                 = make_frontend(resources(), options);
     auto retained_input                      = input;

@@ -7,6 +7,8 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/fp8/tiled_launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/fp8/plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/tiled_launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/fast_prompt_launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/fast_prompt_launch.cu"

@@ -12,8 +12,12 @@
 
 namespace infernix::ops::detail {
 
-// RTX 5090 codec frontiers balance trace-like and independent expert distributions. The public
-// workspace query starts at the earliest codec-specific prefill route.
+// Codec frontiers balance trace-like and independent expert distributions (verified on RTX 5090
+// sm_120a and DGX Spark GB10 sm_121a with 32 MiB cold-L2 flush: q8-q8 prefill overtakes small_t at
+// T=20 [1499 vs 2002 us at T=18], q4-q5/q4-q6 adaptive prefill overtakes small_t at T=47..48
+// [1615 vs 1716 us at T=46], and the 64-column wide plan at T>=768 holds T=512->768 latency growth
+// to +6.0% [3648 -> 3867 us]). The public workspace query starts at the earliest codec-specific
+// prefill route.
 inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;

@@ -18,10 +18,10 @@ namespace {
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 // Under LinearRoutes::Q4W4A8, calls of at least this many columns take the W4A8 route; narrower
-// calls keep the exact route's schedule and bits. 256 is the crossover upstream NInfer measured on
-// an RTX 5090 (giveen/ninfer-ext e99059abb); the route sweep of infernix_q4_linear_swiglu_bench
-// (--routes exact and w4a8 over --t-sweep) sets it for this kernel.
-constexpr std::int32_t kW4A8MinCols = 256;
+// calls keep the exact route's schedule and bits. On GB10 (sm_121, 48 SMs), once columns exceed
+// the 129..152 narrow-tail folded-MMA band, the two-tile W4A8 route (~1155 us at T=153..256)
+// beats the two-tile exact MmaSplitHalfPairR32C128 route (~1545 us) by 25%.
+constexpr std::int32_t kW4A8MinCols = 153;
 
 struct ColsSet {
     std::int32_t first;
@@ -39,17 +39,27 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
-constexpr std::array<RouteSpec, 10> kRoutes{{
+// GB10 (48 SM) retune. Cold-cache candidate sweeps show the split-half-pair MMA tiles dominate the
+// whole prefill range: the materialized [gate_up_rows,cols] scratch route loses 5-19% to them almost
+// everywhere except a narrow 25-32 window and the exact 64-column sweet spot. The narrow-tail variant
+// wins only for the small remainder right after each 128-token block (cols mod 128 <= 24, matching the
+// kernel's own kExactTailCols), where a near-empty wide tile would otherwise be launched.
+constexpr std::array<RouteSpec, 15> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
-    {{33, 128}, Q4LinearSwiGluScheduleId::Materialized},
-    {{129, 168}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
-    {{169, 224}, Q4LinearSwiGluScheduleId::Materialized},
-    {{225, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
-    {{257, 384}, Q4LinearSwiGluScheduleId::Materialized},
-    {{385, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
-    {{513, 640}, Q4LinearSwiGluScheduleId::Materialized},
-    {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{33, 63}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{64, 64}, Q4LinearSwiGluScheduleId::Materialized},
+    {{65, 128}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{129, 152}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
+    {{153, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{257, 280}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
+    {{281, 384}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{385, 408}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
+    {{409, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{513, 536}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
+    {{537, 640}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{641, 664}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
+    {{665, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {

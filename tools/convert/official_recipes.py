@@ -440,6 +440,22 @@ def _flash_next_drafter(model, recipe, experts=Q4):
             _assign(recipe, name, Q8)
 
 
+def _flash_next_drafter_bitexact(model, recipe):
+    """Keep the MTP drafter bit-exact except where the resident-expert kernel forces a bank codec.
+
+    The drafter's dense stack (its QSA block, hyper-connections, shared expert, projections, router,
+    shared-expert gate and the embedding/hidden projections) keeps NVIDIA's stored values exactly -- it
+    is left at the default import, with no ``q8_g32_fp16`` tier. Its 512 routed experts are block-scaled
+    FP8 in the checkpoint, but ``resident_moe_experts`` only loads row-split ``Q4_G64_FP16`` or
+    ``Q8_G32_FP16`` banks (``src/ops/resident_moe``), so they cannot be stored verbatim or as BF16. They
+    are encoded at ``q8_g32_fp16`` with MSE-chosen group scales: the highest-resolution codec the kernel
+    accepts, and a strictly closer match to the checkpoint's own 8-bit precision than recipe A's Q4."""
+
+    for name, parameter in model.parameters.items():
+        if name.startswith("mtp/") and "/moe/experts/" in name and parameter.projection:
+            _assign(recipe, name, Q8, method=grouped_mse)
+
+
 def qwen3_8_flash_next_nvfp4(model, recipe, sources):
     """Recipe A of Qwen3.8-Flash-Next (design §6.1): the main model and the vision tower bit-exact to
     NVIDIA's checkpoint. Every NVIDIA-quantized tensor keeps its codes and scales (the routed
@@ -466,6 +482,31 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
             )
             recipe.group(name, shape=parameter.shape)
     _flash_next_drafter(model, recipe)
+
+
+def qwen3_8_flash_next_nvfp4_bitexact(model, recipe, sources):
+    """Recipe A with a bit-exact MTP drafter. Identical to ``qwen3_8_flash_next_nvfp4`` for the main
+    model and vision tower (every tensor bit-exact to NVIDIA's checkpoint, routed experts as exact
+    ``nvfp4_mul`` banks, the NVFP4 n-gram table in its own volume), except the drafter is not
+    re-quantized to Q8/Q4: its dense stack stays exactly as NVIDIA stored it (BF16) and its routed
+    experts keep the checkpoint's 8-bit precision in ``q8_g32_fp16``. The routed-expert codec is the
+    only deviation, forced by the resident-expert kernel; see ``_flash_next_drafter_bitexact``."""
+
+    from .qwen4_exp import import_expert_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    for name, parameter in model.parameters.items():
+        if name.startswith("text/layers/") and name.endswith("/moe/experts"):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="AllowA4",
+            )
+            recipe.group(name, shape=parameter.shape)
+    _flash_next_drafter_bitexact(model, recipe)
 
 
 def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
@@ -744,6 +785,30 @@ def qwen3_8_flash_next_dflash2(model, recipe, sources):
     _optional(model, recipe)
 
 
+def qwen3_8_flash_next_nvfp4_w4dense(model, recipe, sources):
+    """Recipe B plus a W4 dense tier: the four dense packed-projection families that dominate
+    single-stream decode weight traffic (GDN ``q/k/v/z`` and ``out_proj``, the QSA input group and
+    ``o_proj``, and the PLE key/value projections) move from ``q8_g32_fp16`` to ``nvfp4`` (W4A16,
+    MSE-chosen E4M3FN group scales). Packing is uniform because every member of each packing group
+    is reassigned together. Everything else stays exactly as recipe B has it: shared experts, the
+    hyper-connection mixers, the routers, ``lm_head`` and the whole MTP drafter remain ``q8_g32_fp16``.
+
+    ``activation_policy="A16Only"`` keeps the activations in BF16 (no A4 quantization, no activation
+    divisor), which is what the decode GEMV/SIMT ladder reads; the engine fills the legacy
+    ``input_scale_divisor`` ABI field itself."""
+
+    qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources)
+    tier1 = (
+        "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+        "/attention/query", "/attention/gate", "/attention/key", "/attention/value",
+        "/attention/index_query", "/attention/index_key", "/attention/output",
+        "/ple/key_projection", "/ple/value_projection",
+    )
+    for name in model.parameters:
+        if name.startswith("text/layers/") and name.endswith(tier1):
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -756,10 +821,12 @@ RECIPES = {
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_5_moe_nvfp4_modelopt": qwen3_5_moe_nvfp4_modelopt,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
+    "qwen3_8_flash_next_nvfp4_bitexact": qwen3_8_flash_next_nvfp4_bitexact,
     "qwen3_8_flash_next_nvfp4_dense8": qwen3_8_flash_next_nvfp4_dense8,
     "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
     "qwen3_8_flash_next_fp8": qwen3_8_flash_next_fp8,
     "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
     "qwen3_8_flash_next_gsq_rco_iq3s": qwen3_8_flash_next_gsq_rco_iq3s,
     "qwen3_8_flash_next_dflash2": qwen3_8_flash_next_dflash2,
+    "qwen3_8_flash_next_nvfp4_w4dense": qwen3_8_flash_next_nvfp4_w4dense,
 }

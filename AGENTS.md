@@ -147,6 +147,12 @@ inventories, and exact probabilistic outputs are not default requirements. Use e
 exact outputs, and appropriate numerical or behavioral criteria otherwise. State checks that could
 not run and their implications.
 
+A throughput number is admissible only when the same work was verified to have been computed.
+Tuning a capacity constant (tile width, row block, unit count, stage count) can reduce the work a
+kernel performs instead of making it faster, which shows up as a large apparent speedup. Establish
+the benchmark's units from its header, and re-derive the invariant that bounds the constant (warp
+layout, fragment count, grid extent) before accepting such a result.
+
 ## Reporting and completion
 
 Selective reporting and evidence gaming are prohibited, even when every disclosed
@@ -193,25 +199,144 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Scheduling, permits, preemption; prefix cache; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/hybrid-prefix-cache-spec.md`; `docs/maintainer/paged-kv-cache.md` |
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
-| Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
+| Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md`, `docs/gb10_roadmap.md` |
 | In-tree C++ interface | `include/infernix/engine.h`, `include/infernix/types.h` |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.
 
 ## Local operations
 
-Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
-causes failures or interferes with the task, and briefly explain why.
+For the configured Ninja tree, the high-throughput default build command on this 20-logical-CPU
+GB10 host is `cmake --build build-native --parallel "$(nproc)"` (or `ninja -C build-native -j "$(nproc)"`
+directly to bypass CMake manifest checks). This rebuilds only stale outputs; do not clean or
+reconfigure for ordinary source edits. For a focused change, build only its test or product target,
+then run the matching test selection:
 
-Use a Python 3.11 interpreter explicitly (on Windows `py -3.11`, on Linux `python3.11` or the
-maintainer environment's interpreter); the default `python`/`python3` may be a different version.
-Use it only after selecting that environment or checking its version. Normal resources are the
-build trees (`build-windows/` from `build_native.bat`, `build/` from the CMake presets), `out/`
-for converted artifacts and their `.conversion.json` reports, and `profiles/ncu/`,
-`profiles/nsys/`, `profiles/bench/`; the toolchain is CUDA 13.
+```bash
+# 1. Fast compile check (~2.3s): validate C++/CUDA syntax/templates before linking
+ninja -C build-native src/ops/CMakeFiles/infernix_ops.dir/linear/<qtype>/shapes/n<N>_k<K>.cu.o
+
+# 2. Unified binary build: build bench, test, and infernix-serve in a single invocation to share device link
+ninja -C build-native -j "$(nproc)" infernix_linear_bench infernix_linear_<qtype>_a16_test infernix-serve
+
+# 3. Fast shape-targeted test (~2.1s vs 118s full suite): validate modified shape against oracle
+./build-native/tests/infernix_linear_<qtype>_a16_test --shape <N> <K>
+
+# 4. One-way CUDA stack-spill ratchet gate (verifies zero new STACK>0 or LOCAL>0 symbols on infernix-serve)
+ctest --test-dir build-native -R infernix_cuda_stack_check --output-on-failure
+
+# 5. Final end-to-end model A/B benchmark across KV dtypes and plain/MTP modes (after lower-level A/B passes)
+./bench/run_kv_matrix_bench.sh /tmp/kvmatrix_after
+```
+
+Ninja compilation uses the requested parallelism, while the current CMake configuration also
+allows up to `INFERNIX_LINK_JOBS=8` concurrent link/archive/device-link jobs. The default was
+raised from strict serialization because a serialized link pool left the 20-core host about 63%
+idle for 347 seconds during a measured 12-file change; the current CMake comment records 242
+resulting link edges. Because `infernix_ops` is built with relocatable device code (`-rdc=true`),
+`nvlink` (`cmake_device_link.o`) takes ~55.8s on this host; building multiple consumer targets
+in a single Ninja invocation amortizes this device link so it runs only once. Do not mistake a
+link phase with fewer processes for a stalled parallel build. If links exhaust memory, configure
+`INFERNIX_LINK_JOBS=1`; lower build parallelism only when compilation causes actual memory pressure
+or interferes with other work.
+
+For the full configured test suite, let CTest use the host's available workers:
+
+```bash
+ctest --test-dir build-native --output-on-failure --parallel "$(nproc)"
+```
+
+CTest honors each registration's `RUN_SERIAL` property, running those tests alone while allowing
+the other tests to overlap. In the current `build-native` configuration, 39 of 265 tests are
+marked `RUN_SERIAL` (including real-artifact integrations and selected wide/resource-heavy GPU
+tests). Real-artifact tests skip when their required artifact environment variables are unset.
+Other GPU tests may still compete for device resources; if that is observed, reduce only CTest's
+`--parallel` value and leave build parallelism unchanged. Inspect the active suite and scheduling
+properties with `ctest --test-dir build-native --show-only=json-v1`.
+
+Use a Python 3.11 interpreter explicitly (`python3` or the maintainer environment's
+interpreter); the default `python`/`python3` may be a different version. Use it only after
+selecting that environment or checking its version. Normal resources are the build trees
+(`build/` from the CMake presets), `out/` for converted artifacts and their `.conversion.json`
+reports, and `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the toolchain is CUDA 13 on
+64-bit Linux aarch64, which is the only supported platform.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
 
+Inspect compiled kernels per function, never by dumping a whole binary. `cuobjdump -res-usage <linked-target>`
+takes about 1.1 s and yields the exact stored symbol names together with `REG`/`STACK`/`SHARED`/`LOCAL`;
+`cuobjdump -sass -fun <exact symbol> <linked-target>` then takes about 1.6 s for one kernel. An unfiltered
+`cuobjdump -sass` on a 412 MB linked bench executable emitted 4.53 GB in 132.8 s. `--function` matches the
+stored symbol exactly, so file-static kernels carry their `__nv_static_<hash>_<file>_<id>__` prefix, and a
+short or mangled-only name returns exit code 0 with no instructions — verify a nonzero instruction count
+before drawing any conclusion. This build's `cuobjdump` has no `regex:` function filter.
+
 Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
 such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.
+
+## GPU kernel engineering skills, `cuda-kernel-toolkit`, and multi-agent orchestration
+
+For GPU kernel work (new kernels, kernel optimization, `/shapes/` tuning, profiling, or numerical
+repair), read `.github/copilot-instructions.md`, `cuda-kernel-toolkit/README.md`,
+`cuda-kernel-toolkit/docs/usage.md`, and the skills under `.github/skills/`: architecture discovery
+for every supplied target GPU, kernel optimization for the end-to-end loop, kernel repair for
+failure diagnosis, validation/benchmarking for correctness and honest timing, CUDA profiling for
+NCU/NSYS evidence, experiment memory for candidate history, and the task-specific `cuda-*` design
+playbooks. They provide methods, not additional deliverables, approval requirements, or ceilings
+on the work; the product and architecture rules above still govern. In particular, profile NCU
+(`ncu`) only on synthetic inputs and synthetic parameters — never load real model weights in an
+NCU-instrumented process — while NSYS (`nsys`) may trace a real model invocation.
+
+Always use the in-tree `cuda-kernel-toolkit` (`PYTHONPATH=cuda-kernel-toolkit /opt/etc/Infernix/.venv-convert/bin/python3 -m ckt`)
+instead of writing ad-hoc profiling/timing scripts or doing mental arithmetic:
+
+- **Zero hand math (`ckt math`)**: Never estimate occupancy, warp-register rounding steps, shared-memory
+  bank conflicts, CTA wave efficiency, quantized weight bytes, L2 residency, or A/B statistics by hand.
+  Run `ckt math {occupancy,waves,tile,smem,workload,l2,vector,roofline,mlp,ab}`.
+- **Live hardware & 21-pipe precision ceilings (`ckt env`)**: Queries `cudaDeviceProp` and measures all
+  21 SIMT and Tensor Core pipes (`bandwidth`, `shared_mem_bw`, `fp32`, `fp64`, `int32`, `fp16_simt`,
+  `bf16_simt`, `tf32`, `fp16_f32acc`, `fp16_f16acc`, `bf16`, `int8`, `int4`, `fp8_e4m3`, `fp8_e5m2`,
+  `mxfp8`, `mxfp6`, `mxfp4`, `nvfp4`), cached in `.ckt_cache/env.json`.
+- **Per-symbol SASS & resource inspection (`ckt static --sass` & `ckt compare`)**: Extracts exact
+  stored symbols (`REG`, `STACK`, `SHARED`, `LOCAL`, and SASS instruction mix including `IMMA`, `HMMA`,
+  `QMMA`, `OMMA`, `LDG.128`, `LDS.128`, `STL`/`LDL` spills) in ~1.5 s without dumping whole binaries.
+- **Fast `/shapes/` discovery and cold-L2 benchmarking (`ckt shapes {list,inspect,bench}`, `tools/gb10_shape_sweep.py`, `tools/gb10_nvfp4_a4_sweep.py`)**:
+  Parses all `src/ops/linear/*/shapes/n<N>_k<K>.{cu,cpp}` files, audits spills and `__launch_bounds__`,
+  and benchmarks them via `infernix_linear_bench` with a GB10-right-sized 32–48 MiB L2 flush (5x–8x faster
+  than the 256 MiB RTX 5090 default) and route-boundary token probing (`[B, B+1]`), automatically flagging
+  route-transition cliffs or sweeping new GB10-native tile schedules.
+- **Interleaved A/B testing (`ckt ab`), SQLite hotspot ranking (`ckt hotspots`), & final E2E KV-matrix A/B (`bench/run_kv_matrix_bench.sh`)**:
+  Runs round-robin interleaved GPU commands (`--cmd-a`, `--cmd-b`), env toggles (`--env-a`, `--env-b`), or
+  shape CSV comparisons (`--csv-a`, `--csv-b`), ranks NSYS `.sqlite` traces with GB10 occupancy modeling,
+  and concludes every multi-op or campaign-level optimization with `./bench/run_kv_matrix_bench.sh <out-dir>`
+  to verify end-to-end `prefill t/s`, `decode t/s`, and MTP `acceptance_rate` on real Qwen3.8-Flash-Next
+  artifacts (`iq3s`, `dense8`, `nvfp4`) across KV dtypes and `plain`/`mtp` modes.
+
+When operating with `.github/agents/`, follow the Parent–Child hierarchy:
+
+- **Parent Orchestrators (`cuda-kernel-orchestrator.agent.md` and `cuda-kernel-optimizer.agent.md`)**:
+  Own goal tracking, dispatch child subagents, enforce lower-level op A/B gates followed by the final
+  `./bench/run_kv_matrix_bench.sh` end-to-end A/B benchmark, and recover interrupted work.
+- **Child Subagents (`agents: []`, `user-invocable: false` — cannot spawn nested subagents)**:
+  - `cuda-source-auditor.agent.md` (CPU-only, parallelizable): source audit, `ckt static --sass`,
+    `ckt compare`, `ckt math`, `ckt shapes inspect`, `ckt hotspots`.
+  - `cuda-kernel-implementer.agent.md` (CPU-only, parallelizable): single-mechanism edits, fast `.cu.o`
+    compile checks, unified Ninja build, post-build `ckt compare` and `ckt math` gatekeeper checks, and repair.
+  - `cuda-gpu-benchmarker.agent.md` (Exclusive GPU Owner, strictly serialized — 1 instance at a time):
+    `ctest` (including `infernix_cuda_stack_check`), `compute-sanitizer`, `ckt shapes bench`,
+    op-level `infernix_*_bench` + `ckt ab`, `ckt sweep`, synthetic-only `ckt profile`, and final end-to-end
+    `./bench/run_kv_matrix_bench.sh` A/B validation.
+- **Subagent recovery protocol**: If a child subagent stops before completing its task, the Parent
+  Orchestrator inspects the workspace and re-invokes the subagent with:
+  ```text
+  The previous subagent stopped before completing its task.
+
+  Inspect the current workspace and determine:
+  1. What it already implemented.
+  2. What remains unfinished.
+  3. Whether any tests are failing.
+
+  Continue from the existing changes. Do not redo completed work.
+  Finish the task, run the relevant tests, and report the result.
+  ```

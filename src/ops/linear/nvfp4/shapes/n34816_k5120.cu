@@ -10,8 +10,10 @@ using Gemv =
 using C2      = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
                                      Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                      Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 4, 2, 1>;
+using T64R64  = Nvfp4A4MmaSchedule<64, 64, 256, 2, 4, 2, 1>;
+using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
@@ -20,13 +22,15 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens <= 2) return nvfp4_linear_a16_simt<Geometry, 2, C2, true>;
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2>>;
-    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1>>;
-    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 2>>;
+    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 8, 1>>;
+    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1>>;
     if (tokens <= 64)
-        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
     if (tokens <= 96)
-        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>;
-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;
+    if (tokens <= 128)
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 256, 64, 32, 32, 2, 1>>;
 }
 
 void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
@@ -34,11 +38,13 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 256) return nvfp4_a4_tma_route<Nvfp4GeometryId::N34816K5120>();
-    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R128>();
-    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T64R128>();
-    if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
-    return nvfp4_a4_mma_route<Geometry, T128R128Resident>();
+    if (tokens >= 257) return nvfp4_a4_tma_route<Nvfp4GeometryId::N34816K5120>();
+    if (tokens >= 129)
+        return nvfp4_a4_tma_route<Nvfp4GeometryId::N34816K5120, Nvfp4ScaleLayout::Tiled128>();
+    if (tokens <= 24) return nvfp4_a4_mma_route<Geometry, T32R64>();
+    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T64R128>();
+    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T64R64>();
+    return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
 }
 
 bool uses_a4(std::int32_t, std::int32_t) { return true; }

@@ -115,6 +115,14 @@ public:
         return out;
     }
 
+    bool sliceable(WeightId id) const {
+        const auto& parts = model_.weight(id).view.parts;
+        if (parts.empty()) { return false; }
+        const auto layout = parts.front().parent->geometry.layout;
+        return layout == QuantLayout::Contiguous || layout == QuantLayout::RowSplit ||
+               is_ggml_matrix_layout(layout);
+    }
+
     // The converter packs the six input projections into one parent, unless the index projections
     // are stored in another format (recipe C: FP8 query/gate/key/value, BF16 indexer); then they form
     // two parents and run as two projections.
@@ -123,12 +131,18 @@ public:
         AttentionParameters out{joined ? linear({a.query, a.gate, a.key, a.value, a.index_query, a.index_key})
                                        : linear({a.query, a.gate, a.key, a.value}),
                                 std::nullopt,
+                                std::nullopt,
+                                std::nullopt,
                                 tensor(a.query_norm),
                                 tensor(a.key_norm),
                                 tensor(a.index_query_norm),
                                 tensor(a.index_key_norm),
                                 linear({a.output})};
         if (!joined) { out.index_projection = linear({a.index_query, a.index_key}); }
+        if (sliceable(a.key) && sliceable(a.value) && sliceable(a.index_key)) {
+            out.kv_projection        = linear({a.key, a.value});
+            out.index_key_projection = linear({a.index_key});
+        }
         return out;
     }
 

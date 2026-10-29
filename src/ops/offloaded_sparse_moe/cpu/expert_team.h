@@ -62,6 +62,13 @@ struct CpuExpertHeartbeat {
 
 class CpuExpertTeam {
 public:
+    // Core placement for a team of `workers` on this host: on a big.LITTLE part, the performance
+    // tier when the whole team fits on it (a work-stealing round then loads the fast cores harder);
+    // no preference otherwise. Pinning more workers than there are fast cores oversubscribes them
+    // and stalls the spin barriers (measured: 0.42 ms -> 18 ms at 16 workers on 10 big cores), so a
+    // team larger than the big tier is left to the scheduler. Returns {} on a symmetric host.
+    [[nodiscard]] static std::vector<std::uint64_t> placement_cpus(int workers);
+
     struct Options {
         int workers         = 1;  // including the calling thread
         CpuIsa isa          = best_cpu_isa();
@@ -128,6 +135,7 @@ private:
     int spin_iterations_;
     int prefetch_bytes_;
     ExpertShape shape_;
+    std::vector<std::uint64_t> cpus_;
     std::vector<canon::A4Block> x_gate_; // [job][col][kGateUpBlocks]
     std::vector<canon::A4Block> x_up_;
     std::vector<canon::A4Block> h_; // [job][col][kHBlocks], shared between the phases

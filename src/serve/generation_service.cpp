@@ -357,6 +357,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.chat_template_path       = options_.chat_template_path;
     engine_options.ngram_volume_path        = options_.ngram_volume_path;
     engine_options.ngram_residency          = options_.ngram_residency;
+    engine_options.ngram_cache_bytes        = options_.ngram_cache_bytes;
     engine_options.expert_stripe_path       = options_.expert_stripe_path;
     engine_options.expert_state_path        = options_.expert_state ? *options_.expert_state
                                                                     : std::filesystem::path(options_.artifact_path +
@@ -369,7 +370,6 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.rope_yarn_factor          = options_.rope_yarn_factor;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.vram_headroom_bytes      = options_.vram_headroom_bytes;
-    engine_options.vram_past_budget         = options_.vram_past_budget;
     engine_options.expert_tail_skip         = options_.expert_tail_skip;
     engine_options.expert_a4_activations    = options_.expert_a4_activations;
     engine_options.a8_activations           = options_.a8_activations;

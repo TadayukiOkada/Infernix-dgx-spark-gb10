@@ -35,13 +35,9 @@
 
 #include <cuda_runtime.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -102,11 +98,6 @@ Stats stats(std::vector<double> v) {
 }
 
 std::uint64_t available_ram() {
-#ifdef _WIN32
-    MEMORYSTATUSEX m{};
-    m.dwLength = sizeof(m);
-    return GlobalMemoryStatusEx(&m) ? m.ullAvailPhys : 0;
-#else
     std::ifstream in("/proc/meminfo");
     std::string key;
     std::uint64_t value = 0;
@@ -115,7 +106,6 @@ std::uint64_t available_ram() {
         if (key == "MemAvailable:") { return value * 1024; }
     }
     return 0;
-#endif
 }
 
 // ------------------------------------------------------------------ the artifact's records
@@ -188,9 +178,6 @@ private:
 
 // ------------------------------------------------------------------ unbuffered asynchronous reads
 struct Op {
-#ifdef _WIN32
-    OVERLAPPED overlapped{}; // first member: completions map back to the Op
-#endif
     std::size_t file     = 0;
     std::uint64_t offset = 0;
     std::uint32_t bytes  = 0;
@@ -202,21 +189,6 @@ struct Op {
 class DirectReads {
 public:
     DirectReads(const std::vector<std::filesystem::path>& paths, std::size_t max_in_flight) {
-#ifdef _WIN32
-        (void)max_in_flight;
-        for (std::size_t i = 0; i < paths.size(); ++i) {
-            // Deny writers, as the tier's handles will (memory-tiers.md §4.4).
-            HANDLE file = CreateFileW(paths[i].c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                                      OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
-            if (file == INVALID_HANDLE_VALUE) {
-                throw std::runtime_error("cannot open " + paths[i].string() + " unbuffered (error " +
-                                         std::to_string(GetLastError()) + ")");
-            }
-            files_.push_back(file);
-            port_ = CreateIoCompletionPort(file, port_, static_cast<ULONG_PTR>(i), 0);
-            if (port_ == nullptr) { throw std::runtime_error("CreateIoCompletionPort failed"); }
-        }
-#else
         for (const auto& path : paths) {
             const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
             if (fd < 0) { throw std::runtime_error("cannot open " + path.string() + " with O_DIRECT"); }
@@ -225,13 +197,8 @@ public:
         for (std::size_t i = 0; i < max_in_flight; ++i) {
             workers_.emplace_back([this] { work(); });
         }
-#endif
     }
     ~DirectReads() {
-#ifdef _WIN32
-        for (HANDLE h : files_) { CloseHandle(h); }
-        if (port_ != nullptr) { CloseHandle(port_); }
-#else
         {
             const std::lock_guard lock(mutex_);
             stop_ = true;
@@ -239,56 +206,28 @@ public:
         work_cv_.notify_all();
         for (auto& t : workers_) { t.join(); }
         for (int fd : files_) { ::close(fd); }
-#endif
     }
     DirectReads(const DirectReads&)            = delete;
     DirectReads& operator=(const DirectReads&) = delete;
 
     void submit(Op* op) {
         op->failed = false;
-#ifdef _WIN32
-        op->overlapped            = {};
-        op->overlapped.Offset     = static_cast<DWORD>(op->offset);
-        op->overlapped.OffsetHigh = static_cast<DWORD>(op->offset >> 32);
-        if (!ReadFile(files_[op->file], op->dest, op->bytes, nullptr, &op->overlapped) &&
-            GetLastError() != ERROR_IO_PENDING) {
-            throw std::runtime_error("ReadFile failed (error " + std::to_string(GetLastError()) + ")");
-        }
-#else
         {
             const std::lock_guard lock(mutex_);
             queue_.push_back(op);
         }
         work_cv_.notify_one();
-#endif
     }
 
     // Blocks until at least one read completes and appends the completed ones.
     void wait(std::vector<Op*>& done) {
-#ifdef _WIN32
-        OVERLAPPED_ENTRY entries[64];
-        ULONG n = 0;
-        if (!GetQueuedCompletionStatusEx(port_, entries, 64, &n, INFINITE, FALSE)) {
-            throw std::runtime_error("GetQueuedCompletionStatusEx failed");
-        }
-        for (ULONG i = 0; i < n; ++i) {
-            auto* op   = reinterpret_cast<Op*>(entries[i].lpOverlapped);
-            op->failed = op->overlapped.Internal != 0 || entries[i].dwNumberOfBytesTransferred != op->bytes;
-            done.push_back(op);
-        }
-#else
         std::unique_lock lock(mutex_);
         done_cv_.wait(lock, [this] { return !completed_.empty(); });
         done.insert(done.end(), completed_.begin(), completed_.end());
         completed_.clear();
-#endif
     }
 
 private:
-#ifdef _WIN32
-    std::vector<HANDLE> files_;
-    HANDLE port_ = nullptr;
-#else
     void work() {
         while (true) {
             Op* op = nullptr;
@@ -315,7 +254,6 @@ private:
     std::deque<Op*> queue_;
     std::vector<Op*> completed_;
     bool stop_ = false;
-#endif
 };
 
 // ------------------------------------------------------------------ pinned host slots
@@ -658,13 +596,11 @@ void section_pin(std::uint64_t chunks) {
 void section_pinlimit(std::uint64_t cap_gib) {
     std::printf("\n== pinned-memory limit: 1.32 GiB chunks until failure, %llu GiB, or < 4 GiB available\n",
                 static_cast<unsigned long long>(cap_gib));
-#ifndef _WIN32
     rlimit limit{};
     if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
         std::printf("  RLIMIT_MEMLOCK soft %llu, hard %llu\n", static_cast<unsigned long long>(limit.rlim_cur),
                     static_cast<unsigned long long>(limit.rlim_max));
     }
-#endif
     std::vector<void*> blocks;
     std::string stop = "cap reached";
     while (static_cast<std::uint64_t>(blocks.size() + 1) * kChunkBytes <= cap_gib * kGiB) {

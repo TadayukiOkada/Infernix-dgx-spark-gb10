@@ -6,7 +6,13 @@ namespace infernix::ops::detail {
 SelectorRoute candidate_selector_path_route(int steps, int batch) {
     if (steps < 1 || steps > 15 || batch < 1 || batch > 8)
         throw std::invalid_argument("invalid selector K/B");
-    return steps <= 4 ? SelectorRoute::Direct : SelectorRoute::Lattice;
+    // GB10 Direct/Lattice crossover (48 SMs, measured cold-graph, greedy+stochastic, K1..15 B1..8):
+    // Direct launches `batch` CTAs, so it saturates the device once batch >= 4 and wins at every K
+    // (the old rule forced Lattice here for K >= 5, costing 20-30% -- e.g. K8/B8 direct 16us vs
+    // lattice 22us). Below that Direct under-fills the SMs and the Lattice's K*B*16 CTAs win, but
+    // only from K >= 4 up: at short paths the Lattice's per-step build cost dominates, and K <= 3
+    // is within run-to-run noise at small batch -- the hot --draft-tokens 3 path -- so it stays Direct.
+    return (steps <= 3 || batch >= 4) ? SelectorRoute::Direct : SelectorRoute::Lattice;
 }
 
 const char* selector_route_name(SelectorRoute route) {

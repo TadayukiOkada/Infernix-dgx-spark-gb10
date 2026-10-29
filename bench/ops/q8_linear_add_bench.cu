@@ -29,7 +29,7 @@ using namespace infernix;
 namespace {
 
 constexpr std::int32_t kRows      = 2048;
-constexpr std::size_t kFlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
 
 struct Options {
     std::int32_t hidden = 6144;

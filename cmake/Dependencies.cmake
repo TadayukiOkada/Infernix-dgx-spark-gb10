@@ -2,42 +2,36 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 # CUDA runtime is exposed as a single interface target so every component links the
-# same runtime flavour. On Windows the static runtime is used so the apps do not ship
-# cudart*.dll and the final process keeps a single CRT; elsewhere it is shared.
+# same runtime flavour.
 add_library(infernix_cuda_runtime INTERFACE)
-if(WIN32)
-  set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
-  target_link_libraries(infernix_cuda_runtime INTERFACE CUDA::cudart_static)
-else()
-  set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
-  target_link_libraries(infernix_cuda_runtime INTERFACE CUDA::cudart)
-endif()
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+target_link_libraries(infernix_cuda_runtime INTERFACE CUDA::cudart)
 
-# FFmpeg: the prebuilt Windows vcpkg tree has no CMake package config, so it is resolved
-# from VCPKG_ROOT/VCPKG_TARGET_TRIPLET via the local find module (which also exposes the
-# tree as FFMPEG_VCPKG_TREE for DLL/zlib staging). Cross-platform builds use system
-# FFmpeg via pkg-config.
-if(WIN32)
-  list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-  if(DEFINED ENV{VCPKG_ROOT} AND DEFINED ENV{VCPKG_TARGET_TRIPLET})
-    list(APPEND CMAKE_PREFIX_PATH
-      "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_TARGET_TRIPLET}")
-  endif()
-  find_package(FFMPEG REQUIRED)
-  add_library(infernix_ffmpeg_dependencies INTERFACE)
-  target_include_directories(infernix_ffmpeg_dependencies INTERFACE ${FFMPEG_INCLUDE_DIRS})
-  target_link_directories(infernix_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARY_DIRS})
-  target_link_libraries(infernix_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARIES})
-  set(INFERNIX_FFMPEG_TARGET infernix_ffmpeg_dependencies)
-else()
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
-  set(INFERNIX_FFMPEG_TARGET PkgConfig::FFMPEG)
-endif()
+# FFmpeg from the system, via pkg-config.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+  libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+set(INFERNIX_FFMPEG_TARGET PkgConfig::FFMPEG)
 
-# libjpeg(-turbo) decodes JPEG images as Pillow does (media decoding). Windows finds it in the
-# same vcpkg tree (`vcpkg install libjpeg-turbo:x64-windows`), elsewhere the system package.
+# libjpeg(-turbo) decodes JPEG images as Pillow does (media decoding). The codec is
+# repository-pinned rather than host-discovered: the checked-in libjpeg-turbo 2.1.5 headers and
+# the aarch64 static archive under third_party/libjpeg-turbo are the only accepted implementation,
+# so a clean checkout needs no distribution development package and decoded pixels cannot drift
+# with a host libjpeg. FFmpeg still needs the system libjpeg.so.8 at runtime, which stays separate.
+set(INFERNIX_LIBJPEG_ROOT "${PROJECT_SOURCE_DIR}/third_party/libjpeg-turbo/usr")
+set(INFERNIX_LIBJPEG_LIBDIR "${INFERNIX_LIBJPEG_ROOT}/lib/${CMAKE_LIBRARY_ARCHITECTURE}")
+if(NOT EXISTS "${INFERNIX_LIBJPEG_LIBDIR}/libjpeg.a")
+  message(FATAL_ERROR
+    "Repository-pinned libjpeg-turbo is incomplete: expected "
+    "'${INFERNIX_LIBJPEG_ROOT}/include/jpeglib.h' and "
+    "'${INFERNIX_LIBJPEG_LIBDIR}/libjpeg.a' (host library architecture "
+    "'${CMAKE_LIBRARY_ARCHITECTURE}'). Restore third_party/libjpeg-turbo from git; "
+    "it is version-controlled, not a generated or installed dependency.")
+endif()
+# Seeded before find_package so FindJPEG adopts the pinned copy instead of searching the host,
+# and forced so a stale or host-derived cache entry from an earlier configure cannot win.
+set(JPEG_INCLUDE_DIR "${INFERNIX_LIBJPEG_ROOT}/include" CACHE PATH "" FORCE)
+set(JPEG_LIBRARY_RELEASE "${INFERNIX_LIBJPEG_LIBDIR}/libjpeg.a" CACHE FILEPATH "" FORCE)
 find_package(JPEG REQUIRED)
 
 # Repository-pinned header dependencies. No configure-time downloads.
@@ -57,28 +51,8 @@ add_subdirectory(third_party/xgrammar EXCLUDE_FROM_ALL)
 if(INFERNIX_BUILD_PRODUCT_SUPPORT)
   # Media acquisition uses CURLOPT_PROTOCOLS_STR and CURLOPT_REDIR_PROTOCOLS_STR,
   # introduced in libcurl 7.85 (not merely the version of the maintainer environment).
-  if(WIN32)
-    find_package(CURL 7.85 REQUIRED)
-    set(INFERNIX_CURL_TARGET CURL::libcurl)
-    # The built-in FindCURL / vcpkg config exposes CURL::libcurl as an ALIAS of the
-    # concrete imported target; import libs reference runtime DLLs that CMake only
-    # stages when they are declared. Register them on the concrete target.
-    if(TARGET CURL::libcurl_shared)
-      set(_curl_real CURL::libcurl_shared)
-    else()
-      set(_curl_real CURL::libcurl_static)
-    endif()
-    if(TARGET ${_curl_real})
-      file(GLOB _curl_dlls "${FFMPEG_VCPKG_TREE}/bin/*.dll")
-      if(_curl_dlls)
-        set_target_properties(${_curl_real} PROPERTIES
-          IMPORTED_LINK_DEPENDENT_LIBRARIES "${_curl_dlls}")
-      endif()
-    endif()
-  else()
-    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
-    set(INFERNIX_CURL_TARGET PkgConfig::LIBCURL)
-  endif()
+  pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  set(INFERNIX_CURL_TARGET PkgConfig::LIBCURL)
   add_library(infernix::httplib INTERFACE IMPORTED GLOBAL)
   target_include_directories(infernix::httplib INTERFACE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)

@@ -72,7 +72,7 @@ void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& 
     }
     if (columns <= 16) {
         using Schedule = Fp8A16SlicedKMmaSchedule<4, 16, 7, Cache::ca, Cache::cg,
-                                                  Fp8ActivationStage::PaddedZero, 1>;
+                                                  Fp8ActivationStage::ActiveOnly, 1>;
         const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                        static_cast<__nv_bfloat16*>(z.data)};
         return launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, 5120>>(

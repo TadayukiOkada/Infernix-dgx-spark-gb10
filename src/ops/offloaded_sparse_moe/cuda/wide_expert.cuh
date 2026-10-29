@@ -90,6 +90,8 @@ struct Schedule {
     static constexpr int kUnitRunBytes     = kUnitsPerKTile * static_cast<int>(kUnitBytes); // 1,152
     static constexpr std::uint32_t kStageBytes =
         kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4 + kRowGroups * kUnitRunBytes;
+    static constexpr std::uint32_t kHalfStageBytes =
+        kWarpTokens * kCodeRowBytes + kWarpTokens * kScaleWordsPerRow * 4 + kRowGroups * kUnitRunBytes;
     // Consumer warps compute every 16-column MMA tile of the 64-column token tile, valid or not.
     static constexpr bool kSkipIdleColumns = false;
     static_assert(kWarpRows == 32, "a warp's rows are one A4 block of h");
@@ -118,6 +120,8 @@ struct ScheduleResidual : Schedule {
     static constexpr int kStages = 2;
     static constexpr std::uint32_t kStageBytes =
         kTerms * (kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4) + kRowGroups * kUnitRunBytes;
+    static constexpr std::uint32_t kHalfStageBytes =
+        kTerms * (kWarpTokens * kCodeRowBytes + kWarpTokens * kScaleWordsPerRow * 4) + kRowGroups * kUnitRunBytes;
     static constexpr bool kSkipIdleColumns = !(G::kHidden == kHidden && G::kIntermediate == kIntermediate);
 };
 
@@ -386,7 +390,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
             if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
         }
         // Registers and global memory only, so the producer already fills the next tile's stages.
-        epilogue(acc, ctx);
+        if (S::kTerms > 1 || ctx.warp_m * S::kWarpTokens < ctx.columns) { epilogue(acc, ctx); }
     }
 }
 
@@ -411,7 +415,9 @@ struct GateUpEpilogue {
         for (int m = 0; m < T; ++m) {
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
+                const int column    = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
+                const unsigned mask = __ballot_sync(0xFFFFFFFFU, column < ctx.columns);
+                if (column >= ctx.columns) { continue; }
                 std::uint16_t h[S::kMmaRows];
                 float amax = 0.0F;
 #pragma unroll
@@ -424,25 +430,26 @@ struct GateUpEpilogue {
                 }
 #pragma unroll
                 for (int offset = 1; offset <= 2; offset <<= 1) {
-                    const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
+                    const float other = __shfl_xor_sync(mask, amax, offset);
                     amax              = other > amax ? other : amax;
                 }
                 const std::uint8_t scale = canon::a4_scale_word(amax, sc.input_down);
                 unsigned code[S::kMmaRows] = {};
                 if (canon::e4m3_scaled(scale) != 0) {
+                    const float d = canon::mul_rn(canon::e4m3_value(scale), sc.input_down);
 #pragma unroll
                     for (int r = 0; r < S::kMmaRows; ++r) {
-                        code[r] = canon::a4_code(canon::bf16_to_f32(h[r]), scale, sc.input_down);
+                        code[r] = canon::e2m1_rn_satfinite(canon::div_rn(canon::bf16_to_f32(h[r]), d));
                     }
                 }
                 unsigned low  = (code[0] | (code[1] << 4)) << (8 * ctx.tig);
                 unsigned high = (code[2] | (code[3] << 4)) << (8 * ctx.tig);
 #pragma unroll
                 for (int offset = 1; offset <= 2; offset <<= 1) {
-                    low |= __shfl_xor_sync(0xFFFFFFFFU, low, offset);
-                    high |= __shfl_xor_sync(0xFFFFFFFFU, high, offset);
+                    low |= __shfl_xor_sync(mask, low, offset);
+                    high |= __shfl_xor_sync(mask, high, offset);
                 }
-                if (ctx.tig == 0 && column < ctx.columns) {
+                if (ctx.tig == 0) {
                     std::uint8_t* row = h_plane + static_cast<std::size_t>(ctx.first + column) * kHRowStride;
                     *reinterpret_cast<uint2*>(row + 8 * position) = make_uint2(low, high);
                     row[kHCodeBytes + position] = scale;

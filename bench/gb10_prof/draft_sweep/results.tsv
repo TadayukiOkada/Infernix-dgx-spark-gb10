@@ -1,0 +1,17 @@
+A	W=0.15 spec mtp dt7 lmhead	WC=0.15	dec=39.3	acc_len=3.60	by_pos=59,39,27,21,14,4,0	rounds=63	drafted=213	accepted=164	fallback=28	ngram_acc=0	ec=0
+A	W=0.20 spec mtp dt7 lmhead	WC=0.20	dec=38.7	acc_len=3.44	by_pos=60,40,27,22,11,1,0	rounds=66	drafted=210	accepted=161	fallback=28	ngram_acc=0	ec=0
+A	W=0.25 spec mtp dt7 lmhead	WC=0.25	dec=38.5	acc_len=3.24	by_pos=64,43,28,16,5,1,0	rounds=70	drafted=198	accepted=157	fallback=28	ngram_acc=0	ec=0
+A	W=0.30 spec mtp dt7 lmhead	WC=0.30	dec=38.1	acc_len=2.96	by_pos=68,45,28,9,1,0,0	rounds=77	drafted=200	accepted=151	fallback=27	ngram_acc=0	ec=0
+A	W=0.38 spec mtp dt7 lmhead	WC=0.38	dec=38.0	acc_len=2.99	by_pos=68,47,26,8,0,0,0	rounds=75	drafted=182	accepted=149	fallback=31	ngram_acc=0	ec=0
+B	dt=1 W=0.25 lmhead	WC=0.25	dec=31.1	acc_len=1.91	by_pos=105	rounds=115	drafted=115	accepted=105	fallback=35	ngram_acc=0	ec=0
+B	dt=2 W=0.25 lmhead	WC=0.25	dec=36.2	acc_len=2.51	by_pos=81,56	rounds=91	drafted=163	accepted=137	fallback=27	ngram_acc=0	ec=0
+B	dt=3 W=0.25 lmhead	WC=0.25	dec=39.2	acc_len=2.91	by_pos=71,46,32	rounds=78	drafted=186	accepted=149	fallback=28	ngram_acc=0	ec=0
+B	dt=4 W=0.25 lmhead	WC=0.25	dec=39.0	acc_len=3.20	by_pos=65,45,29,17	rounds=71	drafted=197	accepted=156	fallback=28	ngram_acc=0	ec=0
+B	dt=5 W=0.25 lmhead	WC=0.25	dec=39.2	acc_len=3.24	by_pos=65,43,28,16,5	rounds=70	drafted=197	accepted=157	fallback=28	ngram_acc=0	ec=0
+B	dt=6 W=0.25 lmhead	WC=0.25	dec=38.7	acc_len=3.24	by_pos=64,43,28,16,5,1	rounds=70	drafted=198	accepted=157	fallback=28	ngram_acc=0	ec=0
+B	dt=7 W=0.25 lmhead	WC=0.25	dec=38.6	acc_len=3.24	by_pos=64,43,28,16,5,1,0	rounds=70	drafted=198	accepted=157	fallback=28	ngram_acc=0	ec=0
+C	dt=4 no-lmhead	WC=0.25	dec=36.1	acc_len=3.18	by_pos=64,46,29,16	rounds=71	drafted=197	accepted=155	fallback=29	ngram_acc=0	ec=0
+C	dt=4 lmhead	WC=0.25	dec=38.2	acc_len=3.20	by_pos=65,45,29,17	rounds=71	drafted=197	accepted=156	fallback=28	ngram_acc=0	ec=0
+D	copy baseline mtp-only	WC=0.25	dec=34.8	acc_len=2.61	by_pos=72,44,23,4	rounds=89	drafted=208	accepted=143	fallback=23	ngram_acc=0	ec=0
+D	copy +ngram dm15 mm8	WC=0.25	dec=39.3	acc_len=3.29	by_pos=55,33,23,6,4,4,4,4,4,4,4,4,3,2,2	rounds=68	drafted=202	accepted=156	fallback=31	ngram_acc=0	ec=0
+D	copy +ngram dm15 mm12	WC=0.25	dec=31.9	acc_len=2.51	by_pos=68,34,17,1,1,1,1,1,1,0,0,0,0,0,0	rounds=83	drafted=188	accepted=125	fallback=47	ngram_acc=0	ec=0

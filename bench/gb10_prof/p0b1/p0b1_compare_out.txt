@@ -1,0 +1,70 @@
+== 1. CUPTI table row counts (node mode, capture range = the measured rep) ==
+   CUDA_GRAPH_NODE_EVENTS                   graphs-requested   16293   eager-requested   16293   same
+   CUPTI_ACTIVITY_KIND_GRAPH_TRACE          graphs-requested       0   eager-requested       0   same
+   CUPTI_ACTIVITY_KIND_KERNEL               graphs-requested   80475   eager-requested   80475   same
+   CUPTI_ACTIVITY_KIND_MEMCPY               graphs-requested     745   eager-requested     745   same
+   CUPTI_ACTIVITY_KIND_MEMSET               graphs-requested     270   eager-requested     270   same
+   CUPTI_ACTIVITY_KIND_SYNCHRONIZATION      graphs-requested     220   eager-requested     220   same
+   kernels recorded with a non-null graphNodeId: graphs-requested 78387, eager-requested 78387
+   kernel busy time: graphs-requested 2923.71 ms, eager-requested 2912.92 ms
+   first..last kernel span: graphs-requested 2968.74 ms, eager-requested 2958.97 ms
+
+== 2. CUDA runtime API calls inside the capture range ==
+   cuKernelGetName                          1851    1851  
+   cuProfilerStart                             1       1  
+   cudaDeviceSynchronize_v3020                 1       1  
+   cudaEventQuery_v3020                        3       3  
+   cudaEventRecord_v3020                       3       3  
+   cudaGraphLaunch_v10000                    171     171  
+   cudaLaunchKernelExC_v11060                237     237  
+   cudaLaunchKernel_v7000                   1851    1851  
+   cudaMemGetInfo_v3020                        1       1  
+   cudaMemcpy2DAsync_v3020                    58      58  
+   cudaMemcpyAsync_v3020                     293     293  
+   cudaMemsetAsync_v3020                     130     130  
+   cudaStreamIsCapturing_v10000              243     243  
+   cudaStreamSynchronize_v3020               116     116  
+   (API names with zero occurrences in both ranges: cudaGraphInstantiate, cudaGraphInstantiateWithFlags, cudaStreamBeginCapture, cudaStreamEndCapture, cudaGraphDestroy, cudaGraphExecDestroy)
+    -> graphs are captured during warmup, outside --profile-measured;
+       the measured rep only launches already-instantiated executables.
+
+== 3. Per-kernel histogram equality ==
+   distinct kernel names: graphs-requested 66, eager-requested 66
+   names whose count differs, or whose summed duration differs by >1 ms: 2
+      void infernix::ops::detail::<unnamed>::hc_up_collapse_kernel<infernix::ops::detail::<unnamed>::Q8Codec>(const float *, const float *, const __nv_bfloat16 *, const __nv_bfloat16 *, T1::Params, int, int, int, float *, __nv_bfloat16 *)
+         graphs-requested (6104, 174188412, 17728, 267968, 0)
+         eager-requested  (6104, 173043802, 17920, 220416, 0)
+      void infernix::ops::detail::q8_a16_stream_kernel<infernix::ops::detail::Q8A16StreamSchedule<(int)2560, (int)2, (int)1, (int)8, (int)4, (int)4, (infernix::ops::detail::Q8StreamX)1, (int)2>, (bool)1, infernix::ops::detail::LinearBf16Output, infernix::ops::detail::LinearIdentityEpilogue>(const __nv_bfloat16 *, const unsigned char *, const unsigned char *, T3, T4, int, int, int, int)
+         graphs-requested (2526, 421475485, 10400, 495424, 0)
+         eager-requested  (2526, 418243615, 10112, 360704, 0)
+   max localMemoryPerThread across all records: 0
+
+== 4. Launch-signature multisets (name, grid, block, registers, shared memory) ==
+   distinct signatures: graphs-requested 169, eager-requested 169
+   multisets equal: True
+
+== 5. Kernel records split by CUPTI graphNodeId ==
+   graphs-requested: as graph nodes  78387 kernels /  2846.37 ms; without a graphNodeId  2088 kernels /   77.34 ms
+      CUDA_GRAPH_NODE_EVENTS by name: [('Graph Node Creation', 16293)]
+      eager-recorded: void infernix::ops::detail::gated_delta_net::recurrent_fold_kernel<inf x42 40.93 ms
+      eager-recorded: void infernix::ops::detail::q8_a16_stream_kernel<infernix::ops::detail x39 7.09 ms
+      eager-recorded: void infernix::ops::<unnamed>::gate_up_kernel<(int)1>(const __nv_bfloa x48 4.90 ms
+      eager-recorded: void infernix::ops::detail::q8_a16_simt_kernel<infernix::ops::detail:: x48 3.55 ms
+      eager-recorded: void infernix::ops::detail::bf16_skinny_gemv_kernel<(int)1, (int)8, (i x12 3.39 ms
+      eager-recorded: void infernix::ops::detail::<unnamed>::hc_down_partials_kernel<inferni x98 2.77 ms
+      eager-recorded: infernix::ops::<unnamed>::projection_q8_kernel(const __nv_bfloat16 *,  x1 2.68 ms
+      eager-recorded: void infernix::ops::<unnamed>::down_kernel<(int)1>(infernix::ops::MoeD x48 2.21 ms
+   eager-requested: as graph nodes  78387 kernels /  2836.16 ms; without a graphNodeId  2088 kernels /   76.76 ms
+      CUDA_GRAPH_NODE_EVENTS by name: [('Graph Node Creation', 16293)]
+      eager-recorded: void infernix::ops::detail::gated_delta_net::recurrent_fold_kernel<inf x42 41.22 ms
+      eager-recorded: void infernix::ops::detail::q8_a16_stream_kernel<infernix::ops::detail x39 6.88 ms
+      eager-recorded: void infernix::ops::<unnamed>::gate_up_kernel<(int)1>(const __nv_bfloa x48 4.84 ms
+      eager-recorded: void infernix::ops::detail::q8_a16_simt_kernel<infernix::ops::detail:: x48 3.49 ms
+      eager-recorded: void infernix::ops::detail::bf16_skinny_gemv_kernel<(int)1, (int)8, (i x12 3.37 ms
+      eager-recorded: void infernix::ops::detail::<unnamed>::hc_down_partials_kernel<inferni x98 2.64 ms
+      eager-recorded: infernix::ops::<unnamed>::projection_q8_kernel(const __nv_bfloat16 *,  x1 2.64 ms
+      eager-recorded: void infernix::ops::<unnamed>::down_kernel<(int)1>(infernix::ops::MoeD x48 2.16 ms
+
+== 6. Headline ==
+   identical CUPTI structure (tables, graph-node membership, launch signatures): True
+   per-name duration drift >1 ms (timing noise, not structure): 2 names

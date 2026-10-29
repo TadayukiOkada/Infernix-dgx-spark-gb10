@@ -23,6 +23,32 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
     return static_cast<float2>(value).x;
 }
 
+__device__ __forceinline__ __half2 decode_nvfp4_e2m1x2_f16(std::uint8_t storage) {
+    union {
+        unsigned bits;
+        __half2 h2;
+    } out;
+    asm("{\n"
+        ".reg .b8 packed;\n"
+        "mov.b32 {packed, _, _, _}, %1;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, packed;\n"
+        "}\n"
+        : "=r"(out.bits)
+        : "r"(static_cast<unsigned>(storage)));
+    return out.h2;
+}
+
+__device__ __forceinline__ __half2 decode_nvfp4_e4m3_f16x2(std::uint8_t storage) {
+    union {
+        unsigned bits;
+        __half2 h2;
+    } out;
+    const auto scale_pair =
+        static_cast<std::uint16_t>(storage | (static_cast<unsigned>(storage) << 8));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(out.bits) : "h"(scale_pair));
+    return out.h2;
+}
+
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
 #if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
     // PTX 9.2 exposes native pair widening. E2M1 times a finite E4M3 scale needs
@@ -40,18 +66,48 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
     return result;
 #else
-    // CUDA 13.1 retains the exact FP32 expansion.
-    const float2 values    = decode_nvfp4_e2m1x2(code);
-    const float multiplier = decode_nvfp4_e4m3(scale);
+    // E2M1 times a finite E4M3 scale has at most 6 significand bits and exponent in [-10, +11],
+    // so the FP16 pair multiplication is exact before rounding to BF16.
+    const float2 prod =
+        __half22float2(__hmul2(decode_nvfp4_e2m1x2_f16(code), decode_nvfp4_e4m3_f16x2(scale)));
 
     union {
         __nv_bfloat162 pair;
         unsigned bits;
     } result;
 
-    result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
+    result.pair = __floats2bfloat162_rn(prod.x, prod.y);
     return result.bits;
 #endif
+}
+
+__device__ __forceinline__ uint4 nvfp4_scaled_oct_bf16(std::uint32_t codes4, std::uint8_t scale) {
+    const __half2 mult = decode_nvfp4_e4m3_f16x2(scale);
+    unsigned h0, h1, h2, h3;
+    asm("{\n"
+        ".reg .b8 b0, b1, b2, b3;\n"
+        "mov.b32 {b0, b1, b2, b3}, %4;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
+        "cvt.rn.f16x2.e2m1x2 %1, b1;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\n"
+        "cvt.rn.f16x2.e2m1x2 %3, b3;\n"
+        "}\n"
+        : "=r"(h0), "=r"(h1), "=r"(h2), "=r"(h3)
+        : "r"(codes4));
+    const auto pack_pair = [&](unsigned raw) {
+        union {
+            unsigned bits;
+            __half2 h2;
+        } in{raw};
+        const float2 prod = __half22float2(__hmul2(in.h2, mult));
+        union {
+            __nv_bfloat162 pair;
+            unsigned bits;
+        } res;
+        res.pair = __floats2bfloat162_rn(prod.x, prod.y);
+        return res.bits;
+    };
+    return make_uint4(pack_pair(h0), pack_pair(h1), pack_pair(h2), pack_pair(h3));
 }
 
 __device__ __forceinline__ int nvfp4_a16_shared_col_64(int row, int col) {
@@ -152,12 +208,10 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
 // E4M3 scale of max/6, E2M1 codes of value/scale), and the next term encodes what that term's
 // decoded code * scale left. Term 0 is therefore bit-identical to quantize_nvfp4_k16, and every term
 // shares its divisor, so the MMA sums the terms' products into one accumulator under the same alpha.
-template <int Terms>
-__device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* source,
-                                                         float input_scale_divisor,
-                                                         Nvfp4QuantizedK16 (&terms)[Terms]) {
-    const uint4 packed0                = load_vec<uint4>(source);
-    const uint4 packed1                = load_vec<uint4>(source + 8);
+template <int Terms, bool Reciprocal = false>
+__device__ __forceinline__ void
+quantize_nvfp4_terms_k16_packed(const uint4 packed0, const uint4 packed1, float input_scale_divisor,
+                                Nvfp4QuantizedK16 (&terms)[Terms]) {
     const std::uint32_t represented[8] = {
         packed0.x, packed0.y, packed0.z, packed0.w, packed1.x, packed1.y, packed1.z, packed1.w,
     };
@@ -179,18 +233,28 @@ __device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* so
             max_abs = fmaxf(max_abs, fabsf(remainder[pair].y));
         }
         Nvfp4QuantizedK16 quantized{};
-        quantized.scale =
-            __nv_cvt_float_to_fp8(__fdiv_rn(max_abs, 6.0F), __NV_SATFINITE, __NV_E4M3);
-        terms[term] = quantized;
+        const float unencoded =
+            Reciprocal ? (max_abs * (1.0F / 6.0F)) : __fdiv_rn(max_abs, 6.0F);
+        quantized.scale = __nv_cvt_float_to_fp8(unencoded, __NV_SATFINITE, __NV_E4M3);
+        terms[term]     = quantized;
         // A zero scale encodes zero; the remainder carries on to the next term unchanged.
         if (quantized.scale == 0) { continue; }
 
         const float scale = decode_nvfp4_e4m3(quantized.scale);
         float2 quotients[8];
+        if constexpr (Reciprocal) {
+            const float inv_scale = 1.0F / scale;
 #pragma unroll
-        for (int pair = 0; pair < 8; ++pair) {
-            quotients[pair] = make_float2(__fdiv_rn(remainder[pair].x, scale),
-                                          __fdiv_rn(remainder[pair].y, scale));
+            for (int pair = 0; pair < 8; ++pair) {
+                quotients[pair] = make_float2(remainder[pair].x * inv_scale,
+                                              remainder[pair].y * inv_scale);
+            }
+        } else {
+#pragma unroll
+            for (int pair = 0; pair < 8; ++pair) {
+                quotients[pair] = make_float2(__fdiv_rn(remainder[pair].x, scale),
+                                              __fdiv_rn(remainder[pair].y, scale));
+            }
         }
         pack_nvfp4_e2m1x16(quotients, terms[term].codes_lo, terms[term].codes_hi);
         if (term + 1 == Terms) { break; }
@@ -205,6 +269,16 @@ __device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* so
             remainder[pair].y = __fsub_rn(remainder[pair].y, __fmul_rn(code.y, scale));
         }
     }
+}
+
+template <int Terms, bool Reciprocal = false>
+__device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* source,
+                                                         float input_scale_divisor,
+                                                         Nvfp4QuantizedK16 (&terms)[Terms]) {
+    const uint4 packed0 = load_vec<uint4>(source);
+    const uint4 packed1 = load_vec<uint4>(source + 8);
+    quantize_nvfp4_terms_k16_packed<Terms, Reciprocal>(packed0, packed1, input_scale_divisor,
+                                                       terms);
 }
 
 } // namespace infernix::ops::detail

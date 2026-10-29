@@ -15,6 +15,8 @@ void launch_q4_a16_mma_r32_t128_k64_s2_a2(const Tensor& x, const Weight& weight,
                                           cudaStream_t stream);
 void launch_q4_a16_mma_r32_t32_k128_s2_a2(const Tensor& x, const Weight& weight, Tensor& out,
                                           cudaStream_t stream);
+void launch_q4_a16_mma_r32_t64_k128_s2_a1(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream);
 void launch_q4_a16_mma_r32_t32_k64_wr16_wt16_s3_a3_b2(const Tensor& x, const Weight& weight,
                                                       Tensor& out, cudaStream_t stream);
 void launch_q4_a16_mma_r32_t64_k64_wr16_wt32_s2_a2_b2(const Tensor& x, const Weight& weight,
@@ -51,6 +53,8 @@ void launch_q4_a16_sliced_k5120_t24(const Tensor& x, const Weight& weight, Tenso
                                     cudaStream_t stream);
 void launch_q4_a16_sliced_k5120_t4(const Tensor& x, const Weight& weight, Tensor& out,
                                    cudaStream_t stream);
+void launch_q4_a16_sliced_k5120_t8(const Tensor& x, const Weight& weight, Tensor& out,
+                                   cudaStream_t stream);
 void launch_q4_a16_sliced_r16_t16_w2_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
 void launch_q4_a16_sliced_r16_t16_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
@@ -64,6 +68,8 @@ void launch_q4_a16_sliced_r16_t8_w4_s2(const Tensor& x, const Weight& weight, Te
 void launch_q4_a16_sliced_r32_t16_w4_s1(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
 void launch_q4_a16_sliced_r32_t16_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
+                                        cudaStream_t stream);
+void launch_q4_a16_sliced_r32_t24_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
 void launch_q4_a16_sliced_r32_t32_w2_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);

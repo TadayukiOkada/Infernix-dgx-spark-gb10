@@ -26,7 +26,7 @@ constexpr std::int32_t kGroups           = 320;
 constexpr std::int32_t kTaps             = 2;
 constexpr std::int32_t kSides            = 2;
 constexpr std::int32_t kCoefficientRows  = 1280;
-constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kDefaultFlushBytes{};
 
 struct Options {
     int width               = 0;

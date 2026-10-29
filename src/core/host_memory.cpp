@@ -6,24 +6,15 @@
 #include <stdexcept>
 #include <string>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <psapi.h>
-#else
 #include <sys/mman.h>
 
 #include <fstream>
 #include <sstream>
 #include <string>
-#endif
 
 namespace infernix {
 namespace {
 
-#ifndef _WIN32
 // A "Key:   N kB" field of a /proc file, in bytes.
 std::optional<std::uint64_t> proc_kib_field(const char* path, const std::string& key) {
     std::ifstream file(path);
@@ -47,41 +38,26 @@ std::optional<std::uint64_t> cgroup_bytes(const char* path) {
         return std::stoull(value);
     } catch (const std::exception&) { return std::nullopt; }
 }
-#endif
 
 } // namespace
 
 std::uint64_t available_host_memory_bytes() {
-#ifdef _WIN32
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    if (!::GlobalMemoryStatusEx(&status)) {
-        throw std::runtime_error("GlobalMemoryStatusEx failed");
-    }
-    return status.ullAvailPhys;
-#else
     if (const auto available = proc_kib_field("/proc/meminfo", "MemAvailable:")) { return *available; }
     throw std::runtime_error("/proc/meminfo has no MemAvailable");
-#endif
+}
+
+std::uint64_t reclaimable_pool_bytes() {
+    const std::uint64_t free_physical = proc_kib_field("/proc/meminfo", "MemFree:").value_or(0);
+    std::uint64_t available = available_host_memory_bytes();
+    if (const auto limit = cgroup_bytes("/sys/fs/cgroup/memory.max")) {
+        const std::uint64_t used = cgroup_bytes("/sys/fs/cgroup/memory.current").value_or(0);
+        available = std::min(available, *limit > used ? *limit - used : 0);
+    }
+    return available > free_physical ? available - free_physical : 0;
 }
 
 HostMemorySnapshot host_memory_snapshot() {
     HostMemorySnapshot out;
-#ifdef _WIN32
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    if (!::GlobalMemoryStatusEx(&status)) { throw std::runtime_error("GlobalMemoryStatusEx failed"); }
-    out.total_physical     = status.ullTotalPhys;
-    out.available_physical = status.ullAvailPhys;
-    out.available_commit   = status.ullAvailPageFile;
-    PROCESS_MEMORY_COUNTERS_EX counters{};
-    counters.cb = sizeof(counters);
-    if (::GetProcessMemoryInfo(::GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                               sizeof(counters))) {
-        out.process_private  = counters.PrivateUsage;
-        out.process_resident = counters.WorkingSetSize;
-    }
-#else
     out.total_physical     = proc_kib_field("/proc/meminfo", "MemTotal:").value_or(0);
     out.available_physical = available_host_memory_bytes();
     if (const auto limit = cgroup_bytes("/sys/fs/cgroup/memory.max")) {
@@ -91,56 +67,25 @@ HostMemorySnapshot host_memory_snapshot() {
     out.available_commit = out.available_physical + proc_kib_field("/proc/meminfo", "SwapFree:").value_or(0);
     out.process_private  = proc_kib_field("/proc/self/status", "VmRSS:").value_or(0);
     out.process_resident = out.process_private;
-#endif
     return out;
 }
 
 std::string reserve_process_working_set(std::uint64_t bytes) {
-#ifdef _WIN32
-    SIZE_T minimum = 0, maximum = 0;
-    DWORD flags    = 0;
-    if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
-        return "Windows error " + std::to_string(::GetLastError());
-    }
-    const auto wanted = static_cast<SIZE_T>(bytes);
-    // Only the minimum is hard; the maximum stays soft so the process may grow past it. Windows
-    // rejects a hard minimum equal to the maximum (ERROR_INVALID_PARAMETER), so the maximum is
-    // kept above it.
-    constexpr SIZE_T kMaximumAbove = SIZE_T{64} << 20;
-    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kMaximumAbove),
-                                      QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
-        return "Windows error " + std::to_string(::GetLastError());
-    }
-    return {};
-#else
     // Linux has no per-process resident minimum short of locking pages.
     (void)bytes;
     return {};
-#endif
 }
 
 RegisteredHostBuffer::RegisteredHostBuffer(std::size_t bytes) : size_(bytes) {
     if (bytes == 0) { throw std::invalid_argument("RegisteredHostBuffer size must be nonzero"); }
-#ifdef _WIN32
-    void* p = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (p == nullptr) {
-        throw std::runtime_error("VirtualAlloc of " + std::to_string(bytes) + " bytes failed: Windows error " +
-                                 std::to_string(::GetLastError()));
-    }
-#else
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
-#endif
     data_ = static_cast<std::byte*>(p);
 }
 
 RegisteredHostBuffer::~RegisteredHostBuffer() {
     if (device_ != nullptr) { (void)cudaHostUnregister(data_); }
-#ifdef _WIN32
-    (void)::VirtualFree(data_, 0, MEM_RELEASE);
-#else
     (void)::munmap(data_, size_);
-#endif
 }
 
 void RegisteredHostBuffer::prefault(std::size_t begin, std::size_t end) const noexcept {
@@ -167,57 +112,14 @@ void RegisteredHostBuffer::pin() {
 
 ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
     if (bytes == 0) { throw std::invalid_argument("ResidentHostBuffer size must be nonzero"); }
-#ifdef _WIN32
-    void* p = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (p == nullptr) {
-        throw std::runtime_error("VirtualAlloc of " + std::to_string(bytes) + " bytes failed: Windows error " +
-                                 std::to_string(::GetLastError()));
-    }
-    data_ = static_cast<std::byte*>(p);
-    // VirtualLock holds pages in the working set, so the hard minimum must cover them (with the
-    // process's own pages above it); the maximum stays soft.
-    constexpr SIZE_T kSlack = SIZE_T{64} << 20;
-    SIZE_T minimum = 0, maximum = 0;
-    DWORD flags    = 0;
-    if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
-        lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " reading the working set";
-        return;
-    }
-    const SIZE_T wanted = minimum + bytes + kSlack;
-    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kSlack),
-                                      QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
-        lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " raising the working set";
-        return;
-    }
-    raised_ = bytes + kSlack;
-    constexpr std::size_t kPiece = std::size_t{1} << 30;
-    for (std::size_t at = 0; at < bytes; at += kPiece) {
-        if (!::VirtualLock(data_ + at, std::min(kPiece, bytes - at))) {
-            lock_failure_ = "Windows error " + std::to_string(::GetLastError()) + " locking pages";
-            return;
-        }
-    }
-#else
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
     data_ = static_cast<std::byte*>(p);
     if (::mlock(data_, bytes) != 0) { lock_failure_ = "mlock failed (RLIMIT_MEMLOCK)"; }
-#endif
 }
 
 ResidentHostBuffer::~ResidentHostBuffer() {
-#ifdef _WIN32
-    (void)::VirtualFree(data_, 0, MEM_RELEASE); // releases the locks
-    if (raised_ != 0) {
-        SIZE_T minimum = 0, maximum = 0;
-        DWORD flags    = 0;
-        if (::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags) && minimum > raised_) {
-            (void)::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), minimum - raised_, maximum, flags);
-        }
-    }
-#else
     (void)::munmap(data_, size_);
-#endif
 }
 
 } // namespace infernix

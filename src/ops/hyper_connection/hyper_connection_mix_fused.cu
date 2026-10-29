@@ -24,7 +24,10 @@
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
+#include "ops/hyper_connection/hyper_connection_inject.cuh"
+
 #include "core/pdl.cuh"
+#include "core/temporary_switches.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
@@ -46,7 +49,12 @@ constexpr int kChunks       = kHidden / 256; // a lane's 8-weight chunks per str
 constexpr int kMaxRank      = 512;
 constexpr int kDownRows     = 8; // rows of W_down per CTA (a row per warp)
 constexpr int kDownThreads  = kDownRows * 32;
-constexpr int kPassColumns  = 8;
+// Columns per pass. Decode verifies at most 4 columns (draft-tokens 3 + 1), so 8 wasted half the
+// dot-product/norm iterations behind `if (c < pass)` guards and kept acc[] large. Halving it drops
+// the Q8 kernel from 124 to 96 registers/thread (zero spills), letting more blocks/SM fit at narrow
+// widths without changing the grid (no extra weight streams contending the unified fabric). Bit-exact
+// by the fixed-order guarantee above. Model A/B (interleaved, best config): +0.655% mean, 3/4 rounds.
+constexpr int kPassColumns  = 4;
 constexpr int kUpFeatures   = 16; // features d per CTA (a d per warp)
 constexpr int kUpThreads    = kUpFeatures * 32;
 constexpr std::size_t kDownSharedBytes = static_cast<std::size_t>(kPassColumns) * kHidden * sizeof(float);
@@ -103,6 +111,23 @@ __device__ __forceinline__ float half_bits_to_float(std::uint16_t bits) {
     return __half2float(__ushort_as_half(static_cast<unsigned short>(bits)));
 }
 
+// Eight residual values with the pending inject applied: hc_injected(R, inject, y) element-wise, the
+// value hyper_connection_inject would have stored (hyper_connection_inject_mix's fold).
+__device__ __forceinline__ uint4 injected8(const uint4& r_bits, const uint4& y_bits, float inject) {
+    float r[8], y[8];
+    bf16x8_bits_to_floats(r_bits, r);
+    bf16x8_bits_to_floats(y_bits, y);
+    std::uint32_t out[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const bf16 lo = hc_injected(r[2 * j], inject, y[2 * j]);
+        const bf16 hi = hc_injected(r[2 * j + 1], inject, y[2 * j + 1]);
+        out[j] = static_cast<std::uint32_t>(__bfloat16_as_ushort(lo)) |
+                 (static_cast<std::uint32_t>(__bfloat16_as_ushort(hi)) << 16);
+    }
+    return make_uint4(out[0], out[1], out[2], out[3]);
+}
+
 // q8_g32_fp16 in row_split_k128_v1: int8 codes [rows, padded_k], FP16 scales per 32 codes.
 struct Q8Codec {
     struct Params {
@@ -146,13 +171,16 @@ struct Bf16Codec {
     }
 };
 
-template <class Codec, class Norm>
-__global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
+// Pending: the attention half's inject folds into the residual reads (hyper_connection_inject_mix):
+// every value read is hc_injected(R, pending_inject[t][s], pending_y[t][d]).
+template <class Codec, class Norm, bool Pending, int PassColumns = 1, int MinBlocks = 2>
+__global__ __launch_bounds__(kDownThreads, MinBlocks) void hc_down_partials_kernel(
     const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
-    int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
-    extern __shared__ __align__(16) float rn[]; // [kPassColumns][kHidden]
-    __shared__ float scratch[kDownThreads / 32][kPassColumns];
-    __shared__ float inv[kPassColumns];
+    int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
+    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    extern __shared__ __align__(16) float rn[]; // [PassColumns][kHidden]
+    __shared__ float scratch[kDownThreads / 32][PassColumns];
+    __shared__ float inv[PassColumns];
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
     const int s    = static_cast<int>(blockIdx.y);
     const int row  = static_cast<int>(blockIdx.x) * kDownRows + warp;
@@ -180,224 +208,441 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
     // quarter warp's eight 16-byte reads cover all 32 banks.
     const int first_half = (lane >> 2) & 1;
 
-#pragma unroll 1
-    for (int c0 = 0; c0 < columns; c0 += kPassColumns) {
-        const int pass = min(kPassColumns, columns - c0);
-        // 2. Stage the slice in FP32 with each column's per-thread sum of squares (its elements in
-        // index order), then every column's warp butterfly and its warps' sums in warp order.
-        // Every column's loads are issued before any is used (one CTA per SM: registers are free).
+    if constexpr (PassColumns == 1) {
+        // Single-column decode specialization (columns == 1; columns >= 2 routes to v4).
         constexpr int kSlices = (kHidden + kDownThreads * 8 - 1) / (kDownThreads * 8);
-        uint4 values[kPassColumns][kSlices];
+        const bf16* r         = residual + static_cast<std::int64_t>(s) * kHidden;
+        uint4 values[kSlices];
+        uint4 ys[Pending ? kSlices : 1];
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
-            const bf16* r = residual + static_cast<std::int64_t>(c0 + c) * width + static_cast<std::int64_t>(s) * kHidden;
+        for (int h = 0; h < kSlices; ++h) {
+            const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
+            if (i < kHidden) {
+                values[h] = load_ldg<uint4>(r + i);
+                if constexpr (Pending) { ys[h] = load_ldg<uint4>(pending_y + i); }
+            }
+        }
+        if constexpr (Pending) {
+            const float inject = pending_inject[s];
 #pragma unroll
             for (int h = 0; h < kSlices; ++h) {
                 const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
-                if (c < pass && i < kHidden) { values[c][h] = load_ldg<uint4>(r + i); }
+                if (i < kHidden) { values[h] = injected8(values[h], ys[h], inject); }
             }
         }
-        float sums[kPassColumns];
+        float sum_sq = 0.0F;
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
-            sums[c] = 0.0F;
+        for (int h = 0; h < kSlices; ++h) {
+            const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
+            if (i < kHidden) {
+                const uint4 u   = values[h];
+                const float2 v0 = bf16x2_bits_to_float2(u.x), v1 = bf16x2_bits_to_float2(u.y);
+                const float2 v2 = bf16x2_bits_to_float2(u.z), v3 = bf16x2_bits_to_float2(u.w);
+                const float v[8] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
+                float4* out      = reinterpret_cast<float4*>(rn + i);
+                out[0]           = make_float4(v[0], v[1], v[2], v[3]);
+                out[1]           = make_float4(v[4], v[5], v[6], v[7]);
 #pragma unroll
-            for (int h = 0; h < kSlices; ++h) {
-                const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
-                if (c < pass && i < kHidden) {
-                    const uint4 u   = values[c][h];
-                    const float2 v0 = bf16x2_bits_to_float2(u.x), v1 = bf16x2_bits_to_float2(u.y);
-                    const float2 v2 = bf16x2_bits_to_float2(u.z), v3 = bf16x2_bits_to_float2(u.w);
-                    const float v[8] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
-                    float4* out = reinterpret_cast<float4*>(rn + c * kHidden + i);
-                    out[0] = make_float4(v[0], v[1], v[2], v[3]);
-                    out[1] = make_float4(v[4], v[5], v[6], v[7]);
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) { sums[c] += v[j] * v[j]; }
-                }
+                for (int j = 0; j < 8; ++j) { sum_sq += v[j] * v[j]; }
             }
         }
-#pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
-            if (c < pass) {
-                const float total = warp_sum(sums[c]);
-                if (lane == 0) { scratch[warp][c] = total; }
-            }
-        }
+        const float warp_total = warp_sum(sum_sq);
+        if (lane == 0) { scratch[warp][0] = warp_total; }
         __syncthreads();
-        if (static_cast<int>(threadIdx.x) < pass) {
+        if (threadIdx.x == 0) {
             float total = 0.0F;
 #pragma unroll
-            for (int wp = 0; wp < kDownThreads / 32; ++wp) { total += scratch[wp][threadIdx.x]; }
-            inv[threadIdx.x] = rsqrtf(total / static_cast<float>(kHidden) + eps);
+            for (int wp = 0; wp < kDownThreads / 32; ++wp) { total += scratch[wp][0]; }
+            inv[0] = rsqrtf(total / static_cast<float>(kHidden) + eps);
         }
         __syncthreads();
-        // Rn = R * inv * (1 + w), FP32.
-        for (int c = 0; c < pass; ++c) {
+        const float inv0 = inv[0];
 #pragma unroll
-            for (int j = 0; j < kOwned; ++j) {
-                const int i = c * kHidden + static_cast<int>(threadIdx.x) + kDownThreads * j;
-                rn[i]       = rn[i] * inv[c] * w_bias[j];
-            }
+        for (int j = 0; j < kOwned; ++j) {
+            const int i = static_cast<int>(threadIdx.x) + kDownThreads * j;
+            rn[i]       = rn[i] * inv0 * w_bias[j];
         }
-        if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < pass) {
-            inv_out[static_cast<std::int64_t>(s) * columns + c0 + static_cast<int>(threadIdx.x)] = inv[threadIdx.x];
-        }
+        if (blockIdx.x == 0 && threadIdx.x == 0) { inv_out[s] = inv0; }
         __syncthreads();
-        // 3. The row's dot products: the lane-chunk order, then a warp butterfly.
-        float acc[kPassColumns];
-#pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) { acc[c] = 0.0F; }
+        float acc = 0.0F;
 #pragma unroll
         for (int m = 0; m < kChunks; ++m) {
             const int kk = m * 256 + lane * 8;
             float wv[8];
             Codec::decode(chunk[m], wv);
+            const float4* half = reinterpret_cast<const float4*>(rn + kk);
+            const float4 p = half[first_half], q = half[first_half ^ 1];
+            const float4 a = first_half ? q : p, b = first_half ? p : q;
+            acc = fmaf(wv[0], a.x, acc);
+            acc = fmaf(wv[1], a.y, acc);
+            acc = fmaf(wv[2], a.z, acc);
+            acc = fmaf(wv[3], a.w, acc);
+            acc = fmaf(wv[4], b.x, acc);
+            acc = fmaf(wv[5], b.y, acc);
+            acc = fmaf(wv[6], b.z, acc);
+            acc = fmaf(wv[7], b.w, acc);
+        }
+        const float total = warp_sum(acc);
+        if (lane == 0 && live) { partial[static_cast<std::int64_t>(s) * rows + row] = total; }
+    } else {
+#pragma unroll 1
+        for (int c0 = 0; c0 < columns; c0 += PassColumns) {
+            const int pass = min(PassColumns, columns - c0);
+            // 2. Stage the slice in FP32 with each column's per-thread sum of squares (its elements in
+            // index order), then every column's warp butterfly and its warps' sums in warp order.
+            // Every column's loads are issued before any is used (one CTA per SM: registers are free).
+            constexpr int kSlices = (kHidden + kDownThreads * 8 - 1) / (kDownThreads * 8);
+            uint4 values[PassColumns][kSlices];
+            uint4 ys[Pending ? PassColumns : 1][kSlices];
 #pragma unroll
-            for (int c = 0; c < kPassColumns; ++c) {
+            for (int c = 0; c < PassColumns; ++c) {
+                const bf16* r = residual + static_cast<std::int64_t>(c0 + c) * width + static_cast<std::int64_t>(s) * kHidden;
+#pragma unroll
+                for (int h = 0; h < kSlices; ++h) {
+                    const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
+                    if (c < pass && i < kHidden) {
+                        values[c][h] = load_ldg<uint4>(r + i);
+                        if constexpr (Pending) {
+                            ys[c][h] = load_ldg<uint4>(pending_y + static_cast<std::int64_t>(c0 + c) * kHidden + i);
+                        }
+                    }
+                }
+            }
+            if constexpr (Pending) {
+#pragma unroll
+                for (int c = 0; c < PassColumns; ++c) {
+                    if (c < pass) {
+                        const float inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+#pragma unroll
+                        for (int h = 0; h < kSlices; ++h) {
+                            const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
+                            if (i < kHidden) { values[c][h] = injected8(values[c][h], ys[c][h], inject); }
+                        }
+                    }
+                }
+            }
+            float sums[PassColumns];
+#pragma unroll
+            for (int c = 0; c < PassColumns; ++c) {
+                sums[c] = 0.0F;
+#pragma unroll
+                for (int h = 0; h < kSlices; ++h) {
+                    const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
+                    if (c < pass && i < kHidden) {
+                        const uint4 u   = values[c][h];
+                        const float2 v0 = bf16x2_bits_to_float2(u.x), v1 = bf16x2_bits_to_float2(u.y);
+                        const float2 v2 = bf16x2_bits_to_float2(u.z), v3 = bf16x2_bits_to_float2(u.w);
+                        const float v[8] = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
+                        float4* out = reinterpret_cast<float4*>(rn + c * kHidden + i);
+                        out[0] = make_float4(v[0], v[1], v[2], v[3]);
+                        out[1] = make_float4(v[4], v[5], v[6], v[7]);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) { sums[c] += v[j] * v[j]; }
+                    }
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < PassColumns; ++c) {
                 if (c < pass) {
-                    const float4* half = reinterpret_cast<const float4*>(rn + c * kHidden + kk);
-                    const float4 p = half[first_half], q = half[first_half ^ 1];
-                    const float4 a = first_half ? q : p, b = first_half ? p : q;
-                    acc[c] = fmaf(wv[0], a.x, acc[c]);
-                    acc[c] = fmaf(wv[1], a.y, acc[c]);
-                    acc[c] = fmaf(wv[2], a.z, acc[c]);
-                    acc[c] = fmaf(wv[3], a.w, acc[c]);
-                    acc[c] = fmaf(wv[4], b.x, acc[c]);
-                    acc[c] = fmaf(wv[5], b.y, acc[c]);
-                    acc[c] = fmaf(wv[6], b.z, acc[c]);
-                    acc[c] = fmaf(wv[7], b.w, acc[c]);
+                    const float total = warp_sum(sums[c]);
+                    if (lane == 0) { scratch[warp][c] = total; }
                 }
             }
-        }
+            __syncthreads();
+            if (static_cast<int>(threadIdx.x) < pass) {
+                float total = 0.0F;
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
-            if (c < pass) {
-                const float total = warp_sum(acc[c]);
-                if (lane == 0 && live) {
-                    partial[(static_cast<std::int64_t>(s) * rows + row) * columns + c0 + c] = total;
+                for (int wp = 0; wp < kDownThreads / 32; ++wp) { total += scratch[wp][threadIdx.x]; }
+                inv[threadIdx.x] = rsqrtf(total / static_cast<float>(kHidden) + eps);
+            }
+            __syncthreads();
+            // Rn = R * inv * (1 + w), FP32.
+            for (int c = 0; c < pass; ++c) {
+#pragma unroll
+                for (int j = 0; j < kOwned; ++j) {
+                    const int i = c * kHidden + static_cast<int>(threadIdx.x) + kDownThreads * j;
+                    rn[i]       = rn[i] * inv[c] * w_bias[j];
                 }
             }
+            if (blockIdx.x == 0 && static_cast<int>(threadIdx.x) < pass) {
+                inv_out[static_cast<std::int64_t>(s) * columns + c0 + static_cast<int>(threadIdx.x)] = inv[threadIdx.x];
+            }
+            __syncthreads();
+            // 3. The row's dot products: the lane-chunk order, then a warp butterfly.
+            float acc[PassColumns];
+#pragma unroll
+            for (int c = 0; c < PassColumns; ++c) { acc[c] = 0.0F; }
+#pragma unroll
+            for (int m = 0; m < kChunks; ++m) {
+                const int kk = m * 256 + lane * 8;
+                float wv[8];
+                Codec::decode(chunk[m], wv);
+#pragma unroll
+                for (int c = 0; c < PassColumns; ++c) {
+                    if (c < pass) {
+                        const float4* half = reinterpret_cast<const float4*>(rn + c * kHidden + kk);
+                        const float4 p = half[first_half], q = half[first_half ^ 1];
+                        const float4 a = first_half ? q : p, b = first_half ? p : q;
+                        acc[c] = fmaf(wv[0], a.x, acc[c]);
+                        acc[c] = fmaf(wv[1], a.y, acc[c]);
+                        acc[c] = fmaf(wv[2], a.z, acc[c]);
+                        acc[c] = fmaf(wv[3], a.w, acc[c]);
+                        acc[c] = fmaf(wv[4], b.x, acc[c]);
+                        acc[c] = fmaf(wv[5], b.y, acc[c]);
+                        acc[c] = fmaf(wv[6], b.z, acc[c]);
+                        acc[c] = fmaf(wv[7], b.w, acc[c]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < PassColumns; ++c) {
+                if (c < pass) {
+                    const float total = warp_sum(acc[c]);
+                    if (lane == 0 && live) {
+                        partial[(static_cast<std::int64_t>(s) * rows + row) * columns + c0 + c] = total;
+                    }
+                }
+            }
+            if (PassColumns > 1 || c0 + PassColumns < columns) {
+                __syncthreads(); // the next pass overwrites rn
+            }
         }
-        __syncthreads(); // the next pass overwrites rn
     }
 }
 
-template <class Codec, class Norm>
-__global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
+// Pending: as K1a's, and each residual value it reads (every one of the call, once) is written back with
+// the inject applied, as hyper_connection_inject would have left it. The residual is written only then.
+template <class Codec, class Norm, bool Pending, int Columns = 0, int MinBlocks = 1>
+__global__ __launch_bounds__(kUpThreads, MinBlocks) void hc_up_collapse_kernel(
+    const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x) {
-    __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank]; // [T][rank]
-    __shared__ float inv[kStreams * kHcMixFusedMaxColumns];             // [S][T]
+    float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
+    const float* __restrict__ pending_inject) {
+    // Dynamic shared memory: sized to actual rank x columns at launch time rather than the
+    // worst-case compile-time bounds. For decode (rank=320, columns=1) this drops from 128 KB
+    // to ~5 KB, raising CTAs-per-SM from 1 to ~18 and exposing enough warps to hide DRAM latency.
+    extern __shared__ __align__(16) float dyn_smem[];
+    auto* m   = dyn_smem;                                            // [columns][rank]
+    auto* inv = dyn_smem + static_cast<std::size_t>(columns) * rank; // [streams][columns]
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
     const int d    = static_cast<int>(blockIdx.x) * kUpFeatures + warp;
     const bool live = d < kHidden;
     constexpr int width = kStreams * kHidden;
     const int chunks    = rank / 8;
 
-    // 1. Weights first: the S rows (s*H + d) of W_up, chunks lane and lane + 32.
-    typename Codec::Chunk chunk[kStreams][2];
+    if constexpr (Columns == 1) {
+        const int dl = live ? d : 0;
+        typename Codec::Chunk chunk0[kStreams];
 #pragma unroll
-    for (int s = 0; s < kStreams; ++s) {
-        const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + (live ? d : 0);
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int c = lane + 32 * h;
-            chunk[s][h] = c < chunks ? Codec::load(up, row, c * 8) : typename Codec::Chunk{};
+        for (int s = 0; s < kStreams; ++s) {
+            const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + dl;
+            chunk0[s]              = lane < chunks ? Codec::load(up, row, lane * 8) : typename Codec::Chunk{};
         }
-    }
-    // The norm weights (1 + w) of the warp's S rows, and the residual R[s*H + d, t] for every (t, s):
-    // entry e = t*S + s is held by lane e % 32 in r_held[e / 32], for lane 0's collapse.
-    static_assert(kStreams * kHcMixFusedMaxColumns <= 64);
-    const int dl = live ? d : 0;
-    float w_bias[kStreams];
-#pragma unroll
-    for (int s = 0; s < kStreams; ++s) {
-        w_bias[s] = 1.0F + norm_value(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
-    }
-    // Launched as a programmatic dependent: the weights load while the down partials finish. The next
-    // projection may launch beside this grid at once and fetch its weights meanwhile.
-    pdl::trigger_dependents();
-    pdl::wait_for_dependencies();
-    float r_held[2];
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        const int e = lane + 32 * h, t = e / kStreams, s = e - t * kStreams;
-        r_held[h]   = t < columns ? __bfloat162float(residual[static_cast<std::int64_t>(t) * width +
-                                                              static_cast<std::int64_t>(s) * kHidden + dl])
-                                  : 0.0F;
-    }
-    // Lanes 4-7 of each quarter warp read a chunk's two float4 halves of m in the other order, so a
-    // quarter warp's eight 16-byte reads cover all 32 banks.
-    const int first_half = (lane >> 2) & 1;
-
-    // 2. z = sum_s partial[s] in order s = 0..S-1; m = SiLU(z / S); CTA 0 writes the injects.
-    const float inv_streams = 1.0F / static_cast<float>(kStreams);
-#pragma unroll 4
-    for (int i = static_cast<int>(threadIdx.x); i < down_rows * columns; i += kUpThreads) {
-        const int k = i / columns, t = i - k * columns;
-        float z     = 0.0F;
-#pragma unroll
-        for (int s = 0; s < kStreams; ++s) { z += partial[(static_cast<std::int64_t>(s) * down_rows + k) * columns + t]; }
-        const float v = z * inv_streams;
-        if (k < rank) {
-            m[t * rank + k] = v * sigmoidf(v);
-        } else if (inject != nullptr && blockIdx.x == 0) {
-            inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
+        const int slane = lane < kStreams ? lane : 0;
+        const float wb  = 1.0F + norm_value(norm_weight[static_cast<std::int64_t>(slane) * kHidden + dl]);
+        pdl::trigger_dependents();
+        pdl::wait_for_dependencies();
+        float r_s = 0.0F;
+        if (lane < kStreams) {
+            bf16* at = residual + static_cast<std::int64_t>(slane) * kHidden + dl;
+            if constexpr (Pending) {
+                const bf16 value = hc_injected(__bfloat162float(*at), pending_inject[slane],
+                                               __bfloat162float(pending_y[dl]));
+                if (live) { *at = value; }
+                r_s = __bfloat162float(value);
+            } else {
+                r_s = __bfloat162float(*at);
+            }
         }
-    }
-    for (int i = static_cast<int>(threadIdx.x); i < kStreams * columns; i += kUpThreads) { inv[i] = inv_in[i]; }
-    __syncthreads();
-    if (!live) { return; }
+        const int first_half  = (lane >> 2) & 1;
+        const float inv_streams = 1.0F / static_cast<float>(kStreams);
+        for (int k = static_cast<int>(threadIdx.x); k < down_rows; k += kUpThreads) {
+            float z = 0.0F;
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) { z += partial[static_cast<std::int64_t>(s) * down_rows + k]; }
+            const float v = z * inv_streams;
+            if (k < rank) {
+                m[k] = v * sigmoidf(v);
+            } else if (inject != nullptr && blockIdx.x == 0) {
+                inject[k - rank] = 2.0F * sigmoidf(v);
+            }
+        }
+        if (threadIdx.x < kStreams) { inv[threadIdx.x] = inv_in[threadIdx.x]; }
+        __syncthreads();
+        if (!live) { return; }
 
-    // 3. u_s = W_up[s*H + d] . m in the lane-chunk order, then the collapse in lane 0.
-#pragma unroll 1
-    for (int t = 0; t < columns; ++t) {
-        const float* mt = m + t * rank;
         float acc[kStreams];
 #pragma unroll
         for (int s = 0; s < kStreams; ++s) { acc[s] = 0.0F; }
+        if (lane < chunks) {
+            const float4* half = reinterpret_cast<const float4*>(m + lane * 8);
+            const float4 p = half[first_half], q = half[first_half ^ 1];
+            const float4 a = first_half ? q : p, b = first_half ? p : q;
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int c = lane + 32 * h;
-            if (c < chunks) {
-                const float4* half = reinterpret_cast<const float4*>(mt + c * 8);
-                const float4 p = half[first_half], q = half[first_half ^ 1];
-                const float4 a = first_half ? q : p, b = first_half ? p : q;
+            for (int s = 0; s < kStreams; ++s) {
+                float wv[8];
+                Codec::decode(chunk0[s], wv);
+                acc[s] = fmaf(wv[0], a.x, acc[s]);
+                acc[s] = fmaf(wv[1], a.y, acc[s]);
+                acc[s] = fmaf(wv[2], a.z, acc[s]);
+                acc[s] = fmaf(wv[3], a.w, acc[s]);
+                acc[s] = fmaf(wv[4], b.x, acc[s]);
+                acc[s] = fmaf(wv[5], b.y, acc[s]);
+                acc[s] = fmaf(wv[6], b.z, acc[s]);
+                acc[s] = fmaf(wv[7], b.w, acc[s]);
+            }
+        }
+        const int c1 = lane + 32;
+        if (c1 < chunks) {
+            const float4* half = reinterpret_cast<const float4*>(m + c1 * 8);
+            const float4 p = half[first_half], q = half[first_half ^ 1];
+            const float4 a = first_half ? q : p, b = first_half ? p : q;
 #pragma unroll
-                for (int s = 0; s < kStreams; ++s) {
-                    float wv[8];
-                    Codec::decode(chunk[s][h], wv);
-                    acc[s] = fmaf(wv[0], a.x, acc[s]);
-                    acc[s] = fmaf(wv[1], a.y, acc[s]);
-                    acc[s] = fmaf(wv[2], a.z, acc[s]);
-                    acc[s] = fmaf(wv[3], a.w, acc[s]);
-                    acc[s] = fmaf(wv[4], b.x, acc[s]);
-                    acc[s] = fmaf(wv[5], b.y, acc[s]);
-                    acc[s] = fmaf(wv[6], b.z, acc[s]);
-                    acc[s] = fmaf(wv[7], b.w, acc[s]);
-                }
+            for (int s = 0; s < kStreams; ++s) {
+                const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + d;
+                const auto chunk1      = Codec::load(up, row, c1 * 8);
+                float wv[8];
+                Codec::decode(chunk1, wv);
+                acc[s] = fmaf(wv[0], a.x, acc[s]);
+                acc[s] = fmaf(wv[1], a.y, acc[s]);
+                acc[s] = fmaf(wv[2], a.z, acc[s]);
+                acc[s] = fmaf(wv[3], a.w, acc[s]);
+                acc[s] = fmaf(wv[4], b.x, acc[s]);
+                acc[s] = fmaf(wv[5], b.y, acc[s]);
+                acc[s] = fmaf(wv[6], b.z, acc[s]);
+                acc[s] = fmaf(wv[7], b.w, acc[s]);
             }
         }
 #pragma unroll
         for (int s = 0; s < kStreams; ++s) { acc[s] = warp_sum(acc[s]); }
-        float r[kStreams];
+        float r[kStreams], w_bias[kStreams];
 #pragma unroll
         for (int s = 0; s < kStreams; ++s) {
-            const int e    = t * kStreams + s;
-            const float lo = __shfl_sync(0xFFFFFFFFU, r_held[0], e & 31);
-            const float hi = __shfl_sync(0xFFFFFFFFU, r_held[1], e & 31);
-            r[s]           = e < 32 ? lo : hi;
+            r[s]      = __shfl_sync(0xFFFFFFFFU, r_s, s);
+            w_bias[s] = __shfl_sync(0xFFFFFFFFU, wb, s);
         }
         if (lane == 0) {
             float sum = 0.0F;
 #pragma unroll
             for (int s = 0; s < kStreams; ++s) {
-                const float rn = r[s] * inv[s * columns + t] * w_bias[s];
+                const float rn = r[s] * inv[s] * w_bias[s];
                 sum += sigmoidf(acc[s]) * rn;
             }
-            x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
+            x[d] = __float2bfloat16_rn(sum * inv_streams);
+        }
+    } else {
+        // 1. Weights first: the S rows (s*H + d) of W_up, chunks lane and lane + 32.
+        typename Codec::Chunk chunk[kStreams][2];
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) {
+            const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + (live ? d : 0);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int c = lane + 32 * h;
+                chunk[s][h] = c < chunks ? Codec::load(up, row, c * 8) : typename Codec::Chunk{};
+            }
+        }
+        // The norm weights (1 + w) of the warp's S rows, and the residual R[s*H + d, t] for every (t, s):
+        // entry e = t*S + s is held by lane e % 32 in r_held[e / 32], for lane 0's collapse.
+        static_assert(kStreams * kHcMixFusedMaxColumns <= 64);
+        const int dl = live ? d : 0;
+        float w_bias[kStreams];
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) {
+            w_bias[s] = 1.0F + norm_value(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
+        }
+        // Launched as a programmatic dependent: the weights load while the down partials finish. The next
+        // projection may launch beside this grid at once and fetch its weights meanwhile.
+        pdl::trigger_dependents();
+        pdl::wait_for_dependencies();
+        float r_held[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int e = lane + 32 * h, t = e / kStreams, s = e - t * kStreams;
+            bf16* at    = residual + static_cast<std::int64_t>(t) * width + static_cast<std::int64_t>(s) * kHidden + dl;
+            if constexpr (Pending) {
+                r_held[h] = 0.0F;
+                if (t < columns) {
+                    const bf16 value = hc_injected(__bfloat162float(*at), pending_inject[static_cast<std::int64_t>(t) * kStreams + s],
+                                                   __bfloat162float(pending_y[static_cast<std::int64_t>(t) * kHidden + dl]));
+                    if (live) { *at = value; }
+                    r_held[h] = __bfloat162float(value);
+                }
+            } else {
+                r_held[h] = t < columns ? __bfloat162float(*at) : 0.0F;
+            }
+        }
+        // Lanes 4-7 of each quarter warp read a chunk's two float4 halves of m in the other order, so a
+        // quarter warp's eight 16-byte reads cover all 32 banks.
+        const int first_half = (lane >> 2) & 1;
+
+        // 2. z = sum_s partial[s] in order s = 0..S-1; m = SiLU(z / S); CTA 0 writes the injects.
+        const float inv_streams = 1.0F / static_cast<float>(kStreams);
+#pragma unroll 4
+        for (int i = static_cast<int>(threadIdx.x); i < down_rows * columns; i += kUpThreads) {
+            const int k = i / columns, t = i - k * columns;
+            float z     = 0.0F;
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) { z += partial[(static_cast<std::int64_t>(s) * down_rows + k) * columns + t]; }
+            const float v = z * inv_streams;
+            if (k < rank) {
+                m[t * rank + k] = v * sigmoidf(v);
+            } else if (inject != nullptr && blockIdx.x == 0) {
+                inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
+            }
+        }
+        for (int i = static_cast<int>(threadIdx.x); i < kStreams * columns; i += kUpThreads) { inv[i] = inv_in[i]; }
+        __syncthreads();
+        if (!live) { return; }
+
+        // 3. u_s = W_up[s*H + d] . m in the lane-chunk order, then the collapse in lane 0.
+#pragma unroll 1
+        for (int t = 0; t < columns; ++t) {
+            const float* mt = m + t * rank;
+            float acc[kStreams];
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) { acc[s] = 0.0F; }
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int c = lane + 32 * h;
+                if (c < chunks) {
+                    const float4* half = reinterpret_cast<const float4*>(mt + c * 8);
+                    const float4 p = half[first_half], q = half[first_half ^ 1];
+                    const float4 a = first_half ? q : p, b = first_half ? p : q;
+#pragma unroll
+                    for (int s = 0; s < kStreams; ++s) {
+                        float wv[8];
+                        Codec::decode(chunk[s][h], wv);
+                        acc[s] = fmaf(wv[0], a.x, acc[s]);
+                        acc[s] = fmaf(wv[1], a.y, acc[s]);
+                        acc[s] = fmaf(wv[2], a.z, acc[s]);
+                        acc[s] = fmaf(wv[3], a.w, acc[s]);
+                        acc[s] = fmaf(wv[4], b.x, acc[s]);
+                        acc[s] = fmaf(wv[5], b.y, acc[s]);
+                        acc[s] = fmaf(wv[6], b.z, acc[s]);
+                        acc[s] = fmaf(wv[7], b.w, acc[s]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) { acc[s] = warp_sum(acc[s]); }
+            float r[kStreams];
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) {
+                const int e    = t * kStreams + s;
+                const float lo = __shfl_sync(0xFFFFFFFFU, r_held[0], e & 31);
+                const float hi = __shfl_sync(0xFFFFFFFFU, r_held[1], e & 31);
+                r[s]           = e < 32 ? lo : hi;
+            }
+            if (lane == 0) {
+                float sum = 0.0F;
+#pragma unroll
+                for (int s = 0; s < kStreams; ++s) {
+                    const float rn = r[s] * inv[s * columns + t] * w_bias[s];
+                    sum += sigmoidf(acc[s]) * rn;
+                }
+                x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
+            }
         }
     }
 }
@@ -468,15 +713,19 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
 }
 
 // K1a with v4's staging (see above): one row of W_down per warp, 8 warps per CTA. Shared Rn:
-// [pass column][plane][kHidden / 2].
-template <class Codec, class Norm>
+// [pass column][plane][kHidden / 2]. ColumnGrid (TEMPORARY, INFERNIX_TMP_HC_DOWN_COLUMNS, candidates
+// §2.3 ST-03): a grid of one CTA per (row group, stream, column), blockIdx.z the column; each column's
+// arithmetic is the same fixed order, so its partials and inv keep their bits.
+template <class Codec, class Norm, bool Pending, bool ColumnGrid = false>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
     const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
-    int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out) {
+    int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
+    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
     constexpr int RowsPerWarp = 1;
-    extern __shared__ __align__(16) float rn[]; // [kPassColumns][2][kHidden / 2]
-    __shared__ float scratch[kDownThreads / 32][kPassColumns];
-    __shared__ float inv[kPassColumns];
+    constexpr int kColumns    = ColumnGrid ? 1 : kPassColumns; // columns per pass
+    extern __shared__ __align__(16) float rn[]; // [kColumns][2][kHidden / 2]
+    __shared__ float scratch[kDownThreads / 32][kColumns];
+    __shared__ float inv[kColumns];
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
     const int s    = static_cast<int>(blockIdx.y);
     const int row0 = (static_cast<int>(blockIdx.x) * (kDownThreads / 32) + warp) * RowsPerWarp;
@@ -505,23 +754,42 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
     pdl::wait_for_dependencies();
 
 #pragma unroll 1
-    for (int c0 = 0; c0 < columns; c0 += kPassColumns) {
-        const int pass = min(kPassColumns, columns - c0);
-        // 2. K1a's loads and per-thread sums of squares (its elements in index order), its warp
-        // butterflies and its warps' sums in warp order.
-        uint4 values[kPassColumns][kSlices];
+    for (int c0 = ColumnGrid ? static_cast<int>(blockIdx.z) : 0; c0 < columns; c0 += ColumnGrid ? columns : kPassColumns) {
+        const int pass = min(kColumns, columns - c0);
+        // 2. K1a's loads (and pending inject) and per-thread sums of squares (its elements in index
+        // order), its warp butterflies and its warps' sums in warp order.
+        uint4 values[kColumns][kSlices];
+        uint4 ys[Pending ? kColumns : 1][kSlices];
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
+        for (int c = 0; c < kColumns; ++c) {
             const bf16* r = residual + static_cast<std::int64_t>(c0 + c) * width + static_cast<std::int64_t>(s) * kHidden;
 #pragma unroll
             for (int h = 0; h < kSlices; ++h) {
                 const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
-                if (c < pass && i < kHidden) { values[c][h] = load_ldg<uint4>(r + i); }
+                if (c < pass && i < kHidden) {
+                    values[c][h] = load_ldg<uint4>(r + i);
+                    if constexpr (Pending) {
+                        ys[c][h] = load_ldg<uint4>(pending_y + static_cast<std::int64_t>(c0 + c) * kHidden + i);
+                    }
+                }
             }
         }
-        float sums[kPassColumns];
+        if constexpr (Pending) {
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
+            for (int c = 0; c < kColumns; ++c) {
+                if (c < pass) {
+                    const float inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+#pragma unroll
+                    for (int h = 0; h < kSlices; ++h) {
+                        const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
+                        if (i < kHidden) { values[c][h] = injected8(values[c][h], ys[c][h], inject); }
+                    }
+                }
+            }
+        }
+        float sums[kColumns];
+#pragma unroll
+        for (int c = 0; c < kColumns; ++c) {
             sums[c] = 0.0F;
 #pragma unroll
             for (int h = 0; h < kSlices; ++h) {
@@ -535,7 +803,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
             }
         }
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
+        for (int c = 0; c < kColumns; ++c) {
             if (c < pass) {
                 const float total = warp_sum(sums[c]);
                 if (lane == 0) { scratch[warp][c] = total; }
@@ -552,7 +820,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
         // Rn = R * inv * (1 + w), FP32, K1a's expression, stored once from the registers: group g of 8
         // elements goes to float4 g of plane 0 (elements 0-3) and of plane 1 (elements 4-7).
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
+        for (int c = 0; c < kColumns; ++c) {
             if (c < pass) {
                 const float ic = inv[c];
                 float4* plane  = reinterpret_cast<float4*>(rn) + c * 2 * kPlane;
@@ -579,11 +847,11 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
         }
         __syncthreads();
         // 3. Each row's dot products: the lane-chunk order, then a warp butterfly per (row, column).
-        float acc[RowsPerWarp][kPassColumns];
+        float acc[RowsPerWarp][kColumns];
 #pragma unroll
         for (int r = 0; r < RowsPerWarp; ++r) {
 #pragma unroll
-            for (int c = 0; c < kPassColumns; ++c) { acc[r][c] = 0.0F; }
+            for (int c = 0; c < kColumns; ++c) { acc[r][c] = 0.0F; }
         }
 #pragma unroll
         for (int m = 0; m < kChunks; ++m) {
@@ -592,7 +860,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
 #pragma unroll
             for (int r = 0; r < RowsPerWarp; ++r) { Codec::decode(chunk[r][m], wv[r]); }
 #pragma unroll
-            for (int c = 0; c < kPassColumns; ++c) {
+            for (int c = 0; c < kColumns; ++c) {
                 if (c < pass) {
                     const float4* plane = reinterpret_cast<const float4*>(rn) + c * 2 * kPlane;
                     const float4 a = plane[g], b = plane[kPlane + g];
@@ -613,7 +881,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
 #pragma unroll
         for (int r = 0; r < RowsPerWarp; ++r) {
 #pragma unroll
-            for (int c = 0; c < kPassColumns; ++c) {
+            for (int c = 0; c < kColumns; ++c) {
                 if (c < pass) {
                     const float total = warp_sum(acc[r][c]);
                     if (lane == 0 && row0 + r < rows) {
@@ -631,11 +899,12 @@ constexpr int kUpV4Warps   = 8;
 constexpr int kUpV4Threads = kUpV4Warps * 32;
 constexpr int kUpV4Rows    = 8; // a warp's rows: features warp and warp + 8, 4 streams each
 
-template <class Codec, class Norm>
+template <class Codec, class Norm, bool Pending>
 __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, const bf16* __restrict__ residual,
+    const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x) {
+    float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
+    const float* __restrict__ pending_inject) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);
     static_assert(kUpFeatures * kHcMixFusedMaxColumns <= kUpV4Threads);
     __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank];    // [T][2][rank / 2]
@@ -675,9 +944,19 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     float r[kStreams];
 #pragma unroll
     for (int s = 0; s < kStreams; ++s) {
-        r[s] = collapses ? __bfloat162float(__ldg(residual + static_cast<std::int64_t>(te) * width +
-                                                  static_cast<std::int64_t>(s) * kHidden + de))
-                         : 0.0F;
+        bf16* at = residual + static_cast<std::int64_t>(te) * width + static_cast<std::int64_t>(s) * kHidden + de;
+        if constexpr (Pending) {
+            // Every (column, stream, feature) belongs to one collapse thread: it reads and writes it back.
+            r[s] = 0.0F;
+            if (collapses) {
+                const bf16 value = hc_injected(__bfloat162float(*at), pending_inject[static_cast<std::int64_t>(te) * kStreams + s],
+                                               __bfloat162float(pending_y[static_cast<std::int64_t>(te) * kHidden + de]));
+                *at  = value;
+                r[s] = __bfloat162float(value);
+            }
+        } else {
+            r[s] = collapses ? __bfloat162float(__ldg(at)) : 0.0F;
+        }
     }
 
     // 2. z = sum_s partial[s] in order s = 0..S-1; m = SiLU(z / S) into plane (k / 4) % 2 at
@@ -768,12 +1047,19 @@ Q8Codec::Params q8_params(const Weight& w) {
 
 Bf16Codec::Params bf16_params(const Weight& w) { return {static_cast<const bf16*>(w.qdata), bf16_stride(w)}; }
 
+// The attention half's pending inject of hyper_connection_inject_mix (null y: none).
+struct PendingInject {
+    const bf16* y        = nullptr; // BF16 [H, T]
+    const float* inject  = nullptr; // FP32 [S, T]
+};
+
 // Launches hc_down_partials_v4_kernel in K1a's place.
-template <class Codec, class Norm>
+template <class Codec, class Norm, bool Fold>
 void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down, int down_rows,
-                    int streams, float eps, float* partial, float* inv, std::size_t rn_bytes, cudaStream_t stream) {
+                    int streams, float eps, float* partial, float* inv, std::size_t rn_bytes, const PendingInject& pending,
+                    cudaStream_t stream) {
     static const bool configured = [] {
-        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec, Norm>,
+        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec, Norm, Fold>,
                                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                        static_cast<int>(kDownSharedBytes));
         if (error != cudaSuccess) {
@@ -782,30 +1068,61 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
         return true;
     }();
     (void)configured;
-    // One CTA per row group and stream, looping over the columns. A grid of one CTA per column at 2-8 columns
-    // (candidates §2.3 ST-03) was slower: Dense8 MTP-3 0.996x, IQ3_S DFlash2 0.983x (2026-10-28, removed).
+    // TEMPORARY (INFERNIX_TMP_HC_DOWN_COLUMNS, candidates §2.3 ST-03): calls of up to a pass's columns
+    // spread their columns over the grid (one CTA per row group, stream and column) instead of one
+    // CTA per row group and stream, about one per SM, looping over them.
+    static const bool column_grid = temporary_switches::flag("INFERNIX_TMP_HC_DOWN_COLUMNS");
+    const int columns             = residual.ne[1];
+    if (column_grid && columns <= kPassColumns) {
+        check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams, columns),
+                                           dim3(kDownThreads), kHidden * sizeof(float), stream},
+                                          hc_down_partials_v4_kernel<Codec, Norm, Fold, true>,
+                                          static_cast<const bf16*>(residual.data),
+                                          static_cast<const Norm*>(norm_weight.data), down, down_rows, columns, eps,
+                                          partial, inv, pending.y, pending.inject),
+                     "down partials v4 (column grid)");
+        return;
+    }
     check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
                                        rn_bytes, stream},
-                                      hc_down_partials_v4_kernel<Codec, Norm>,
+                                      hc_down_partials_v4_kernel<Codec, Norm, Fold>,
                                       static_cast<const bf16*>(residual.data), static_cast<const Norm*>(norm_weight.data),
-                                      down, down_rows, residual.ne[1], eps, partial, inv),
+                                      down, down_rows, residual.ne[1], eps, partial, inv, pending.y, pending.inject),
                  "down partials v4");
 }
 
-template <class Codec, class Norm>
+template <class Codec, class Norm, bool Fold>
 void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down,
             typename Codec::Params up, int down_rows, int rank, int streams, float eps, Tensor& x, Tensor* inject,
-            void* partials, cudaStream_t stream) {
+            void* partials, const PendingInject& pending, cudaStream_t stream) {
     static const bool configured = [] {
-        const cudaError_t error = cudaFuncSetAttribute(hc_down_partials_kernel<Codec, Norm>,
-                                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                       static_cast<int>(kDownSharedBytes));
-        if (error != cudaSuccess) {
-            throw std::runtime_error(std::string("hyper_connection_mix: shared memory: ") + cudaGetErrorString(error));
+        const cudaError_t e1 = cudaFuncSetAttribute(hc_down_partials_kernel<Codec, Norm, Fold, 1, 2>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    static_cast<int>(kHidden * sizeof(float)));
+        const cudaError_t e1_wide = cudaFuncSetAttribute(hc_down_partials_kernel<Codec, Norm, Fold, kPassColumns, 1>,
+                                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                         static_cast<int>(kDownSharedBytes));
+        // The up collapse's arrays shrink to the call's own rank x columns; the attribute states the
+        // worst case it may ever be given, not what a decode call allocates.
+        constexpr int kUpMaxSmem = static_cast<int>(
+            (static_cast<std::size_t>(kHcMixFusedMaxColumns) * kMaxRank +
+             static_cast<std::size_t>(kStreams) * kHcMixFusedMaxColumns) *
+            sizeof(float));
+        constexpr int kUp1Smem = static_cast<int>((kMaxRank + kStreams) * sizeof(float));
+        const cudaError_t e2_1 = cudaFuncSetAttribute(hc_up_collapse_kernel<Codec, Norm, Fold, 1, 2>,
+                                                      cudaFuncAttributeMaxDynamicSharedMemorySize, kUp1Smem);
+        const cudaError_t e2 = cudaFuncSetAttribute(hc_up_collapse_kernel<Codec, Norm, Fold>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kUpMaxSmem);
+        if (e1 != cudaSuccess || e1_wide != cudaSuccess || e2_1 != cudaSuccess || e2 != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("hyper_connection_mix: shared memory: ") +
+                cudaGetErrorString(e1 != cudaSuccess ? e1 : (e1_wide != cudaSuccess ? e1_wide : (e2_1 != cudaSuccess ? e2_1 : e2))));
         }
         return true;
     }();
     (void)configured;
+    // The fold writes the injected residual back (K1b); the plain mix only reads it.
+    auto* residual_data = static_cast<bf16*>(residual.data);
     const int columns = residual.ne[1];
     auto* partial     = static_cast<float*>(partials);
     const std::size_t partial_bytes =
@@ -820,45 +1137,96 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     // 16-byte vectors.
     const bool v4 = columns >= 2 && reinterpret_cast<std::uintptr_t>(norm_weight.data) % 16 == 0;
     if (v4) {
-        launch_down_v4<Codec, Norm>(residual, norm_weight, down, down_rows, streams, eps, partial, inv, rn_bytes,
-                                    stream);
+        launch_down_v4<Codec, Norm, Fold>(residual, norm_weight, down, down_rows, streams, eps, partial, inv, rn_bytes,
+                                          pending, stream);
+    } else if (columns == 1) {
+        check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
+                                           rn_bytes, stream},
+                                          hc_down_partials_kernel<Codec, Norm, Fold, 1, 2>,
+                                          static_cast<const bf16*>(residual.data),
+                                          static_cast<const Norm*>(norm_weight.data), down, down_rows, columns, eps,
+                                          partial, inv, pending.y, pending.inject),
+                     "down partials");
     } else {
         check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
                                            rn_bytes, stream},
-                                          hc_down_partials_kernel<Codec, Norm>, static_cast<const bf16*>(residual.data),
+                                          hc_down_partials_kernel<Codec, Norm, Fold, kPassColumns, 1>,
+                                          static_cast<const bf16*>(residual.data),
                                           static_cast<const Norm*>(norm_weight.data), down, down_rows, columns, eps,
-                                          partial, inv),
+                                          partial, inv, pending.y, pending.inject),
                      "down partials");
     }
     if (v4) {
         check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpV4Threads), 0, stream},
-                                          hc_up_collapse_v4_kernel<Codec, Norm>, static_cast<const float*>(partial),
-                                          static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
+                                          hc_up_collapse_v4_kernel<Codec, Norm, Fold>, static_cast<const float*>(partial),
+                                          static_cast<const float*>(inv), residual_data,
                                           static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
                                           inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
-                                          static_cast<bf16*>(x.data)),
+                                          static_cast<bf16*>(x.data), pending.y, pending.inject),
                      "up collapse v4");
         return;
     }
-    check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpThreads), 0, stream},
-                                      hc_up_collapse_kernel<Codec, Norm>, static_cast<const float*>(partial),
-                                      static_cast<const float*>(inv), static_cast<const bf16*>(residual.data),
-                                      static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
-                                      inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
-                                      static_cast<bf16*>(x.data)),
-                 "up collapse");
+    // The up collapse's shared arrays are m[columns][rank] and inv[streams][columns]; sizing them
+    // from the call's own values (rather than kHcMixFusedMaxColumns * kMaxRank) is what lets
+    // decode's ~5 KB sit beside a down CTA on its SM instead of reserving 128 KB.
+    const std::size_t up_smem =
+        (static_cast<std::size_t>(columns) * static_cast<std::size_t>(rank) +
+         static_cast<std::size_t>(streams) * static_cast<std::size_t>(columns)) *
+        sizeof(float);
+    if (columns == 1) {
+        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpThreads), up_smem, stream},
+                                          hc_up_collapse_kernel<Codec, Norm, Fold, 1, 2>, static_cast<const float*>(partial),
+                                          static_cast<const float*>(inv), residual_data,
+                                          static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
+                                          inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
+                                          static_cast<bf16*>(x.data), pending.y, pending.inject),
+                     "up collapse");
+    } else {
+        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpThreads), up_smem, stream},
+                                          hc_up_collapse_kernel<Codec, Norm, Fold>, static_cast<const float*>(partial),
+                                          static_cast<const float*>(inv), residual_data,
+                                          static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
+                                          inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
+                                          static_cast<bf16*>(x.data), pending.y, pending.inject),
+                     "up collapse");
+    }
 }
 
 template <class Codec>
 void launch_norm(const Tensor& residual, const Tensor& norm_weight, typename Codec::Params down,
                  typename Codec::Params up, int down_rows, int rank, int streams, float eps, Tensor& x, Tensor* inject,
-                 void* partials, cudaStream_t stream) {
+                 void* partials, const PendingInject& pending, cudaStream_t stream) {
+    const auto with = [&]<class Norm>() {
+        if (pending.y != nullptr) {
+            launch<Codec, Norm, true>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject, partials,
+                                      pending, stream);
+        } else {
+            launch<Codec, Norm, false>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject,
+                                       partials, pending, stream);
+        }
+    };
     if (norm_weight.dtype == DType::FP32) {
-        launch<Codec, float>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject, partials,
-                             stream);
+        with.template operator()<float>();
     } else {
-        launch<Codec, bf16>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject, partials,
-                            stream);
+        with.template operator()<bf16>();
+    }
+}
+
+void mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down, const Weight& up,
+               std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
+               const PendingInject& pending, cudaStream_t stream) {
+    if (!hc_mix_fused_supported(down, up, x.ne[0], streams, rank, residual.ne[1])) {
+        throw std::invalid_argument("hyper_connection_mix: the fused route does not serve this problem");
+    }
+    if (inject != nullptr && down.n != rank + streams) {
+        throw std::invalid_argument("hyper_connection_mix: injects need the down projection's injection rows");
+    }
+    if (down.qtype == QType::Q8_G32_FP16) {
+        launch_norm<Q8Codec>(residual, norm_weight, q8_params(down), q8_params(up), down.n, rank, streams, eps, x,
+                             inject, partials, pending, stream);
+    } else {
+        launch_norm<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank, streams, eps,
+                               x, inject, partials, pending, stream);
     }
 }
 
@@ -881,19 +1249,23 @@ std::size_t hc_mix_fused_workspace_bytes(std::int32_t down_rows, std::int32_t st
 void hc_mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& down, const Weight& up,
                   std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
                   cudaStream_t stream) {
-    if (!hc_mix_fused_supported(down, up, x.ne[0], streams, rank, residual.ne[1])) {
-        throw std::invalid_argument("hyper_connection_mix: the fused route does not serve this problem");
+    mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials, PendingInject{}, stream);
+}
+
+void hc_inject_mix_fused(const Tensor& y, const Tensor& pending_inject, Tensor& residual, const Tensor& norm_weight,
+                         const Weight& down, const Weight& up, std::int32_t streams, std::int32_t rank, float eps,
+                         Tensor& x, Tensor* inject, void* partials, cudaStream_t stream) {
+    const std::int32_t T = residual.ne[1];
+    if (y.data == nullptr || y.dtype != DType::BF16 || !y.is_contiguous() || y.ne[0] != kHidden || y.ne[1] != T ||
+        pending_inject.data == nullptr || pending_inject.dtype != DType::FP32 || !pending_inject.is_contiguous() ||
+        pending_inject.ne[0] != streams || pending_inject.ne[1] != T) {
+        throw std::invalid_argument("hyper_connection_inject_mix: y or the pending inject disagree with the residual");
     }
-    if (inject != nullptr && down.n != rank + streams) {
-        throw std::invalid_argument("hyper_connection_mix: injects need the down projection's injection rows");
+    if (inject != nullptr && inject->data == pending_inject.data) {
+        throw std::invalid_argument("hyper_connection_inject_mix: the mix's injects would overwrite the pending ones");
     }
-    if (down.qtype == QType::Q8_G32_FP16) {
-        launch_norm<Q8Codec>(residual, norm_weight, q8_params(down), q8_params(up), down.n, rank, streams, eps, x,
-                             inject, partials, stream);
-    } else {
-        launch_norm<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank, streams, eps,
-                               x, inject, partials, stream);
-    }
+    mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials,
+              PendingInject{static_cast<const bf16*>(y.data), static_cast<const float*>(pending_inject.data)}, stream);
 }
 
 } // namespace infernix::ops::detail

@@ -1,15 +1,10 @@
-if(WIN32)
-  set(INFERNIX_READ_ONLY_FILE_SOURCE read_only_file_win32.cpp)
-else()
-  set(INFERNIX_READ_ONLY_FILE_SOURCE read_only_file_posix.cpp)
-endif()
-
 add_library(infernix_core STATIC
-  ${INFERNIX_READ_ONLY_FILE_SOURCE}
+  read_only_file_posix.cpp
   arena.cu
   block_copy.cu
   copy_batch.cpp
   cpu_topology.cpp
+  gpu_telemetry.cpp
   evictable_weight_pool.cu
   vmm_arena.cu
   device.cu
@@ -20,7 +15,6 @@ add_library(infernix_core STATIC
   host_memory.cpp
   host_worker_pool.cpp
   link_probe.cu
-  power_throttling.cpp
   temporary_switches.cpp
   vram_budget.cpp
   gdn_replay_records.cpp
@@ -38,11 +32,3 @@ add_library(infernix_core STATIC
 infernix_internal_includes(infernix_core)
 infernix_cuda_archive(infernix_core)
 target_link_libraries(infernix_core PUBLIC infernix_cuda_runtime CUDA::nvtx3 CUDA::cuda_driver Threads::Threads)
-if(WIN32)
-  # DXGI: the OS video-memory budget and display outputs of the CUDA adapter (vram_budget.cpp).
-  target_link_libraries(infernix_core PRIVATE dxgi)
-else()
-  # DXCore under WSL2: the Windows adapter's shared system memory (vram_budget.cpp).
-  target_sources(infernix_core PRIVATE dxcore_adapter.cpp)
-  target_link_libraries(infernix_core PRIVATE ${CMAKE_DL_LIBS})
-endif()

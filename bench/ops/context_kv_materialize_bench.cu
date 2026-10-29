@@ -43,7 +43,7 @@ struct Options {
     Execution execution     = Execution::Graph;
     int warmup              = 10;
     int repeat              = 100;
-    std::size_t flush_bytes = 256ULL << 20;
+    std::size_t flush_bytes = infernix::bench::default_cold_flush_bytes();
 };
 
 [[noreturn]] void usage(const char* program, const char* error) {

@@ -18,6 +18,7 @@ namespace infernix::ops::detail {
                                                                 std::int32_t max_tokens);
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
-                    WorkspaceArena* workspace, cudaStream_t stream);
+                    WorkspaceArena* workspace, cudaStream_t stream,
+                    LinearRoutes routes = LinearRoutes::Exact);
 
 } // namespace infernix::ops::detail

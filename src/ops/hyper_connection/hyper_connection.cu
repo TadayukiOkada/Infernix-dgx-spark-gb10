@@ -56,38 +56,40 @@ __device__ __forceinline__ float norm_value(bf16 w) { return __bfloat162float(w)
 __device__ __forceinline__ float norm_value(float w) { return w; }
 
 // The norm weights are BF16, or FP32 (NVIDIA FP4-Local's trained norms).
-template <class Norm>
+template <class Norm = bf16, int PerThread = kNormPerThread, bool Full = false>
 __global__ void __launch_bounds__(kThreads) norm_kernel(const bf16* __restrict__ residual,
-                                                      const Norm* __restrict__ weight, int hidden,
-                                                      int width, float eps, bf16* __restrict__ out) {
+                                                        const Norm* __restrict__ weight, int hidden,
+                                                        int width, float eps, bf16* __restrict__ out) {
     __shared__ float scratch[kThreads / 32];
     const int s = blockIdx.x, t = blockIdx.y;
     const bf16* x = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
     bf16* y       = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
     const Norm* w = weight + static_cast<std::size_t>(s) * hidden;
-    bf16 xs[kNormPerThread];
-    Norm ws[kNormPerThread];
+    bf16 xs[PerThread];
+    Norm ws[PerThread];
 #pragma unroll
-    for (int i = 0; i < kNormPerThread; ++i) {
+    for (int i = 0; i < PerThread; ++i) {
         const int d = threadIdx.x + i * kThreads;
-        if (d < hidden) {
+        if (Full || d < hidden) {
             xs[i] = x[d];
             ws[i] = w[d];
         }
     }
     float sum = 0.0F;
 #pragma unroll
-    for (int i = 0; i < kNormPerThread; ++i) {
-        if (threadIdx.x + i * kThreads < hidden) {
+    for (int i = 0; i < PerThread; ++i) {
+        if (Full || threadIdx.x + i * kThreads < hidden) {
             const float v = __bfloat162float(xs[i]);
             sum += v * v;
         }
     }
     const float inv = rsqrtf(block_sum(sum, scratch) / static_cast<float>(hidden) + eps);
 #pragma unroll
-    for (int i = 0; i < kNormPerThread; ++i) {
+    for (int i = 0; i < PerThread; ++i) {
         const int d = threadIdx.x + i * kThreads;
-        if (d < hidden) { y[d] = __float2bfloat16_rn(__bfloat162float(xs[i]) * inv * (1.0F + norm_value(ws[i]))); }
+        if (Full || d < hidden) {
+            y[d] = __float2bfloat16_rn(__bfloat162float(xs[i]) * inv * (1.0F + norm_value(ws[i])));
+        }
     }
 }
 
@@ -171,14 +173,27 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::in
             "norm shapes disagree");
     require(eps > 0, "norm epsilon must be positive");
     require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
+    const int hidden = width / streams;
     if (weight.dtype == DType::FP32) {
-        norm_kernel<float><<<dim3(streams, columns), kThreads, 0, stream>>>(
-            static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data), width / streams, width,
-            eps, static_cast<bf16*>(out.data));
+        if (hidden == kThreads * 10) {
+            norm_kernel<float, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        } else {
+            norm_kernel<float><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        }
     } else {
-        norm_kernel<bf16><<<dim3(streams, columns), kThreads, 0, stream>>>(
-            static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data), width / streams, width,
-            eps, static_cast<bf16*>(out.data));
+        if (hidden == kThreads * 10) {
+            norm_kernel<bf16, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        } else {
+            norm_kernel<bf16><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        }
     }
     check_launch("norm");
 }

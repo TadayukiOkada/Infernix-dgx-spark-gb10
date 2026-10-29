@@ -453,7 +453,10 @@ PromptInput image_prompt(int dimension) {
 ArtifactProfile inspect_artifact(const std::filesystem::path& artifact_path) {
     const std::filesystem::path path = existing_input_path(artifact_path);
     infernix::artifact::Reader reader(path);
-    return ArtifactProfile{.path = path};
+    return ArtifactProfile{
+        .path = path,
+        .has_vision = reader.directory().components.contains("vision"),
+    };
 }
 
 TransferSuiteResult measure_context_transfers(const MeasurementOptions& options) {
@@ -498,7 +501,7 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     engine_options.prefill_chunk         = options.prefill_chunk;
     engine_options.kv_cache              = KvCacheStorage::BFloat16;
     engine_options.speculative.backend   = SpeculativeBackend::None;
-    engine_options.enable_vision         = true;
+    engine_options.enable_vision         = artifact.has_vision;
     engine_options.use_cuda_graph        = true;
     engine_options.context_cache.enabled = false;
     engine_options.context_cache.host_capacity_bytes = 0;
@@ -562,55 +565,57 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
         });
     }
 
-    struct VisionCase {
-        int dimension;
-        bool validation;
-    };
+    if (artifact.has_vision) {
+        struct VisionCase {
+            int dimension;
+            bool validation;
+        };
 
-    constexpr std::array<VisionCase, 4> vision_cases{{
-        {.dimension = 224, .validation = false},
-        {.dimension = 448, .validation = false},
-        {.dimension = 672, .validation = false},
-        {.dimension = 560, .validation = true},
-    }};
-    const auto run_vision = [&](int dimension) {
-        PreparedPrompt prompt       = engine.prepare(image_prompt(dimension));
-        const std::uint64_t patches = prompt.preparation_stats().raw_patches;
-        GenerationResult generated  = engine.generate(std::move(prompt), one_token_request());
-        if (patches == 0 || generated.generated_token_ids.size() != 1 ||
-            generated.finish_reason != FinishReason::OutputLimit || !generated.prompt.has_media ||
-            !(generated.timings.vision_seconds > 0.0)) {
-            throw std::runtime_error("Vision prefill calibration did not execute Vision");
-        }
-        return std::pair{patches, generated.timings.vision_seconds * 1'000'000'000.0};
-    };
-    (void)run_vision(vision_cases.back().dimension);
-    std::array<std::vector<double>, vision_cases.size()> vision_samples;
-    std::array<std::uint64_t, vision_cases.size()> patches{};
-    for (int repetition = 0; repetition < options.prefill_repetitions; ++repetition) {
-        for (std::size_t offset = 0; offset < vision_cases.size(); ++offset) {
-            const std::size_t index =
-                (offset + static_cast<std::size_t>(repetition)) % vision_cases.size();
-            const auto [count, nanoseconds] = run_vision(vision_cases[index].dimension);
-            if (patches[index] != 0 && patches[index] != count) {
-                throw std::runtime_error("synthetic image patch count changed between runs");
+        constexpr std::array<VisionCase, 4> vision_cases{{
+            {.dimension = 224, .validation = false},
+            {.dimension = 448, .validation = false},
+            {.dimension = 672, .validation = false},
+            {.dimension = 560, .validation = true},
+        }};
+        const auto run_vision = [&](int dimension) {
+            PreparedPrompt prompt       = engine.prepare(image_prompt(dimension));
+            const std::uint64_t patches = prompt.preparation_stats().raw_patches;
+            GenerationResult generated  = engine.generate(std::move(prompt), one_token_request());
+            if (patches == 0 || generated.generated_token_ids.size() != 1 ||
+                generated.finish_reason != FinishReason::OutputLimit || !generated.prompt.has_media ||
+                !(generated.timings.vision_seconds > 0.0)) {
+                throw std::runtime_error("Vision prefill calibration did not execute Vision");
             }
-            patches[index] = count;
-            vision_samples[index].push_back(nanoseconds);
+            return std::pair{patches, generated.timings.vision_seconds * 1'000'000'000.0};
+        };
+        (void)run_vision(vision_cases.back().dimension);
+        std::array<std::vector<double>, vision_cases.size()> vision_samples;
+        std::array<std::uint64_t, vision_cases.size()> patches{};
+        for (int repetition = 0; repetition < options.prefill_repetitions; ++repetition) {
+            for (std::size_t offset = 0; offset < vision_cases.size(); ++offset) {
+                const std::size_t index =
+                    (offset + static_cast<std::size_t>(repetition)) % vision_cases.size();
+                const auto [count, nanoseconds] = run_vision(vision_cases[index].dimension);
+                if (patches[index] != 0 && patches[index] != count) {
+                    throw std::runtime_error("synthetic image patch count changed between runs");
+                }
+                patches[index] = count;
+                vision_samples[index].push_back(nanoseconds);
+            }
         }
-    }
-    for (std::size_t index = 0; index < vision_cases.size(); ++index) {
-        result.measurements.push_back(PrefillMeasurement{
-            .label           = "vision-" + std::to_string(vision_cases[index].dimension),
-            .prefix_tokens   = 0,
-            .suffix_tokens   = 0,
-            .chunks          = 0,
-            .attention_pairs = 0,
-            .vision_items    = 1,
-            .vision_patches  = patches[index],
-            .validation      = vision_cases[index].validation,
-            .timing          = summarize_samples(std::move(vision_samples[index])),
-        });
+        for (std::size_t index = 0; index < vision_cases.size(); ++index) {
+            result.measurements.push_back(PrefillMeasurement{
+                .label           = "vision-" + std::to_string(vision_cases[index].dimension),
+                .prefix_tokens   = 0,
+                .suffix_tokens   = 0,
+                .chunks          = 0,
+                .attention_pairs = 0,
+                .vision_items    = 1,
+                .vision_patches  = patches[index],
+                .validation      = vision_cases[index].validation,
+                .timing          = summarize_samples(std::move(vision_samples[index])),
+            });
+        }
     }
     return result;
 }

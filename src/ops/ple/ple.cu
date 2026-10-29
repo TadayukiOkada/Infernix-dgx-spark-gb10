@@ -29,6 +29,13 @@ bool contiguous(const Tensor& t, DType dtype) {
     return t.data != nullptr && t.dtype == dtype && t.is_contiguous();
 }
 
+bool column_strided_2d(const Tensor& t, DType dtype) {
+    return t.data != nullptr && t.dtype == dtype && t.ne[2] == 1 && t.ne[3] == 1 &&
+           t.nb[0] == static_cast<std::int64_t>(dtype_size(dtype)) &&
+           t.nb[1] >= static_cast<std::int64_t>(t.ne[0]) * t.nb[0] &&
+           t.nb[1] % t.nb[0] == 0;
+}
+
 __device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
 
 __device__ __forceinline__ float block_sum(float value, float* scratch) {
@@ -103,13 +110,16 @@ __global__ void __launch_bounds__(kThreads)
     gate_kernel(const bf16* __restrict__ key, const bf16* __restrict__ value,
                 const bf16* __restrict__ residual, const Norm* __restrict__ key_norm,
                 const Norm* __restrict__ query_norm, const Norm* __restrict__ conv_norm, int hidden,
-                int width, float eps, bf16* __restrict__ gated, bf16* __restrict__ normalized) {
+                int width, int key_stride, int value_stride, float eps, bf16* __restrict__ gated,
+                bf16* __restrict__ normalized) {
     __shared__ float scratch[kThreads / 32];
     const int s = blockIdx.x, t = blockIdx.y;
-    const std::size_t base = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
+    const std::size_t base     = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
+    const std::size_t key_base = static_cast<std::size_t>(t) * key_stride + static_cast<std::size_t>(s) * hidden;
+    const std::size_t val_base = static_cast<std::size_t>(t) * value_stride;
     float key_sq = 0.0F, query_sq = 0.0F;
     for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        const float k = __bfloat162float(key[base + d]);
+        const float k = __bfloat162float(key[key_base + d]);
         const float q = __bfloat162float(residual[base + d]);
         key_sq += k * k;
         query_sq += q * q;
@@ -119,7 +129,7 @@ __global__ void __launch_bounds__(kThreads)
     float dot = 0.0F;
     for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
         const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
-        const float k = __bfloat162float(key[base + d]) * key_inv * (1.0F + norm_value(key_norm[c]));
+        const float k = __bfloat162float(key[key_base + d]) * key_inv * (1.0F + norm_value(key_norm[c]));
         const float q = __bfloat162float(residual[base + d]) * query_inv * (1.0F + norm_value(query_norm[c]));
         dot += k * q;
     }
@@ -128,14 +138,14 @@ __global__ void __launch_bounds__(kThreads)
     const float gate = sigmoidf(g);
     float gated_sq   = 0.0F;
     for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        const float v = gate * __bfloat162float(value[static_cast<std::size_t>(t) * hidden + d]);
+        const float v = gate * __bfloat162float(value[val_base + d]);
         gated[base + d] = __float2bfloat16_rn(v);
         gated_sq += v * v;
     }
     const float gated_inv = rsqrtf(block_sum(gated_sq, scratch) / static_cast<float>(hidden) + eps);
     for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
         const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
-        const float v = gate * __bfloat162float(value[static_cast<std::size_t>(t) * hidden + d]);
+        const float v = gate * __bfloat162float(value[val_base + d]);
         normalized[base + d] = __float2bfloat16_rn(v * gated_inv * (1.0F + norm_value(conv_norm[c])));
     }
 }
@@ -215,11 +225,29 @@ __global__ void commit_kernel(const bf16* __restrict__ normalized, int span, int
 } // namespace
 
 void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_t stream) {
-    require(contiguous(rows, DType::U8) && contiguous(scale, DType::BF16) && contiguous(out, DType::BF16),
-            "embed requires contiguous U8 rows, BF16 scale and BF16 output");
-    const int elements = rows.ne[0] * rows.ne[1];
-    const int columns  = rows.ne[2];
-    require(scale.numel() == 1 && out.ne[0] == elements && out.ne[1] == columns && columns > 0,
+    require(contiguous(rows, DType::U8) && contiguous(out, DType::BF16),
+            "embed requires contiguous U8 rows and BF16 output");
+    const int heads   = rows.ne[1];
+    const int columns = rows.ne[2];
+    const int row_bytes = rows.ne[0];
+    require(columns > 0 && heads > 0, "embed shapes disagree");
+    if (scale.dtype == DType::FP32) {
+        require(contiguous(scale, DType::FP32), "NVFP4 embed requires a contiguous FP32 scale");
+        const int embed_dim = out.ne[0];
+        require(scale.numel() == 1 && out.ne[1] == columns && embed_dim % heads == 0,
+                "embed shapes disagree");
+        const int head_width = embed_dim / heads;
+        require(head_width % 16 == 0 && row_bytes == head_width / 2 + head_width / 16,
+                "NVFP4 row bytes disagree with the head width");
+        embed_nvfp4_kernel<<<columns, kThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(rows.data), static_cast<const float*>(scale.data), row_bytes,
+            heads, head_width, static_cast<std::uint16_t*>(out.data));
+        check_launch("embed");
+        return;
+    }
+    require(contiguous(scale, DType::BF16), "embed requires a BF16 or FP32 scale");
+    const int elements = row_bytes * heads;
+    require(scale.numel() == 1 && out.ne[0] == elements && out.ne[1] == columns,
             "embed shapes disagree");
     embed_kernel<<<dim3((elements + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
         static_cast<const std::uint8_t*>(rows.data), static_cast<const bf16*>(scale.data), elements,
@@ -245,8 +273,9 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
               const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
               std::int32_t streams, float eps, Tensor& gated, Tensor& normalized,
               cudaStream_t stream) {
-    for (const Tensor* t : {&key, &value, &residual, static_cast<const Tensor*>(&gated),
-                            static_cast<const Tensor*>(&normalized)}) {
+    require(column_strided_2d(key, DType::BF16) && column_strided_2d(value, DType::BF16),
+            "gate requires column-strided 2D BF16 key and value tensors");
+    for (const Tensor* t : {&residual, static_cast<const Tensor*>(&gated), static_cast<const Tensor*>(&normalized)}) {
         require(contiguous(*t, DType::BF16), "gate requires contiguous BF16 tensors");
     }
     const DType norm = key_norm.dtype;
@@ -261,12 +290,15 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
                 conv_norm.numel() == width && gated.ne[0] == width && gated.ne[1] == columns &&
                 normalized.ne[0] == width && normalized.ne[1] == columns && columns > 0 && eps > 0,
             "gate shapes disagree");
+    const int key_stride   = static_cast<int>(key.nb[1] / static_cast<std::int64_t>(sizeof(bf16)));
+    const int value_stride = static_cast<int>(value.nb[1] / static_cast<std::int64_t>(sizeof(bf16)));
     const auto launch = [&]<class Norm>() {
         gate_kernel<Norm><<<dim3(streams, columns), kThreads, 0, stream>>>(
             static_cast<const bf16*>(key.data), static_cast<const bf16*>(value.data),
             static_cast<const bf16*>(residual.data), static_cast<const Norm*>(key_norm.data),
-            static_cast<const Norm*>(query_norm.data), static_cast<const Norm*>(conv_norm.data), hidden, width, eps,
-            static_cast<bf16*>(gated.data), static_cast<bf16*>(normalized.data));
+            static_cast<const Norm*>(query_norm.data), static_cast<const Norm*>(conv_norm.data), hidden,
+            width, key_stride, value_stride, eps, static_cast<bf16*>(gated.data),
+            static_cast<bf16*>(normalized.data));
     };
     if (norm == DType::FP32) {
         launch.template operator()<float>();

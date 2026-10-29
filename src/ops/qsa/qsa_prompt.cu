@@ -2,7 +2,6 @@
 
 #include "ops/qsa/qsa_prompt.h"
 
-
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -22,11 +21,11 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+#include "core/temporary_switches.h"
 
 namespace infernix::ops::detail {
 namespace {
@@ -113,11 +112,10 @@ struct PromptShape<KvCacheStorage::Q4KeyVq2Value> {
     static constexpr int Warps = 3;
     static constexpr Code Key = Code::Int8, Value = Code::Int8;
 };
-// Three warps: one stage and the NVFP4 value tile then fit two CTAs per SM.
 template <>
 struct PromptShape<KvCacheStorage::Fp8KeyNvfp4Value> {
     static constexpr int Vq    = 0;
-    static constexpr int Warps = 3;
+    static constexpr int Warps = 4;
     static constexpr Code Key = Code::Fp8, Value = Code::Nvfp4;
 };
 
@@ -141,8 +139,7 @@ struct Stage {
     static constexpr int VqTags       = VqCodeScales + (Shape::Vq > 0 ? kTile * 8 : 0);
     static constexpr int VqMeta       = VqTags + (Shape::Vq > 0 ? kTile * 8 : 0);
     static constexpr int Bytes        = VqMeta + (Shape::Vq > 0 ? kTile * 8 : 0);
-    // NVFP4 values decode into one FP16 [16][128] tile per warp, half the dimensions at a time.
-    static constexpr int Scratch = Shape::Value == Code::Nvfp4 ? kTile * kD : 0; // half the dimensions, FP16
+    static constexpr int Scratch      = 0;
     static constexpr bool RotatedKeys   = Shape::Key != Code::Bf16;
     static constexpr bool RotatedValues = Shape::Value == Code::Nvfp4 || Shape::Vq > 0;
     static constexpr bool EvenOddValues = Shape::Value == Code::Int8 || Shape::Value == Code::Fp8;
@@ -265,17 +262,23 @@ __device__ __forceinline__ void decode_v_pair(unsigned codes, __half2 scales, un
     }
 }
 
-// What one gather copies of a tile: its keys and values together, or one of them (the split stage).
-enum class Part { Both, Keys, Values };
-template <Part P>
-using PartTag = std::integral_constant<Part, P>;
+// One ldmatrix.trans b16 lane of an NVFP4 [key][d] tile holds two packed bytes (four E2M1 codes,
+// dimensions 32c + 4n .. + 3) of key k (low 16 bits) and key k + 1 (high 16 bits), all four in the
+// same 16-element scale group: decode to the four FP16 B halves {V[k][d+u], V[k+1][d+u]} for u = 0..3.
+__device__ __forceinline__ void decode_v_quad_nvfp4(unsigned codes, __half s0, __half s1, unsigned (&out)[4]) {
+    const __half2 s0_pair = __halves2half2(s0, s0);
+    const __half2 s1_pair = __halves2half2(s1, s1);
+    const unsigned w0_01  = e2m1x2_times(codes & 0xffu, s0_pair);
+    const unsigned w1_01  = e2m1x2_times((codes >> 16) & 0xffu, s1_pair);
+    out[0]                = __byte_perm(w0_01, w1_01, 0x5410);
+    out[1]                = __byte_perm(w0_01, w1_01, 0x7632);
+    const unsigned w0_23  = e2m1x2_times((codes >> 8) & 0xffu, s0_pair);
+    const unsigned w1_23  = e2m1x2_times(codes >> 24, s1_pair);
+    out[2]                = __byte_perm(w0_23, w1_23, 0x5410);
+    out[3]                = __byte_perm(w0_23, w1_23, 0x7632);
+}
 
-// `Split` (one stage, scalar storages; qsa_prompt_split chooses it by storage): each warp gathers tile
-// i + Warps's keys into its stage as soon as tile i's scores are taken and its values as soon as tile
-// i's P x V is done, so every gather overlaps the rest of a tile's arithmetic instead of waiting in
-// front of it; the first tile's gather is issued before the query rows. The arithmetic, the tile
-// partition and the merge are the unsplit kernel's, so the bits are too.
-template <KvCacheStorage Storage, int Stages, bool Split>
+template <KvCacheStorage Storage, int Stages>
 __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 ? 2 : 1)
     qsa_prompt_kernel(const bf16* __restrict__ q, int heads, int kv_heads, const void* __restrict__ k_pages,
                       const void* __restrict__ v_pages, const void* __restrict__ k_scales,
@@ -292,7 +295,6 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     constexpr int Threads       = Warps * 32;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
-    static_assert(!Split || (Stages == 1 && Shape::Vq == 0), "the split stage serves one-stage scalar storages");
     extern __shared__ __align__(16) unsigned char smem[];
 
     const int t = static_cast<int>(blockIdx.x), kv_head = static_cast<int>(blockIdx.y);
@@ -304,43 +306,60 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     const int total = count < 0 ? p + 1 : count * ratio + (p + 1) % ratio;
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t / width]) * table_stride;
     const std::int32_t* list  = selected + static_cast<std::size_t>(t) * top_blocks;
-    unsigned char* q_s        = smem;
+
+    // Query rows (rotated into the keys' Hadamard domain where keys are rotated, then FP16 in the
+    // key code's k-step order; BF16 keys: the stored values). Rows past the group are zero.
+    unsigned char* q_s = smem;
+    for (int r = warp; r < kRows; r += Warps) {
+        float v[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            v[k] = r < group ? __bfloat162float(
+                                   q[(static_cast<std::size_t>(t) * heads + kv_head * group + r) * kD + lane + 32 * k])
+                             : 0.0f;
+        }
+        if constexpr (S::RotatedKeys) { normalized_hadamard_d256_inplace(v, lane); }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int d = lane + 32 * k;
+            const int e = query_position<Shape::Key>(d);
+            unsigned char* at = q_s + swizzled(r, kQRow, e >> 3) + 2 * (e & 7);
+            if constexpr (Shape::Key == Code::Bf16) {
+                *reinterpret_cast<bf16*>(at) = __float2bfloat16_rn(v[k]);
+            } else {
+                *reinterpret_cast<__half*>(at) = __float2half_rn(v[k]);
+            }
+        }
+    }
+    __syncthreads();
+
+    // VQ2 codebook (vector-quantized storages): behind the stages and the merge rows.
+    constexpr int kCodebookAt = prompt_smem_bytes<Storage, Stages>() -
+                                (Shape::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0);
+    const auto* codebook = reinterpret_cast<const std::int8_t*>(smem + kCodebookAt);
+    if constexpr (Shape::Vq > 0) {
+        for (int i = tid; i < static_cast<int>(sizeof(kKVCacheVq2Codebook)) / 16; i += Threads) {
+            reinterpret_cast<uint4*>(const_cast<std::int8_t*>(codebook))[i] =
+                reinterpret_cast<const uint4*>(g_kv_cache_vq2_codebook)[i];
+        }
+        __syncthreads();
+    }
     const int call_first = positions[(t / width) * width];
     const int window_row = vq.slots != nullptr ? vq.slots[t / width] : 0;
-    unsigned char* stages  = smem + kQRow * kRows + warp * (Stages * S::Bytes + S::Scratch);
-    unsigned char* scratch = stages + Stages * S::Bytes;
-    const int tiles        = (total + kTile - 1) / kTile;
+    unsigned char* stages = smem + kQRow * kRows + warp * (Stages * S::Bytes + S::Scratch);
+    const int tiles       = (total + kTile - 1) / kTile;
 
-    // The parity word (bit j: tile token j's parity) the values' FP8 row scales read: the keys' word,
-    // except in the split stage, where the next tile's keys replace it while this tile's values are
-    // still unread.
-    constexpr int ValueParity = Split ? 4 : 0;
-
-    // Lane l's row l % 16 of tile i: whether it is in the column's list, its token and page id.
-    struct Located {
-        bool valid;
-        int token, id;
-    };
-    const auto locate = [&](int i) {
-        const int index  = i * kTile + (lane & 15);
-        const bool valid = index < total;
-        const int token  = valid ? attended_token(index, count, list, ratio, p) : 0;
-        return Located{valid, token, table[token >> kPagedKVPageShift]};
-    };
-
-    // Gathers the located tile's keys, values and scales (`part`: both, or only the keys or the values
-    // with their scales) into stage s as one cp.async group; tokens past the column's list are
+    // Gathers tile i's keys, values and scales into stage s; tokens past the column's list are
     // zero-filled. Lane l locates row l % 16 once (its token, page space and row in the planes); the
     // lanes copying a row's chunks take its addresses by shuffle.
-    const auto issue = [&](const Located& at, int s, auto part) {
-        constexpr Part P   = decltype(part)::value;
-        constexpr bool Ks  = P != Part::Values, Vs = P != Part::Keys;
+    const auto issue = [&](int i, int s) {
         unsigned char* k_s = stages + s * S::Bytes;
         unsigned char* v_s = k_s + S::Values;
         const int row      = lane & 15;
-        const bool valid   = at.valid;
-        const int token    = at.token;
-        const int id       = at.id;
+        const int index    = i * kTile + row;
+        const bool valid   = index < total;
+        const int token    = valid ? attended_token(index, count, list, ratio, p) : 0;
+        const int id       = table[token >> kPagedKVPageShift];
         int page;
         const auto* k_plane =
             static_cast<const unsigned char*>(qsa_space_plane(spaces, k_pages, spaces.host_k, spaces.lent_k, id, page));
@@ -368,7 +387,6 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             copy_rows(dst_rows, own_row, valid, bytes, std::true_type{});
         };
         if constexpr (Shape::Vq > 0) {
-            static_assert(P == Part::Both, "vector-quantized tiles expand keys and values together");
             // Paged code rows; the exact rows (window slot or staged call row) of the keys this column
             // reads exactly, with their group scales and window tags; the code scales; token and mode.
             copy_rows(k_s + S::VqKeyCodes, k_plane + row_at * Shape::Vq, valid,
@@ -407,9 +425,9 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             cp_commit();
             return;
         }
-        if constexpr (Ks) { rows(k_s, k_plane + row_at * K::Bytes, std::integral_constant<int, K::Bytes>{}); }
-        if constexpr (Vs) { rows(v_s, v_plane + row_at * V::Bytes, std::integral_constant<int, V::Bytes>{}); }
-        if constexpr ((Ks && K::ScaleSlot > 0) || (Vs && V::ScaleSlot > 0) || S::Parity) {
+        rows(k_s, k_plane + row_at * K::Bytes, std::integral_constant<int, K::Bytes>{});
+        rows(v_s, v_plane + row_at * V::Bytes, std::integral_constant<int, V::Bytes>{});
+        if constexpr (K::ScaleSlot > 0 || V::ScaleSlot > 0) {
             // Lanes 0-15 gather their row's key scales, lanes 16-31 its value scales.
             const bool key    = lane < 16;
             const auto scales = [&](const void* pool, const void* host, const void* lent, int slot_bytes,
@@ -425,74 +443,23 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                 }
             };
             if (key) {
-                if constexpr (Ks && K::ScaleSlot > 0) {
+                if constexpr (K::ScaleSlot > 0) {
                     scales(k_scales, spaces.host_k_scale, spaces.lent_k_scale, K::ScaleSlot,
                            k_s + S::KeyScales + row * K::ScaleSlot);
                 }
             } else {
-                if constexpr (Vs && V::ScaleSlot > 0) {
+                if constexpr (V::ScaleSlot > 0) {
                     scales(v_scales, spaces.host_v_scale, spaces.lent_v_scale, V::ScaleSlot,
                            k_s + S::ValueScales + row * V::ScaleSlot);
                 }
             }
             if constexpr (S::Parity) {
                 const unsigned odd = __ballot_sync(FullMask, key && (token & 1) != 0);
-                if (lane == 0) {
-                    if constexpr (Ks) { *reinterpret_cast<unsigned*>(k_s + S::ParityWord) = odd; }
-                    if constexpr (Vs && ValueParity != 0) {
-                        *reinterpret_cast<unsigned*>(k_s + S::ParityWord + ValueParity) = odd;
-                    }
-                }
+                if (lane == 0) { *reinterpret_cast<unsigned*>(k_s + S::ParityWord) = odd; }
             }
         }
         cp_commit();
     };
-
-    // The split stage's first tile: gathered while the query rows are staged.
-    if constexpr (Split) {
-        if (warp < tiles) {
-            const Located first = locate(warp);
-            issue(first, 0, PartTag<Part::Keys>{});
-            issue(first, 0, PartTag<Part::Values>{});
-        }
-    }
-
-    // Query rows (rotated into the keys' Hadamard domain where keys are rotated, then FP16 in the
-    // key code's k-step order; BF16 keys: the stored values). Rows past the group are zero.
-    for (int r = warp; r < kRows; r += Warps) {
-        float v[8];
-#pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            v[k] = r < group ? __bfloat162float(
-                                   q[(static_cast<std::size_t>(t) * heads + kv_head * group + r) * kD + lane + 32 * k])
-                             : 0.0f;
-        }
-        if constexpr (S::RotatedKeys) { normalized_hadamard_d256_inplace(v, lane); }
-#pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const int d = lane + 32 * k;
-            const int e = query_position<Shape::Key>(d);
-            unsigned char* at = q_s + swizzled(r, kQRow, e >> 3) + 2 * (e & 7);
-            if constexpr (Shape::Key == Code::Bf16) {
-                *reinterpret_cast<bf16*>(at) = __float2bfloat16_rn(v[k]);
-            } else {
-                *reinterpret_cast<__half*>(at) = __float2half_rn(v[k]);
-            }
-        }
-    }
-    __syncthreads();
-
-    // VQ2 codebook (vector-quantized storages): behind the stages and the merge rows.
-    constexpr int kCodebookAt = prompt_smem_bytes<Storage, Stages>() -
-                                (Shape::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0);
-    const auto* codebook = reinterpret_cast<const std::int8_t*>(smem + kCodebookAt);
-    if constexpr (Shape::Vq > 0) {
-        for (int i = tid; i < static_cast<int>(sizeof(kKVCacheVq2Codebook)) / 16; i += Threads) {
-            reinterpret_cast<uint4*>(const_cast<std::int8_t*>(codebook))[i] =
-                reinterpret_cast<const uint4*>(g_kv_cache_vq2_codebook)[i];
-        }
-        __syncthreads();
-    }
 
     // The A fragments of k step kb of the query rows.
     const int a_mat = lane >> 3, a_rin = lane & 7;
@@ -516,15 +483,16 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
     const float scale_l2 = scale * Log2E;
 
-    // A tile's scores from the keys and key scales of stage s.
-    const auto qk = [&](int s, float (&score)[2][4]) {
+    const auto compute = [&](int i, int s) {
         const unsigned char* k_s = stages + s * S::Bytes;
+        const unsigned char* v_s = k_s + S::Values;
         unsigned parity          = 0;
         if constexpr (S::Parity) { parity = *reinterpret_cast<const unsigned*>(k_s + S::ParityWord); }
         // FP16 row scale of tile token `key` from its gathered word.
         const auto row_scale = [&](int scales_at, int key) {
             return reinterpret_cast<const __half*>(k_s + scales_at)[2 * key + ((parity >> key) & 1)];
         };
+        float score[2][4];
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
 #pragma unroll
@@ -619,11 +587,8 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                 mma_bf16(score[1][0], score[1][1], score[1][2], score[1][3], a[0], a[1], a[2], a[3], b[2], b[3]);
             }
         }
-    };
 
-    // Online softmax over tile i's 16 tokens (columns past the list are masked): the running (max,
-    // sum) and the output rows rescaled, and the tile's probabilities `pr`.
-    const auto softmax = [&](int i, float (&score)[2][4], float (&pr)[2][4]) {
+        // Online softmax over the tile's 16 tokens (columns past the list are masked).
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
@@ -641,6 +606,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         m0 = nm0;
         m1 = nm1;
         const float base0 = nm0 * scale_l2, base1 = nm1 * scale_l2;
+        float pr[2][4];
         float bl0 = 0.0f, bl1 = 0.0f;
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
@@ -663,20 +629,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                 o[b][h][3] *= alpha1;
             }
         }
-    };
 
-    // P x V of a tile's probabilities over the values and value scales of stage s.
-    const auto values_times = [&](int s, const float (&pr)[2][4]) {
-        const unsigned char* k_s = stages + s * S::Bytes;
-        const unsigned char* v_s = k_s + S::Values;
-        unsigned parity          = 0;
-        if constexpr (S::Parity) {
-            parity = *reinterpret_cast<const unsigned*>(k_s + S::ParityWord + ValueParity);
-        }
-        // FP16 row scale of tile token `key` from its gathered word.
-        const auto row_scale = [&](int scales_at, int key) {
-            return reinterpret_cast<const __half*>(k_s + scales_at)[2 * key + ((parity >> key) & 1)];
-        };
         if constexpr (S::EvenOddValues) {
             // Decoded values stay finite in FP16: a tile whose largest scale exceeds MaxScale decodes
             // with its scales divided by 2^shift and multiplies the probabilities by 2^shift
@@ -751,36 +704,29 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                 }
             };
             if constexpr (Shape::Value == Code::Nvfp4) {
-                // Each half: lane l decodes key l / 2's code chunks 4 half + 2 (l % 2) and + 1 (32
-                // dimensions each) into the [16][128] FP16 tile, then P x V over those dimensions.
-                const int key = lane >> 1, sub = lane & 1;
-                const unsigned char* vs = k_s + S::ValueScales + key * V::ScaleSlot;
+                const int key  = 2 * lid;
+                const int g_in = gid >> 2;
 #pragma unroll
-                for (int half = 0; half < 2; ++half) {
+                for (int c = 0; c < 8; c += 2) {
+                    unsigned r[4];
+                    ldmatrix_x4_t(r[0], r[1], r[2], r[3],
+                                  smem_addr(v_s + swizzled(v_row, V::Bytes, c + (v_mat >> 1))));
 #pragma unroll
-                    for (int c = 0; c < 2; ++c) {
-                        const int chunk = 4 * half + 2 * sub + c; // 16 code bytes: dimensions 32 chunk .. + 31
-                        const uint4 codes = load_vec<uint4>(v_s + swizzled(key, V::Bytes, chunk));
-                        const unsigned words[4] = {codes.x, codes.y, codes.z, codes.w};
+                    for (int hc = 0; hc < 2; ++hc) {
+                        const int chunk = c + hc;
+                        const int g     = 2 * chunk + g_in;
+                        const unsigned char* vs = k_s + S::ValueScales + g;
+                        unsigned b0[4], b1[4];
+                        decode_v_quad_nvfp4(r[2 * hc], e4m3_to_half(vs[key * V::ScaleSlot]),
+                                            e4m3_to_half(vs[(key + 1) * V::ScaleSlot]), b0);
+                        decode_v_quad_nvfp4(r[2 * hc + 1], e4m3_to_half(vs[(key + 8) * V::ScaleSlot]),
+                                            e4m3_to_half(vs[(key + 9) * V::ScaleSlot]), b1);
 #pragma unroll
-                        for (int w = 0; w < 4; ++w) { // dimensions 32 chunk + 8 w .. + 7
-                            const __half sc  = e4m3_to_half(vs[2 * chunk + (w >> 1)]);
-                            const __half2 s2 = __halves2half2(sc, sc);
-                            uint4 values;
-                            values.x = e2m1x2_times(words[w] & 0xffu, s2);
-                            values.y = e2m1x2_times((words[w] >> 8) & 0xffu, s2);
-                            values.z = e2m1x2_times((words[w] >> 16) & 0xffu, s2);
-                            values.w = e2m1x2_times(words[w] >> 24, s2);
-                            store_vec(scratch + swizzled(key, kD, 4 * (chunk - 4 * half) + w), values);
+                        for (int u = 0; u < 4; ++u) {
+                            float* dst = o[2 * chunk + (u >> 1)][u & 1];
+                            mma_f16(dst[0], dst[1], dst[2], dst[3], pa[0], pa[1], pa[2], pa[3], b0[u], b1[u]);
                         }
                     }
-                    __syncwarp();
-                    if (half == 0) {
-                        pv.template operator()<0, 16>(scratch, kD);
-                    } else {
-                        pv.template operator()<16, 32>(scratch, kD);
-                    }
-                    __syncwarp();
                 }
             } else {
                 pv.template operator()<0, 32>(v_s, 2 * kD);
@@ -828,43 +774,10 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             __syncwarp();
         }
     };
-    // Tile i from stage s.
-    const auto compute = [&](int i, int s) {
-        float score[2][4], pr[2][4];
-        qk(s, score);
-        softmax(i, score, pr);
-        values_times(s, pr);
-    };
-
-    if constexpr (Split) {
-        // One stage that the next tile refills in two parts: groups complete in issue order (tile i's
-        // keys, its values, tile i + Warps's keys, its values), so one pending group is the other
-        // half's. The next tile's rows are located (list and page-table reads) while tile i's keys
-        // may still be in flight.
-        for (int i = warp; i < tiles; i += Warps) {
-            const bool next         = i + Warps < tiles;
-            const Located next_rows = next ? locate(i + Warps) : Located{false, 0, 0};
-            cp_wait<1>(); // tile i's keys
-            __syncwarp();
-            float score[2][4], pr[2][4];
-            qk(0, score);
-            __syncwarp(); // every lane is done with the keys
-            if (next) { issue(next_rows, 0, PartTag<Part::Keys>{}); }
-            softmax(i, score, pr);
-            if (next) {
-                cp_wait<1>(); // tile i's values
-            } else {
-                cp_wait<0>();
-            }
-            __syncwarp();
-            values_times(0, pr);
-            __syncwarp(); // every lane is done with the values
-            if (next) { issue(next_rows, 0, PartTag<Part::Values>{}); }
-        }
-    } else if constexpr (Stages == 1) {
+    if constexpr (Stages == 1) {
         // Two CTAs per SM: the other warps hide each tile's gather.
         for (int i = warp; i < tiles; i += Warps) {
-            issue(locate(i), 0, PartTag<Part::Both>{});
+            issue(i, 0);
             cp_wait<0>();
             __syncwarp();
             expand(0);
@@ -873,10 +786,10 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         }
     } else {
         int s = 0;
-        if (warp < tiles) { issue(locate(warp), 0, PartTag<Part::Both>{}); }
+        if (warp < tiles) { issue(warp, 0); }
         for (int i = warp; i < tiles; i += Warps) {
             if (i + Warps < tiles) {
-                issue(locate(i + Warps), s ^ 1, PartTag<Part::Both>{});
+                issue(i + Warps, s ^ 1);
                 cp_wait<1>();
             } else {
                 cp_wait<0>();
@@ -925,7 +838,10 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                     for (int j = 0; j < 4; ++j) {
                         const int upper = j >> 1;
                         const int row   = gid + 8 * upper;
-                        const int d = S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h : 16 * b + 8 * h + 2 * lid + (j & 1);
+                        const int d     = Shape::Value == Code::Nvfp4
+                                              ? 32 * (b >> 1) + 8 * lid + 4 * (j & 1) + 2 * (b & 1) + h
+                                              : (S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h
+                                                                  : 16 * b + 8 * h + 2 * lid + (j & 1));
                         const bool live = (upper ? m1 : m0) != -CUDART_INF_F;
                         float& a        = rows[row * kD + d];
                         if (w == 0) {
@@ -981,15 +897,15 @@ template <KvCacheStorage Storage>
 void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
             const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
             const QsaVqWindow& vq) {
-    const auto run = [&]<int Stages, bool Split>() {
+    const auto run = [&]<int Stages>() {
         constexpr int bytes = prompt_smem_bytes<Storage, Stages>();
         static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
         static const cudaError_t configured = cudaFuncSetAttribute(
-            qsa_prompt_kernel<Storage, Stages, Split>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+            qsa_prompt_kernel<Storage, Stages>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
         require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
         const int columns = q.ne[2];
         const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
-        qsa_prompt_kernel<Storage, Stages, Split><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(
+        qsa_prompt_kernel<Storage, Stages><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(
             static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
             layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
             static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
@@ -1009,21 +925,13 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
         }
         return count;
     }();
-    // The one-stage calls of the scalar storages may take the split stage (qsa_prompt_split), which gives the
-    // same bits.
+    // GB10: the split stage (upstream qsa_prompt_split) was removed with the one-stage gather
+    // rewrite; the combined gather below is the only route.
     constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
     if (two_ctas && q.ne[2] * g.kv_heads >= sms) {
-        if constexpr (two_ctas && PromptShape<Storage>::Vq == 0) {
-            if (qsa_prompt_split(Storage)) {
-                run.template operator()<1, true>();
-            } else {
-                run.template operator()<1, false>();
-            }
-        } else {
-            run.template operator()<1, false>();
-        }
+        run.template operator()<1>();
     } else {
-        run.template operator()<2, false>();
+        run.template operator()<2>();
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa prompt attention: ") + cudaGetErrorString(error)); }

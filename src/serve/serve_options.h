@@ -36,7 +36,8 @@ struct ServeOptions {
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
-    NgramResidency ngram_residency = NgramResidency::Auto;
+    NgramResidency ngram_residency    = NgramResidency::Auto;
+    std::uint64_t ngram_cache_bytes   = 0;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
     std::optional<std::filesystem::path> expert_state;
     // --expert-stripe FILE: the experts' record tails on a second drive (EngineOptions::expert_stripe_path).
@@ -53,7 +54,6 @@ struct ServeOptions {
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
-    bool vram_past_budget = false;
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     bool a8_activations            = false; // EngineOptions::a8_activations

@@ -1,0 +1,41 @@
+# cuda-kernel-toolkit configuration — Infernix ggml_linear, IQ3_S dead zone (GB10 sm_121a).
+# The harness is Infernix's own op test, built against the production ops library:
+#   tests/ops/test_ggml_linear.cpp  --ckt  (the harness contract in kernels/harness.h)
+# Every timing comes from ops::ggml_linear exactly as the model calls it, and `--verify` compares
+# its outputs to the bit-exact host oracle, so the toolkit's correctness gate protects the same
+# numerical contract the production test does.
+exe: /opt/etc/Infernix/build-native/tests/infernix_ggml_linear_test
+
+# The workload labels are the base names of the kernels the production dispatch launches, which is
+# what both the binary inspector's symbol match and NCU's exact `--kernel-name` match require.
+workloads:
+  - encode_kernel
+  - rows_kernel
+  - mma_rows_kernel
+  - tile_kernel
+
+# Rows of the single IQ3_S segment. 49,152 rows x 1,100 B = 54 MB of weights: past GB10's 24 MB L2,
+# the regime of the 248,320-row LM head, and small enough for the oracle gate to stay cheap.
+problem_size: 49152
+
+iterations: 30
+warmup: 5
+repeats: 5
+
+atol: 0.0            # the gate is bit-exact by construction; tolerances are unused
+rtol: 0.0
+dtype: bf16
+
+# The columns of the call, read by the harness from INFERNIX_CKT_COLUMNS (see the README note).
+# Per-label defaults (2026-10-22 batched-mma change): rows_kernel 2 (its decode width),
+# mma_rows_kernel 16 (two batches of the dead zone), tile_kernel 64 (first plane width).
+# stage B: hardware counters from a single replay pass (the classifier's stall evidence).
+stage: B
+
+# Launch-parameter search: the rows route derives its geometry from the shape, so the search is
+# restricted to the widths the production dispatch actually selects.
+strategy: model-guided
+threads: [128]
+sm_multiples: [2, 4, 8, 16, 32, 48]
+shared_mem: [0]
+budget: 12

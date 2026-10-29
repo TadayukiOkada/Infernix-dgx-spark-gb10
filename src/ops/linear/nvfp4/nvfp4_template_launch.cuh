@@ -71,7 +71,8 @@ void launch_nvfp4_a16_mma(const Nvfp4A16Operands& p, Output output, Epilogue epi
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
-                                   cudaStream_t stream, Rows rows = {}) {
+                                   cudaStream_t stream, Rows rows = {},
+                                   pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_nvfp4_operands<Schedule>(p);
     constexpr int capacity =
         Schedule::kTokenCapacity ? Schedule::kTokenCapacity : Schedule::kBlockTokens;
@@ -85,8 +86,9 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
     const int bytes              = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(pdl::launch_with(
+            dependency, {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream},
+            kernel, p, output, epilogue, rows, offset));
     });
 }
 

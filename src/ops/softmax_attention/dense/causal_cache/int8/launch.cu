@@ -1,8 +1,10 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/fast_prompt_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/fast_tiled_launch.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/template_launch.cuh"
+#include "ops/softmax_attention/dense/causal_cache/int8/tiled_launch.h"
 #include "ops/kv_cache/append/launch.h"
 
 namespace infernix::ops::detail {
@@ -120,12 +122,11 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
 void tiled(const CausalAttentionOperands& p, Int8KvReadView cache,
            const CausalAttentionExecutionEnvelope& envelope, WorkspaceArena& workspace,
            cudaStream_t stream) {
-    with_causal_geometry(p.query_heads, [&]<class G>() {
-        if (envelope.fast_prompt_kernel)
-            launch_int8_kv_fast_tiled_mma<G>(p, cache, envelope, workspace, stream);
-        else
-            launch_int8_kv_tiled_mma<G, Int8KvTiledInstance>(p, cache, stream);
-    });
+    if (envelope.fast_prompt_kernel) {
+        int8_kv_fast_prompt_attention(p, cache, envelope, workspace, stream);
+        return;
+    }
+    int8_kv_tiled_attention(p, cache, stream);
 }
 
 } // namespace

@@ -26,7 +26,6 @@ target_link_libraries(infernix PRIVATE
 add_dependencies(infernix infernix_build_id_stamp)
 target_sources(infernix PRIVATE ${INFERNIX_BUILD_ID_HEADER})
 target_include_directories(infernix PRIVATE ${CMAKE_BINARY_DIR}/generated)
-infernix_stage_runtime_dlls(infernix)
 
 add_executable(infernix-serve serve/main.cpp)
 add_dependencies(infernix-serve infernix_build_id_stamp)
@@ -40,7 +39,6 @@ target_include_directories(infernix-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib
   ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(infernix-serve PRIVATE infernix_serve infernix_product_config infernix_product_logging)
-infernix_stage_runtime_dlls(infernix-serve)
 
 add_executable(infernix-perplexity
   perplexity/main.cpp
@@ -56,8 +54,6 @@ target_link_libraries(infernix-perplexity PRIVATE
   infernix_engine infernix_product_logging infernix::json)
 add_dependencies(infernix-perplexity infernix_build_id_stamp)
 target_sources(infernix-perplexity PRIVATE ${INFERNIX_BUILD_ID_HEADER})
-infernix_stage_runtime_dlls(infernix-perplexity)
-
 # The IQS-2 certification measurements (docs/maintainer/model-quality.md §6): references, prefill and
 # decode arms per position; tools/quality/iqs.py decides.
 add_executable(infernix-certify
@@ -74,4 +70,3 @@ target_include_directories(infernix-certify PRIVATE
 target_link_libraries(infernix-certify PRIVATE infernix_engine infernix::json)
 add_dependencies(infernix-certify infernix_build_id_stamp)
 target_sources(infernix-certify PRIVATE ${INFERNIX_BUILD_ID_HEADER})
-infernix_stage_runtime_dlls(infernix-certify)

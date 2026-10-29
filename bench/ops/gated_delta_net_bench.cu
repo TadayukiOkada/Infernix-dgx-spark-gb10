@@ -32,7 +32,7 @@ namespace chunked_detail         = infernix::ops::detail::gated_delta_net::chunk
 constexpr std::int32_t kDefaultQkHeads    = 16;
 constexpr std::int32_t kDefaultValueHeads = 48;
 constexpr std::int32_t kDefaultTokens     = 1024;
-constexpr std::size_t kDefaultFlushBytes  = 256ULL << 20;
+infernix::bench::ColdFlushBytes kDefaultFlushBytes{};
 constexpr float kQkNormEpsilon            = 1.0e-6F;
 
 enum class Mode {
@@ -49,6 +49,7 @@ struct Options {
     bool tokens_explicit     = false;
     bool sweep               = false;
     bool breakdown           = false;
+    bool fp16_acc            = false;
     bool csv                 = false;
     bool help                = false;
     std::int32_t qk_heads    = kDefaultQkHeads;
@@ -153,6 +154,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--breakdown") {
             options.breakdown = true;
+        } else if (arg == "--fp16-acc") {
+            options.fp16_acc = true;
         } else if (arg == "--warmup") {
             options.warmup = parse_integer("--warmup", take("--warmup"), 0);
         } else if (arg == "--repeat") {
@@ -211,7 +214,7 @@ void print_help(const char* program) {
         "Measurement:\n"
         "  --warmup N         cold-L2 graph warmups per case (default: 20)\n"
         "  --repeat N         measured cold-L2 graph replays per case (default: 100)\n"
-        "  --flush-mib N      L2 flush allocation in MiB (default: 256)\n"
+        "  --flush-mib N      L2 flush allocation in MiB (default: sized to device L2)\n"
         "  --csv              emit CSV instead of human-readable rows\n"
         "  -h, --help         show this help\n"
         "\n"
@@ -576,11 +579,11 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                                                          prep_io.intermediate + rec_io.intermediate}
                                           : TrafficBytes{running_logical_bytes(problem), 0};
     auto prepare                = [&](cudaStream_t stream) {
-        chunked_detail::launch_prepare(args, qk, control, normalize, stream, /*fp16=*/false);
+        chunked_detail::launch_prepare(args, qk, control, normalize, stream, options.fp16_acc);
     };
     auto recurrence = [&](cudaStream_t stream) {
         chunked_detail::launch_recurrence(args, qk, control,
-                                          {stream, execution.multiprocessor_count}, /*fp16=*/false);
+                                          {stream, execution.multiprocessor_count}, options.fp16_acc);
     };
     auto pipeline = [&](cudaStream_t stream) {
         if (force_chunked) {
@@ -591,7 +594,9 @@ std::vector<BenchRow> run_prefill(const Options& options, std::int32_t tokens,
                 q, k, v, g, beta, gated_delta_net_scale(), normalize, si, so, out, stream);
         else
             ops::gated_delta_net(q, k, v, g, beta, gated_delta_net_scale(), normalize, workspace,
-                                 si, so, out, {stream, execution.multiprocessor_count});
+                                 si, so, out, {stream, execution.multiprocessor_count},
+                                 options.fp16_acc ? ops::GdnChunkArithmetic::Fp16Accumulate
+                                                  : ops::GdnChunkArithmetic::Exact);
     };
     std::vector<BenchRow> rows;
     auto measure = [&](const char* name, TrafficBytes io, auto& body, double logical) {

@@ -35,7 +35,7 @@ namespace {
 
 constexpr std::int32_t kHeadDim   = 256;
 constexpr float kScale            = 0.0625F;
-constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
 
 
 enum class Entry : std::uint8_t { Append, Cached, Both };

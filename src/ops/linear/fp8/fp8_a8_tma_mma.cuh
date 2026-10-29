@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tma_descriptor_staging.cuh"
+#include "ops/common/device_info.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace infernix::ops::detail {
 
@@ -47,15 +49,46 @@ struct Fp8TmaSplitKPlan {
     }
 };
 
+// One resident wave of `kernel`'s CTAs on the running device: its occupancy at `threads` and
+// `shared` bytes times the device's SM count. Cached per (kernel, threads, shared).
+template <class Kernel>
+inline int fp8_a8_tma_wave(Kernel kernel, int threads, int shared, int ceiling) {
+    struct Entry {
+        const void* kernel;
+        int threads;
+        int shared;
+        int wave;
+    };
+    thread_local std::vector<Entry> cache;
+    const void* key = reinterpret_cast<const void*>(kernel);
+    for (const Entry& e : cache) {
+        if (e.kernel == key && e.threads == threads && e.shared == shared) { return e.wave; }
+    }
+    int per_sm = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, shared));
+    // The partials buffer is sized for `ceiling` CTAs; never plan a split beyond it.
+    const int wave = std::min(ceiling, per_sm * device_sm_count());
+    cache.push_back({key, threads, shared, wave});
+    return wave;
+}
+
+// Splits any underfilled final wave of `wave` CTAs. `wave` is one resident wave of this shape on the
+// running device: `Schedule::kSplitWaveCtas` is the ceiling the partials buffer was sized for when
+// the schedule was fitted to the RTX 5090's 170 SMs, and taking it as the wave itself made the
+// planner skip every tail between half and one GB10 wave (48 SMs). With the wave correct, a tail is
+// worth splitting at any size: the old `tail <= wave / 2` cut, also fitted on 170, still refused
+// tails of two thirds and five sixths of a wave, and splitting those measured 8-15 % faster at
+// T=1024, 1792, 2560 and 4096 (n34816_k5120). `wave == 0` disables splitting (no partial plane).
 template <class Schedule>
-inline Fp8TmaSplitKPlan fp8_tma_split_k_plan(int tiles, int k) {
+inline Fp8TmaSplitKPlan fp8_tma_split_k_plan(int tiles, int k, int wave) {
     Fp8TmaSplitKPlan plan{tiles, 0, 0};
     if constexpr (Schedule::kSplitWaveCtas > 0) {
-        const int tail = tiles % Schedule::kSplitWaveCtas;
-        if (tail && tail <= Schedule::kSplitWaveCtas / 2) {
-            const int max_parts = std::min(Schedule::kMaxParts, k / Schedule::kBlockK);
-            if (max_parts >= 2)
-                plan = {tiles - tail, tail, std::min(Schedule::kSplitWaveCtas, tail * max_parts)};
+        if (wave > 0) {
+            const int tail = tiles % wave;
+            if (tail) {
+                const int max_parts = std::min(Schedule::kMaxParts, k / Schedule::kBlockK);
+                if (max_parts >= 2) plan = {tiles - tail, tail, std::min(wave, tail * max_parts)};
+            }
         }
     }
     return plan;
@@ -323,8 +356,29 @@ void launch_fp8_a8_tma_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilog
         fp8_tma_map(p.codes, p.rows, p.k, weight_span, Schedule::kBlockK)};
     const auto launch_slices = [&]<bool InPlace>(std::bool_constant<InPlace>, const auto& parameter) {
         for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-            const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
-            const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
+            const int blocks = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
+            int wave         = 0;
+            if constexpr (Schedule::kSplitWaveCtas > 0) {
+                constexpr int bytes =
+                    fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
+                if (count % Schedule::kBlockTokens == 0) {
+                    constexpr auto probe =
+                        fp8_a8_tma_mma_kernel<Schedule, true, Output, Epilogue, false, RowPolicy,
+                                              Scale, InPlace>;
+                    wave = fp8_a8_tma_wave(probe, Schedule::kThreads,
+                                           fp8_prepare_shared<bytes, probe, true>(),
+                                           Schedule::kSplitWaveCtas);
+                } else {
+                    constexpr auto probe =
+                        fp8_a8_tma_mma_kernel<Schedule, false, Output, Epilogue, false, RowPolicy,
+                                              Scale, InPlace>;
+                    wave = fp8_a8_tma_wave(probe, Schedule::kThreads,
+                                           fp8_prepare_shared<bytes, probe, true>(),
+                                           Schedule::kSplitWaveCtas);
+                }
+            }
+            const auto plan =
+                fp8_tma_split_k_plan<Schedule>(blocks, p.k, partials ? wave : 0);
             const auto launch = [&]<bool Full, bool Split>() {
                 constexpr auto kernel = fp8_a8_tma_mma_kernel<Schedule, Full, Output, Epilogue, Split,
                                                               RowPolicy, Scale, InPlace>;

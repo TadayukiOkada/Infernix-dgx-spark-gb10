@@ -6,6 +6,21 @@
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
+// Per-variant harness headers: every internal A16/A4 schedule that the production plan selects
+// behind its token bands, exposed so each can be timed independently on this device.
+#include "core/pdl.cuh"
+#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
+#include "ops/linear/nvfp4/nvfp4_geometry.h"
+#include "ops/linear/nvfp4/nvfp4_layout.h"
+#include "ops/linear/nvfp4/nvfp4_instances.cuh"
+#include "ops/linear/nvfp4/nvfp4_launch.cuh"
+#include "ops/linear/nvfp4/nvfp4_operands.h"
+#include "ops/linear/nvfp4/nvfp4_schedule.cuh"
+#include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
+#include "ops/linear/common/epilogue.cuh"
+#include "ops/linear/common/output.cuh"
+
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
@@ -15,6 +30,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -26,7 +42,47 @@ using namespace infernix;
 namespace {
 
 constexpr std::int32_t kRows      = 5120;
-constexpr std::size_t kFlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
+
+namespace d = ops::detail;
+
+// Direct instantiations of every internal NVFP4 schedule that the production A16/A4 plans select
+// behind their token bands, so each can be timed independently on this device (GB10). These mirror
+// the exact template arguments used in src/ops/linear_add/nvfp4/{a16,a4}.cu.
+template <class Schedule, int K>
+void bench_a4_gemm(const Weight& weight, Tensor& out, d::Nvfp4A4Workspace workspace, int tokens,
+                   cudaStream_t stream) {
+    d::launch_nvfp4_a4_mma<d::Nvfp4ScheduleInstance<Schedule, K>>(
+        d::nvfp4_a4_operands(weight, workspace, tokens, d::Nvfp4ScaleLayout::RowMajor),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream, {},
+        pdl::Dependency::Programmatic);
+}
+
+template <d::Nvfp4GeometryId Geometry>
+void bench_a4_tma(const Weight& weight, Tensor& out, d::Nvfp4A4Workspace workspace, int tokens,
+                  cudaStream_t stream) {
+    d::launch_nvfp4_a4_tma_linear_add(
+        d::nvfp4_a4_operands(weight, workspace, tokens, d::Nvfp4ScaleLayout::Tiled256),
+        static_cast<__nv_bfloat16*>(out.data), stream);
+}
+
+template <int Tokens, int Warps, int Stages, int K>
+void bench_a16_sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    d::launch_nvfp4_a16_sliced_k_mma<
+        d::Nvfp4ScheduleInstance<d::Nvfp4SlicedInstance<Tokens, Warps, Stages>, K>>(
+        d::nvfp4_a16_operands(x, weight),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
+}
+
+template <class Schedule, int K>
+void bench_a16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    d::launch_nvfp4_a16_mma<d::Nvfp4ScheduleInstance<Schedule, K>>(
+        d::nvfp4_a16_operands(x, weight),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
+}
 
 struct Options {
     std::int32_t n           = 0;
@@ -35,7 +91,8 @@ struct Options {
     std::vector<std::int32_t> t_sweep{1, 4, 8, 16, 17, 128, 512, 1024};
     int warmup   = 5;
     int repeat   = 30;
-    bool profile = false;
+    bool profile   = false;
+    bool variants  = false;
     std::string csv_out;
 };
 
@@ -98,12 +155,15 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat")));
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--variants") {
+            options.variants = true;
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
             std::printf(
-                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a4|a4r|invariant] "
-                "[--t-sweep 1,4,...] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a4|a4r|invariant] [--variants] "
+                "[--t-sweep 1,4,...] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n"
+                "  --variants: time every internal A16/A4 schedule variant independently per token.\n",
                 argv[0]);
             std::exit(0);
         } else {
@@ -163,8 +223,13 @@ int main(int argc, char** argv) {
         bench::SavedBuffer residual_initial(residual);
         const auto restore                   = [&](cudaStream_t s) { residual_initial.restore(s); };
         bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(options.n, options.k);
-        const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::NVFP4, options.n, options.k, options.policy, min_t, max_t);
+        const std::size_t workspace_capacity = options.variants
+            ? std::max(ops::linear_add_workspace_capacity_bytes(QType::NVFP4, options.n, options.k,
+                                                                ops::LinearPolicy::AllowA4, min_t,
+                                                                max_t),
+                       d::nvfp4_a4_workspace_capacity_bytes(max_t, options.k))
+            : ops::linear_add_workspace_capacity_bytes(QType::NVFP4, options.n, options.k,
+                                                       options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto make_launch = [&](std::int32_t tokens) {
@@ -174,6 +239,201 @@ int main(int argc, char** argv) {
                 ops::linear_add(x, packed.weight, out, options.policy, workspace, launch_stream);
             };
         };
+
+        if (options.variants) {
+            // Per-schedule cold sweep: drive every internal A16/A4 schedule the production plan
+            // hides behind its token bands, each over its full route, so the GB10 winner can be
+            // read per token count rather than inferred from the policy gate.
+            using LaunchFn = std::function<void(cudaStream_t)>;
+            struct Cand {
+                const char* name;
+                LaunchFn launch;
+            };
+            std::FILE* cfile = nullptr;
+            if (!options.csv_out.empty()) {
+                std::filesystem::create_directories(std::filesystem::path(options.csv_out).parent_path());
+                cfile = std::fopen(options.csv_out.c_str(), "w");
+                std::fprintf(cfile, "path,kind,K,T,median_us,min_us,p95_us\n");
+            }
+            const bool k6144 = options.k == 6144;
+            std::printf("# variants N=%d K=%d warmup=%d repeat=%d\n", options.n, options.k,
+                        options.warmup, options.repeat);
+            for (const std::int32_t tokens : options.t_sweep) {
+                Tensor x(input.p, DType::BF16, {options.k, tokens});
+                Tensor out(residual.p, DType::BF16, {options.n, tokens});
+                workspace.reset();
+                const d::Nvfp4A4Workspace scratch =
+                    d::allocate_nvfp4_a4_workspace(workspace, tokens, options.k);
+                const auto a4 = [&](const char* name, void (*gemm)(const Weight&, Tensor&,
+                                                                   d::Nvfp4A4Workspace, int,
+                                                                   cudaStream_t)) {
+                    return Cand{name, [&](cudaStream_t s) {
+                                   d::launch_nvfp4_a4_quantize(x, packed.weight, scratch,
+                                                               d::Nvfp4ScaleLayout::RowMajor, s);
+                                   gemm(packed.weight, out, scratch, tokens, s);
+                               }};
+                };
+                const auto a16 = [&](const char* name, void (*fn)(const Tensor&, const Weight&,
+                                                                  Tensor&, cudaStream_t)) {
+                    return Cand{name, [&](cudaStream_t s) { fn(x, packed.weight, out, s); }};
+                };
+                std::vector<Cand> cands;
+                if (k6144) {
+                    cands.push_back(a16("a16_sliced_t8_w8_s2", [](const Tensor& x_, const Weight& w,
+                                                                  Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<8, 8, 2, 6144>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t16_w8_s2", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<16, 8, 2, 6144>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t32_w8_s1", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<32, 8, 1, 6144>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t32_w4_s2", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<32, 4, 2, 6144>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t32_w2_s2", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<32, 2, 2, 6144>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t64_w2_s2", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<64, 2, 2, 6144>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_mma_64x64", [](const Tensor& x_, const Weight& w,
+                                                            Tensor& o, cudaStream_t s) {
+                        bench_a16_mma<d::Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>, 6144>(x_, w,
+                                                                                              o, s);
+                    }));
+                    cands.push_back(a16("a16_mma_64x128", [](const Tensor& x_, const Weight& w,
+                                                             Tensor& o, cudaStream_t s) {
+                        bench_a16_mma<d::Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 6144>(x_, w,
+                                                                                              o, s);
+                    }));
+                    cands.push_back(a4("a4_m32n64", [](const Weight& w, Tensor& o,
+                                                       d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2>, 6144>(w, o, ws,
+                                                                                            t, s);
+                    }));
+                    cands.push_back(a4("a4_m32n128", [](const Weight& w, Tensor& o,
+                                                        d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>, 6144>(w, o, ws,
+                                                                                             t, s);
+                    }));
+                    cands.push_back(a4("a4_m64n128", [](const Weight& w, Tensor& o,
+                                                        d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>, 6144>(w, o, ws,
+                                                                                             t, s);
+                    }));
+                    cands.push_back(a4("a4_m128n128_resident",
+                                       [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                                          cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 1>, 6144>(w, o,
+                                                                                              ws, t, s);
+                    }));
+                    cands.push_back(a4("a4_m128n128_pipelined",
+                                       [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                                          cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>, 6144>(w, o,
+                                                                                              ws, t, s);
+                    }));
+                    cands.push_back(Cand{"a4_tma", [&](cudaStream_t s) {
+                        d::launch_nvfp4_a4_quantize(x, packed.weight, scratch,
+                                                    d::Nvfp4ScaleLayout::Tiled256, s);
+                        bench_a4_tma<d::Nvfp4GeometryId::N5120K6144>(packed.weight, out, scratch,
+                                                                     tokens, s);
+                    }});
+                } else {
+                    cands.push_back(a16("a16_sliced_t8_w4_s2", [](const Tensor& x_, const Weight& w,
+                                                                  Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<8, 4, 2, 17408>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t16_w4_s2", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<16, 4, 2, 17408>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t32_w4_s2", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<32, 4, 2, 17408>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t32_w4_s1", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<32, 4, 1, 17408>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_sliced_t64_w2_s2", [](const Tensor& x_, const Weight& w,
+                                                                   Tensor& o, cudaStream_t s) {
+                        bench_a16_sliced<64, 2, 2, 17408>(x_, w, o, s);
+                    }));
+                    cands.push_back(a16("a16_mma_32x64", [](const Tensor& x_, const Weight& w,
+                                                            Tensor& o, cudaStream_t s) {
+                        bench_a16_mma<d::Nvfp4A16MmaSchedule<32, 64, 128, 32, 16, 2, 2>, 17408>(x_, w,
+                                                                                               o, s);
+                    }));
+                    cands.push_back(a16("a16_mma_64x128", [](const Tensor& x_, const Weight& w,
+                                                             Tensor& o, cudaStream_t s) {
+                        bench_a16_mma<d::Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 17408>(x_, w,
+                                                                                               o, s);
+                    }));
+                    cands.push_back(a4("a4_m32n32k512", [](const Weight& w, Tensor& o,
+                                                           d::Nvfp4A4Workspace ws, int t,
+                                                           cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<32, 32, 512, 2, 2, 3, 2>, 17408>(w, o, ws,
+                                                                                             t, s);
+                    }));
+                    cands.push_back(a4("a4_m32n64", [](const Weight& w, Tensor& o,
+                                                       d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2>, 17408>(w, o, ws,
+                                                                                             t, s);
+                    }));
+                    cands.push_back(a4("a4_m32n128", [](const Weight& w, Tensor& o,
+                                                        d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>, 17408>(w, o, ws,
+                                                                                              t, s);
+                    }));
+                    cands.push_back(a4("a4_m64n128", [](const Weight& w, Tensor& o,
+                                                        d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>, 17408>(w, o, ws,
+                                                                                              t, s);
+                    }));
+                    cands.push_back(a4("a4_m128n128_resident",
+                                       [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                                          cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 1>, 17408>(w, o,
+                                                                                               ws, t, s);
+                    }));
+                    cands.push_back(a4("a4_m128n128_pipelined",
+                                       [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                                          cudaStream_t s) {
+                        bench_a4_gemm<d::Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>, 17408>(w, o,
+                                                                                               ws, t, s);
+                    }));
+                    cands.push_back(Cand{"a4_tma", [&](cudaStream_t s) {
+                        d::launch_nvfp4_a4_quantize(x, packed.weight, scratch,
+                                                    d::Nvfp4ScaleLayout::Tiled256, s);
+                        bench_a4_tma<d::Nvfp4GeometryId::N5120K17408>(packed.weight, out, scratch,
+                                                                      tokens, s);
+                    }});
+                }
+                for (const Cand& cand : cands) {
+                    const bench::ColdTiming timing = bench::measure_cold_launch_prepared(
+                        restore, cand.launch, flush, stream, options.warmup, options.repeat);
+                    std::printf("K=%-5d T=%-4d %-24s median=%9.3f us min=%9.3f p95=%9.3f\n",
+                                options.k, tokens, cand.name, timing.median_us, timing.min_us,
+                                timing.p95_us);
+                    if (cfile) {
+                        std::fprintf(cfile, "%s,%s,%d,%d,%.3f,%.3f,%.3f\n", cand.name,
+                                     k6144 ? "6144" : "17408", options.k, tokens, timing.median_us,
+                                     timing.min_us, timing.p95_us);
+                    }
+                }
+            }
+            if (cfile) { std::fclose(cfile); }
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            return 0;
+        }
 
         if (options.profile) {
             const std::int32_t tokens = options.t_sweep.front();

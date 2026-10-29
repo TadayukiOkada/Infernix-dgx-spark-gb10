@@ -7,9 +7,7 @@
 // tensor-core tiles), each checked for column invariance (column 0's bits at every T equal its bits at
 // T = 8, which speculative verification relies on, §11.3) and grouped by the bits it produces, so a
 // selector only mixes candidates of one family.
-// Verification and prefill widths (T >= 9): sliced-K, MMA and ring MMA candidates (the ring's
-// schedules with the cp.async producer, ring_*, and with the fenced TMA producer, tma_*: the same
-// consumers and bits, so a selector may mix them by width), each first screened
+// Verification and prefill widths (T >= 9): sliced-K, MMA and TMA MMA candidates, each first screened
 // against an FP64 host reference on sampled rows at T = 77 and 1000, then timed with cold-L2 CUDA
 // graphs; a proposed selector keeps the fastest candidate per measured T, merged into intervals within
 // --tolerance-pct.
@@ -20,10 +18,9 @@
 #include "core/device.h"
 #include "core/weight.h"
 #include "infernix_bench_common.h"
-#include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
 #include "ops/linear/fp8/fp8_launch.cuh"
 #include "quantized_weight.cuh"
-#include "roofline.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -45,14 +42,13 @@
 #include <vector>
 
 using namespace infernix;
-namespace roofline = infernix::bench::roofline;
 using namespace infernix::ops::detail;
 
 namespace {
 
 using Fp8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-enum class Kind { Gemv, Simt, Sliced, Mma, Ring, Tma };
+enum class Kind { Gemv, Simt, Sliced, Mma, Tma };
 
 struct Candidate {
     const char* name;
@@ -69,7 +65,6 @@ const char* launcher(Kind kind) {
     case Kind::Simt: return "fp8_linear_a16_simt<Geometry, 8, %s>";
     case Kind::Sliced: return "fp8_linear_a16_sliced_k<Geometry, %s>";
     case Kind::Mma: return "fp8_linear_a16_mma<Geometry, %s>";
-    case Kind::Ring: return "fp8_linear_a16_ring<Geometry, %s>";
     case Kind::Tma: return "fp8_linear_a16_tma<Geometry, %s>";
     }
     return "?";
@@ -117,12 +112,33 @@ using GemvW4R4V16C4   = Fp8A16GemvSchedule<4, 4, 16, 4, Fp8CodeCache::Default, 1
 using GemvW8R1V16C2   = Fp8A16GemvSchedule<8, 1, 16, 2, Fp8CodeCache::Default, 1, 2>;
 using MmaR32T64K128   = Fp8A16MmaSchedule<32, 64, 128, 32, 16, 2, 2>;
 using MmaR32T64K128W16 = Fp8A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>;
+using MmaR64T64K64    = Fp8A16MmaSchedule<64, 64, 64, 32, 16, 2, 2>;
 using MmaR64T64K128   = Fp8A16MmaSchedule<64, 64, 128, 32, 16, 2, 2>;
 using MmaR64T96K128   = Fp8A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>;
 using MmaR64T128K64   = Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
 using MmaR128T128K64  = Fp8A16MmaSchedule<128, 128, 64, 64, 32, 2, 1>;
-using RingT64R256      = Fp8A16RingMmaSchedule<64, 256, 2, 8, 2, 1>;
-using RingT128R128     = Fp8A16RingMmaSchedule<128, 128, 4, 4, 2, 1>;
+using MmaR64T128K128  = Fp8A16MmaSchedule<64, 128, 128, 32, 32, 2, 1>;
+using MmaR128T192K64  = Fp8A16MmaSchedule<128, 192, 64, 32, 32, 2, 1>;
+using MmaR128T256K64  = Fp8A16MmaSchedule<128, 256, 64, 32, 32, 2, 1>;
+using TmaT64R256      = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1>;
+using TmaT128R128     = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1>;
+// Cycle-2 widened grid: BlockK=64 halves the weight stage so deeper rings and wider row tiles fit
+// 99 KB of shared memory; RowFast trades the raster order. Same accumulation contract (the sweep's
+// invariance hash admits or rejects each of these into a shape's bit family).
+using TmaT64R64S4      = Fp8A16TmaMmaSchedule<64, 64, 2, 2, 4, 1>;
+using TmaT64R128S4K64  = Fp8A16TmaMmaSchedule<64, 128, 2, 4, 4, 1, 64>;
+using TmaT96R128S3K64  = Fp8A16TmaMmaSchedule<96, 128, 2, 4, 3, 1, 64>;
+using TmaT64R256S3K64  = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 3, 1, 64>;
+using TmaT32R256S4K64  = Fp8A16TmaMmaSchedule<32, 256, 1, 8, 4, 1, 64>;
+using TmaT32R128S8K64  = Fp8A16TmaMmaSchedule<32, 128, 1, 4, 8, 1, 64>;
+using TmaT64R256RF     = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1, 128, Fp8MmaRaster::RowFast>;
+// GB10 (sm_121a, 48 SMs, 100 KB SMEM, 24 MiB L2) 2-blocks/SM and L2-swizzled TMA schedules:
+using TmaT32R128S4B2K64  = Fp8A16TmaMmaSchedule<32, 128, 1, 4, 4, 2, 64>;
+using TmaT64R128S3B2K64  = Fp8A16TmaMmaSchedule<64, 128, 2, 4, 3, 2, 64>;
+using TmaT128R128S2B2K64 = Fp8A16TmaMmaSchedule<128, 128, 2, 4, 2, 2, 64>;
+using TmaT128R128RF      = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1, 128, Fp8MmaRaster::RowFast>;
+using TmaT128R128G8      = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1, 128, Fp8MmaRaster::Grouped, 8>;
+using TmaT64R256G8       = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1, 128, Fp8MmaRaster::Grouped, 8>;
 
 #define INFERNIX_C(kind, name, max_t, rows, ...) \
     Candidate { name, #__VA_ARGS__, kind, launch_of<kind, __VA_ARGS__, K>(), max_t, rows }
@@ -133,7 +149,6 @@ constexpr Fp8Launch launch_of() {
     if constexpr (kind == Kind::Simt) return fp8_linear_a16_simt<G<K>, 8, Schedule>;
     if constexpr (kind == Kind::Sliced) return fp8_linear_a16_sliced_k<G<K>, Schedule>;
     if constexpr (kind == Kind::Mma) return fp8_linear_a16_mma<G<K>, Schedule>;
-    if constexpr (kind == Kind::Ring) return fp8_linear_a16_ring<G<K>, Schedule>;
     if constexpr (kind == Kind::Tma) return fp8_linear_a16_tma<G<K>, Schedule>;
     return nullptr;
 }
@@ -182,25 +197,39 @@ const std::vector<Candidate>& candidates() {
         INFERNIX_C(Kind::Sliced, "sliced_t32w4s2", 128, 0, Fp8SlicedInstance<32, 4, 2>),
         INFERNIX_C(Kind::Sliced, "sliced_t32w8s2", 128, 0, Fp8SlicedInstance<32, 8, 2>),
         INFERNIX_C(Kind::Sliced, "sliced_t64w4s1", 128, 0, Fp8SlicedInstance<64, 4, 1>),
+        INFERNIX_C(Kind::Sliced, "sliced_r2_t16w4s1", 128, 32, Fp8SlicedR2Instance<16, 4, 1>),
+        INFERNIX_C(Kind::Sliced, "sliced_r2_t16w8s2", 128, 32, Fp8SlicedR2Instance<16, 8, 2>),
+        INFERNIX_C(Kind::Sliced, "sliced_r2_t32w4s2", 128, 32, Fp8SlicedR2Instance<32, 4, 2>),
+        INFERNIX_C(Kind::Sliced, "sliced_r2_t32w8s2", 128, 32, Fp8SlicedR2Instance<32, 8, 2>),
         INFERNIX_C(Kind::Mma, "mma_r32t64k128", INT_MAX, 32, MmaR32T64K128),
         INFERNIX_C(Kind::Mma, "mma_r32t64k128w16", INT_MAX, 32, MmaR32T64K128W16),
+        INFERNIX_C(Kind::Mma, "mma_r64t64k64", INT_MAX, 64, MmaR64T64K64),
         INFERNIX_C(Kind::Mma, "mma_r64t64k128", INT_MAX, 64, MmaR64T64K128),
         INFERNIX_C(Kind::Mma, "mma_r64t96k128", INT_MAX, 64, MmaR64T96K128),
         INFERNIX_C(Kind::Mma, "mma_r64t128k64", INT_MAX, 64, MmaR64T128K64),
         INFERNIX_C(Kind::Mma, "mma_r128t128k64", INT_MAX, 128, MmaR128T128K64),
-        INFERNIX_C(Kind::Ring, "ring_t32r64s6", INT_MAX, 64, Fp8A16RingT32R64),
-        INFERNIX_C(Kind::Ring, "ring_t32r64s3b2", INT_MAX, 64, Fp8A16RingT32R64S3),
-        INFERNIX_C(Kind::Ring, "ring_t32r128s4", INT_MAX, 128, Fp8A16RingT32R128),
-        INFERNIX_C(Kind::Ring, "ring_t64r128s3", INT_MAX, 128, Fp8A16RingT64R128),
-        INFERNIX_C(Kind::Ring, "ring_t64r256s2", INT_MAX, 256, RingT64R256),
-        INFERNIX_C(Kind::Ring, "ring_t128r128s2", INT_MAX, 128, RingT128R128),
-        // The same schedules with the TMA producer (same consumers, same bits).
-        INFERNIX_C(Kind::Tma, "tma_t32r64s6", INT_MAX, 64, Fp8A16RingT32R64),
-        INFERNIX_C(Kind::Tma, "tma_t32r64s3b2", INT_MAX, 64, Fp8A16RingT32R64S3),
-        INFERNIX_C(Kind::Tma, "tma_t32r128s4", INT_MAX, 128, Fp8A16RingT32R128),
-        INFERNIX_C(Kind::Tma, "tma_t64r128s3", INT_MAX, 128, Fp8A16RingT64R128),
-        INFERNIX_C(Kind::Tma, "tma_t64r256s2", INT_MAX, 256, RingT64R256),
-        INFERNIX_C(Kind::Tma, "tma_t128r128s2", INT_MAX, 128, RingT128R128),
+        INFERNIX_C(Kind::Mma, "mma_r64t128k128", INT_MAX, 64, MmaR64T128K128),
+        INFERNIX_C(Kind::Mma, "mma_r128t192k64", INT_MAX, 128, MmaR128T192K64),
+        INFERNIX_C(Kind::Mma, "mma_r128t256k64", INT_MAX, 128, MmaR128T256K64),
+        INFERNIX_C(Kind::Tma, "tma_t32r64s6", INT_MAX, 64, Fp8A16TmaT32R64),
+        INFERNIX_C(Kind::Tma, "tma_t32r64s3b2", INT_MAX, 64, Fp8A16TmaT32R64S3),
+        INFERNIX_C(Kind::Tma, "tma_t32r128s4", INT_MAX, 128, Fp8A16TmaT32R128),
+        INFERNIX_C(Kind::Tma, "tma_t64r128s3", INT_MAX, 128, Fp8A16TmaT64R128),
+        INFERNIX_C(Kind::Tma, "tma_t64r256s2", INT_MAX, 256, TmaT64R256),
+        INFERNIX_C(Kind::Tma, "tma_t128r128s2", INT_MAX, 128, TmaT128R128),
+        INFERNIX_C(Kind::Tma, "tma_t64r64s4", INT_MAX, 64, TmaT64R64S4),
+        INFERNIX_C(Kind::Tma, "tma_t64r128s4k64", INT_MAX, 128, TmaT64R128S4K64),
+        INFERNIX_C(Kind::Tma, "tma_t96r128s3k64", INT_MAX, 128, TmaT96R128S3K64),
+        INFERNIX_C(Kind::Tma, "tma_t64r256s3k64", INT_MAX, 256, TmaT64R256S3K64),
+        INFERNIX_C(Kind::Tma, "tma_t32r256s4k64", INT_MAX, 256, TmaT32R256S4K64),
+        INFERNIX_C(Kind::Tma, "tma_t32r128s8k64", INT_MAX, 128, TmaT32R128S8K64),
+        INFERNIX_C(Kind::Tma, "tma_t64r256rf", INT_MAX, 256, TmaT64R256RF),
+        INFERNIX_C(Kind::Tma, "tma_t32r128s4b2k64", INT_MAX, 128, TmaT32R128S4B2K64),
+        INFERNIX_C(Kind::Tma, "tma_t64r128s3b2k64", INT_MAX, 128, TmaT64R128S3B2K64),
+        INFERNIX_C(Kind::Tma, "tma_t128r128s2b2k64", INT_MAX, 128, TmaT128R128S2B2K64),
+        INFERNIX_C(Kind::Tma, "tma_t128r128rf", INT_MAX, 128, TmaT128R128RF),
+        INFERNIX_C(Kind::Tma, "tma_t128r128g8", INT_MAX, 128, TmaT128R128G8),
+        INFERNIX_C(Kind::Tma, "tma_t64r256g8", INT_MAX, 256, TmaT64R256G8),
     };
     return list;
 }
@@ -218,6 +247,11 @@ constexpr Shape kShapes[] = {
     {"out6144", 2560, 6144},  // GDN output and QSA output projections
     {"shgu", 1280, 2560},     // shared expert gate and up
     {"shdown", 2560, 640},    // shared expert down
+    {"ffn14336", 14336, 5120},   // FFN gate/up of the K=5120 models (A16 ladder)
+    {"ffn16384", 16384, 5120},   // FFN gate/up variant
+    {"ffn34816", 34816, 5120},   // FFN fused gate/up+other of the 27B groupwise artifacts
+    {"down5120", 5120, 6144},    // FFN down of K=6144-column models
+    {"down17408", 5120, 17408},  // FFN down of the wide intermediate models
 };
 
 const std::vector<int> kDefaultTs{9,   12,  16,  24,  32,   48,   64,   96,   128,  192,
@@ -229,8 +263,10 @@ struct Options {
     int warmup          = 2;
     int repeat          = 7;
     double tolerance    = 0.02;
-    double dram_gbps    = roofline::kDramSpecGBs;
+    double dram_gbps    = 246.0; // GB10 LPDDR5x peak
+    int flush_mib       = 32;    // GB10 24 MiB L2 flush
     bool decode_only    = false;
+    bool skip_decode    = false;
     std::string csv;
 };
 
@@ -272,8 +308,12 @@ Options parse(int argc, char** argv) {
             options.tolerance = std::atof(next()) / 100.0;
         } else if (arg == "--dram-gbps") {
             options.dram_gbps = std::atof(next());
+        } else if (arg == "--flush-mib") {
+            options.flush_mib = std::atoi(next());
         } else if (arg == "--decode-only") {
             options.decode_only = true;
+        } else if (arg == "--skip-decode") {
+            options.skip_decode = true;
         } else if (arg == "--csv") {
             options.csv = next();
         } else {
@@ -455,6 +495,7 @@ void sweep_shape(const Shape& shape, const std::vector<Candidate>& list, const O
     const double floor_us = (static_cast<double>(shape.n) * shape.k + 2.0 * shape.n) / (options.dram_gbps * 1e3);
 
     // ---------------------------------------------------------------- decode widths
+    if (!options.skip_decode) {
     std::printf("\n## %s [%d,%d] decode widths (floor %.2f us = weight bytes at %.0f GB/s)\n", shape.label, shape.n,
                 shape.k, floor_us, options.dram_gbps);
     std::printf("%-24s %-9s %-18s", "route", "invariant", "T=8 bits");
@@ -512,6 +553,7 @@ void sweep_shape(const Shape& shape, const std::vector<Candidate>& list, const O
         }
         std::printf("\n");
         std::fflush(stdout);
+    }
     }
     if (options.decode_only) return;
 
@@ -606,12 +648,16 @@ int main(int argc, char** argv) {
         std::fprintf(csv, "shape,N,K,T,route,median_us,min_us,p95_us\n");
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        bench::L2FlushBuffer flush(256ULL << 20);
+        bench::L2FlushBuffer flush(static_cast<std::size_t>(options.flush_mib) << 20);
         bool matched = false;
         for (const Shape& shape : kShapes) {
             if (!options.shape.empty() && options.shape != shape.label) continue;
             matched = true;
-            const auto& list = shape.k == 2560 ? candidates<2560>() : shape.k == 6144 ? candidates<6144>() : candidates<640>();
+            const auto& list = shape.k == 2560    ? candidates<2560>()
+                               : shape.k == 6144  ? candidates<6144>()
+                               : shape.k == 5120  ? candidates<5120>()
+                               : shape.k == 17408 ? candidates<17408>()
+                                                  : candidates<640>();
             sweep_shape(shape, list, options, csv, flush, stream);
         }
         CUDA_CHECK(cudaStreamDestroy(stream));

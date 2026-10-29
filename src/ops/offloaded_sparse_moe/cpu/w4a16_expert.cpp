@@ -1,20 +1,15 @@
 #include "ops/offloaded_sparse_moe/cpu/w4a16_expert.h"
 
+#include "ops/offloaded_sparse_moe/cpu/neon_mad.h"
+
 #include <array>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#    include <immintrin.h>
-#    define INFERNIX_MOE_X86 1
-#endif
+#include <sys/auxv.h>
 
-#if defined(_MSC_VER) && !defined(__clang__)
-#    define INFERNIX_TARGET(x)
-#else
-#    define INFERNIX_TARGET(x) __attribute__((target(x)))
-#endif
+#define INFERNIX_MOE_NEON 1
 
 namespace infernix::ops::offloaded_moe {
 namespace {
@@ -46,20 +41,19 @@ void row_sums_scalar(const std::uint8_t* matrix, int blocks, int rg_begin, int r
     }
 }
 
-#if defined(INFERNIX_MOE_X86)
+#if defined(INFERNIX_MOE_NEON)
 
 // Software prefetch `distance` bytes ahead along the unit stream (design §10.3, §14.2).
 inline void prefetch_unit(const std::uint8_t* unit, int distance) {
     if (distance > 0) {
         const char* p = reinterpret_cast<const char*>(unit) + distance;
-        _mm_prefetch(p, _MM_HINT_T0);
-        _mm_prefetch(p + 64, _MM_HINT_T0);
-        _mm_prefetch(p + 128, _MM_HINT_T0);
+        __builtin_prefetch(p);
+        __builtin_prefetch(p + 64);
+        __builtin_prefetch(p + 128);
     }
 }
 
-// Code -> doubled E2M1 value as a signed byte (for unsigned activation bytes), and biased by +12 as
-// an unsigned byte (for the signed high byte of X).
+// Code -> doubled E2M1 value as a signed byte, and biased by +12 as an unsigned byte.
 constexpr std::array<std::int8_t, 16> kSignedCodes = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 constexpr std::array<std::int8_t, 16> kBiasedCodes = {12, 13, 14, 15, 16, 18, 20, 24,
                                                       12, 11, 10, 9,  8,  6,  4,  0};
@@ -72,184 +66,161 @@ inline std::int32_t quad_word(const T (&bytes)[16], int q) {
     return w;
 }
 
-// ----------------------------------------------------------------------------------- AVX-512
-
-INFERNIX_TARGET("avx512f,avx512bw,avx512vnni")
-inline __m512i scales16_avx512(const std::uint8_t* s) {
-    const __m512i w    = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s)));
-    const __m512i m    = _mm512_and_si512(w, _mm512_set1_epi32(7));
-    const __m512i e    = _mm512_and_si512(_mm512_srli_epi32(w, 3), _mm512_set1_epi32(15));
-    const __m512i norm = _mm512_sllv_epi32(_mm512_or_si512(m, _mm512_set1_epi32(8)),
-                                           _mm512_sub_epi32(e, _mm512_set1_epi32(1)));
-    const __mmask16 sub = _mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512());
-    return _mm512_mask_blend_epi32(sub, norm, m);
-}
-
-// Lane r of the 16-lane vectors is row r of the unit (rows 0-7: low nibbles of the first 256 bits,
-// rows 8-15: high nibbles moved into the second 256 bits). Per block and column: lo and mid bytes
-// (unsigned) times signed codes, hi bytes (signed) times biased codes, P = lo + 256 mid + 65536 hi
-// in wrapping int32 (exact: |P| < 2^31), then P * Sw into int64 per row.
-template <int N>
-INFERNIX_TARGET("avx512f,avx512bw,avx512vnni")
-void row_sums_avx512(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, const A16Block* const* acts,
-                     std::int64_t* out, int prefetch_bytes) {
-    const __m512i lut_s = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kSignedCodes.data())));
-    const __m512i lut_b = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data())));
-    const __m512i low4  = _mm512_set1_epi8(0x0F);
-    for (int rg = rg_begin; rg < rg_end; ++rg) {
-        __m512i even[N], odd[N];
-        for (int c = 0; c < N; ++c) { even[c] = odd[c] = _mm512_setzero_si512(); }
-        for (int b = 0; b < blocks; ++b) {
-            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes;
-            prefetch_unit(unit, prefetch_bytes);
-            __m512i plo[N], pmid[N], phi[N];
-            for (int c = 0; c < N; ++c) { plo[c] = pmid[c] = phi[c] = _mm512_setzero_si512(); }
-            for (int q = 0; q < 4; ++q) {
-                __m512i v = _mm512_broadcast_i64x4(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)));
-                v         = _mm512_mask_srli_epi16(v, 0xFFFF0000U, v, 4); // upper half: high nibbles
-                v         = _mm512_and_si512(v, low4);
-                const __m512i ws = _mm512_shuffle_epi8(lut_s, v);
-                const __m512i wb = _mm512_shuffle_epi8(lut_b, v);
-                for (int c = 0; c < N; ++c) {
-                    const A16Block& a = acts[c][b];
-                    plo[c]  = _mm512_dpbusd_epi32(plo[c], _mm512_set1_epi32(quad_word(a.lo, q)), ws);
-                    pmid[c] = _mm512_dpbusd_epi32(pmid[c], _mm512_set1_epi32(quad_word(a.mid, q)), ws);
-                    phi[c]  = _mm512_dpbusd_epi32(phi[c], wb, _mm512_set1_epi32(quad_word(a.hi, q)));
-                }
-            }
-            const __m512i sw     = scales16_avx512(unit + 128);
-            const __m512i sw_odd = _mm512_srli_epi64(sw, 32);
-            for (int c = 0; c < N; ++c) {
-                const __m512i hi = _mm512_sub_epi32(phi[c], _mm512_set1_epi32(kBias * acts[c][b].hi_sum));
-                const __m512i p  = _mm512_add_epi32(_mm512_add_epi32(plo[c], _mm512_slli_epi32(pmid[c], 8)),
-                                                    _mm512_slli_epi32(hi, 16));
-                even[c] = _mm512_add_epi64(even[c], _mm512_mul_epi32(p, sw));
-                odd[c]  = _mm512_add_epi64(odd[c], _mm512_mul_epi32(_mm512_srli_epi64(p, 32), sw_odd));
-            }
-        }
-        for (int c = 0; c < N; ++c) {
-            alignas(64) std::int64_t e[8], o[8];
-            _mm512_store_si512(reinterpret_cast<__m512i*>(e), even[c]);
-            _mm512_store_si512(reinterpret_cast<__m512i*>(o), odd[c]);
-            for (int i = 0; i < 8; ++i) {
-                const std::size_t base = static_cast<std::size_t>(rg - rg_begin) * 16;
-                out[(base + 2 * i) * N + c]     = e[i];
-                out[(base + 2 * i + 1) * N + c] = o[i];
-            }
-        }
+// The 16 per-row scales of a unit (16 e4m3 bytes at unit + 128) as four int32x4 for rows 0-3, 4-7,
+// 8-11 and 12-15: m << (e - 1), or m when e == 0.
+inline void unit_scales(const std::uint8_t* s, int32x4_t (&out)[4]) {
+    // Two 8-byte loads, one per group of eight rows: widening 8 -> 16 -> 32 bits lands rows 0-3,
+    // 4-7, 8-11 and 12-15 in the four output vectors with no shuffles. Loading four bytes per group
+    // instead lets the compiler merge the loads into overlapping 8-byte ones that read past the
+    // record, so the row-group's own 16 scale bytes are the ones loaded.
+    const uint16x8_t lo = vmovl_u8(vld1_u8(s));
+    const uint16x8_t hi = vmovl_u8(vld1_u8(s + 8));
+    const uint32x4_t g[4] = {vmovl_u16(vget_low_u16(lo)), vmovl_u16(vget_high_u16(lo)),
+                             vmovl_u16(vget_low_u16(hi)), vmovl_u16(vget_high_u16(hi))};
+    for (int i = 0; i < 4; ++i) {
+        const uint32x4_t m = vandq_u32(g[i], vdupq_n_u32(7));
+        const uint32x4_t e = vandq_u32(vshrq_n_u32(g[i], 3), vdupq_n_u32(15));
+        // vshlq with the huge count (e - 1 when e == 0) yields zero, which vbsl replaces by m.
+        const uint32x4_t norm =
+            vshlq_u32(vorrq_u32(m, vdupq_n_u32(8)), vreinterpretq_s32_u32(vsubq_u32(e, vdupq_n_u32(1))));
+        out[i] = vreinterpretq_s32_u32(vbslq_u32(vceqq_u32(e, vdupq_n_u32(0)), m, norm));
     }
 }
 
-// ----------------------------------------------------------------------------------- AVX2
-
-INFERNIX_TARGET("avx2")
-inline __m256i scales8_avx2(const std::uint8_t* s) {
-    const __m256i w    = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s)));
-    const __m256i m    = _mm256_and_si256(w, _mm256_set1_epi32(7));
-    const __m256i e    = _mm256_and_si256(_mm256_srli_epi32(w, 3), _mm256_set1_epi32(15));
-    const __m256i norm = _mm256_sllv_epi32(_mm256_or_si256(m, _mm256_set1_epi32(8)),
-                                           _mm256_sub_epi32(e, _mm256_set1_epi32(1)));
-    const __m256i sub  = _mm256_cmpeq_epi32(e, _mm256_setzero_si256());
-    return _mm256_blendv_epi8(norm, m, sub);
-}
-
-// acc + sum of four (unsigned byte of u) * (signed byte of s) per lane.
-INFERNIX_TARGET("avx2")
-inline __m256i dot4_avx2(__m256i acc, __m256i u, __m256i s) {
-    const __m256i pairs = _mm256_maddubs_epi16(u, s); // |pair| <= 2 * 255 * 12 or 2 * 24 * 128: no saturation
-    return _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
-}
-
-INFERNIX_TARGET("avx2,avxvnni")
-inline __m256i dot4_avxvnni(__m256i acc, __m256i u, __m256i s) {
-    return _mm256_dpbusd_avx_epi32(acc, u, s);
-}
-
-// One body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant. Half h holds
-// rows 8h..8h+7 (low nibbles for h = 0, high nibbles for h = 1).
-#define INFERNIX_AVX2_ROW_SUMS_A16(NAME, DOT) \
-void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
-          const A16Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
-    const __m256i lut_s = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kSignedCodes.data()))); \
-    const __m256i lut_b = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data()))); \
-    const __m256i low4  = _mm256_set1_epi8(0x0F); \
-    for (int rg = rg_begin; rg < rg_end; ++rg) { \
-        __m256i even[2][N], odd[2][N]; \
-        for (int h = 0; h < 2; ++h) { \
-            for (int c = 0; c < N; ++c) { even[h][c] = odd[h][c] = _mm256_setzero_si256(); } \
-        } \
-        for (int b = 0; b < blocks; ++b) { \
-            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes; \
-            prefetch_unit(unit, prefetch_bytes); \
-            __m256i plo[2][N], pmid[2][N], phi[2][N]; \
-            for (int h = 0; h < 2; ++h) { \
-                for (int c = 0; c < N; ++c) { plo[h][c] = pmid[h][c] = phi[h][c] = _mm256_setzero_si256(); } \
-            } \
-            for (int q = 0; q < 4; ++q) { \
-                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(unit + 32 * q)); \
-                const __m256i idx[2] = {_mm256_and_si256(v, low4), _mm256_and_si256(_mm256_srli_epi16(v, 4), low4)}; \
-                for (int h = 0; h < 2; ++h) { \
-                    const __m256i ws = _mm256_shuffle_epi8(lut_s, idx[h]); \
-                    const __m256i wb = _mm256_shuffle_epi8(lut_b, idx[h]); \
-                    for (int c = 0; c < N; ++c) { \
-                        const A16Block& a = acts[c][b]; \
-                        plo[h][c]  = DOT(plo[h][c], _mm256_set1_epi32(quad_word(a.lo, q)), ws); \
-                        pmid[h][c] = DOT(pmid[h][c], _mm256_set1_epi32(quad_word(a.mid, q)), ws); \
-                        phi[h][c]  = DOT(phi[h][c], wb, _mm256_set1_epi32(quad_word(a.hi, q))); \
-                    } \
-                } \
-            } \
-            for (int h = 0; h < 2; ++h) { \
-                const __m256i sw     = scales8_avx2(unit + 128 + 8 * h); \
-                const __m256i sw_odd = _mm256_srli_epi64(sw, 32); \
-                for (int c = 0; c < N; ++c) { \
-                    const __m256i hi = _mm256_sub_epi32(phi[h][c], _mm256_set1_epi32(kBias * acts[c][b].hi_sum)); \
-                    const __m256i p  = _mm256_add_epi32(_mm256_add_epi32(plo[h][c], _mm256_slli_epi32(pmid[h][c], 8)), \
-                                                        _mm256_slli_epi32(hi, 16)); \
-                    even[h][c] = _mm256_add_epi64(even[h][c], _mm256_mul_epi32(p, sw)); \
-                    odd[h][c]  = _mm256_add_epi64(odd[h][c], _mm256_mul_epi32(_mm256_srli_epi64(p, 32), sw_odd)); \
-                } \
-            } \
-        } \
-        for (int h = 0; h < 2; ++h) { \
-            for (int c = 0; c < N; ++c) { \
-                alignas(32) std::int64_t e[4], o[4]; \
-                _mm256_store_si256(reinterpret_cast<__m256i*>(e), even[h][c]); \
-                _mm256_store_si256(reinterpret_cast<__m256i*>(o), odd[h][c]); \
-                for (int i = 0; i < 4; ++i) { \
-                    const std::size_t base = static_cast<std::size_t>(rg - rg_begin) * 16 + 8 * h; \
-                    out[(base + 2 * i) * N + c]     = e[i]; \
-                    out[(base + 2 * i + 1) * N + c] = o[i]; \
-                } \
-            } \
-        } \
-    } \
-}
-
-template <int N>
-INFERNIX_TARGET("avx2")
-INFERNIX_AVX2_ROW_SUMS_A16(row_sums_avx2, dot4_avx2)
-
-template <int N>
-INFERNIX_TARGET("avx2,avxvnni")
-INFERNIX_AVX2_ROW_SUMS_A16(row_sums_avxvnni, dot4_avxvnni)
-
-#undef INFERNIX_AVX2_ROW_SUMS_A16
-
-#define INFERNIX_MOE_DISPATCH(CALL)                                                                   \
-    switch (ncols) {                                                                                \
-    case 1: CALL(1); break;                                                                         \
-    case 2: CALL(2); break;                                                                         \
-    case 3: CALL(3); break;                                                                         \
-    case 4: CALL(4); break;                                                                         \
-    case 5: CALL(5); break;                                                                         \
-    case 6: CALL(6); break;                                                                         \
-    case 7: CALL(7); break;                                                                         \
-    case 8: CALL(8); break;                                                                         \
-    default: throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]");                 \
+// One row group's exact row sums for every column of a row-group-major matrix (design §6.2).
+//
+// Unit byte 32 * (k / 4) + 4 * (r % 8) + k % 4 holds row r's code for k-values 4 * (k / 4) .. +3,
+// low nibble for r < 8 and high nibble for r >= 8. A 16-byte window at 32 * q + 16 * w therefore
+// holds, in 32-bit lane l, the four k-codes of row 4w + l (low nibbles) and of row 4w + l + 8 (high
+// nibbles), so one dot product accumulates four rows at once, one row per lane, and the lanes are
+// the rows.
+//
+// P = lo + 256 mid + 65536 hi with X split into unsigned lo/mid bytes and a signed hi byte, exactly
+// as the scalar route and x86's AVX-512 path compute it: lo and mid are unsigned activations times
+// signed codes, hi is a signed activation times biased codes with kBias * hi_sum removed. The int64
+// accumulation of P * row_scale is then identical.
+//
+// GCC cannot inline an `usdot` callee into a caller without FEAT_I8MM, and a template body carries
+// one target for every instantiation, so the two ISA levels are generated separately: the x86 route
+// does the same with INFERNIX_AVX2_ROW_SUMS. `mad` and the kernel share the target attribute, which
+// is what turns each dot product into one instruction instead of a call.
+#define INFERNIX_NEON_ROW_SUMS(NAME, MAD, TARGET)                                                   \
+    TARGET void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,              \
+                     const A16Block* const* acts, int ncols, std::int64_t* out, int prefetch_bytes) { \
+        const int8x16_t lut_s   = vld1q_s8(kSignedCodes.data());                                    \
+        const uint8x16_t lut_b  = vreinterpretq_u8_s8(vld1q_s8(kBiasedCodes.data()));               \
+        const uint8x16_t low4   = vdupq_n_u8(0x0F);                                                 \
+        for (int rg = rg_begin; rg < rg_end; ++rg) {                                                \
+            for (int column = 0; column < ncols; ++column) {                                        \
+                const A16Block* act = acts[column];                                                 \
+                /* sum[4w + 2n + i]: rows 4w + 8n + 2i and +1 as int64 across all blocks. */        \
+                int64x2_t sum[8];                                                                   \
+                for (int i = 0; i < 8; ++i) { sum[i] = vdupq_n_s64(0); }                            \
+                const std::size_t row_group = static_cast<std::size_t>(rg) * blocks;                \
+                for (int b = 0; b < blocks; ++b) {                                                  \
+                    const std::uint8_t* unit = matrix + (row_group + b) * kUnitBytes;                \
+                    prefetch_unit(unit, prefetch_bytes);                                            \
+                    const A16Block& ab = act[b];                                                    \
+                    uint8x16_t alo[4], amd[4];                                                      \
+                    int8x16_t ahi[4];                                                               \
+                    for (int q = 0; q < 4; ++q) {                                                   \
+                        alo[q] = vreinterpretq_u8_s32(vdupq_n_s32(quad_word(ab.lo, q)));             \
+                        amd[q] = vreinterpretq_u8_s32(vdupq_n_s32(quad_word(ab.mid, q)));            \
+                        ahi[q] = vreinterpretq_s8_s32(vdupq_n_s32(quad_word(ab.hi, q)));             \
+                    }                                                                               \
+                    int32x4_t plo[4], pmd[4], phi[4];                                               \
+                    for (int i = 0; i < 4; ++i) {                                                   \
+                        plo[i] = pmd[i] = phi[i] = vdupq_n_s32(0);                                  \
+                    }                                                                               \
+                    for (int q = 0; q < 4; ++q) {                                                   \
+                        for (int w = 0; w < 2; ++w) {                                               \
+                            const uint8x16_t raw = vld1q_u8(unit + 32 * q + 16 * w);                 \
+                            const int8x16_t cs = vqtbl1q_s8(lut_s, vandq_u8(raw, low4));             \
+                            const int8x16_t ch =                                                     \
+                                vqtbl1q_s8(lut_s, vandq_u8(vshrq_n_u8(raw, 4), low4));               \
+                            const uint8x16_t cb =                                                    \
+                                vreinterpretq_u8_s8(vqtbl1q_s8(vreinterpretq_s8_u8(lut_b),            \
+                                                               vandq_u8(raw, low4)));               \
+                            const uint8x16_t cb2 =                                                   \
+                                vreinterpretq_u8_s8(vqtbl1q_s8(vreinterpretq_s8_u8(lut_b),            \
+                                                               vandq_u8(vshrq_n_u8(raw, 4), low4))); \
+                            plo[2 * w]     = MAD::mad(plo[2 * w], alo[q], cs);                       \
+                            pmd[2 * w]     = MAD::mad(pmd[2 * w], amd[q], cs);                       \
+                            phi[2 * w]     = MAD::mad(phi[2 * w], cb, ahi[q]);                       \
+                            plo[2 * w + 1] = MAD::mad(plo[2 * w + 1], alo[q], ch);                   \
+                            pmd[2 * w + 1] = MAD::mad(pmd[2 * w + 1], amd[q], ch);                   \
+                            phi[2 * w + 1] = MAD::mad(phi[2 * w + 1], cb2, ahi[q]);                  \
+                        }                                                                           \
+                    }                                                                               \
+                    int32x4_t sw[4];                                                                \
+                    unit_scales(unit + 128, sw);                                                    \
+                    const int32x4_t bias = vdupq_n_s32(kBias * ab.hi_sum);                           \
+                    for (int w = 0; w < 2; ++w) {                                                   \
+                        for (int n = 0; n < 2; ++n) {                                               \
+                            const int i = 2 * w + n;                                                \
+                            const int32x4_t hi = vsubq_s32(phi[i], bias);                            \
+                            const int32x4_t p  = vaddq_s32(                                          \
+                                vaddq_s32(plo[i], vshlq_n_s32(pmd[i], 8)), vshlq_n_s32(hi, 16));     \
+                            const int32x4_t sc = sw[w + 2 * n];                                     \
+                            sum[4 * w + 2 * n] = vaddq_s64(                                          \
+                                sum[4 * w + 2 * n], vmull_s32(vget_low_s32(p), vget_low_s32(sc)));    \
+                            sum[4 * w + 2 * n + 1] = vaddq_s64(                                      \
+                                sum[4 * w + 2 * n + 1], vmull_high_s32(p, sc));                       \
+                        }                                                                           \
+                    }                                                                               \
+                }                                                                                   \
+                alignas(16) std::int64_t v[4];                                                       \
+                for (int w = 0; w < 2; ++w) {                                                       \
+                    for (int n = 0; n < 2; ++n) {                                                   \
+                        vst1q_s64(v, sum[4 * w + 2 * n]);                                           \
+                        const std::size_t base =                                                    \
+                            (static_cast<std::size_t>(rg - rg_begin) * 16 + 4 * w + 8 * n) * ncols;  \
+                        out[base + 0 * ncols + column] = v[0];                                      \
+                        out[base + 1 * ncols + column] = v[1];                                      \
+                        vst1q_s64(v, sum[4 * w + 2 * n + 1]);                                       \
+                        out[base + 2 * ncols + column] = v[0];                                      \
+                        out[base + 3 * ncols + column] = v[1];                                      \
+                    }                                                                                \
+                }                                                                                    \
+            }                                                                                        \
+        }                                                                                            \
     }
 
-#endif // INFERNIX_MOE_X86
+INFERNIX_NEON_ROW_SUMS(row_sums_neon_i8mm, neon::I8mmMad, INFERNIX_I8MM_TARGET)
+INFERNIX_NEON_ROW_SUMS(row_sums_neon_asimd, neon::AsimdMad, /* baseline */)
+
+#undef INFERNIX_NEON_ROW_SUMS
+
+struct CpuFeatures {
+    bool neon    = false; // FEAT_ASIMD, the baseline AArch64 vector unit
+    bool dotprod = false; // FEAT_DotProd (HWCAP_ASIMDDP)
+    bool i8mm    = false; // FEAT_I8MM (HWCAP2_I8MM)
+};
+
+// The kernel reports optional features through AT_HWCAP/AT_HWCAP2 (the AArch64 analogue of
+// CPUID/xgetbv). macOS exposes the same facts through sysctl.
+CpuFeatures detect_features() {
+    CpuFeatures f;
+    f.neon = true; // AArch64 always has Advanced SIMD
+    const unsigned long hwcap  = getauxval(AT_HWCAP);
+    const unsigned long hwcap2 = getauxval(AT_HWCAP2);
+#    ifndef HWCAP_ASIMDDP
+#        define HWCAP_ASIMDDP (1UL << 20)
+#    endif
+#    ifndef HWCAP2_I8MM
+#        define HWCAP2_I8MM (1UL << 13)
+#    endif
+    f.dotprod = (hwcap & HWCAP_ASIMDDP) != 0;
+    f.i8mm    = (hwcap2 & HWCAP2_I8MM) != 0;
+    return f;
+}
+
+const CpuFeatures& features() {
+    static const CpuFeatures f = detect_features();
+    return f;
+}
+
+#endif // INFERNIX_MOE_NEON
 
 } // namespace
 
@@ -270,21 +241,13 @@ void rg16_row_sums_a16(CpuIsa isa, const std::uint8_t* matrix, int blocks, int r
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_moe: unsupported CPU ISA"); }
     switch (isa) {
     case CpuIsa::kScalar: row_sums_scalar(matrix, blocks, rg_begin, rg_end, acts, ncols, out); return;
-#if defined(INFERNIX_MOE_X86)
-    case CpuIsa::kAvx512Vnni:
-#    define INFERNIX_CALL(n) row_sums_avx512<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
-        INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
-#    undef INFERNIX_CALL
-        return;
-    case CpuIsa::kAvxVnni:
-#    define INFERNIX_CALL(n) row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
-        INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
-#    undef INFERNIX_CALL
-        return;
-    case CpuIsa::kAvx2:
-#    define INFERNIX_CALL(n) row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
-        INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
-#    undef INFERNIX_CALL
+#if defined(INFERNIX_MOE_NEON)
+    case CpuIsa::kNeon:
+        if (features().i8mm) {
+            row_sums_neon_i8mm(matrix, blocks, rg_begin, rg_end, acts, ncols, out, prefetch_bytes);
+        } else {
+            row_sums_neon_asimd(matrix, blocks, rg_begin, rg_end, acts, ncols, out, prefetch_bytes);
+        }
         return;
 #else
     default: break;

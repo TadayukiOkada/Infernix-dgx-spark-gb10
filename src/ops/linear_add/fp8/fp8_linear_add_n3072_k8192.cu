@@ -7,7 +7,7 @@
 // tiles, so the TMA tiles split K over an underfilled wave.
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_a16_gemv.cuh"
-#include "ops/linear/fp8/fp8_a16_ring_mma.cuh"
+#include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
@@ -82,15 +82,16 @@ void fp8_linear_add_n3072_a16_launch(const Tensor& x, const Weight& weight, Tens
     }
     if (tokens <= 8) return sliced<Fp8SlicedInstance<8, 8, 2>>(x, weight, residual, stream);
     if (tokens <= 16) return sliced<Fp8SlicedInstance<16, 8, 2>>(x, weight, residual, stream);
-    const auto ring = [&]<class Schedule>() {
-        launch_fp8_a16_ring_mma<Fp8ScheduleInstance<Schedule, kK>>(operands, d.output, d.epilogue,
-                                                                  stream);
+    const auto tma = [&]<class Schedule>() {
+        launch_fp8_a16_tma_mma<Fp8ScheduleInstance<Schedule, kK>>(operands, d.output, d.epilogue,
+                                                                 stream);
     };
-    if (tokens <= 64) return ring.template operator()<Fp8A16RingT32R64>();
+    if (tokens <= 64) return tma.template operator()<Fp8A16TmaT32R64>();
     if (tokens <= 128 || (tokens > 256 && tokens <= 384))
-        return ring.template operator()<Fp8A16RingT32R128>();
-    if (tokens <= 192) return ring.template operator()<Fp8A16RingT32R64S3>();
-    ring.template operator()<Fp8A16RingT64R128>();
+        return tma.template operator()<Fp8A16TmaT32R128>();
+    if (tokens <= 192) return tma.template operator()<Fp8A16TmaT32R64S3>();
+    if (tokens <= 512) return tma.template operator()<Fp8A16TmaT64R128>();
+    tma.template operator()<Fp8A16TmaT64R128G8>();
 }
 
 void fp8_linear_add_n3072_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,

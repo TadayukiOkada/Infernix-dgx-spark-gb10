@@ -1,5 +1,5 @@
 // Implements: include/infernix/ops/mtp_round.h
-// Match: K=1..63 verified drafts, followed by N=1..5 MTP drafts.
+// Match: K=1..63 verified drafts, followed by N=1..7 MTP drafts.
 #include "ops/launcher/mtp_round.h"
 
 #include "core/device.h"

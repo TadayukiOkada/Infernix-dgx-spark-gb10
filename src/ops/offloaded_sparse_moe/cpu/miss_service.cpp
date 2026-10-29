@@ -45,6 +45,8 @@ void cuda_require(cudaError_t error, const char* what) {
 void relax() {
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
 #endif
 }
 

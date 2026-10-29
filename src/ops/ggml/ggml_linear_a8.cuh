@@ -129,12 +129,11 @@ struct Columns {
 // is exact; a NaN scale gives NaN outputs either way, and the GPU's FP32 arithmetic returns its canonical NaN).
 __device__ __forceinline__ float weight_scale(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
 
-// A 16-byte cp.async of which the first `bytes` are read (the rest zero-filled), with an L2 cache policy:
-// evict-first for the dense weights, read once per call (ggml_linear.cu's cp_async16_evict_first).
-__device__ __forceinline__ void cp_async16_hint(void* shared, const void* global, int bytes, std::uint64_t policy) {
+// A 16-byte cp.async with an L2 cache policy: evict-first for the dense weights, read once per call
+// (ggml_linear_tiled.cu's cp_async16_evict_first).
+__device__ __forceinline__ void cp_async16_hint(void* shared, const void* global, std::uint64_t policy) {
     const auto s = static_cast<unsigned>(__cvta_generic_to_shared(shared));
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" ::"r"(s), "l"(global), "r"(bytes),
-                 "l"(policy));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(s), "l"(global), "l"(policy));
 }
 
 // Waits until at most n of the thread's cp.async groups are pending (n < 4).
@@ -298,15 +297,17 @@ __device__ __forceinline__ void mma_body(const Slot& seg, int slices, const std:
         return seg.weights + static_cast<std::size_t>(min(row0 + r, seg.rows - 1)) * seg.row_bytes;
     };
     [[maybe_unused]] const std::uint8_t* tile_base = seg.weights + static_cast<std::size_t>(row0) * seg.row_bytes; // Tiled
-    std::uint64_t policy;
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    [[maybe_unused]] std::uint64_t policy = 0;
+    if constexpr (Tiled) {
+        asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    }
     const auto issue = [&](int i) { // the warp's i-th unit into its ring slot, one cp.async group
         if (i < mine) {
             const int u        = part + i * split;
             unsigned char* dst = ring + (i % stages) * slot_bytes;
             if constexpr (Tiled) {
                 const std::uint8_t* src = tile_base + static_cast<std::size_t>(u) * 16 * kBlockBytes;
-                for (int c = lane; c < kBlockBytes; c += 32) { cp_async16_hint(dst + 16 * c, src + 16 * c, 16, policy); }
+                for (int c = lane; c < kBlockBytes; c += 32) { cp_async16_hint(dst + 16 * c, src + 16 * c, policy); }
             } else {
                 const int bytes = ggml::mma_rows::unit_row_bytes<F>(u, slices);
                 for (int c = lane; c < 16 * kChunks; c += 32) {
@@ -315,7 +316,7 @@ __device__ __forceinline__ void mma_body(const Slot& seg, int slices, const std:
                     const auto* aligned =
                         reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{15});
                     const int need = static_cast<int>(src - aligned) + bytes - 16 * cc; // bytes of this copy the unit reads
-                    if (need > 0) { cp_async16_hint(dst + r * kPitch + 16 * cc, aligned + 16 * cc, need < 16 ? need : 16, policy); }
+                    if (need > 0) { tile::cp_async16(dst + r * kPitch + 16 * cc, aligned + 16 * cc, need < 16 ? need : 16); }
                 }
             }
         }

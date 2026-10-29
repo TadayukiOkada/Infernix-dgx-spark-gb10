@@ -433,7 +433,7 @@ void columns_timing() {
         const Expert e = fixtures::random_a16_expert(rng, shape);
         const auto x   = fixtures::random_activations(rng, kCols, H);
         std::vector<std::uint16_t> y(static_cast<std::size_t>(H) * kCols);
-        for (const auto isa : {moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+        for (const auto isa : {moe::CpuIsa::kNeon}) {
             if (!moe::cpu_isa_supported(isa)) { continue; }
             for (int ncols = 1; ncols <= kCols; ++ncols) {
                 const std::uint16_t* xp[kCols];
@@ -481,7 +481,7 @@ INFERNIX_OP_TEST(offloaded_moe_w4a8_cpu) {
         }
     }
     try {
-        const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni};
+        const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kNeon};
         for (const auto isa : isas) {
             const bool run = moe::cpu_isa_supported(isa) && (g_only_isa.empty() || g_only_isa == moe::cpu_isa_name(isa));
             std::printf("CPU ISA %-12s %s\n", moe::cpu_isa_name(isa), run ? "tested" : "skipped (not supported or not selected)");

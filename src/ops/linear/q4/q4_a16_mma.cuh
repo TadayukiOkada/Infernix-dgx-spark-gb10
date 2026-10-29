@@ -14,6 +14,24 @@ __device__ __forceinline__ int q4_mma_swizzle_k64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
+union alignas(16) Q4Bf16x8Bits {
+    uint4 raw;
+    __nv_bfloat162 pair[4];
+};
+static_assert(sizeof(Q4Bf16x8Bits) == 16);
+
+template <int Bytes>
+__device__ __forceinline__ unsigned char* q4_mma_shared_storage() {
+    static_assert(Bytes <= 99 * 1024);
+    if constexpr (Bytes > 48 * 1024) {
+        extern __shared__ __align__(16) unsigned char dynamic_shared[];
+        return dynamic_shared;
+    } else {
+        __shared__ __align__(16) unsigned char storage[Bytes];
+        return storage;
+    }
+}
+
 // clang-format off
 template <class Schedule, bool Full, class Output, class Epilogue>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
@@ -40,11 +58,23 @@ void q4_a16_mma_kernel(
     constexpr int BS     = Schedule::kActivationStages;
     constexpr int GPB    = Schedule::kGroupsPerK;
     constexpr int SB     = Schedule::kScaleBytes;
+    constexpr int SRB    = Schedule::kScaleRowBytes;
+    constexpr bool kPackedScalePairs =
+        (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32 && (GPB % 2 == 0));
 
-    __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
-    __shared__ __align__(16) __nv_bfloat16 Bs[BS][BN * BK];
-    __shared__ __align__(16) std::uint8_t Cr[S][BM * GPB * Q4RowSplitStorage::kCodeBytesPerGroup];
-    __shared__ __align__(16) std::uint8_t Sr[S][BM * GPB * SB];
+    struct SharedStorage {
+        alignas(16) __nv_bfloat16 As[BM * BK];
+        alignas(16) __nv_bfloat16 Bs[BS][BN * BK];
+        alignas(16) std::uint8_t Cr[S][BM * GPB * Q4RowSplitStorage::kCodeBytesPerGroup];
+        alignas(16) std::uint8_t Sr[S][BM * SRB];
+    };
+    static_assert(sizeof(SharedStorage) == Schedule::kSharedBytes);
+    auto* smem_raw = q4_mma_shared_storage<Schedule::kSharedBytes>();
+    auto& smem     = *reinterpret_cast<SharedStorage*>(smem_raw);
+    auto& As       = smem.As;
+    auto& Bs       = smem.Bs;
+    auto& Cr       = smem.Cr;
+    auto& Sr       = smem.Sr;
 
     const int groups_per_row = padded_k / Q4RowSplitStorage::kGroupK;
     const int tid            = static_cast<int>(threadIdx.x);
@@ -55,8 +85,23 @@ void q4_a16_mma_kernel(
     const int mma_row        = lane >> 2;
     const int mma_col        = lane & 3;
 
-    const int row0 = static_cast<int>(blockIdx.x) * BM;
-    const int col0 = static_cast<int>(blockIdx.y) * BN;
+    const int tiles_m = static_cast<int>(gridDim.x);
+    const int tiles_n = static_cast<int>(gridDim.y);
+    int tile_m        = static_cast<int>(blockIdx.x);
+    int tile_n        = static_cast<int>(blockIdx.y);
+    if (tiles_n > 1 && tiles_m >= 8) {
+        constexpr int kGroupRows = 8;
+        const int linear         = tile_n * tiles_m + tile_m;
+        const int group_span     = kGroupRows * tiles_n;
+        const int group          = linear / group_span;
+        const int first_m        = group * kGroupRows;
+        const int active_m       = min(kGroupRows, tiles_m - first_m);
+        const int within         = linear - group * group_span;
+        tile_m                   = first_m + within % active_m;
+        tile_n                   = within / active_m;
+    }
+    const int row0 = tile_m * BM;
+    const int col0 = tile_n * BN;
 
     float accum[MT][NT][4];
 #pragma unroll
@@ -130,36 +175,32 @@ void q4_a16_mma_kernel(
             }
         }
 
+        if constexpr (kPackedScalePairs) {
+            constexpr int kPairsPerRow = GPB / 2;
 #pragma unroll 1
-        for (int row_group = tid; row_group < BM * GPB; row_group += Schedule::kThreads) {
-            const int local_row   = row_group / GPB;
-            const int group       = row_group - local_row * GPB;
-            const int row         = row0 + local_row;
-            const int scale_group = group0 + group;
-            auto* dst             = &Sr[stage][row_group * SB];
-            if constexpr (kFull) {
-                const std::int64_t group_index =
-                    static_cast<std::int64_t>(row) * groups_per_row + scale_group;
-                if constexpr (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32) {
-                    const int aligned_group = scale_group & ~1;
-                    const std::int64_t aligned_index =
-                        static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
-                    if (aligned_group + 1 < groups_per_row) {
-                        cp_async<4>(
-                            dst, &scales[aligned_index * Q4RowSplitStorage::kScaleBytesPerGroup]);
-                    } else {
-                        *reinterpret_cast<std::uint16_t*>(dst) =
-                            *reinterpret_cast<const std::uint16_t*>(
-                                &scales[group_index * Q4RowSplitStorage::kScaleBytesPerGroup]);
-                        *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
-                    }
+            for (int item = tid; item < BM * kPairsPerRow; item += Schedule::kThreads) {
+                const int local_row   = item / kPairsPerRow;
+                const int pair_idx    = item - local_row * kPairsPerRow;
+                const int row         = row0 + local_row;
+                const int scale_group = group0 + pair_idx * 2;
+                auto* dst             = &Sr[stage][item * 4];
+                if (kFull || row < rows) {
+                    const std::int64_t group_index =
+                        static_cast<std::int64_t>(row) * groups_per_row + scale_group;
+                    cp_async<4>(dst, &scales[group_index * Q4RowSplitStorage::kScaleBytesPerGroup]);
                 } else {
-                    *reinterpret_cast<std::uint16_t*>(dst) =
-                        *reinterpret_cast<const std::uint16_t*>(
-                            &scales[group_index * Q4RowSplitStorage::kScaleBytesPerGroup]);
+                    *reinterpret_cast<std::uint32_t*>(dst) = 0;
                 }
-            } else {
-                if (row < rows) {
+            }
+        } else {
+#pragma unroll 1
+            for (int row_group = tid; row_group < BM * GPB; row_group += Schedule::kThreads) {
+                const int local_row   = row_group / GPB;
+                const int group       = row_group - local_row * GPB;
+                const int row         = row0 + local_row;
+                const int scale_group = group0 + group;
+                auto* dst             = &Sr[stage][row_group * SB];
+                if constexpr (kFull) {
                     const std::int64_t group_index =
                         static_cast<std::int64_t>(row) * groups_per_row + scale_group;
                     if constexpr (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32) {
@@ -182,11 +223,36 @@ void q4_a16_mma_kernel(
                                 &scales[group_index * Q4RowSplitStorage::kScaleBytesPerGroup]);
                     }
                 } else {
-                    dst[0] = 0;
-                    dst[1] = 0;
-                    if constexpr (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32) {
-                        dst[2] = 0;
-                        dst[3] = 0;
+                    if (row < rows) {
+                        const std::int64_t group_index =
+                            static_cast<std::int64_t>(row) * groups_per_row + scale_group;
+                        if constexpr (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32) {
+                            const int aligned_group = scale_group & ~1;
+                            const std::int64_t aligned_index =
+                                static_cast<std::int64_t>(row) * groups_per_row + aligned_group;
+                            if (aligned_group + 1 < groups_per_row) {
+                                cp_async<4>(dst,
+                                            &scales[aligned_index *
+                                                    Q4RowSplitStorage::kScaleBytesPerGroup]);
+                            } else {
+                                *reinterpret_cast<std::uint16_t*>(dst) =
+                                    *reinterpret_cast<const std::uint16_t*>(
+                                        &scales[group_index *
+                                                Q4RowSplitStorage::kScaleBytesPerGroup]);
+                                *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
+                            }
+                        } else {
+                            *reinterpret_cast<std::uint16_t*>(dst) =
+                                *reinterpret_cast<const std::uint16_t*>(
+                                    &scales[group_index * Q4RowSplitStorage::kScaleBytesPerGroup]);
+                        }
+                    } else {
+                        dst[0] = 0;
+                        dst[1] = 0;
+                        if constexpr (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32) {
+                            dst[2] = 0;
+                            dst[3] = 0;
+                        }
                     }
                 }
             }
@@ -199,27 +265,43 @@ void q4_a16_mma_kernel(
     };
 
     auto decode_weight = [&](int stage, int k_tile) {
-        const int scale_group = (k_tile * BK) / Q4RowSplitStorage::kGroupK;
-        for (int local_row = warp; local_row < BM; local_row += Schedule::kWarps) {
-            auto* dst = &As[local_row * BK];
+        const int scale_group      = (k_tile * BK) / Q4RowSplitStorage::kGroupK;
+        constexpr int kChunksPerRow = BK / 8;
+        for (int item = tid; item < BM * kChunksPerRow; item += Schedule::kThreads) {
+            const int local_row    = item / kChunksPerRow;
+            const int chunk        = item - local_row * kChunksPerRow;
+            const int group        = chunk >> 3;
+            const int sub          = chunk & 7;
+            const int staged_group = local_row * GPB + group;
+            const std::uint8_t* scale_ptr =
+                kPackedScalePairs
+                    ? &Sr[stage][local_row * SRB + group * Q4RowSplitStorage::kScaleBytesPerGroup]
+                    : &Sr[stage][staged_group * SB +
+                                 (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32
+                                      ? ((scale_group + group) & 1) *
+                                            Q4RowSplitStorage::kScaleBytesPerGroup
+                                      : 0)];
+            const float scale =
+                __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+            const std::uint32_t packed4 = *reinterpret_cast<const std::uint32_t*>(
+                &Cr[stage][staged_group * Q4RowSplitStorage::kCodeBytesPerGroup + sub * 4]);
+            Q4Bf16x8Bits decoded;
 #pragma unroll
-            for (int group = 0; group < GPB; ++group) {
-                const int staged_group = local_row * GPB + group;
-                const std::uint8_t* scale_ptr =
-                    &Sr[stage][staged_group * SB + (Schedule::kScaleLoadMode == Q4ScaleLoad::Pair32
-                                                        ? ((scale_group + group) & 1) *
-                                                              Q4RowSplitStorage::kScaleBytesPerGroup
-                                                        : 0)];
-                const __nv_bfloat162 weights =
-                    Q4MmaDecodeAtom::decode_pair(Cr[stage], scale_ptr, staged_group, lane);
-                const int shared_col =
-                    q4_mma_swizzle_k64(local_row, group * Q4RowSplitStorage::kGroupK + 2 * lane);
-                store_vec(&dst[shared_col], weights);
+            for (int b = 0; b < 4; ++b) {
+                const std::uint8_t packed = static_cast<std::uint8_t>((packed4 >> (b * 8)) & 0xffu);
+                const int q0              = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
+                const int q1              = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
+                decoded.pair[b]           = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                                  static_cast<float>(q1) * scale);
             }
+            const int shared_col = q4_mma_swizzle_k64(local_row, chunk * 8);
+            store_vec(&As[local_row * BK + shared_col], decoded.raw);
         }
     };
 
-    if constexpr (BS == S) {
+    constexpr bool kEarlyQuantPrefetch = (BS == 1 && (S == 1 || S == 2));
+
+    if constexpr (!kEarlyQuantPrefetch) {
 #pragma unroll
         for (int stage = 0; stage < S; ++stage) {
             if (stage < k_tiles) { stage_inputs(stage, stage); }
@@ -237,17 +319,17 @@ void q4_a16_mma_kernel(
 
     for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
         const int stage = k_tile % S;
-        if constexpr (BS == S) {
+        if constexpr (!kEarlyQuantPrefetch) {
             cp_wait<S - 1>();
+            __syncthreads();
+            decode_weight(stage, k_tile);
+            __syncthreads();
         } else {
+            cp_wait<1>();
+            __syncthreads();
+            decode_weight(stage, k_tile);
             cp_wait<0>();
-        }
-        __syncthreads();
-
-        decode_weight(stage, k_tile);
-        __syncthreads();
-
-        if constexpr (BS == 1 && BS != S) {
+            __syncthreads();
             const int prefetch_quant_tile = k_tile + S;
             if (prefetch_quant_tile < k_tiles) { stage_quant(stage, prefetch_quant_tile); }
             cp_commit();
@@ -310,7 +392,7 @@ void q4_a16_mma_kernel(
         }
 
         __syncthreads();
-        if constexpr (BS == S) {
+        if constexpr (!kEarlyQuantPrefetch) {
             const int prefetch_tile = k_tile + S;
             if (prefetch_tile < k_tiles) { stage_inputs(stage, prefetch_tile); }
             cp_commit();
@@ -323,7 +405,7 @@ void q4_a16_mma_kernel(
 
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
-        const int row0 = static_cast<int>(blockIdx.x) * BM + warp_row * WM + mi * 16 + mma_row;
+        const int out_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
 #pragma unroll
         for (int ni = 0; ni < NT; ++ni) {
             const int token0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
@@ -333,10 +415,10 @@ void q4_a16_mma_kernel(
                     output.store(row, global_token, epilogue.apply(row, global_token, value));
                 }
             };
-            store(row0, token0, accum[mi][ni][0]);
-            store(row0, token0 + 1, accum[mi][ni][1]);
-            store(row0 + 8, token0, accum[mi][ni][2]);
-            store(row0 + 8, token0 + 1, accum[mi][ni][3]);
+            store(out_row0, token0, accum[mi][ni][0]);
+            store(out_row0, token0 + 1, accum[mi][ni][1]);
+            store(out_row0 + 8, token0, accum[mi][ni][2]);
+            store(out_row0 + 8, token0 + 1, accum[mi][ni][3]);
         }
     }
 }

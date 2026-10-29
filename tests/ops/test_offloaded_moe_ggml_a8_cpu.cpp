@@ -397,7 +397,7 @@ void run(QType gu, QType down, std::mt19937& rng) {
     // Every ISA at every width: the GPU order's bits, and the scalar route's.
     std::vector<Widths> scalar(kCols + 1);
     bool have_scalar = false;
-    const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni};
+    const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kNeon};
     for (const auto isa : isas) {
         if (!moe::cpu_isa_supported(isa) || (!g_only_isa.empty() && g_only_isa != moe::cpu_isa_name(isa))) { continue; }
         const std::string where = name + ", " + moe::cpu_isa_name(isa);
@@ -535,7 +535,7 @@ void columns() {
         std::vector<std::uint16_t> x(static_cast<std::size_t>(H) * kCols), y(static_cast<std::size_t>(H) * kCols);
         std::normal_distribution<float> normal(0.0F, 1.0F);
         for (auto& v : x) { v = bf16(normal(rng)); }
-        for (const auto isa : {moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+        for (const auto isa : {moe::CpuIsa::kNeon}) {
             if (!moe::cpu_isa_supported(isa)) { continue; }
             for (int ncols = 1; ncols <= kCols; ++ncols) {
                 const std::uint16_t* xp[kCols];

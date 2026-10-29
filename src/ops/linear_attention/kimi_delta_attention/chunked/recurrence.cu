@@ -333,7 +333,7 @@ void launch(const Arguments& args, const Chunk* workspace, cudaStream_t stream) 
 
 int chunk_value_tile(int value_heads, int multiprocessor_count) {
     // Small grids need the narrowest stripe. Otherwise minimize SM waves weighted
-    // by the measured per-wave cost of this mixed BF16/TF32 kernel on SM120a.
+    // by the measured per-wave cost of this mixed BF16/TF32 kernel on GB10 (sm_121a, 48 SMs).
     // Wider stripes reduce replicated packet reads but retain more state per CTA.
     if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
     int best               = 64;

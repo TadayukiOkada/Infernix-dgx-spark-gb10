@@ -26,6 +26,11 @@ struct RouteSpec {
     Q4Q5GdnInputScheduleId schedule;
 };
 
+// GB10 (48 SM, sm_121a) retune. The independent direct launcher beats every grouped MMA tile
+// only up to T=10; from T=11 it jumps to ~600 us (the sliced K-split band runs out of resident
+// blocks) while the grouped R32C32 tile holds ~426 us. On the RTX 5090 the crossover sat at 12;
+// on GB10 it moves left to 10. Grouped sub-band boundaries (32/33, 64/65) are unchanged: the
+// tiles spill one wave-step at exactly those token counts.
 constexpr std::array<RouteSpec, 4> kRoutes{{
     {{1, 12}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
     {{13, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2},
@@ -78,6 +83,24 @@ const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedu
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols >= 1;
+}
+
+// GB10 retune candidate gate. The grouped-MMA launchers tile the column dimension generically
+// (predicated or full token slices), so every grouped schedule is shape-legal for any T >= 1.
+// The independent-direct family dispatches through fixed SIMT/K-split arms that only cover
+// T <= 15, so it is the sole band-limited candidate.
+bool q4_q5_gdn_input_candidate_is_legal(Q4Q5GdnInputScheduleId schedule,
+                                        const Q4Q5GdnInputProblem& problem) noexcept {
+    if (!supported_shape(problem) || problem.cols < 1) { return false; }
+    switch (schedule) {
+    case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
+        return problem.cols <= 15;
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2:
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
+        return true;
+    }
+    return false;
 }
 
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem,
@@ -159,6 +182,34 @@ void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
     const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem, column_invariant);
     q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream,
                                  column_invariant);
+}
+
+// Candidate entry point for GB10 route retuning: forces a specific schedule without the
+// production resolve-match guard, so a bench sweep can A/B every legal schedule against the
+// 48-SM grid. Legality is still enforced by q4_q5_gdn_input_candidate_is_legal.
+void q4_q5_gdn_input_execute_candidate(Q4Q5GdnInputScheduleId schedule, const Tensor& x,
+                                       const Weight& qk_weight, const Weight& value_z_weight,
+                                       Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
+                                      qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
+                                      x.ne[1]};
+    if (!q4_q5_gdn_input_candidate_is_legal(schedule, problem)) {
+        throw std::invalid_argument("Q4/Q5 GDN input: candidate is not legal for exact problem");
+    }
+    switch (schedule) {
+    case Q4Q5GdnInputScheduleId::IndependentDirectFixed: {
+        Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
+        Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+        q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
+        return;
+    }
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2:
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4:
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
+        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, schedule, stream);
+        return;
+    }
+    throw std::logic_error("Q4/Q5 GDN input: unknown candidate schedule");
 }
 
 } // namespace infernix::ops::detail

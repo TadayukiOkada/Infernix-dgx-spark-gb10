@@ -29,15 +29,16 @@ struct Fp8KvTiledValues {
     static constexpr int kScaleItems  = 1;
     static constexpr bool kE4m3Values = false;
 
-    // A 64-key FP16 PV partial is bounded by 64 * 448 * max_scale. Row scales are nonnegative
-    // FP16 values; dividing them by 2^e, e = ilogb(max_scale) when it is at least 2, leaves the
-    // largest below 2 and the bound below 57344. The 64 keys' scales are two per lane.
+    // With FP32 PV accumulation, only individual decoded V values (at most 448 * max_scale) must
+    // fit in FP16. Row scales are nonnegative FP16 values; dividing them by 2^e,
+    // e = ilogb(max_scale) - 6 when max_scale >= 128, leaves the largest below 128 and decoded V
+    // below 57344. The 64 keys' scales are two per lane.
     template <int Keys>
     __device__ __forceinline__ static int tile_shift(const Scale* scales, int lane) {
         static_assert(Keys == 64);
         const __half2 pair  = load_vec<__half2>(scales + 2 * lane);
         const float maximum = warp_max(fmaxf(__low2float(pair), __high2float(pair)), 0xffffffffU);
-        return maximum < 2.0F ? 0 : ilogbf(maximum);
+        return maximum < 128.0F ? 0 : ilogbf(maximum) - 6;
     }
 
     // `mul` is the tile's exact power-of-two shift.

@@ -51,17 +51,15 @@ struct Q8GdnSplitKConvEpilogue {
     }
 };
 
-template <int ActiveCols>
-void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                        cudaStream_t stream) {
-    constexpr int TileCols =
-        ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+template <int TileCols, Q8ScaleAccess ScaleAccess>
+void launch_exact_projection(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                             cudaStream_t stream) {
     using Geometry = Q8LinearGeometry<kRows, kHidden>;
-    using Schedule = Q8SlicedKDefault<TileCols, ActiveCols>;
+    using Schedule = Q8SlicedKRuntimeDefault<TileCols, ScaleAccess>;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     launch_q8_a16_sliced_k_mma<
-        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
+        typename Schedule::template with_problem<Geometry::kInputRows, TileCols, true>>(
         q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
@@ -151,19 +149,12 @@ void launch_medium_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
                                                  LinearIdentityEpilogue{}, stream);
 }
 
-using ProjectionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
 using SnapshotLauncher   = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&,
                                   const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                   Tensor&, Tensor&, cudaStream_t);
 using RecordLauncher     = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
                                 const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
                                 Tensor&, cudaStream_t);
-
-template <std::size_t... Offsets>
-constexpr auto make_projection_launchers(std::index_sequence<Offsets...>) {
-    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
-        &launch_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
-}
 
 template <std::size_t... Offsets>
 constexpr auto make_snapshot_launchers(std::index_sequence<Offsets...>) {
@@ -177,8 +168,6 @@ constexpr auto make_record_launchers(std::index_sequence<Offsets...>) {
         &launch_active_cols_conv_record<kFirstExactCols + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kProjectionLaunchers = make_projection_launchers(
-    std::make_index_sequence<kLastProjectionExactCols - kFirstExactCols + 1>{});
 constexpr auto kSnapshotLaunchers = make_snapshot_launchers(
     std::make_index_sequence<kLastSnapshotExactCols - kFirstExactCols + 1>{});
 constexpr auto kRecordLaunchers =
@@ -192,8 +181,16 @@ void q8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tenso
     if (cols < kFirstExactCols || cols > 96) {
         throw std::invalid_argument("Q8 GDN split-K MMA requires T=2..96");
     }
-    if (cols <= kLastProjectionExactCols) {
-        kProjectionLaunchers[cols - kFirstExactCols](x, weight, qkv, z, stream);
+    if (cols <= 4) {
+        launch_exact_projection<8, Q8ScaleAccess::Direct>(x, weight, qkv, z, stream);
+    } else if (cols <= 8) {
+        launch_exact_projection<8, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
+    } else if (cols <= 16) {
+        launch_exact_projection<16, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
+    } else if (cols <= 24) {
+        launch_exact_projection<24, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
+    } else if (cols <= kLastProjectionExactCols) {
+        launch_exact_projection<32, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
     } else if (cols <= 48) {
         launch_medium_cols<48, 4, 2, 3>(x, weight, qkv, z, stream);
     } else if (cols <= 64) {
@@ -212,10 +209,16 @@ void q8_gdn_input_column_invariant_launch(const Tensor& x, const Weight& weight,
                                           Tensor& z, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
     if (cols < 1) { throw std::invalid_argument("Q8 GDN column-invariant route requires T >= 1"); }
-    if (cols == 1) {
-        launch_active_cols<1>(x, weight, qkv, z, stream);
+    if (cols <= 4) {
+        launch_exact_projection<8, Q8ScaleAccess::Direct>(x, weight, qkv, z, stream);
+    } else if (cols <= 8) {
+        launch_exact_projection<8, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
+    } else if (cols <= 16) {
+        launch_exact_projection<16, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
+    } else if (cols <= 24) {
+        launch_exact_projection<24, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
     } else if (cols <= kLastProjectionExactCols) {
-        kProjectionLaunchers[cols - kFirstExactCols](x, weight, qkv, z, stream);
+        launch_exact_projection<32, Q8ScaleAccess::Shared>(x, weight, qkv, z, stream);
     } else {
         launch_sliced32(x, weight, qkv, z, stream);
     }

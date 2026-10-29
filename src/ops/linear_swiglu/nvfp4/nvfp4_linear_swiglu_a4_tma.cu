@@ -5,7 +5,8 @@
 namespace infernix::ops::detail {
 void launch_nvfp4_linear_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* output,
                                        cudaStream_t stream) {
-    using S = Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<256, 3, 1>, 5120>;
+    using S = Nvfp4ScheduleInstance<
+        Nvfp4A4TmaMmaSchedule<256, 3, 1, CU_TENSOR_MAP_L2_PROMOTION_L2_128B>, 5120>;
     launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2},
                                SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
 }
@@ -13,7 +14,7 @@ void launch_nvfp4_linear_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* 
 void launch_nvfp4_linear_swiglu_a4_residual_tma(const Nvfp4A4Operands& p, __nv_bfloat16* output,
                                                 cudaStream_t stream) {
     using S = Nvfp4ScheduleInstance<
-        Nvfp4A4TmaMmaSchedule<128, 3, 1, CU_TENSOR_MAP_L2_PROMOTION_NONE, kNvfp4A4ResidualTerms>,
+        Nvfp4A4TmaMmaSchedule<128, 3, 1, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, kNvfp4A4ResidualTerms>,
         5120>;
     launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2},
                                SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});

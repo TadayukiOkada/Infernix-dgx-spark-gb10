@@ -5,7 +5,6 @@
 
 #include "core/device.h"
 #include "infernix_bench_common.h"
-#include "roofline.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -27,7 +26,6 @@
 #include <vector>
 
 using namespace infernix;
-namespace roofline = infernix::bench::roofline;
 
 namespace {
 
@@ -35,7 +33,10 @@ constexpr std::int32_t kHeadDim = 72;
 constexpr std::int32_t kHeads   = 16;
 constexpr float kScale          = 0.11785113019775792073F;
 constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kHeads, kHeads};
-constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
+constexpr double kDenseBf16TcTflops = bench::kDenseBf16Tflops; // GB10 measured
+constexpr double kDramGBs = bench::kDramSpecGBs; // GB10 published spec (informational)
+constexpr double kEfficiencyGBs = bench::kSustainedReadGBs; // GB10 measured 
 
 enum class Entry : std::uint8_t { Uniform, Packed, Both };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
@@ -311,9 +312,8 @@ void report(const Result& result) {
                 entry_name(result.entry), execution_name(result.execution),
                 cache_name(result.cache), result.tokens, result.segments, result.workspace_bytes,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
-                gbps / roofline::kDramSpecGBs * 100.0, roofline::kDramSpecGBs, tflops,
-                tflops / roofline::kBf16Fp32AccumulateTFLOPs * 100.0,
-                roofline::kBf16Fp32AccumulateTFLOPs);
+                gbps / kEfficiencyGBs * 100.0, kEfficiencyGBs, tflops,
+                tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {

@@ -56,7 +56,13 @@ __device__ __forceinline__ uint2 kv_cache_q4_decode_word(std::uint32_t word) {
     };
     const std::uint32_t lo_neg = spread(positive & 0xffffu);
     const std::uint32_t hi_neg = spread(positive >> 16);
-    return make_uint2(__vsub4(lo_mag ^ lo_neg, lo_neg), __vsub4(hi_mag ^ hi_neg, hi_neg));
+    // Per-byte conditional negate. Every magnitude byte is nonzero (kKVCacheQ4Levels min 4), so
+    // (mag ^ mask) + mask_one cannot carry out of its byte lane (255 - mag + 1 <= 255), making this
+    // byte-independent and bit-identical to __vsub4(mag ^ mask, mask). __vsub4 is emulated (~10
+    // instructions, no native packed-byte adder on sm_121a); the XOR+ADD form is LOP3 + IADD3.
+    const std::uint32_t lo_one = lo_neg & 0x01010101u;
+    const std::uint32_t hi_one = hi_neg & 0x01010101u;
+    return make_uint2((lo_mag ^ lo_neg) + lo_one, (hi_mag ^ hi_neg) + hi_one);
 }
 
 } // namespace infernix::ops

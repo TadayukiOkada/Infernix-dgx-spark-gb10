@@ -21,8 +21,6 @@ void q8_linear_add_column_invariant_launch(const Tensor& x, const Weight& w, Ten
                                            cudaStream_t stream);
 void q8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      cudaStream_t stream);
-void q8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                        cudaStream_t stream);
 void q8_linear_add_mma_r32_c128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream);
 void q8_linear_add_mma_r32_c32_launch(const Tensor& x, const Weight& w, Tensor& residual_out,

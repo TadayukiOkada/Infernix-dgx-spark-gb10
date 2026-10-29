@@ -34,20 +34,17 @@ Bf16Launch ninfer_route(std::int32_t tokens) {
 // Qwen3.8-Flash-Next: the GDN a/b projections (both recipes), T = a call's columns.
 // T <= 8 runs one column-invariant route at every width, so a column's bits do not depend on how
 // many columns share the call (C = 1 and C = 2 give the same greedy text). Wider calls take the
-// fastest measured route per interval (bench/ops/bf16_flash_next_sweep.cu, RTX 5090, 2 % tolerance,
+// fastest measured route per interval (bench/ops/bf16_flash_next_sweep.cu, GB10 sm_121a, 2 % tolerance,
 // seams at the last measured T).
 Bf16Launch select_bf16_n96_k2560(std::int32_t tokens) {
     // NInfer's T = 1 route accumulates a column like its T = 8 route (checked bit for bit): 3.20 us vs 4.74.
     if (tokens == 1) return ninfer_route(1);
-    if (tokens <= 8) return ninfer_route(8); // decode 33.0 us vs skinny 50.9 us over T = 1..8
-    if (tokens <= 384) return ninfer_route(tokens);
-    if (tokens <= 512) return launch_bf16_sliced_k_mma<Bf16A16SlicedR32T16W4>; // sliced_r32t16w4
-    if (tokens <= 768) return launch_bf16_mma<Bf16A16MmaR32T32K256S3>; // mma_r32t32k256s3
-    if (tokens <= 1024) return ninfer_route(tokens);
-    if (tokens <= 1536) return launch_bf16_mma<Bf16A16MmaR32T32K128S3>; // mma_r32t32k128s3
-    if (tokens <= 2048) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 32, 32, 16, 3>>; // tail_r64t32s3
-    if (tokens <= 3072) return launch_bf16_mma<Bf16A16MmaR32T32K128S3>; // mma_r32t32k128s3
-    if (tokens <= 4096) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>>; // tail_r64t64s3
-    return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>; // tail_r64t128s2_rows
+    if (tokens <= 8) return ninfer_route(8); // decode 5.8-7.8 us vs skinny 9.9-11.9 us over T = 1..8 (GB10)
+    if (tokens <= 256) return ninfer_route(tokens); // 9..256 ninfer fastest on GB10
+    if (tokens <= 384) return launch_bf16_mma<Bf16A16MmaR32T32K256S3>; // mma_r32t32k256s3 (1.24x)
+    if (tokens <= 512) return ninfer_route(tokens); // 512 ninfer fastest on GB10
+    if (tokens <= 1024) return launch_bf16_mma<Bf16A16MmaR32T32K128S3>; // mma_r32t32k128s3 (1.25-1.33x)
+    if (tokens <= 3072) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>>; // tail_r64t64s3 (1.19-1.36x)
+    return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>; // tail_r64t128s2_rows (1.16x at 4096)
 }
 } // namespace infernix::ops::detail

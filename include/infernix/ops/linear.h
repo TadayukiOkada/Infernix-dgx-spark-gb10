@@ -87,6 +87,9 @@ enum class LinearRoutes : std::uint16_t {
     /// reproducible route; it takes precedence over GgmlBf16Wide where both are set, and is independent of
     /// GgmlA8 (which decides the calls of 1-31 columns).
     GgmlA8Wide = 512,
+    /// nvfp4-a4-pair: NVFP4 weights (W4A16) with the activation carried as two row-scaled NVFP4
+    /// terms on the 4-bit Tensor Core path.
+    Nvfp4A4Pair = 1024,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -98,7 +101,7 @@ enum class LinearRoutes : std::uint16_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint16_t>(routes) & ~std::uint16_t{1023}) == 0;
+    return (static_cast<std::uint16_t>(routes) & ~std::uint16_t{2047}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {

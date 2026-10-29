@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "infernix/ops/gdn_gating_proj.h"
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 #include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
@@ -19,6 +20,7 @@ using namespace infernix::bench;
 namespace {
 struct Options {
     bool geometry35 = false, parent = true, norm = true, profile = false;
+    bool candidates = false;
     std::vector<int> tokens{1, 2, 4, 6, 8, 9, 16, 32, 64, 128};
     std::string execution = "graph", cache = "cold", csv;
     int warmup = 10, repeat = 61, graph_calls = 1;
@@ -87,8 +89,8 @@ Options parse(int argc, char** argv) {
         else if (a == "--csv-out")
             o.csv = next();
         else if (a == "--profile")
-            o.profile = true;
-        else
+            o.profile = true;        else if (a == "--candidates")
+            o.candidates = true;        else
             throw std::invalid_argument("unknown argument: " + std::string(a));
     }
     if (o.execution != "eager" && o.execution != "graph" && o.execution != "both")
@@ -235,6 +237,56 @@ void run(const Options& o, int t, DeviceExecutionView execution, bench::L2FlushB
                      << time.p95_us << '\n';
         }
     }
+
+    // Candidate sweep: drive every legal schedule directly through the detail candidate API
+    // (production dispatch re-resolves the plan and rejects forced schedules). Control op only.
+    if (o.candidates && !o.norm) {
+        namespace D = ops::detail;
+        const int heads = o.geometry35 ? 32 : 48, hidden = o.geometry35 ? 2048 : 5120;
+        const D::Bf16GdnGatingProblem problem{heads, hidden, t};
+        static const D::Bf16GdnGatingScheduleId kAll[] = {
+            D::Bf16GdnGatingScheduleId::GemvPairedRows,
+            D::Bf16GdnGatingScheduleId::SmallTSplit10,
+            D::Bf16GdnGatingScheduleId::SimtWarpRowC4,
+            D::Bf16GdnGatingScheduleId::SimtWarpRowC8,
+            D::Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
+            D::Bf16GdnGatingScheduleId::MmaCooperativeSplit16,
+            D::Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
+            D::Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
+            D::Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
+            D::Bf16GdnGatingScheduleId::MmaUnsplit,
+        };
+        std::size_t max_ws = 256;
+        for (auto s : kAll) {
+            try {
+                max_ws = std::max(max_ws, D::bf16_gdn_gating_resolve_candidate(s, problem).workspace_bytes);
+            } catch (...) {
+            }
+        }
+        WorkspaceArena cws(std::max<std::size_t>(max_ws, capacity));
+        for (auto s : kAll) {
+            D::Bf16GdnGatingPlan plan;
+            try {
+                plan = D::bf16_gdn_gating_resolve_candidate(s, problem);
+            } catch (...) {
+                continue;  // schedule illegal for this exact problem/geometry
+            }
+            cws.reset();
+            const auto cl = [&](cudaStream_t stream) {
+                const DeviceExecutionView e{stream, execution.multiprocessor_count};
+                D::bf16_gdn_gating_execute_candidate(s, tx, wa, wb, ta, td, cws, tg, tb, e);
+            };
+            const auto ct = bench::measure_cold_launch(cl, flush, execution.stream, o.warmup, o.repeat);
+            const char* name = D::bf16_gdn_gating_schedule_name(s);
+            std::cout << (o.geometry35 ? "35b" : "27b") << " CAND T=" << t << ' ' << name
+                      << " median=" << ct.median_us << " min=" << ct.min_us << " p95=" << ct.p95_us
+                      << " us workspace=" << plan.workspace_bytes << '\n';
+            if (csv)
+                *csv << (o.geometry35 ? "35b" : "27b") << ",cand," << (o.parent ? "parent" : "split")
+                     << ',' << t << ",eager,cold,0,0," << plan.workspace_bytes << ",0,"
+                     << ct.median_us << ',' << ct.min_us << ',' << ct.p95_us << '\n';
+        }
+    }
 }
 } // namespace
 
@@ -252,7 +304,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetDeviceProperties(&props, device));
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        bench::L2FlushBuffer flush(256ULL << 20);
+        bench::L2FlushBuffer flush(infernix::bench::default_cold_flush_bytes());
         std::ofstream csv;
         if (!o.csv.empty()) {
             csv.open(o.csv);

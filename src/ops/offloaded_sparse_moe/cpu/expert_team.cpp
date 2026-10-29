@@ -1,4 +1,5 @@
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
+#include "core/cpu_topology.h"
 
 #if defined(_WIN32)
 #    ifndef WIN32_LEAN_AND_MEAN
@@ -26,6 +27,8 @@ namespace {
 inline void cpu_relax() {
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
 #endif
 }
 
@@ -55,10 +58,21 @@ std::size_t h_index(int job, int col, int h_blocks = kHBlocks) {
 
 } // namespace
 
+std::vector<std::uint64_t> CpuExpertTeam::placement_cpus(int workers) {
+    const std::vector<int> big = infernix::core::performance_cpus();
+    if (big.empty() || workers > static_cast<int>(big.size())) { return {}; }
+    std::vector<std::uint64_t> masks;
+    masks.reserve(big.size());
+    for (int cpu : big) {
+        masks.push_back(cpu >= 0 && cpu < 64 ? (std::uint64_t{1} << cpu) : 0);
+    }
+    return masks;
+}
+
 CpuExpertTeam::CpuExpertTeam(Options options)
     : workers_(options.workers), isa_(options.isa), max_jobs_(options.max_jobs),
       spin_iterations_(options.spin_iterations), prefetch_bytes_(options.prefetch_bytes),
-      shape_(options.shape), activation_(options.activation), ggml_(options.ggml) {
+      shape_(options.shape), cpus_(options.cpus), activation_(options.activation), ggml_(options.ggml) {
     if (!registered_shape(shape_) ||
         (shape_ != kFlashNextShape && (activation_ != ExpertActivation::kA16 || ggml_))) {
         throw std::invalid_argument("CpuExpertTeam: this expert geometry is registered for NVFP4 A16 banks only");
@@ -578,6 +592,13 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat h
         const std::size_t counters = jobs.size() * static_cast<std::size_t>(shape_.intermediate / 32);
         for (std::size_t i = 0; i < counters; ++i) { h8_units_[i].store(0, std::memory_order_relaxed); }
     }
+    cpu_set_t saved;
+    const bool pin_caller = !cpus_.empty() && workers_ > 1;
+    if (pin_caller) {
+        CPU_ZERO(&saved);
+        (void)pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved);
+        pin_current_thread(cpus_[0]);
+    }
     jobs_      = jobs;
     heartbeat_ = heartbeat;
     if (ggml) { // each job's countdowns, published by the epoch below
@@ -596,6 +617,7 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat h
     if (sleepers_.load(std::memory_order_acquire) > 0) { epoch_.notify_all(); }
     work(0);
     while (finished_.load(std::memory_order_acquire) != workers_ - 1) { cpu_relax(); }
+    if (pin_caller) { (void)pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved); }
     jobs_      = {};
     heartbeat_ = {};
 }

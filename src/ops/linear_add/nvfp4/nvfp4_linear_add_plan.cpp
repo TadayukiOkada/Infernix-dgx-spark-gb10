@@ -34,8 +34,10 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         return tokens >= 5 ? Nvfp4LinearAddRoute::A4Residual : Nvfp4LinearAddRoute::A16;
     }
     if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
-    // With the three-stage A4 tile, K=6144 is ahead of A16 from 8 tokens too: 21.1 us against
-    // 23.1-31.3 us at 8-16 tokens on RTX 5090.
+    // GB10 (sm_121a, 48 SMs): re-measured with a cold-cache A16-vs-A4 sweep (bench/ops/nvfp4_linear_add_bench,
+    // N=5120, warmup 12 / repeat 60). A4 wins from 8 tokens up at both K=6144 (81.7 us vs 86.9 us A16 at T=8,
+    // 330.8 vs 1008.6 at T=1024) and K=17408. The threshold (8) carried over from the RTX 5090 sweep still
+    // matches GB10, so the value is unchanged; the crossover was re-confirmed on 48 SMs rather than assumed.
     const std::int32_t first_a4 = 8;
     return tokens >= first_a4 ? Nvfp4LinearAddRoute::A4 : Nvfp4LinearAddRoute::A16;
 }

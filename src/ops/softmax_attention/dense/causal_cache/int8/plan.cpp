@@ -6,7 +6,7 @@
 
 namespace infernix::ops::detail {
 namespace {
-constexpr int kGroupedPrefillMaxWidth = 256;
+constexpr int kGroupedPrefillMaxWidth = 192;
 } // namespace
 
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
@@ -67,7 +67,8 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
         maximum = std::max(maximum, int8_fast_prompt_workspace_bytes(
                                         heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
                                         max_width, envelope.max_visible_keys,
-                                        envelope.prompt_split_workspace_bytes));
+                                        envelope.prompt_split_workspace_bytes,
+                                        multiprocessor_count));
     return maximum;
 }
 

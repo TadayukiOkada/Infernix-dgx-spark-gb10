@@ -1,3 +1,4 @@
+#include "ops/linear/bf16/bf16_instances.cuh"
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"
 
@@ -29,11 +30,8 @@ using S9 = Bf16ScheduleInstance<
 Bf16Launch select_bf16_n2560_k2560(std::int32_t tokens) {
     // T = 1 takes the T <= 8 route below (one column-invariant route per decode width; NInfer used a GEMV).
     if (tokens <= 8) return launch_bf16_sliced_k_mma<S1>;
-    if (tokens <= 32) return launch_bf16_sliced_k_mma<S2>;
-    if (tokens <= 48) return launch_bf16_sliced_k_mma<S3>;
-    if (tokens <= 64) return launch_bf16_mma<S4>;
-    if (tokens <= 96) return launch_bf16_tma_mma<S5>;
-    if (tokens <= 128) return launch_bf16_mma<S6>;
+    if (tokens <= 96) return launch_bf16_mma<Bf16A16MmaR32T32K128S3>; // mma_r32t32k128s3 (1.19x faster at T=32..48)
+    if (tokens <= 128) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 64, 128, 32, 32, 2>>;
     if (tokens <= 512) return launch_bf16_tma_mma<S7>;
     if (tokens <= 2048) return launch_bf16_tma_mma<S8>;
     return launch_bf16_tma_mma<S9>;

@@ -26,15 +26,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#include <winternl.h>
-#include <d3dkmthk.h>
-#include <dxgi1_6.h>
-#include <psapi.h>
-#else
 #include <dlfcn.h>
-#endif
 
 #include <nvml.h>
 
@@ -117,18 +109,10 @@ struct Nvml {
     DriverFn driver_model = nullptr;
 
     void* symbol(const char* name) const {
-#ifdef _WIN32
-        return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(library), name));
-#else
         return dlsym(library, name);
-#endif
     }
     bool open(const char* pci_bus_id) {
-#ifdef _WIN32
-        library = LoadLibraryA("nvml.dll");
-#else
         library = dlopen("libnvidia-ml.so.1", RTLD_NOW);
-#endif
         if (library == nullptr) { return false; }
         const auto init   = reinterpret_cast<InitFn>(symbol("nvmlInit_v2"));
         const auto handle = reinterpret_cast<HandleFn>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
@@ -142,94 +126,6 @@ struct Nvml {
 };
 
 // ------------------------------------------------------------------ Windows sources
-#ifdef _WIN32
-struct Dxgi {
-    IDXGIFactory4* factory = nullptr;
-    IDXGIAdapter3* adapter = nullptr;
-    HANDLE event           = nullptr;
-    DWORD cookie           = 0;
-    bool open(LUID luid) {
-        if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) { return false; }
-        if (FAILED(factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter)))) {
-            return false;
-        }
-        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (event != nullptr && FAILED(adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(event, &cookie))) {
-            CloseHandle(event);
-            event = nullptr;
-        }
-        return true;
-    }
-    int outputs() const {
-        int n = 0;
-        IDXGIOutput* output = nullptr;
-        while (adapter->EnumOutputs(static_cast<UINT>(n), &output) != DXGI_ERROR_NOT_FOUND) {
-            if (output != nullptr) { output->Release(); }
-            output = nullptr;
-            ++n;
-        }
-        return n;
-    }
-    DXGI_QUERY_VIDEO_MEMORY_INFO query(DXGI_MEMORY_SEGMENT_GROUP group) const {
-        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-        adapter->QueryVideoMemoryInfo(0, group, &info);
-        return info;
-    }
-};
-
-struct Kmt {
-    LUID luid{};
-    ULONG segments = 0;
-    bool ok        = false;
-    bool open(LUID l) {
-        luid = l;
-        D3DKMT_QUERYSTATISTICS q{};
-        q.Type        = D3DKMT_QUERYSTATISTICS_ADAPTER;
-        q.AdapterLuid = luid;
-        if (D3DKMTQueryStatistics(&q) < 0) { return false; }
-        segments = q.QueryResult.AdapterInformation.NbSegments;
-        ok       = true;
-        return true;
-    }
-    // Per-process LOCAL segment group: budget, requested, usage, demoted (summed over classes).
-    bool process_group(std::uint64_t& budget, std::uint64_t& requested, std::uint64_t& usage,
-                       std::uint64_t& demoted) const {
-        D3DKMT_QUERYSTATISTICS q{};
-        q.Type                     = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP;
-        q.AdapterLuid              = luid;
-        q.hProcess                 = GetCurrentProcess();
-        q.QueryProcessSegmentGroup = D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
-        if (D3DKMTQueryStatistics(&q) < 0) { return false; }
-        const auto& g = q.QueryResult.ProcessSegmentGroupInformation;
-        budget        = g.Budget;
-        requested     = g.Requested;
-        usage         = g.Usage;
-        demoted       = 0;
-        for (auto d : g.Demoted) { demoted += d; }
-        return true;
-    }
-    // Device-wide local memory segments: commit limit, committed and resident bytes.
-    bool device_segments(std::uint64_t& limit, std::uint64_t& committed, std::uint64_t& resident) const {
-        limit = committed = resident = 0;
-        bool any                     = false;
-        for (ULONG s = 0; s < segments; ++s) {
-            D3DKMT_QUERYSTATISTICS q{};
-            q.Type                   = D3DKMT_QUERYSTATISTICS_SEGMENT;
-            q.AdapterLuid            = luid;
-            q.QuerySegment.SegmentId = s;
-            if (D3DKMTQueryStatistics(&q) < 0) { continue; }
-            const auto& seg = q.QueryResult.SegmentInformation;
-            if (seg.Aperture != 0) { continue; }
-            if (seg.SegmentProperties.SystemMemory != 0) { continue; }
-            limit += seg.CommitLimit;
-            committed += seg.BytesCommitted;
-            resident += seg.BytesResident;
-            any = true;
-        }
-        return any;
-    }
-};
-#endif
 
 // ------------------------------------------------------------------ snapshot
 struct Probe;
@@ -253,11 +149,6 @@ struct Probe {
     cudaDeviceProp prop{};
     Nvml nvml;
     bool has_nvml = false;
-#ifdef _WIN32
-    Dxgi dxgi;
-    bool has_dxgi = false;
-    Kmt kmt;
-#endif
 
     void open() {
         check(cudaSetDevice(device), "cudaSetDevice");
@@ -266,38 +157,11 @@ struct Probe {
         char bus[32];
         std::snprintf(bus, sizeof(bus), "%08X:%02X:%02X.0", prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
         has_nvml = nvml.open(bus);
-#ifdef _WIN32
-        LUID luid{};
-        std::memcpy(&luid, prop.luid, sizeof(luid));
-        has_dxgi = dxgi.open(luid);
-        kmt.open(luid);
-#endif
     }
 
     Snapshot snapshot() const {
         Snapshot s;
         check(cudaMemGetInfo(&s.cuda_free, &s.cuda_total), "cudaMemGetInfo");
-#ifdef _WIN32
-        if (has_dxgi) {
-            s.dxgi                = true;
-            const auto local      = dxgi.query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
-            const auto nonlocal   = dxgi.query(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL);
-            s.local_budget        = local.Budget;
-            s.local_usage         = local.CurrentUsage;
-            s.local_avail_res     = local.AvailableForReservation;
-            s.nonlocal_budget     = nonlocal.Budget;
-            s.nonlocal_usage      = nonlocal.CurrentUsage;
-            s.outputs             = dxgi.outputs();
-        }
-        if (kmt.ok) {
-            s.kmt     = kmt.process_group(s.kmt_budget, s.kmt_requested, s.kmt_usage, s.kmt_demoted);
-            s.kmt_seg = kmt.device_segments(s.seg_limit, s.seg_committed, s.seg_resident);
-        }
-        PROCESS_MEMORY_COUNTERS_EX pmc{};
-        if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
-            s.private_usage = pmc.PrivateUsage;
-        }
-#endif
         if (has_nvml) {
             nvmlMemory_v2_t m{};
             m.version = nvmlMemory_v2;
@@ -532,25 +396,6 @@ void section_query_cost(const Probe& probe) {
                            std::size_t f = 0, t = 0;
                            check(cudaMemGetInfo(&f, &t), "cudaMemGetInfo");
                        }});
-#ifdef _WIN32
-    if (probe.has_dxgi) {
-        queries.push_back({"DXGI QueryVideoMemoryInfo LOCAL", [&] { (void)probe.dxgi.query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL); }});
-        queries.push_back({"DXGI IsCurrent + EnumOutputs", [&] {
-                               (void)probe.dxgi.factory->IsCurrent();
-                               (void)probe.dxgi.outputs();
-                           }});
-    }
-    if (probe.kmt.ok) {
-        queries.push_back({"D3DKMT process segment group", [&] {
-                               std::uint64_t a, b, c, d;
-                               (void)probe.kmt.process_group(a, b, c, d);
-                           }});
-        queries.push_back({"D3DKMT local segments (device free)", [&] {
-                               std::uint64_t a, b, c;
-                               (void)probe.kmt.device_segments(a, b, c);
-                           }});
-    }
-#endif
     if (probe.has_nvml && probe.nvml.memory != nullptr) {
         queries.push_back({"NVML memory v2", [&] {
                                nvmlMemory_v2_t m{};
@@ -588,15 +433,6 @@ void section_query_cost(const Probe& probe) {
         std::printf("    launch loop with these queries: %.1f ms (%+.2f %% against alone)\n", loaded / 1000,
                     100.0 * (loaded - base) / base);
     }
-#ifdef _WIN32
-    const Snapshot s = probe.snapshot();
-    if (s.kmt_seg) {
-        std::printf("  device free: cudaMemGetInfo %lld MiB; D3DKMT segment limit - resident %lld MiB; NVML free %lld MiB\n",
-                    mib(static_cast<long long>(s.cuda_free)),
-                    mib(static_cast<long long>(s.seg_limit) - static_cast<long long>(s.seg_resident)),
-                    mib(static_cast<long long>(s.nvml_free)));
-    }
-#endif
     check(cudaStreamDestroy(stream), "stream destroy");
 }
 
@@ -786,11 +622,7 @@ int main(int argc, char** argv) {
         std::printf("device %d: %s, %zu MiB, PCI %04x:%02x:%02x, NVML %s, DXGI %s\n", probe.device, probe.prop.name,
                     probe.prop.totalGlobalMem >> 20, probe.prop.pciDomainID, probe.prop.pciBusID,
                     probe.prop.pciDeviceID, probe.has_nvml ? "loaded" : "unavailable",
-#ifdef _WIN32
-                    probe.has_dxgi ? "adapter matched by LUID" : "unavailable"
-#else
                     "not on this platform"
-#endif
         );
         print_snapshot("baseline after context creation", probe.snapshot());
         if (wanted("malloc")) { section_malloc(probe); }
@@ -798,12 +630,6 @@ int main(int argc, char** argv) {
         if (wanted("query")) { section_query_cost(probe); }
         if (wanted("unmap")) { section_unmap_stall(probe); }
         if (wanted("parity")) { section_parity(probe, parity_gib); }
-#ifdef _WIN32
-        if (probe.dxgi.event != nullptr) {
-            std::printf("\nDXGI budget-change event signalled during the run: %s\n",
-                        WaitForSingleObject(probe.dxgi.event, 0) == WAIT_OBJECT_0 ? "yes" : "no");
-        }
-#endif
         print_snapshot("final", probe.snapshot());
         return 0;
     } catch (const std::exception& e) {

@@ -31,7 +31,7 @@ namespace {
 
 constexpr int kD = 256, kHeads = 24, kKvHeads = 2, kDi = 128, kIndexHeads = 4, kR = 4, kBudget = 2048;
 constexpr int kPage           = 64;
-constexpr std::size_t kFlush  = std::size_t{256} << 20;
+infernix::bench::ColdFlushBytes kFlush{};
 const ops::QsaGeometry kGeometry{.heads          = kHeads,
                                  .kv_heads       = kKvHeads,
                                  .head_dim       = kD,

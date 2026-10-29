@@ -11,10 +11,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-#include <xmmintrin.h>
-#endif
-
 namespace infernix::models::qwen3_5::detail {
 
 // A bounded, position-indexed proposal corpus. It never owns target state.
@@ -39,6 +35,8 @@ public:
             throw std::invalid_argument("invalid ngram corpus capacity");
         }
     }
+
+    [[nodiscard]] std::size_t capacity() const noexcept { return tokens_.size(); }
 
     void boundary() { append(-1); }
 
@@ -113,6 +111,9 @@ public:
                                 std::uint32_t minimum_match = 12) const {
         Match best;
         if (maximum == 0) { return best; }
+        const std::uint64_t live = live_begin();
+        std::array<std::uint64_t, widths_.size() * 4> seen_ends{};
+        std::size_t seen_count = 0;
         for (const auto n : widths_) {
             if (history.size() < n) { continue; }
             const auto tail = history.last(n);
@@ -122,10 +123,18 @@ public:
             }
             const auto& bucket = buckets_[hash(tail, n) & (buckets_.size() - 1)];
             for (const auto entry : bucket) {
-                if (entry.width != n || entry.end < n || entry.end - n < live_begin() ||
-                    entry.end >= end_) {
+                if (entry.width != n || entry.end < n || entry.end - n < live ||
+                    entry.end >= end_ || entry.end - live < best.matched) {
                     continue;
                 }
+                bool duplicate = false;
+                for (std::size_t i = 0; i < seen_count; ++i) {
+                    if (seen_ends[i] == entry.end) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) { continue; }
                 bool equal = true;
                 for (std::uint32_t j = 0; j < n; ++j) {
                     if (at(entry.end - n + j) != tail[j]) {
@@ -134,22 +143,27 @@ public:
                     }
                 }
                 if (!equal) { continue; }
+                seen_ends[seen_count++] = entry.end;
                 std::uint32_t matched = n;
-                while (matched < history.size() && entry.end - matched > live_begin()) {
+                while (matched < history.size() && entry.end - matched > live) {
                     const auto token = at(entry.end - matched - 1);
                     if (token < 0 || token != history[history.size() - matched - 1]) { break; }
                     ++matched;
                 }
                 if (matched < minimum_match || matched < best.matched) { continue; }
-                std::vector<Token> draft;
-                for (std::uint64_t p = entry.end; p < end_ && draft.size() < maximum; ++p) {
-                    const auto token = at(p);
-                    if (token < 0) { break; }
-                    draft.push_back(token);
+                std::uint32_t avail = 0;
+                while (avail < maximum && entry.end + avail < end_ &&
+                       at(entry.end + avail) >= 0) {
+                    ++avail;
                 }
-                if (!draft.empty() &&
-                    (matched > best.matched || draft.size() > best.tokens.size())) {
-                    best = {std::move(draft), matched};
+                if (avail != 0 &&
+                    (matched > best.matched || avail > best.tokens.size())) {
+                    best.tokens.resize(avail);
+                    for (std::uint32_t j = 0; j < avail; ++j) {
+                        best.tokens[j] = at(entry.end + j);
+                    }
+                    best.matched = matched;
+                    if (maximal(best, history.size(), maximum)) { return best; }
                 }
             }
         }
@@ -175,9 +189,7 @@ private:
     }
 
     static void prefetch(const void* address) {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-        _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
-#elif defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
         __builtin_prefetch(address, 1);
 #else
         (void)address;

@@ -17,6 +17,7 @@ int main() {
         std::vector<int> source(128);
         std::iota(source.begin(), source.end(), 100);
         NgramProposer proposer(256, 1024);
+        require(proposer.capacity() == 256, "proposer capacity query");
         proposer.ingest(source);
         require(proposer.propose(source, 0).tokens.empty(), "zero budget cannot propose tokens");
         for (const auto [capacity, buckets] :

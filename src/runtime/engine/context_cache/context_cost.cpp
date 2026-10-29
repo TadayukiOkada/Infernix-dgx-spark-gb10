@@ -12,11 +12,7 @@
 #include <system_error>
 #include <utility>
 
-#ifdef _WIN32
-#    include <process.h>
-#else
 #    include <unistd.h>
-#endif
 
 namespace infernix::runtime {
 
@@ -272,11 +268,7 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-#ifdef _WIN32
-    const long process_id = _getpid();
-#else
     const long process_id = ::getpid();
-#endif
     temporary += ".tmp." + std::to_string(static_cast<long long>(process_id)) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {

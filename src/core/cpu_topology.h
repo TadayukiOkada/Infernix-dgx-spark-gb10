@@ -4,6 +4,14 @@
 // efficiency class, so a placement can give threads one physical core each or keep a core apart.
 // Logical CPUs are bits of a 64-bit mask (bit i: logical CPU i of the process's processor group);
 // machines with more than 64 logical CPUs report no topology.
+//
+// Also exposes logical-CPU topology for a big.LITTLE (asymmetric) ARM/Grace CPU.
+// The Grace host that runs the offloaded-expert CPU service is a 20-core ARMv9.2 part: ten
+// Cortex-X925 performance cores and ten Cortex-A725 efficiency cores. A CPU expert round is
+// throughput-bound on the workers that take it, so a worker parked on an efficiency core runs the
+// same work ~40% slower than on a performance core. Pinning the team to the performance cores turns
+// that into throughput; it must not be done on a symmetric host, where a fixed core subset would
+// only remove parallelism.
 
 #include <cstdint>
 #include <vector>
@@ -15,8 +23,8 @@ struct PhysicalCore {
     std::uint8_t efficiency = 0; // the OS's efficiency class: higher is a faster core (hybrid CPUs: P-cores)
 };
 
-// The physical cores in the OS's order (Windows: GetLogicalProcessorInformationEx; Linux: sysfs
-// core ids and, on hybrid Intel CPUs, /sys/devices/cpu_core/cpus). Empty when the platform does not
+// The physical cores in the OS's order (Linux: sysfs core ids and, on hybrid Intel/ARM CPUs,
+// /sys/devices/cpu_core/cpus or normalized CPU capacities). Empty when the platform does not
 // tell or the machine has more than 64 logical CPUs.
 [[nodiscard]] std::vector<PhysicalCore> physical_cores();
 
@@ -32,4 +40,15 @@ struct PhysicalCore {
 // mask (0 when unknown or when the change failed).
 std::uint64_t set_current_thread_cpus(std::uint64_t cpus) noexcept;
 
+namespace core {
+
+// The performance-tier logical CPUs, sorted highest-capacity first; empty when the host is
+// symmetric (all cores one tier) or the topology is unavailable. A homogeneous host therefore
+// returns {} and the caller must not pin.
+[[nodiscard]] std::vector<int> performance_cpus();
+
+// True when the host exposes two or more performance tiers (a big.LITTLE / hybrid part).
+[[nodiscard]] bool hybrid_cpu();
+
+} // namespace core
 } // namespace infernix

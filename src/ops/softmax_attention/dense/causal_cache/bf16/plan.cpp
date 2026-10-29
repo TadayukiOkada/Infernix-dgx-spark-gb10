@@ -6,7 +6,7 @@
 
 namespace infernix::ops::detail {
 namespace {
-constexpr int kGroupedPrefillMaxWidth = 256;
+constexpr int kGroupedPrefillMaxWidth = 192;
 } // namespace
 
 Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,

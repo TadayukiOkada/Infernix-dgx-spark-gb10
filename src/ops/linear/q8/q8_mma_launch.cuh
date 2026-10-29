@@ -30,11 +30,13 @@ void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue
                                                                  row_policy, offset, count);
             CUDA_CHECK(cudaGetLastError());
         };
+        constexpr bool kPaddedFullK = Schedule::kBlockRows != 96;
+        const bool full_k =
+            kPaddedFullK ? (operands.k % Schedule::kBlockK == 0) : (operands.k == operands.padded_k);
         if (!Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&
-            count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&
-            operands.padded_k % 256 == 0)
+            count % Schedule::kBlockTokens == 0 && full_k && operands.padded_k % 256 == 0)
             launch.template operator()<true, true>();
-        else if (operands.k == operands.padded_k)
+        else if (full_k)
             launch.template operator()<false, true>();
         else
             launch.template operator()<false, false>();

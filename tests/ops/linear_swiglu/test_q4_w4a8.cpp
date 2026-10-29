@@ -15,14 +15,14 @@ INFERNIX_OP_TEST(linear_swiglu_q4_w4a8) {
     try {
         int failures = 0;
 
-        // Every call passes the flag. The route serves T >= 256 (a private threshold the route
+        // Every call passes the flag. The route serves T >= 153 (a private threshold the route
         // sweep sets; the exact-route cases below pin it: move them with it). Below it, the flag
         // must leave the exact route's bits, at each of its schedules: the paired GEMV (1), the
-        // small-T tiles (2), the materialized projection (128), the narrow-tail folded MMA (129) and
-        // the folded MMA (255). The int8 criterion covers both sides of the threshold.
-        constexpr std::array<std::int32_t, 9> kTokenCases{1, 2, 128, 129, 255, 256, 257, 1024, 4096};
-        constexpr std::array<std::int32_t, 4> kGraphCases{255, 256, 257, 4096};
-        constexpr std::array<std::int32_t, 5> kExactRouteCases{1, 2, 128, 129, 255};
+        // small-T tiles (2), the materialized projection (64), the folded MMA (128), and the
+        // narrow-tail folded MMA (129, 152). The int8 criterion covers both sides of the threshold.
+        constexpr std::array<std::int32_t, 10> kTokenCases{1, 2, 64, 128, 129, 152, 153, 256, 1024, 4096};
+        constexpr std::array<std::int32_t, 4> kGraphCases{152, 153, 256, 4096};
+        constexpr std::array<std::int32_t, 6> kExactRouteCases{1, 2, 64, 128, 129, 152};
         failures += run_profile("LinearSwiGLU Q4 W4A8",
                                 {QType::Q4_G64_FP16, 34816, 5120, 17408, 1403U,
                                  ActivationCompute::A8Int, ops::LinearRoutes::Q4W4A8},

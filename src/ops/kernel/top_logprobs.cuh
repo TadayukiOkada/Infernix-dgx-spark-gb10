@@ -74,15 +74,41 @@ __launch_bounds__(BlockSize) __global__
                              std::int32_t count) {
     const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
     const Logit* values       = logits + static_cast<std::int64_t>(column) * physical_rows;
-    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows);
+    float local_max              = -CUDART_INF_F;
+    float local_sum              = 0.0f;
+    unsigned long long first_key = 0;
+    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
+         row += BlockSize) {
+        const float value   = logprob_logit(values[row]);
+        const float new_max = fmaxf(local_max, value);
+        if (new_max > local_max) {
+            local_sum *= expf(local_max - new_max);
+        }
+        local_max = new_max;
+        local_sum += expf(value - local_max);
+        const unsigned long long key = top_logprobs_key(value, row);
+        if (key < ~0ULL && key > first_key) { first_key = key; }
+    }
+    const float maximum = target_logprobs_block_max<BlockSize>(local_max);
+    local_sum *= expf(local_max - maximum);
+    __shared__ float warp_sums[BlockSize / kWarpSize];
+    __shared__ float log_sum;
+    const float sum = block_reduce_sum<BlockSize>(local_sum, warp_sums);
+    if (threadIdx.x == 0) { log_sum = logf(sum); }
+    __syncthreads();
+    const TargetLogprobsColumn lse{maximum, log_sum};
 
     unsigned long long previous = ~0ULL;
     for (std::int32_t rank = 0; rank < count; ++rank) {
         unsigned long long best = 0;
-        for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
-             row += BlockSize) {
-            const unsigned long long key = top_logprobs_key(logprob_logit(values[row]), row);
-            if (key < previous && key > best) { best = key; }
+        if (rank == 0) {
+            best = first_key;
+        } else {
+            for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
+                 row += BlockSize) {
+                const unsigned long long key = top_logprobs_key(logprob_logit(values[row]), row);
+                if (key < previous && key > best) { best = key; }
+            }
         }
         best = top_logprobs_block_max<BlockSize>(best);
         if (threadIdx.x == 0) {

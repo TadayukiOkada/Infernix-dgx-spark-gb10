@@ -39,11 +39,16 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
         if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
         return Nvfp4LinearSwiGluRoute::FusedA4Residual;
     }
+    // GB10 (sm_121a, 48 SMs): the fused-A4 quantize+MMA route beats the dedicated small-T A16 SIMT
+    // kernel from 2 tokens up (437-439 us vs 474/451/440 at 2/3/4); only single-token decode stays
+    // on the fused A16 kernel. The RTX 5090 fit kept small-T out to 4.
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-    if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     // This route dispatches its own fused kernel rather than a Linear shape's, so it carries its
     // own condition; the call site below forces the matching scale layout.
-    if (tokens >= 256) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
+    // GB10 (sm_121a, 48 SMs): the resident M128N128 tile falls off a cliff once the wave spills
+    // past what it can hide (914 us at 136 tokens vs 467 at 128), while the TMA path holds at
+    // ~540. Cold-weight sweeps put the crossover at 128 -> 136 tokens; the RTX 5090 fit had 256.
+    if (tokens >= 136) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
     return Nvfp4LinearSwiGluRoute::FusedA4;
 }
 
@@ -68,9 +73,11 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
+    // These policies route to an A16 kernel that never allocates a fused workspace. On GB10 the
+    // fused-A4 route covers every token count above single-token decode (see resolve_route),
+    // including 2-4, so the old `max_tokens <= 4` carve-out no longer applies.
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-        allows_a8_residual(policy) ||
-        column_invariant(policy) || max_tokens <= 4) {
+        allows_a8_residual(policy) || column_invariant(policy)) {
         return 0;
     }
     if (allows_a4_residual(policy)) {

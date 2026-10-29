@@ -60,6 +60,15 @@ __device__ __forceinline__ uint2 ld_nc_na_evict_first(const void* ptr) {
     return value;
 }
 
+// The 4-byte form, for a packed row codec whose one-lane unit is a single 32-bit word (q4 nibbles).
+__device__ __forceinline__ std::uint32_t ld_nc_na_evict_first_u32(const void* ptr) {
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    std::uint32_t value;
+    asm("ld.global.nc.L1::no_allocate.L2::cache_hint.u32 %0, [%1], %2;" : "=r"(value) : "l"(ptr), "l"(policy));
+    return value;
+}
+
 template <class T, class V>
 __device__ __forceinline__ void store_vec(T* ptr, V value) {
     static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||

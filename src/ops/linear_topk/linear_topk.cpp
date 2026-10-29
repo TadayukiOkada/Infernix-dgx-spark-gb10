@@ -87,19 +87,41 @@ struct Plan {
 Plan plan_for(HeadProfile profile, int columns) {
     // The 122B heads' producers are 128-row groups of the materialized logits.
     if (materialized(profile)) return {detail::kLinearTopKGroupedRows, 0};
+    // GB10 (sm_121a, 48 SMs) tuned buckets. Low columns (draft_tokens x batch)
+    // are bandwidth-bound and stay on the shipped tiles; the MMA sweet spot
+    // shifts wider than the original heuristic, measured via tile-forcing sweeps
+    // (see RESEARCH_NOTES target #131):
+    //   Q8:  cols 49-96  -> tile96 (beats 64/80 at U=64 +4.4%, U=80 +7.6%)
+    //          cols 97-120 -> tile120 (beats 112 at U=112 +5.7%)
+    //   FP8: cols 49-80  -> tile96 (beats 64/80 at U=64 +2.3%, U=80 +7.5%);
+    //          cols 89-96 keep the tuned tile96/block_k64 variant (U=96 best).
+    //   Q4:  cols 49-80  -> tile80 (beats 64 at U=64 +1.9%).
     if (profile == HeadProfile::Q4Optimized) {
         if (columns <= 16) return {16, 0};
         if (columns <= 32) return {64, 32};
         if (columns <= 48) return {64, 48};
-    } else {
+        if (columns <= 80) return {64, 80};
+        if (columns <= 96) return {64, 96};
+        if (columns <= 112) return {64, 112, 64};
+        if (columns <= 120) return {64, 120, 64};
+        return {64, 128, 64};
+    }
+    if (profile == HeadProfile::Q8Full) {
         if (columns <= 24) return {128, 0};
-        if (columns <= 32) return {profile == HeadProfile::Q8Full ? 128 : 64, 32};
+        if (columns <= 32) return {128, 32};
         if (columns <= 40) return {64, 40};
         if (columns <= 48) return {64, 48};
+        if (columns <= 96) return {64, 96};
+        if (columns <= 120) return {64, 120, 64};
+        return {64, 128, 64};
     }
-    if (columns <= 64) return {64, 64};
-    if (columns <= 80) return {64, 80};
-    if (columns <= 96) return {64, 96, profile == HeadProfile::Fp8Full && columns > 88 ? 64 : 128};
+    // Fp8Full
+    if (columns <= 24) return {128, 0};
+    if (columns <= 32) return {64, 32};
+    if (columns <= 40) return {64, 40};
+    if (columns <= 48) return {64, 48};
+    if (columns <= 80) return {64, 96};
+    if (columns <= 96) return {64, 96, columns > 88 ? 64 : 128};
     if (columns <= 112) return {64, 112, 64};
     if (columns <= 120) return {64, 120, 64};
     return {64, 128, 64};

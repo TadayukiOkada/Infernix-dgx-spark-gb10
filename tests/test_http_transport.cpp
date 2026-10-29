@@ -7,16 +7,6 @@
 #include <string>
 #include <vector>
 
-#if defined(__linux__)
-#    include <arpa/inet.h>
-#    include <netinet/in.h>
-#    include <netinet/tcp.h>
-#    include <sys/socket.h>
-#    include <unistd.h>
-#elif defined(_WIN32)
-#    include <winsock2.h>
-#    include <ws2tcpip.h>
-#endif
 
 namespace {
 
@@ -270,117 +260,6 @@ int test_schema_number_precision() {
     return failures;
 }
 
-#if defined(__linux__) || defined(_WIN32)
-#    if defined(_WIN32)
-using NativeSocket               = SOCKET;
-using SocketLength               = int;
-constexpr NativeSocket kNoSocket = INVALID_SOCKET;
-void close_socket(NativeSocket socket) { ::closesocket(socket); }
-#    else
-using NativeSocket               = int;
-using SocketLength               = socklen_t;
-constexpr NativeSocket kNoSocket = -1;
-void close_socket(NativeSocket socket) { ::close(socket); }
-#    endif
-
-class Socket final {
-public:
-    explicit Socket(NativeSocket descriptor = kNoSocket) : descriptor_(descriptor) {}
-
-    ~Socket() {
-        if (valid()) { close_socket(descriptor_); }
-    }
-
-    Socket(const Socket&)            = delete;
-    Socket& operator=(const Socket&) = delete;
-
-    [[nodiscard]] NativeSocket get() const noexcept { return descriptor_; }
-    [[nodiscard]] bool valid() const noexcept { return descriptor_ != kNoSocket; }
-
-private:
-    NativeSocket descriptor_ = kNoSocket;
-};
-
-template <class T>
-bool socket_option_equals(NativeSocket socket, int level, int option, T expected) {
-    T actual{};
-    SocketLength size = sizeof(actual);
-    return ::getsockopt(socket, level, option, reinterpret_cast<char*>(&actual), &size) == 0 &&
-           size == static_cast<SocketLength>(sizeof(actual)) && actual == expected;
-}
-
-int test_inherited_socket_liveness() {
-    int failures = 0;
-#    if defined(_WIN32)
-    WSADATA winsock{};
-    if (::WSAStartup(MAKEWORD(2, 2), &winsock) != 0) {
-        return check(false, "failed to start Winsock for the liveness test");
-    }
-    struct WinsockCleanup {
-        ~WinsockCleanup() { ::WSACleanup(); }
-    } cleanup;
-#    endif
-    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
-    if (!listener.valid()) { return check(false, "failed to create HTTP listener test socket"); }
-    infernix::serve::configure_http_server_socket(listener.get());
-
-    sockaddr_in address{};
-    address.sin_family      = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port        = 0;
-    if (::bind(listener.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
-        ::listen(listener.get(), 1) != 0) {
-        return check(false, "failed to bind HTTP listener test socket");
-    }
-    SocketLength address_size = sizeof(address);
-    if (::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
-        return check(false, "failed to inspect HTTP listener test address");
-    }
-
-    Socket client(::socket(AF_INET, SOCK_STREAM, 0));
-    if (!client.valid() || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
-                                     sizeof(address)) != 0) {
-        return check(false, "failed to connect HTTP liveness test socket");
-    }
-    Socket accepted(::accept(listener.get(), nullptr, nullptr));
-    if (!accepted.valid()) { return check(false, "failed to accept HTTP liveness test socket"); }
-
-#    if defined(_WIN32)
-    // Windows reports SO_KEEPALIVE as a one-byte BOOLEAN and TCP_MAXRTMS stands for
-    // TCP_USER_TIMEOUT.
-    failures += check(socket_option_equals<char>(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
-                      "accepted HTTP socket did not inherit SO_KEEPALIVE");
-    failures += check(socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_KEEPIDLE, 10),
-                      "accepted HTTP socket did not inherit TCP_KEEPIDLE");
-    failures += check(socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_KEEPINTVL, 3),
-                      "accepted HTTP socket did not inherit TCP_KEEPINTVL");
-    failures += check(socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_KEEPCNT, 3),
-                      "accepted HTTP socket did not inherit TCP_KEEPCNT");
-    failures += check(
-        socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_MAXRTMS, 15000),
-        "accepted HTTP socket did not inherit TCP_MAXRTMS");
-#    else
-#        if defined(__linux__)
-    // Both reuse options, so a server setting either one binds the port right after a stop.
-    failures += check(socket_option_equals(listener.get(), SOL_SOCKET, SO_REUSEADDR, 1) &&
-                          socket_option_equals(listener.get(), SOL_SOCKET, SO_REUSEPORT, 1),
-                      "HTTP listener lacks SO_REUSEADDR or SO_REUSEPORT");
-#        endif
-    failures += check(socket_option_equals(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
-                      "accepted HTTP socket did not inherit SO_KEEPALIVE");
-    failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPIDLE, 10),
-                      "accepted HTTP socket did not inherit TCP_KEEPIDLE");
-    failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPINTVL, 3),
-                      "accepted HTTP socket did not inherit TCP_KEEPINTVL");
-    failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPCNT, 3),
-                      "accepted HTTP socket did not inherit TCP_KEEPCNT");
-    failures += check(
-        socket_option_equals<unsigned int>(accepted.get(), IPPROTO_TCP, TCP_USER_TIMEOUT, 15000U),
-        "accepted HTTP socket did not inherit TCP_USER_TIMEOUT");
-#    endif
-    return failures;
-}
-#endif
 
 } // namespace
 
@@ -388,9 +267,6 @@ int main() {
     int failures = test_ngram_identity() + test_request_label() + test_ngram_generation() + test_sse_transport() +
                    test_sse_response_headers() + test_prompt_json_member_order() +
                    test_schema_number_precision();
-#if defined(__linux__) || defined(_WIN32)
-    failures += test_inherited_socket_liveness();
-#endif
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

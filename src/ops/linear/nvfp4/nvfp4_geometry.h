@@ -32,6 +32,7 @@ using Nvfp4N34816K5120 = Nvfp4Geometry<34816, 5120>;
 using Nvfp4N5120K6144  = Nvfp4Geometry<5120, 6144>;
 using Nvfp4N5120K17408 = Nvfp4Geometry<5120, 17408>;
 
+using Nvfp4Activation2560Geometry  = Nvfp4ActivationGeometry<2560>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;

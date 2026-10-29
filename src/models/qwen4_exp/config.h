@@ -101,8 +101,7 @@ struct QsaConfig {
 // scale per 16 elements, with one FP32 multiplier for the table; design §12.5). Any volume of the
 // model's table, in any of the four formats, may replace the artifact's at run time
 // (resolve_ngram_volume).
-enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16, Nvfp4 };
-
+enum class NgramRowFormat : std::uint8_t { Fp8E4m3, Iq4Nl, Bf16, Nvfp4, Nvfp4E2m1 = Nvfp4 };
 struct NgramTableConfig {
     NgramRowFormat format = NgramRowFormat::Fp8E4m3;
     // An FP8 volume that is not the artifact's own: its per-tensor scale (BF16 bits), from its header

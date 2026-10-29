@@ -5,7 +5,9 @@
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
 // clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
-// cap, display hot-plug, and the reserve spent by Infernix's own later allocations. The exclusive RAM
+// cap, display hot-plug, and the reserve spent by Infernix's own later allocations. RT8, integrated
+// (unified-memory) sizing: reclaimable cache sizes the frames, the process's Host-side claim is
+// charged once, and the declared frame-pool ceiling bounds the pool. The exclusive RAM
 // layout's tier for one record size (the Qwen3.5-122B-A10B's, plan_exclusive_tier): the shadows cover the
 // loan, a sixteenth of the frames and the KV growth, the seeds never take the frames they cover, and RAM holds
 // every other expert.
@@ -324,6 +326,76 @@ void test_sizing() {
             "the sizing line names the headroom's source and the display: " + line);
 }
 
+// ---------------------------------------------------------------- integrated (unified) memory
+
+// GB10-like card: one physical pool, cudaMemGetInfo's free equal to MemFree, the rest held as
+// reclaimable file cache.
+VramSnapshot unified(std::uint64_t free, std::uint64_t reclaimable) {
+    VramSnapshot s  = card(free, DisplayState::Headless);
+    s.integrated    = true;
+    s.reclaimable   = reclaimable;
+    return s;
+}
+
+void test_integrated_sizing() {
+    const std::uint64_t free  = 28 * kGiB;
+    const std::uint64_t fixed = 3 * kGiB;
+
+    // The reclaimable part of the pool counts, the Host-side claim is charged once.
+    VramDemand d = demand(fixed, 20);
+    d.shared_host_bytes = 6 * kGiB;
+    const auto credited = size_expert_frames(unified(free, 10 * kGiB), d);
+    const std::int64_t expect =
+        static_cast<std::int64_t>(free + 10 * kGiB - 6 * kGiB - fixed - 256 * kMiB - 256 * kMiB);
+    require(credited.frame_bytes == expect && credited.frames == static_cast<std::uint32_t>(expect / kRecord),
+            "reclaimable memory sizes the frames: " + credited.describe());
+
+    // Nothing reclaimable: the driver's reading alone, exactly as before this accounting existed.
+    const auto plain = size_expert_frames(unified(free, 0), d);
+    require(plain.frame_bytes == expect - static_cast<std::int64_t>(10 * kGiB), "a full cache is not assumed");
+
+    // A Host-side claim above what the pool can carry refuses, instead of spending it twice.
+    VramDemand greedy = demand(fixed, 20);
+    greedy.shared_host_bytes = 40 * kGiB;
+    const auto refused = size_expert_frames(unified(free, 10 * kGiB), greedy);
+    require(refused.frame_bytes < 0 && refused.frames == 0, "the shared claim is not double-counted");
+
+    // The declared ceiling bounds the frames however large the pool looks.
+    VramDemand uncapped = demand(fixed, 20);
+    uncapped.frame_pool_cap = 4 * kGiB;
+    const auto capped = size_expert_frames(unified(free, 60 * kGiB), uncapped);
+    require(capped.frame_bytes == static_cast<std::int64_t>(4 * kGiB), "the frame-pool ceiling applies");
+
+    // A discrete GPU keeps ignoring both terms: dedicated VRAM is a different pool.
+    const auto discrete = size_expert_frames(card(free, DisplayState::Headless), d);
+    require(discrete.frame_bytes == static_cast<std::int64_t>(free - fixed - 256 * kMiB - 256 * kMiB),
+            "Host memory is a separate pool on a discrete GPU");
+
+    // The sizing line names the pool an allocation can reach.
+    const auto line = credited.describe();
+    require(line.find("reclaimable") != std::string::npos && line.find("allocatable") != std::string::npos &&
+                line.find("Host-side claim") != std::string::npos,
+            "the unified pool is explained: " + line);
+}
+
+void test_shared_host_claim() {
+    HostMemoryDemand d;
+    d.reserve      = 2 * kGiB;
+    d.other_pinned = 1 * kGiB;
+    d.later_pinned = 256 * kMiB;
+    d.prefix_cache = 512 * kMiB;
+    d.pageable     = 160 * kMiB;
+    d.load_staging = 264 * kMiB;
+    d.process_growth = 1 * kGiB;
+    d.expert_banks = 64 * kGiB; // charged only through host_expert_bytes, never as the demand's banks
+    const std::uint64_t pins  = 1 * kGiB + 256 * kMiB + 512 * kMiB;
+    const std::uint64_t overhead = static_cast<std::uint64_t>(pins * 0.0025) + 1;
+    const std::uint64_t claim = shared_host_claim(d, 8 * kGiB);
+    require(claim >= pins + overhead + 8 * kGiB + 160 * kMiB + 264 * kMiB + 1 * kGiB + 2 * kGiB &&
+                claim <= pins + overhead + 8 * kGiB + 160 * kMiB + 264 * kMiB + 1 * kGiB + 2 * kGiB + 1,
+            "the claim is every ledger term plus the experts pinned there and the reserve");
+}
+
 // Free device memory per query, and optionally this process's shared system memory use (a source
 // with an adapter: Windows, WSL2) in step with it.
 class ScriptedSource final : public VramBudgetSource {
@@ -508,6 +580,8 @@ int main() {
         test_display_headroom();
         test_internal_reserve();
         test_sizing();
+        test_integrated_sizing();
+        test_shared_host_claim();
         test_spill();
         test_control_law();
         test_exclusive_tier();

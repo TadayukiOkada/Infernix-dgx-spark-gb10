@@ -21,6 +21,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
 #include <algorithm>
@@ -79,29 +80,32 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
 // text token (three equal axes) rotates exactly as by its 1-D position.
 __device__ __forceinline__ void rope_angle(const std::int32_t* rope, std::int64_t stride, int i, int rotary,
                                            float theta, const PreparedRope& yarn, float& c, float& s) {
+    float angle;
     if (yarn.factor == 1.0F) {
-        const float inv   = 1.0F / powf(theta, static_cast<float>(2 * i) / static_cast<float>(rotary));
-        const float angle = static_cast<float>(rope[(i % 3) * stride]) * inv;
-        sincosf(angle, &s, &c);
-        return;
+        const float inv = 1.0F / powf(theta, static_cast<float>(2 * i) / static_cast<float>(rotary));
+        angle           = static_cast<float>(rope[(i % 3) * stride]) * inv;
+    } else {
+        // YaRN: the attention rotation's coefficients (ops/kernel/rope.cuh PreparedRopeCoefficients): the
+        // angle in FP64, reduced to one turn, FP32 sincos, both scaled by the attention scale.
+        constexpr double kInvTwoPi = 1.59154943091895336e-01;
+        constexpr double kTwoPi    = 6.28318530717958648e+00;
+        const double raw           = static_cast<double>(rope[(i % 3) * stride]) * yarn.inverse[i];
+        angle                      = static_cast<float>(raw - nearbyint(raw * kInvTwoPi) * kTwoPi);
     }
-    // YaRN: the attention rotation's coefficients (ops/kernel/rope.cuh PreparedRopeCoefficients): the
-    // angle in FP64, reduced to one turn, FP32 sincos, both scaled by the attention scale.
-    constexpr double kInvTwoPi = 1.59154943091895336e-01;
-    constexpr double kTwoPi    = 6.28318530717958648e+00;
-    const double angle   = static_cast<double>(rope[(i % 3) * stride]) * yarn.inverse[i];
-    const float reduced  = static_cast<float>(angle - nearbyint(angle * kInvTwoPi) * kTwoPi);
-    sincosf(reduced, &s, &c);
-    s *= yarn.attention_scale;
-    c *= yarn.attention_scale;
+    sincosf(angle, &s, &c);
+    if (yarn.factor != 1.0F) {
+        s *= yarn.attention_scale;
+        c *= yarn.attention_scale;
+    }
 }
 
 // ------------------------------------------------------------------------------- index query
 
 // One CTA (128 threads) per (index head, column).
-__global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict__ weight,
-                                   const std::int32_t* __restrict__ rope, int heads, int rotary,
-                                   float theta, PreparedRope yarn, float eps) {
+__global__ void __launch_bounds__(kIndexDim)
+    index_query_kernel(bf16* __restrict__ q, const bf16* __restrict__ weight,
+                       const std::int32_t* __restrict__ rope, int heads, int rotary,
+                       float theta, PreparedRope yarn, float eps) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     pdl::enter(); // launched as a programmatic dependent
@@ -133,14 +137,15 @@ __device__ __forceinline__ bf16* pooled_element(bf16* pool, const QsaPageSpaces&
 }
 
 // One CTA (128 threads) per column; columns that complete a block pool it.
-__global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict__ weight,
-                            const bf16* __restrict__ tails, const std::int32_t* __restrict__ tables,
-                            int table_stride, const std::int32_t* __restrict__ table_rows,
-                            const std::int32_t* __restrict__ positions,
-                            const std::int32_t* __restrict__ tail_slots,
-                            const std::int32_t* __restrict__ rope, const std::int32_t* __restrict__ block_rope,
-                            int batch, int width, int ratio, int rotary, float theta, PreparedRope yarn, float eps,
-                            bf16* __restrict__ pooled, QsaPageSpaces spaces) {
+__global__ void __launch_bounds__(kIndexDim)
+    pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict__ weight,
+                const bf16* __restrict__ tails, const std::int32_t* __restrict__ tables,
+                int table_stride, const std::int32_t* __restrict__ table_rows,
+                const std::int32_t* __restrict__ positions,
+                const std::int32_t* __restrict__ tail_slots,
+                const std::int32_t* __restrict__ rope, const std::int32_t* __restrict__ block_rope,
+                int batch, int width, int ratio, int rotary, float theta, PreparedRope yarn, float eps,
+                bf16* __restrict__ pooled, QsaPageSpaces spaces) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     pdl::enter(); // launched as a programmatic dependent
@@ -166,11 +171,9 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
         const int half = rotary / 2, i = d % half;
         float c, s;
         // The block's first token: a column of this call, or the sequence's block start before it.
-        if (first >= start) {
-            rope_angle(rope + (t - (p - first)), gridDim.x, i, rotary, theta, yarn, c, s);
-        } else {
-            rope_angle(block_rope + sequence, batch, i, rotary, theta, yarn, c, s);
-        }
+        const std::int32_t* rope_base = first >= start ? rope + (t - (p - first)) : block_rope + sequence;
+        const std::int64_t rope_stride = first >= start ? static_cast<std::int64_t>(gridDim.x) : batch;
+        rope_angle(rope_base, rope_stride, i, rotary, theta, yarn, c, s);
         out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
     }
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[sequence]) * table_stride;
@@ -315,10 +318,9 @@ __device__ __forceinline__ float e4m3_at(const unsigned char* p, int i) {
 
 // E2M1 element d of a packed row (dimension 2j in the low nibble of byte j).
 __device__ __forceinline__ float e2m1_at(const unsigned char* p, int d) {
-    const unsigned code = (p[d >> 1] >> (4 * (d & 1))) & 0xFU;
-    const unsigned e = (code >> 1) & 3U, m = code & 1U;
-    const float magnitude = e == 0 ? 0.5F * static_cast<float>(m) : __uint_as_float(((e + 126U) << 23) | (m << 22));
-    return (code & 8U) != 0 ? -magnitude : magnitude;
+    __nv_fp4_e2m1 v;
+    v.__x = static_cast<__nv_fp4_storage_t>((p[d >> 1] >> (4 * (d & 1))) & 0xFU);
+    return static_cast<float>(v);
 }
 
 // FP8 E4M3 rows with one FP16 scale; NVFP4 rows (E2M1 codes) with one E4M3 scale per 16.
@@ -555,7 +557,7 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
                                     detail::vq_window_row(window_row, kv_head, kv_heads, kv_window_slot(key)) * kHeadDim;
                 cp_async<16, Cache::cg>(stage + (role ? Tile::kValues : 0) + j * kHeadDim + 16 * chunk, src + 16 * chunk);
             }
-            for (int c = threadIdx.x; c < n * 2; c += kAttentionThreads) {
+            if (const int c = threadIdx.x; c < n * 2) {
                 const int j = c / 2, role = c % 2;
                 const int key = tokens[buf][j];
                 int page;
@@ -581,7 +583,7 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
     // VQ2 codebook for code decoding (in the first tile's copy group).
     const std::int8_t* codebook = reinterpret_cast<const std::int8_t*>(smem + Shared::kCodebook);
     if constexpr (Tile::kVq) {
-        for (int i = threadIdx.x; i < static_cast<int>(sizeof(kKVCacheVq2Codebook)) / 16; i += kAttentionThreads) {
+        if (const int i = threadIdx.x; i < static_cast<int>(sizeof(kKVCacheVq2Codebook)) / 16) {
             cp_async<16>(smem + Shared::kCodebook + 16 * i, g_kv_cache_vq2_codebook + 16 * i);
         }
     }
@@ -615,8 +617,8 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
                                                           offset(j, page, is_key ? Tile::kKeyBytes : Tile::kValueBytes) +
                                                           16 * chunk);
         }
-        if constexpr (Tile::kKeyScaleBytes > 0) {
-            for (int j = threadIdx.x; j < n; j += kAttentionThreads) {
+        if constexpr (Tile::kKeyScaleBytes > 2) {
+            if (const int j = threadIdx.x; j < n) {
                 int page;
                 const void* base = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
                                                            spaces.lent_k_scale, ids[buf][j], page);
@@ -625,8 +627,9 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
                                                       offset(j, page, Tile::kKeyScaleBytes));
             }
         }
-        if constexpr (Tile::kValueScaleBytes > 0) {
-            for (int j = threadIdx.x; j < n; j += kAttentionThreads) {
+        if constexpr (Tile::kValueScaleBytes > 2) {
+            constexpr int kVThreadBase = Tile::kKeyScaleBytes > 2 ? kTokenTile : 0;
+            if (const int j = static_cast<int>(threadIdx.x) - kVThreadBase; j >= 0 && j < n) {
                 int page;
                 const void* base = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
                                                            spaces.lent_v_scale, ids[buf][j], page);
@@ -636,6 +639,25 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             }
         }
         cp_commit();
+        if constexpr (Tile::kKeyScaleBytes == 2) {
+            if (const int j = threadIdx.x; j < n) {
+                int page;
+                const void* base = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
+                                                           spaces.lent_k_scale, ids[buf][j], page);
+                copy_scales<2>(stage + Tile::kKeyScales + j * 2,
+                               static_cast<const unsigned char*>(base) + offset(j, page, 2));
+            }
+        }
+        if constexpr (Tile::kValueScaleBytes == 2) {
+            constexpr int kVThreadBase = Tile::kKeyScaleBytes == 2 ? kTokenTile : 0;
+            if (const int j = static_cast<int>(threadIdx.x) - kVThreadBase; j >= 0 && j < n) {
+                int page;
+                const void* base = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
+                                                           spaces.lent_v_scale, ids[buf][j], page);
+                copy_scales<2>(stage + Tile::kValueScales + j * 2,
+                               static_cast<const unsigned char*>(base) + offset(j, page, 2));
+            }
+        }
     };
 
     // The first tile streams while the query heads load and rotate.
@@ -703,7 +725,7 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             // Keep a row's exact copy when its tag matches the stored codes (staged rows always), and
             // decode the codes of every other row into the INT8 planes, the row scale as each group's.
             unsigned char* st = smem + s * Shared::kStage;
-            for (int c = threadIdx.x; c < n * 2; c += kAttentionThreads) {
+            if (const int c = threadIdx.x; c < n * 2) {
                 const int j = c / 2, role = c % 2;
                 const int key  = tokens[s][j];
                 const int mode = detail::vq_read_mode(vq, key, p, call_first);
@@ -814,27 +836,29 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
         __syncthreads();
     }
     if constexpr (Tile::kRotatedValues) {
-        // Values are stored in the normalized Hadamard domain (its own inverse): rotate the
-        // unnormalized output back, a linear map, so partials still merge by their weights.
-        __syncthreads(); // the query heads are no longer read
-        float* rows = qs; // [Group][256]
+        if (splits == 1) {
+            // Values are stored in the normalized Hadamard domain (its own inverse): rotate back when
+            // writing directly, or once after merging the unrotated partials when split > 1.
+            __syncthreads(); // the query heads are no longer read
+            float* rows = qs; // [Group][256]
 #pragma unroll
-        for (int i = 0; i < Half; ++i) {
-            if (mine(i)) { rows[(h_base + i) * kHeadDim + d_own] = acc[i]; }
-        }
-        __syncthreads();
-        for (int h = warp; h < group; h += kAttentionWarps) {
-            float v[8];
+            for (int i = 0; i < Half; ++i) {
+                if (mine(i)) { rows[(h_base + i) * kHeadDim + d_own] = acc[i]; }
+            }
+            __syncthreads();
+            for (int h = warp; h < group; h += kAttentionWarps) {
+                float v[8];
 #pragma unroll
-            for (int r = 0; r < 8; ++r) { v[r] = rows[h * kHeadDim + lane + 32 * r]; }
-            normalized_hadamard_d256_inplace(v, lane);
+                for (int r = 0; r < 8; ++r) { v[r] = rows[h * kHeadDim + lane + 32 * r]; }
+                normalized_hadamard_d256_inplace(v, lane);
 #pragma unroll
-            for (int r = 0; r < 8; ++r) { rows[h * kHeadDim + lane + 32 * r] = v[r]; }
-        }
-        __syncthreads();
+                for (int r = 0; r < 8; ++r) { rows[h * kHeadDim + lane + 32 * r] = v[r]; }
+            }
+            __syncthreads();
 #pragma unroll
-        for (int i = 0; i < Half; ++i) {
-            if (mine(i)) { acc[i] = rows[(h_base + i) * kHeadDim + d_own]; }
+            for (int i = 0; i < Half; ++i) {
+                if (mine(i)) { acc[i] = rows[(h_base + i) * kHeadDim + d_own]; }
+            }
         }
     }
 #pragma unroll
@@ -857,6 +881,7 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
     if constexpr (Tile::kVq) { cp_wait<0>(); } // the codebook copy of a split without tiles
 }
 
+template <bool RotateValues>
 __global__ void merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
     pdl::enter();
     const int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
@@ -873,7 +898,23 @@ __global__ void merge_kernel(const float* __restrict__ partial, int heads, int s
         l += w * slot[kHeadDim + 1];
         acc += w * slot[d];
     }
-    out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(l > 0.0F ? acc / l : 0.0F);
+    const float val = l > 0.0F ? acc / l : 0.0F;
+    if constexpr (!RotateValues) {
+        out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(val);
+    } else {
+        __shared__ float smem[kHeadDim];
+        smem[d] = val;
+        __syncthreads();
+        if (d < 32) {
+            float v[8];
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { v[r] = smem[d + 32 * r]; }
+            normalized_hadamard_d256_inplace(v, d);
+            bf16* dst = out + (static_cast<std::size_t>(t) * heads + head) * kHeadDim;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { dst[d + 32 * r] = __float2bfloat16_rn(v[r]); }
+        }
+    }
 }
 
 // Calls of at most this many columns: decode, one row's verification, up to eight plain lanes.
@@ -886,8 +927,10 @@ constexpr int kSmallCallColumns = 8;
 //   prefix-cache resumes rely on it; test_qsa checks it). Against one wave per call (the rule below)
 //   this costs ~2 us at W = 5 and ~10 us at W = 8 per call, under 0.2 % of a round; W = 1-2 are equal.
 // - Wider calls: one wave of the decode kernel's CTAs (one 512-thread CTA per SM), at most 48 and at
-//   least 4 once split. A call that fills half the SMs unsplit takes the prompt route. Against the
-//   earlier 340-CTA / 33-split rule: 42-73 % faster at 43-85 columns (design §19.3.15).
+//   least 4 once split. When a 4-split decode kernel would exceed a single wave (splits < 4, i.e.
+//   columns * kv_heads > sms / 4; columns >= 9 on 48 SMs), the call runs unsplit on the Tensor Core
+//   prompt route (qsa_prompt_attention). Against the earlier 340-CTA / 33-split rule: 42-73 % faster
+//   at 43-85 columns (design §19.3.15), and avoids a 2-wave decode cliff at 9-12 columns on GB10.
 int attention_splits(int columns, const QsaGeometry& g) {
     const int attended = g.budget + g.ratio - 1;
     if (columns <= kSmallCallColumns) { return (attended + kTokenTile - 1) / kTokenTile; }
@@ -900,7 +943,7 @@ int attention_splits(int columns, const QsaGeometry& g) {
         return count;
     }();
     const int splits = std::clamp(sms / (columns * g.kv_heads), 1, 48);
-    return splits == 1 ? 1 : std::max(splits, 4);
+    return splits < 4 ? 1 : splits;
 }
 
 struct Workspace {
@@ -1224,10 +1267,17 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     }
     check_launch("attention");
     if (splits > 1) {
+        const bool rotate_values = layer.kv.storage == KvCacheStorage::Nvfp4Group16 ||
+                                   layer.kv.storage == KvCacheStorage::Fp8KeyNvfp4Value ||
+                                   vector_quantized(layer.kv.storage);
         const cudaError_t error =
-            pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel,
-                                 static_cast<const float*>(ws.partial), geometry.heads, splits,
-                                 static_cast<bf16*>(out.data));
+            rotate_values
+                ? pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel<true>,
+                                       static_cast<const float*>(ws.partial), geometry.heads, splits,
+                                       static_cast<bf16*>(out.data))
+                : pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel<false>,
+                                       static_cast<const float*>(ws.partial), geometry.heads, splits,
+                                       static_cast<bf16*>(out.data));
         if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa merge: ") + cudaGetErrorString(error)); }
     }
     commit();

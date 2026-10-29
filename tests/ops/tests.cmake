@@ -329,6 +329,7 @@ infernix_add_family_op_test(infernix_gated_delta_net_replay_record_conv_test FAM
 infernix_add_family_op_test(infernix_gdn_replay_fold_test FAMILY recurrent
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_replay_fold.cpp"
   LIBRARIES infernix_ops)
+set_tests_properties(infernix_gdn_replay_fold_test PROPERTIES RUN_SERIAL TRUE)
 
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
@@ -385,15 +386,15 @@ endforeach()
 set_tests_properties(infernix_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
 
 # The wide sweep, one entry per width and layer profile plus the batched cases: together they run
-# exactly the cases of --wide-only, and `ctest -j` runs the width entries concurrently (at most about
-# 1.3 GiB of device memory each). The batched entry's 64-round record folds hold about 10 GiB, so it
-# runs alone rather than failing an allocation beside the others.
+# exactly the cases of --wide-only. These entries fold recurrent state against an FP64 snapshot on
+# the device, and overlapping GPU work changed the folded state, so they run one at a time.
+# The batched entry's 64-round record folds hold about 10 GiB, so it runs alone.
 foreach(width 33 48 64)
   foreach(layers 48 30)
     add_test(NAME infernix_gdn_replay_fold_wide_w${width}_l${layers}_test
       COMMAND ${infernix_gdn_replay_fold_test_COMMAND} --wide-only --width ${width} --layers ${layers})
     set_tests_properties(infernix_gdn_replay_fold_wide_w${width}_l${layers}_test
-      PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
   endforeach()
 endforeach()
 add_test(NAME infernix_gdn_replay_fold_wide_batched_test
@@ -466,6 +467,11 @@ infernix_add_family_op_test(infernix_speculative_state_ops_test FAMILY sampling
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_state_ops.cu"
   LIBRARIES infernix_ops)
 
+# PLE n-gram embedding decode: the FP8 and NVFP4 dispatch paths against a host oracle.
+infernix_add_family_op_test(infernix_ple_embed_test FAMILY elementwise
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_embed.cu"
+  LIBRARIES infernix_ops)
+
 # QSA index queries, pooled keys and tails, selection and attention against FP64 oracles. One
 # entry per independent part (infernix_qsa_<part>_test), so `ctest -j` runs them concurrently;
 # together they run every case of the unsharded executable.
@@ -493,6 +499,9 @@ infernix_add_family_op_test(infernix_offloaded_moe_layer_test FAMILY offloaded_m
 infernix_add_family_op_test(infernix_offloaded_moe_plan_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_plan.cu"
   LIBRARIES infernix_ops)
+# The layer test asserts on idle-service wall-clock tolerances, which other tests' concurrent GPU
+# and CPU work breaks; it passes when it runs alone.
+set_tests_properties(infernix_offloaded_moe_layer_test PROPERTIES RUN_SERIAL TRUE)
 
 # The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
 infernix_add_family_op_test(infernix_offloaded_moe_wide_test FAMILY offloaded_moe

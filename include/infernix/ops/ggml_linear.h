@@ -103,7 +103,8 @@ struct GgmlSegment {
  * different rounding of each term and order of the sum). A non-finite weight scale gives its rows NaN.
  */
 void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, Tensor& out, const std::int32_t* input_perm,
-                 std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream, LinearRoutes routes);
+                 std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream,
+                 LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * ggml_linear into several outputs (one encoding of x): segment s writes rows [s.out_offset,
@@ -112,7 +113,7 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, Tensor&
  */
 void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::span<Tensor* const> outs,
                  const std::int32_t* input_perm, std::int32_t perm_block, WorkspaceArena& workspace, cudaStream_t stream,
-                 LinearRoutes routes);
+                 LinearRoutes routes = LinearRoutes::Exact);
 
 /**
  * x as ggml_linear's exact route encodes it, written by x's producer (infernix/ops/ggml_encode.h) instead of by

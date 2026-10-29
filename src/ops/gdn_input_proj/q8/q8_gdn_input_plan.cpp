@@ -18,6 +18,16 @@ struct RouteSpec {
     Q8GdnInputScheduleId schedule;
 };
 
+// The split-K direct MMA holds the whole 2..96 decode band and the plain R64C128 tile takes 97
+// columns and above. GB10 (48 SM, sm_121a) re-measured 2026-10-19, cold cache, 60 repeats:
+//   65 cols  split-K 151 us, R64C128 143 us
+//   80 cols  split-K 166 us, R64C128 143 us
+//   96 cols  split-K 190 us, R64C128 143 us
+// A lower crossover is genuinely faster, but R64C128 fails the A16 reduction criterion at 96
+// aggregate columns: rel-L2 3.28e-3 against the 3.15e-3 limit (2.59e-3 for split-K). Both are
+// valid FP32 accumulation orders; the wider tile reduces over a different K split and loses
+// accuracy the Op contract does not allow. Accuracy binds before speed, so the crossover stays
+// at 96. Re-tuning this band requires a numerically-equal R64C128, not a route change.
 constexpr std::array<RouteSpec, 3> kRoutes{{
     {1, 1, Q8GdnInputScheduleId::DecodeR8Direct},
     {2, 96, Q8GdnInputScheduleId::SplitKMmaDirect},
@@ -116,6 +126,42 @@ void q8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
         return;
     }
     throw std::logic_error("Q8 GDN input: unknown schedule");
+}
+
+bool q8_gdn_input_candidate_is_legal(Q8GdnInputScheduleId schedule,
+                                     const Q8GdnInputProblem& problem) noexcept {
+    if (!supported_shape(problem) || problem.cols < 1) { return false; }
+    switch (schedule) {
+    case Q8GdnInputScheduleId::DecodeR8Direct:
+        return problem.cols == 1;
+    case Q8GdnInputScheduleId::SplitKMmaDirect:
+        return problem.cols >= 2 && problem.cols <= 96;
+    case Q8GdnInputScheduleId::MmaR64C128:
+        return true;
+    }
+    return false;
+}
+
+void q8_gdn_input_execute_candidate(Q8GdnInputScheduleId schedule, const Tensor& x,
+                                    const Weight& weight, Tensor& qkv, Tensor& z,
+                                    cudaStream_t stream) {
+    const Q8GdnInputProblem problem{x.ne[0], qkv.ne[0], z.ne[0], weight.n, weight.padded_shape[1],
+                                    x.ne[1]};
+    if (!q8_gdn_input_candidate_is_legal(schedule, problem)) {
+        throw std::invalid_argument("Q8 GDN input: candidate schedule is not legal for problem");
+    }
+    switch (schedule) {
+    case Q8GdnInputScheduleId::DecodeR8Direct:
+        q8_gdn_input_decode_launch(x, weight, qkv, z, stream);
+        return;
+    case Q8GdnInputScheduleId::SplitKMmaDirect:
+        q8_gdn_input_splitk_mma_launch(x, weight, qkv, z, stream);
+        return;
+    case Q8GdnInputScheduleId::MmaR64C128:
+        q8_gdn_input_mma_r64_c128_launch(x, weight, qkv, z, stream);
+        return;
+    }
+    throw std::logic_error("Q8 GDN input: unknown candidate schedule");
 }
 
 } // namespace infernix::ops::detail

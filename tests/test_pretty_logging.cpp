@@ -6,12 +6,7 @@
 
 #include <spdlog/logger.h>
 
-#ifdef _WIN32
-#    include <fcntl.h>
-#    include <io.h>
-#else
 #    include <unistd.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -25,18 +20,6 @@
 
 namespace {
 
-#ifdef _WIN32
-constexpr int STDERR_FILENO = 2;
-// Text-mode pipe: the stdio layer emits \r\n for the stderr writes, and _read normalizes it
-// back to \n so the captured bytes match the POSIX expectation.
-inline int port_pipe(int fds[2])   { return _pipe(fds, 0, _O_TEXT); }
-inline int port_dup(int fd)        { return _dup(fd); }
-inline int port_dup2(int a, int b) { return _dup2(a, b); }
-inline int port_close(int fd)      { return _close(fd); }
-inline int port_read(int fd, void* buffer, unsigned long count) {
-    return _read(fd, buffer, static_cast<unsigned int>(count));
-}
-#else
 inline int port_pipe(int fds[2])   { return ::pipe(fds); }
 inline int port_dup(int fd)        { return ::dup(fd); }
 inline int port_dup2(int a, int b) { return ::dup2(a, b); }
@@ -44,7 +27,6 @@ inline int port_close(int fd)      { return ::close(fd); }
 inline int port_read(int fd, void* buffer, std::size_t count) {
     return static_cast<int>(::read(fd, buffer, count));
 }
-#endif
 
 class StderrCapture {
 public:

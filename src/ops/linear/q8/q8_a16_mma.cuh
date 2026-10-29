@@ -96,8 +96,25 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    const int m0 = static_cast<int>(blockIdx.x) * kOutputRowsPerCta;
-    const int n0 = token_begin + static_cast<int>(blockIdx.y) * BN;
+    const int tiles_m = static_cast<int>(gridDim.x);
+    const int tiles_n = static_cast<int>(gridDim.y);
+    int tile_m        = static_cast<int>(blockIdx.x);
+    int tile_n        = static_cast<int>(blockIdx.y);
+    if constexpr (BM != 96) {
+        if (tiles_n > 1 && tiles_m >= 8) {
+            constexpr int kGroupRows = 8;
+            const int linear         = tile_n * tiles_m + tile_m;
+            const int group_span     = kGroupRows * tiles_n;
+            const int group          = linear / group_span;
+            const int first_m        = group * kGroupRows;
+            const int active_m       = min(kGroupRows, tiles_m - first_m);
+            const int within         = linear - group * group_span;
+            tile_m                   = first_m + within % active_m;
+            tile_n                   = within / active_m;
+        }
+    }
+    const int m0 = tile_m * kOutputRowsPerCta;
+    const int n0 = token_begin + tile_n * BN;
     const int kg = padded_k / 32;
 
     float acc[MT][NT][4];
@@ -226,7 +243,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
         }
     };
 
-    const int nkt = padded_k / BK;
+    const int nkt = (BM != 96) ? ((k + BK - 1) / BK) : (padded_k / BK);
     stage_x(0, 0);
     stage_w(0);
     infernix::ops::cp_commit();
@@ -249,8 +266,11 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             infernix::ops::cp_commit();
         }
 
-        unsigned af[2][MT][4];
-        unsigned bf[2][NT][2];
+        constexpr bool kPingPong =
+            Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong &&
+            (FullK || Cfg::kThreads < 1024 || Cfg::kMmaRows * Cfg::kMmaTokens <= 2);
+        unsigned af[kPingPong ? 2 : 1][MT][4];
+        unsigned bf[kPingPong ? 2 : 1][NT][2];
         auto load_fragments = [&](int slot, int ks) {
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
@@ -269,15 +289,15 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             }
         };
 
-        if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong)
+        if constexpr (kPingPong)
             load_fragments(0, 0);
 #pragma unroll
         for (int ks = 0; ks < KSUB; ++ks) {
-            const int slot = Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong ? ks & 1 : 0;
-            if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::Serial) {
+            const int slot = kPingPong ? ks & 1 : 0;
+            if constexpr (!kPingPong) {
                 load_fragments(0, ks);
             }
-            if (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong && ks + 1 < KSUB) {
+            if (kPingPong && ks + 1 < KSUB) {
                 load_fragments(slot ^ 1, ks + 1);
             }
 #pragma unroll

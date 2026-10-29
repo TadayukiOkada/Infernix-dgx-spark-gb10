@@ -398,8 +398,8 @@ __device__ inline void sampling_build_truncated_block_fast(
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab); // always <= kSamplerFastCandidates
 
-    float local_val[kSamplerFastCandidates];
-    int local_idx[kSamplerFastCandidates];
+    float* local_val = merge_val + tid * kSamplerFastCandidates;
+    int* local_idx   = merge_idx + tid * kSamplerFastCandidates;
 #pragma unroll
     for (int j = 0; j < kSamplerFastCandidates; ++j) {
         local_val[j] = -CUDART_INF_F;
@@ -411,12 +411,6 @@ __device__ inline void sampling_build_truncated_block_fast(
         const float x = sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg, overlay,
                                                 overlay_len);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
-    }
-
-    for (int j = 0; j < kSamplerFastCandidates; ++j) {
-        const int off  = tid * kSamplerFastCandidates + j;
-        merge_val[off] = local_val[j];
-        merge_idx[off] = local_idx[j];
     }
     __syncthreads();
 

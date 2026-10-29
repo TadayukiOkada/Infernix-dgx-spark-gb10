@@ -27,7 +27,7 @@ using namespace infernix::bench;
 namespace {
 
 constexpr std::int32_t kVocab       = 248320;
-constexpr std::size_t kL2FlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kL2FlushBytes{};
 
 enum class Profile {
     Q6D5120,

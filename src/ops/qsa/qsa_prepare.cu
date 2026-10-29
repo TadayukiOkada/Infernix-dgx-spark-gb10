@@ -488,14 +488,22 @@ void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, T
     require(qsa_prepare_supports(storage),
             "the KV storage has no fused prepare (the vector-quantized storages append in qsa_attention)");
     const int heads = geometry.heads, kv_heads = geometry.kv_heads, index_heads = geometry.index_heads;
-    const int columns = inputs.q.ne[2];
+    const int columns = inputs.k.ne[2];
     require(batch.batch > 0 && batch.width > 0 && columns == batch.batch * batch.width, "T must be batch * width");
 
-    // Inputs and norms.
-    require(dense(inputs.q, DType::BF16, {kHeadDim, heads, columns}) &&
+    // Outputs: both present (in place or disjoint from every input) or both empty (K/V only).
+    const bool queries = q_out.data != nullptr;
+    require(queries == (index_q_out.data != nullptr), "q_out and index_q_out are both present or both empty");
+
+    // Inputs and norms (a K/V-only call may omit q and index_q when they are not projected).
+    require(((queries || inputs.q.data != nullptr)
+                 ? dense(inputs.q, DType::BF16, {kHeadDim, heads, columns})
+                 : true) &&
                 dense(inputs.k, DType::BF16, {kHeadDim, kv_heads, columns}) &&
                 dense(inputs.v, DType::BF16, {kHeadDim, kv_heads, columns}) &&
-                dense(inputs.index_q, DType::BF16, {kIndexDim, index_heads, columns}) &&
+                ((queries || inputs.index_q.data != nullptr)
+                     ? dense(inputs.index_q, DType::BF16, {kIndexDim, index_heads, columns})
+                     : true) &&
                 dense(inputs.index_k, DType::BF16, {kIndexDim, columns}),
             "inputs are BF16 q [256, heads, T], k/v [256, kv_heads, T], index_q [128, index_heads, T], "
             "index_k [128, T]");
@@ -504,10 +512,6 @@ void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, T
                 dense(norms.index_query, DType::BF16, {kIndexDim}) &&
                 dense(norms.index_key, DType::BF16, {kIndexDim}),
             "norm weights are BF16 [256] (query, key) and [128] (index query, index key)");
-
-    // Outputs: both present (in place or disjoint from every input) or both empty (K/V only).
-    const bool queries = q_out.data != nullptr;
-    require(queries == (index_q_out.data != nullptr), "q_out and index_q_out are both present or both empty");
     if (queries) {
         require(dense(q_out, DType::BF16, {kHeadDim, heads, columns}) &&
                     dense(index_q_out, DType::BF16, {kIndexDim, index_heads, columns}),

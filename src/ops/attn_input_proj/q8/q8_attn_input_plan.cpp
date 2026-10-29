@@ -19,32 +19,37 @@ struct RouteSpec {
     Q8AttnInputScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 4> kTargetRoutes{{
+// Retuned on GB10 (sm_121a, 48 SMs) via candidate sweeps + high-repeat edge sweeps. The HEAD
+// tables inherited 5090 tuning: MmaR32C128 never wins on this device, and the narrow DFlash2 lanes
+// (r16c64k128 / r32c32k128 / r32c64) are dominated by r32c64k128 (49..64) then r64c128 (65+).
+constexpr std::array<RouteSpec, 3> kTargetRoutes{{
     {1, 1, Q8AttnInputScheduleId::DecodeR8Direct},
     {2, 64, Q8AttnInputScheduleId::SplitKMmaDirect},
-    {65, 128, Q8AttnInputScheduleId::MmaR32C128},
-    {129, kAnyCols, Q8AttnInputScheduleId::MmaR64C128},
+    {65, kAnyCols, Q8AttnInputScheduleId::MmaR64C128},
 }};
 
-constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
+// Companion alternates between MmaR64C128 and MmaR128C80 across token bands (tile-wave
+// quantization on 48 SMs); both reproduce across independent sweeps with large gaps, so the
+// alternation is captured rather than averaged away. SplitK now ends at 48 (it loses from 56+).
+constexpr std::array<RouteSpec, 12> kCompanionRoutes{{
     {1, 1, Q8AttnInputScheduleId::DecodeR8Direct},
-    {2, 96, Q8AttnInputScheduleId::SplitKMmaDirect},
-    {97, 192, Q8AttnInputScheduleId::MmaR32C64},
-    {193, 288, Q8AttnInputScheduleId::MmaR64C96},
-    {289, 320, Q8AttnInputScheduleId::MmaR64C64},
+    {2, 48, Q8AttnInputScheduleId::SplitKMmaDirect},
+    {49, 132, Q8AttnInputScheduleId::MmaR64C128},
+    {133, 164, Q8AttnInputScheduleId::MmaR128C80},
+    {165, 192, Q8AttnInputScheduleId::MmaR64C96},
+    {193, 256, Q8AttnInputScheduleId::MmaR64C128},
+    {257, 320, Q8AttnInputScheduleId::MmaR128C80},
     {321, 384, Q8AttnInputScheduleId::MmaR64C128},
-    {385, 448, Q8AttnInputScheduleId::MmaR128C64},
-    {449, 560, Q8AttnInputScheduleId::MmaR128C80},
+    {385, 480, Q8AttnInputScheduleId::MmaR128C80},
+    {481, 512, Q8AttnInputScheduleId::MmaR64C128},
+    {513, 560, Q8AttnInputScheduleId::MmaR128C80},
     {561, kAnyCols, Q8AttnInputScheduleId::MmaR64C128},
 }};
 
-constexpr std::array<RouteSpec, 6> kDFlash2Routes{{
+constexpr std::array<RouteSpec, 3> kDFlash2Routes{{
     {1, 48, Q8AttnInputScheduleId::DFlash2SmallT},
-    {49, 63, Q8AttnInputScheduleId::DFlash2MmaR16C64K128},
-    {64, 96, Q8AttnInputScheduleId::DFlash2MmaR32C32K128},
-    {97, 128, Q8AttnInputScheduleId::DFlash2MmaR32C64K128},
-    {129, 192, Q8AttnInputScheduleId::DFlash2MmaR32C64},
-    {193, kAnyCols, Q8AttnInputScheduleId::DFlash2MmaR64C128},
+    {49, 64, Q8AttnInputScheduleId::DFlash2MmaR32C64K128},
+    {65, kAnyCols, Q8AttnInputScheduleId::DFlash2MmaR64C128},
 }};
 
 template <std::size_t N>
@@ -164,6 +169,136 @@ Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem,
     if (is_dflash2_shape(problem)) { return resolve_from(kDFlash2Routes); }
     if (is_companion_shape(problem)) { return resolve_from(kCompanionRoutes); }
     return resolve_from(kTargetRoutes);
+}
+
+namespace {
+
+template <std::size_t N>
+constexpr bool routes_contain(const std::array<RouteSpec, N>& routes,
+                              Q8AttnInputScheduleId schedule) noexcept {
+    for (const RouteSpec& route : routes) {
+        if (route.schedule == schedule) { return true; }
+    }
+    return false;
+}
+
+} // namespace
+
+bool q8_attn_input_candidate_is_legal(Q8AttnInputScheduleId schedule,
+                                      const Q8AttnInputProblem& problem) noexcept {
+    if (!supported_shape(problem) || problem.cols < 1) { return false; }
+    const std::int32_t cols = problem.cols;
+    // Each lane's kernel enforces its own column window; mirror it so the sweep never throws.
+    switch (schedule) {
+    case Q8AttnInputScheduleId::DecodeR8Direct:
+        return cols == 1;
+    case Q8AttnInputScheduleId::SplitKMmaDirect:
+        if (is_dflash2_shape(problem)) { return false; }
+        return cols >= 2 && cols <= (is_companion_shape(problem) ? 96 : 64);
+    case Q8AttnInputScheduleId::DFlash2SmallT:
+        return is_dflash2_shape(problem) && cols <= 48;
+    default:
+        break;
+    }
+    if (is_dflash2_shape(problem)) { return routes_contain(kDFlash2Routes, schedule); }
+    if (is_companion_shape(problem)) { return routes_contain(kCompanionRoutes, schedule); }
+    // Target four-output shape: the routed schedules plus the SimtR8C4 lane, which the four-output
+    // execute path supports but HEAD never routes to.
+    return routes_contain(kTargetRoutes, schedule) || schedule == Q8AttnInputScheduleId::SimtR8C4;
+}
+
+void q8_attn_input_execute_candidate(Q8AttnInputScheduleId schedule, const Tensor& x,
+                                     const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                     Tensor& v, cudaStream_t stream) {
+    const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
+                                     x.ne[1]};
+    if (!q8_attn_input_candidate_is_legal(schedule, problem)) {
+        throw std::invalid_argument("Q8 attention input: candidate schedule not legal for shape");
+    }
+    switch (schedule) {
+    case Q8AttnInputScheduleId::DecodeR8Direct:
+        q8_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::SplitKMmaDirect:
+        q8_attn_input_splitk_mma_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::SimtR8C4:
+        q8_attn_input_simt_r8_c4_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR32C128:
+        q8_attn_input_mma_r32_c128_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR64C128:
+        q8_attn_input_mma_r64_c128_launch(x, weight, q, gate, k, v, stream);
+        return;
+    default:
+        throw std::logic_error("Q8 attention input: three-output schedule in four-output candidate");
+    }
+}
+
+void q8_attn_input_execute_candidate(Q8AttnInputScheduleId schedule, const Tensor& x,
+                                     const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                                     cudaStream_t stream) {
+    const Q8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
+                                     x.ne[1]};
+    if (!q8_attn_input_candidate_is_legal(schedule, problem)) {
+        throw std::invalid_argument("Q8 attention input: candidate schedule not legal for shape");
+    }
+    if (is_dflash2_shape(problem)) {
+        switch (schedule) {
+        case Q8AttnInputScheduleId::DFlash2SmallT:
+            q8_dflash2_attn_input_small_t_launch(x, weight, q, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::DFlash2MmaR16C64K128:
+            q8_dflash2_attn_input_mma_r16_c64_k128_launch(x, weight, q, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::DFlash2MmaR32C32K128:
+            q8_dflash2_attn_input_mma_r32_c32_k128_launch(x, weight, q, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::DFlash2MmaR32C64K128:
+            q8_dflash2_attn_input_mma_r32_c64_k128_launch(x, weight, q, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::DFlash2MmaR32C64:
+            q8_dflash2_attn_input_mma_r32_c64_launch(x, weight, q, k, v, stream);
+            return;
+        case Q8AttnInputScheduleId::DFlash2MmaR64C128:
+            q8_dflash2_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
+            return;
+        default:
+            throw std::logic_error("Q8 attention input: non-DFlash2 schedule in DFlash2 candidate");
+        }
+    }
+    switch (schedule) {
+    case Q8AttnInputScheduleId::DecodeR8Direct:
+        q8_attn_input_decode_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::SplitKMmaDirect:
+        q8_attn_input_splitk_mma_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR32C128:
+        q8_attn_input_mma_r32_c128_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR32C64:
+        q8_companion_attn_input_mma_r32_c64_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR64C64:
+        q8_companion_attn_input_mma_r64_c64_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR64C96:
+        q8_companion_attn_input_mma_r64_c96_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR128C64:
+        q8_companion_attn_input_mma_r128_c64_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR128C80:
+        q8_companion_attn_input_mma_r128_c80_launch(x, weight, q, k, v, stream);
+        return;
+    case Q8AttnInputScheduleId::MmaR64C128:
+        q8_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
+        return;
+    default:
+        throw std::logic_error("Q8 attention input: schedule not legal for companion candidate");
+    }
 }
 
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/pdl.cuh"
+#include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 
@@ -115,6 +116,112 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quan
         store_vec(codes + term * code_plane + code_offset,
                   make_uint2(terms[term].codes_lo, terms[term].codes_hi));
         scales[term * scale_plane + scale_offset] = terms[term].scale;
+    }
+}
+
+// Per-token row-scaled A4 residual quantizer (1 CTA per token): reduces amax across the token's K
+// elements, sets row_scales[token] = amax / (6 * 448) so every 16-element group's first-term E4M3
+// scale uses the full [2^-9, 448] dynamic range without clipping, and writes the `Terms` planes.
+template <class Geometry, int Threads, int Terms,
+          Nvfp4ScaleLayout Layout = Nvfp4ScaleLayout::RowMajor>
+__global__ __launch_bounds__(
+    Threads, ((Geometry::kInputRows / 16 + Threads - 1) / Threads <= 2) ? (1024 / Threads) : 2) void
+nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ input,
+                                             std::uint8_t* __restrict__ codes,
+                                             std::uint8_t* __restrict__ scales,
+                                             float* __restrict__ row_scales,
+                                             std::int32_t tokens, std::int64_t code_plane,
+                                             std::int64_t scale_plane) {
+    static_assert(Threads % 32 == 0 && Threads <= 512);
+    constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
+    constexpr int kWarps        = Threads / 32;
+    constexpr bool kExactGroups = (kGroupsPerRow % Threads) == 0;
+    __shared__ float warp_maxima[kWarps];
+
+    pdl::enter();
+    const int token = static_cast<int>(blockIdx.x);
+    const int tid   = static_cast<int>(threadIdx.x);
+    if (token >= tokens) {
+        if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
+            for (int group = tid; group < kGroupsPerRow; group += Threads) {
+                const std::int64_t scale_offset =
+                    nvfp4_tiled_scale_offset<Geometry, Layout>(token, group);
+#pragma unroll
+                for (int term = 0; term < Terms; ++term) {
+                    scales[term * scale_plane + scale_offset] = 0;
+                }
+            }
+        }
+        return;
+    }
+
+    const __nv_bfloat16* row_in = input + static_cast<std::int64_t>(token) * Geometry::kInputRows;
+    constexpr int kMaxGroups    = (kGroupsPerRow + Threads - 1) / Threads;
+    uint4 cached_p0[kMaxGroups <= 2 ? kMaxGroups : 1];
+    uint4 cached_p1[kMaxGroups <= 2 ? kMaxGroups : 1];
+    float amax = 0.0F;
+#pragma unroll
+    for (int iter = 0; iter < kMaxGroups; ++iter) {
+        const int group = tid + iter * Threads;
+        if (kExactGroups || group < kGroupsPerRow) {
+            const uint4 p0 = load_vec<uint4>(row_in + group * 16);
+            const uint4 p1 = load_vec<uint4>(row_in + group * 16 + 8);
+            if constexpr (kMaxGroups <= 2) {
+                cached_p0[iter] = p0;
+                cached_p1[iter] = p1;
+            }
+            const std::uint32_t words[8]{p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+#pragma unroll
+            for (int pair = 0; pair < 8; ++pair) {
+                const float2 v = bf16x2_bits_to_float2(words[pair]);
+                const float a  = fabsf(v.x);
+                const float b  = fabsf(v.y);
+                amax           = (a > amax || a != a) ? a : amax;
+                amax           = (b > amax || b != b) ? b : amax;
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
+        amax              = (other > amax || other != other) ? other : amax;
+    }
+    if ((tid & 31) == 0) { warp_maxima[tid >> 5] = amax; }
+    __syncthreads();
+    float all = 0.0F;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+        const float m = warp_maxima[w];
+        all           = (m > all || m != m) ? m : all;
+    }
+    const float rs = !isfinite(all) ? __int_as_float(0x7FC00000)
+                                    : (all > 0.0F ? (all * (1.0F / (6.0F * 448.0F))) : 0.0F);
+    if (tid == 0) { row_scales[token] = rs; }
+    const float divisor = (rs > 0.0F && isfinite(rs)) ? (1.0F / rs) : 0.0F;
+#pragma unroll
+    for (int iter = 0; iter < kMaxGroups; ++iter) {
+        const int group = tid + iter * Threads;
+        if (kExactGroups || group < kGroupsPerRow) {
+            Nvfp4QuantizedK16 terms[Terms];
+            if constexpr (kMaxGroups <= 2) {
+                quantize_nvfp4_terms_k16_packed<Terms, true>(cached_p0[iter], cached_p1[iter],
+                                                             divisor, terms);
+            } else {
+                quantize_nvfp4_terms_k16<Terms, true>(row_in + group * 16, divisor, terms);
+            }
+            const std::int64_t code_offset =
+                static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
+            std::int64_t scale_offset = static_cast<std::int64_t>(token) * kGroupsPerRow + group;
+            if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
+                scale_offset = nvfp4_tiled_scale_offset<Geometry, Layout>(token, group);
+            }
+#pragma unroll
+            for (int term = 0; term < Terms; ++term) {
+                store_vec(codes + term * code_plane + code_offset,
+                          make_uint2(terms[term].codes_lo, terms[term].codes_hi));
+                scales[term * scale_plane + scale_offset] = terms[term].scale;
+            }
+        }
     }
 }
 

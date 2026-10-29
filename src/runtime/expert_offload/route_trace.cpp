@@ -28,11 +28,7 @@ std::filesystem::path& seam_path() {
 
 RouteTrace::RouteTrace(const std::filesystem::path& path, const RouteTraceSetup& setup)
     : layers_(setup.layers), top_k_(setup.top_k), max_columns_(setup.max_columns) {
-#ifdef _WIN32
-    file_ = _wfopen(path.c_str(), L"wb");
-#else
     file_ = std::fopen(path.c_str(), "wb");
-#endif
     if (file_ == nullptr) { throw std::runtime_error("route trace: cannot create " + path.string()); }
     std::setvbuf(file_, nullptr, _IOFBF, kBufferBytes);
     std::array<std::uint32_t, 16> header{};

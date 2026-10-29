@@ -16,15 +16,15 @@
 
 namespace infernix::ops::detail {
 
-// Whether an NVFP4 prompt-route launch runs the fast kernel: over 768 visible keys. Forced at
-// every visible count (3 passes, H24 and H16 geometries, 256-3584 columns over 0-8192 keys) the
-// fast kernel is equal to the tiled kernel at 512-768 visible keys, up to 1.6x faster from 1024
-// on and up to 3.4x at 8192, and up to 1.6x slower for 256-512-column launches over an empty
-// context (the tiled kernel's launch is cheaper there). Picking the fast kernel above 768 keys is
-// within 0.03 % of the per-shape best in both geometries; the 2048 threshold of 2026-09, from a
-// kernel without the one-decode V arena, costs 2.3-2.7 % overall and 56-64 % in its worst cell.
-inline bool nvfp4_fast_prompt_applies(std::uint32_t max_visible_keys) {
-    return max_visible_keys > 768;
+// Whether an NVFP4 prompt-route launch runs the fast kernel: over 768 visible keys once at least
+// 512 keys precede the chunk (or visible keys exceed 3072). On GB10 (48 SMs), chunks up to 2048
+// columns over < 512 prior keys run 1 split over the causal triangle, where the 64-row ping-pong
+// tiled kernel avoids 128-row causal-triangle waste and global FP32 split-partial merge traffic
+// (7-28 % faster at W = 768-2048, ctx = 0-256).
+inline bool nvfp4_fast_prompt_applies(std::uint32_t max_visible_keys, int width = 0) {
+    return max_visible_keys > 768 &&
+           (max_visible_keys >= static_cast<std::uint32_t>(width) + 512U ||
+            max_visible_keys > 3072U);
 }
 
 void nvfp4_kv_fast_prompt_attention(const CausalAttentionOperands&, Nvfp4KvReadView,

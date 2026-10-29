@@ -9,10 +9,13 @@ using S0 = Bf16ScheduleInstance<
     Bf16A16GemvSchedule<2, 1, 1, 16, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
                         Bf16PhaseOrder::Sequential, 1, 1, 4, 2>,
     10240>;
-using S1 = Bf16ScheduleInstance<
+template <int BlockTokens>
+using Simt = Bf16ScheduleInstance<
     Bf16A16SimtSchedule<8, 2, 1, 8, 4, 2, Bf16SimtActivationAccess::DirectStream,
-                        Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 2>,
+                        Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2,
+                        BlockTokens>,
     10240>;
+using S1 = Simt<2>;
 using S2 =
     Bf16RowTailSchedule<Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 8, 4, 128, 3>, 10240>>;
 using S3 =
@@ -37,18 +40,21 @@ Bf16Launch ninfer_route(std::int32_t tokens) {
 // Qwen3.8-Flash-Next: the hyper-connection mixers' down and inject projections (recipe A), T = a call's columns.
 // T <= 8 runs one column-invariant route at every width, so a column's bits do not depend on how
 // many columns share the call (C = 1 and C = 2 give the same greedy text). Wider calls take the
-// fastest measured route per interval (bench/ops/bf16_flash_next_sweep.cu, RTX 5090, 2 % tolerance,
-// seams at the last measured T).
+// fastest measured route per interval (bench/ops/bf16_flash_next_sweep.cu, GB10 sm_121a,
+// warmup 8 / repeat 40, 2 % tolerance, seams at the last measured T).
 Bf16Launch select_bf16_n324_k10240(std::int32_t tokens) {
     // NInfer's T = 1 route accumulates a column like its T = 8 route (checked bit for bit): 6.75 us vs 7.26.
     if (tokens == 1) return ninfer_route(1);
-    if (tokens <= 8) return ninfer_route(8); // decode 58.4 us vs skinny 139.6 us over T = 1..8
-    if (tokens <= 512) return ninfer_route(tokens);
-    if (tokens <= 768) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 32, 32, 16, 3>>; // tail_r64t32s3
-    if (tokens <= 1024) return ninfer_route(tokens);
-    if (tokens <= 1536) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>>; // tail_r64t64s3
-    if (tokens <= 3072) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2>>; // tail_r64t128s2
-    if (tokens <= 4096) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>>; // tail_r64t64s3
-    return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>; // tail_r64t128s2_rows
+    if (tokens <= 4) return launch_bf16_simt<Simt<2>>;
+    if (tokens <= 8) return launch_bf16_simt<Simt<4>>;
+    if (tokens <= 64) return ninfer_route(tokens); // 9..64 ninfer fastest on GB10
+    if (tokens <= 128) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 32, 32, 16, 3>>; // tail_r64t32s3 (1.10-1.52x at 96..128)
+    if (tokens <= 384) return ninfer_route(tokens); // 192..384 ninfer fastest on GB10
+    if (tokens <= 512) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>>; // tail_r64t64s3 (1.07x at 512)
+    if (tokens <= 1024) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<128, 64, 32, 32, 4, 1, Bf16MmaRaster::RowFast>>; // tail_r128t64s4_rows (1.75-1.79x at 768..1024)
+    if (tokens <= 1536) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<128, 128, 64, 32, 3, 1, Bf16MmaRaster::RowFast>>; // tail_r128t128s3_w64x32_rows (1.71x at 1536)
+    if (tokens <= 3072) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<128, 128, 32, 64, 3, 1, Bf16MmaRaster::RowFast>>; // tail_r128t128s3_w32x64_rows (1.04-1.63x at 2048..3072)
+    if (tokens <= 4096) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<128, 128, 64, 32, 3, 1, Bf16MmaRaster::RowFast>>; // tail_r128t128s3_w64x32_rows (3.38x at 4096)
+    return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<128, 128, 32, 64, 3, 1, Bf16MmaRaster::RowFast>>; // tail_r128t128s3_w32x64_rows (1.25x at 8192)
 }
 } // namespace infernix::ops::detail

@@ -20,6 +20,7 @@ enum class TransferDirection : std::uint8_t {
 
 struct ArtifactProfile {
     std::filesystem::path path;
+    bool has_vision = false;
 };
 
 struct MeasurementOptions {

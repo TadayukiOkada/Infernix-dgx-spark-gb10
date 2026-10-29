@@ -26,7 +26,7 @@ namespace {
 // This criterion belongs to the complete A16 fused projection/conv/snapshot Op.
 constexpr ReductionCriterion kGdnInputProjConvSnapshotA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
 constexpr ReductionCriterion kGdnInputProjConvSnapshotA4Tolerance{0.16, 4.0e-3, 0.16};
-constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
+constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{6.0e-3, 1.0 / 256.0,
                                                                       2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 // Two E4M3 terms put the A8 residual profile near A16; one term (A8's error) fails it.

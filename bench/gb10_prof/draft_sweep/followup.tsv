@@ -1,0 +1,11 @@
+reason W=0.15 trial1	WC=0.15	dec=39.0	acc_len=3.55	by_pos=59,39,28,22,15	fallback=28
+reason W=0.15 trial2	WC=0.15	dec=38.9	acc_len=3.55	by_pos=59,39,28,22,15	fallback=28
+reason W=0.15 trial3	WC=0.15	dec=39.2	acc_len=3.55	by_pos=59,39,28,22,15	fallback=28
+reason W=0.20 trial1	WC=0.20	dec=38.7	acc_len=3.44	by_pos=60,40,27,22,12	fallback=28
+reason W=0.20 trial2	WC=0.20	dec=39.6	acc_len=3.44	by_pos=60,40,27,22,12	fallback=28
+reason W=0.20 trial3	WC=0.20	dec=38.7	acc_len=3.44	by_pos=60,40,27,22,12	fallback=28
+reason W=0.25 trial1	WC=0.25	dec=38.9	acc_len=3.24	by_pos=65,43,28,16,5	fallback=28
+reason W=0.25 trial2	WC=0.25	dec=38.5	acc_len=3.24	by_pos=65,43,28,16,5	fallback=28
+reason W=0.25 trial3	WC=0.25	dec=39.2	acc_len=3.24	by_pos=65,43,28,16,5	fallback=28
+reason mtp-only	WC=0.25	dec=38.3	acc_len=3.20	by_pos=65,45,29,17	fallback=28
+reason +ngram dm15 mm8	WC=0.25	dec=37.1	acc_len=3.16	by_pos=62,39,30,12,2,2,2,2,1,1,1,1,1,1,1	fallback=24

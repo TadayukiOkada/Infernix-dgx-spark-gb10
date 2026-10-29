@@ -42,6 +42,18 @@ __device__ __forceinline__ void chunk_values(const std::uint8_t* row, int index,
     }
 }
 
+// One 16-byte store for the eight BF16 words of a chunk. The row start is 16-byte aligned
+// whenever the row stride in bytes is a multiple of 16 (hidden or width a multiple of 8), so
+// the eight separately addressed 2-byte stores SASS produced before collapse into one STG.E.128.
+__device__ __forceinline__ void store_chunk(std::uint16_t* out, const std::uint16_t (&w)[8]) {
+    uint4 pack;
+    pack.x = static_cast<std::uint32_t>(w[0]) | (static_cast<std::uint32_t>(w[1]) << 16);
+    pack.y = static_cast<std::uint32_t>(w[2]) | (static_cast<std::uint32_t>(w[3]) << 16);
+    pack.z = static_cast<std::uint32_t>(w[4]) | (static_cast<std::uint32_t>(w[5]) << 16);
+    pack.w = static_cast<std::uint32_t>(w[6]) | (static_cast<std::uint32_t>(w[7]) << 16);
+    *reinterpret_cast<uint4*>(out) = pack;
+}
+
 template <QType F>
 __global__ void __launch_bounds__(kThreads)
     embedding_kernel(const std::int32_t* __restrict__ ids, const std::uint8_t* __restrict__ table, int vocab, int hidden,
@@ -50,30 +62,43 @@ __global__ void __launch_bounds__(kThreads)
     const int id = ids[t];
     if (id < 0 || id >= vocab) { __trap(); }
     const std::uint8_t* row = table + static_cast<std::size_t>(id) * row_bytes;
+    std::uint16_t* dst      = out + static_cast<std::size_t>(t) * hidden;
     for (int i = threadIdx.x; i < hidden / 8; i += blockDim.x) {
         float v[8];
         chunk_values<F>(row, i, v);
+        std::uint16_t w[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            out[static_cast<std::size_t>(t) * hidden + 8 * i + j] = canon::f32_to_bf16_rn(v[j]);
-        }
+        for (int j = 0; j < 8; ++j) { w[j] = canon::f32_to_bf16_rn(v[j]); }
+        store_chunk(dst + 8 * i, w);
     }
 }
 
 __global__ void __launch_bounds__(kThreads)
     ple_iq4_nl_kernel(const std::uint8_t* __restrict__ rows, int row_bytes, int heads, int width,
                       std::uint16_t* __restrict__ out) {
-    const int t = blockIdx.x;
-    const int per_head = width / 8;
-    for (int i = threadIdx.x; i < heads * per_head; i += blockDim.x) {
-        const int h = i / per_head, chunk = i % per_head;
+    const int t         = blockIdx.x;
+    const int per_head  = width / 8;
+    const int total     = heads * per_head;
+    // Advance (h, chunk) across the grid-stride loop without a per-iteration division: one
+    // quotient/remainder of the (loop-invariant) stride, then a single conditional carry.
+    const int stride_h    = blockDim.x / per_head;
+    const int stride_edge = blockDim.x % per_head;
+    int h                 = threadIdx.x / per_head;
+    int chunk             = threadIdx.x % per_head;
+    std::uint16_t* dst    = out + static_cast<std::size_t>(t) * heads * width;
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
         const std::uint8_t* row = rows + (static_cast<std::size_t>(t) * heads + h) * row_bytes;
         float v[8];
         chunk_values<QType::GGML_IQ4_NL>(row, chunk, v);
+        std::uint16_t w[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            out[static_cast<std::size_t>(t) * heads * width + static_cast<std::size_t>(h) * width + 8 * chunk + j] =
-                canon::f32_to_bf16_rn(v[j]);
+        for (int j = 0; j < 8; ++j) { w[j] = canon::f32_to_bf16_rn(v[j]); }
+        store_chunk(dst + static_cast<std::size_t>(h) * width + 8 * chunk, w);
+        h += stride_h;
+        chunk += stride_edge;
+        if (chunk >= per_head) {
+            chunk -= per_head;
+            ++h;
         }
     }
 }

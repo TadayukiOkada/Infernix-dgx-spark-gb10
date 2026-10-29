@@ -181,6 +181,10 @@ int run_tests() {
     failures += check(mtp_ngram.speculative.draft_tokens == 5 &&
                           mtp_ngram.speculative.ngram_draft_tokens == 1,
                       "CLI narrow ngram/wide MTP pair changed");
+    const auto mtp_deep = parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                 "--draft-tokens", "7"});
+    failures += check(mtp_deep.speculative.draft_tokens == 7,
+                      "CLI must admit MTP depths up to 7 (models bound themselves below)");
     failures += check(rejects([] {
                           (void)parse({"infernix-cli", "model.ninfer", "--prompt", "x", "--spec",
                                        "mtp", "--draft-tokens", "8", "--ngram-draft-tokens", "15"});

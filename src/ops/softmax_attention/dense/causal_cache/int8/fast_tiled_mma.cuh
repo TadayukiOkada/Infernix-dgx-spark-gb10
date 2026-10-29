@@ -51,6 +51,7 @@
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/common/causal_geometry.h"
 #include "ops/softmax_attention/dense/causal_cache/fast_prompt_common.cuh"
+#include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 
 #include <cstdint>
 
@@ -76,56 +77,9 @@ struct CausalPromptI8FastShape {
     static constexpr int SmemBytes = QBytes + 2 * kCausalPromptI8FastStageBytes;
 };
 
-// A 64-key FP16 partial is bounded by 64 * 127 * max_scale (every probability is at most one).
-// Keeping max_scale at or below 8 leaves that bound, with FP16 rounding slack, under 65504.
-inline constexpr float kCausalPromptI8FastF16PartialScaleLimit = 8.0f;
-
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
 static_assert(CausalPromptI8FastShape<8>::SmemBytes == 100352);
-
-__device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
-                                                                  unsigned a0, unsigned a1,
-                                                                  unsigned a2, unsigned a3,
-                                                                  unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c0), "+r"(c1)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ void causal_prompt_i8_fast_mma_u8s8(int& c0, int& c1, int& c2, int& c3,
-                                                               unsigned a0, unsigned a1,
-                                                               unsigned a2, unsigned a3,
-                                                               unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-// Exact for |value| < 2^22: the integer lands in the mantissa of 1.5 * 2^23.
-__device__ __forceinline__ float causal_prompt_i8_fast_small_int_to_float(int value) {
-    return __int_as_float(value + 0x4B400000) - 12582912.0f;
-}
-
-// One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes
-// {V[k][d], V[k][d+1], V[k+1][d], V[k+1][d+1]}. Returns the FP16 B-fragment halves
-// {V[k][d], V[k+1][d]} and {V[k][d+1], V[k+1][d+1]}, each code widened exactly and multiplied
-// once by its key's represented group scale.
-__device__ __forceinline__ void causal_prompt_i8_fast_decode_v_pair(unsigned codes, unsigned scales,
-                                                                    unsigned& even, unsigned& odd) {
-    // code ^ 0x80 is code + 128; 0x6400 | byte is the FP16 value 1024 + byte.
-    const unsigned biased = codes ^ 0x80808080u;
-    unsigned e            = __byte_perm(biased, 0x64646464u, 0x4240);
-    unsigned o            = __byte_perm(biased, 0x64646464u, 0x4341);
-    const __half2 offset  = __float2half2_rn(1152.0f);
-    const __half2 s2      = load_vec<__half2>(&scales);
-    const __half2 ve      = __hmul2(__hsub2(load_vec<__half2>(&e), offset), s2);
-    const __half2 vo      = __hmul2(__hsub2(load_vec<__half2>(&o), offset), s2);
-    even                  = load_vec<unsigned>(&ve);
-    odd                   = load_vec<unsigned>(&vo);
-}
 
 template <typename Geometry, typename Metadata, int Warps, bool Pv8, bool Split>
 __global__ __launch_bounds__(
@@ -562,8 +516,10 @@ __global__ __launch_bounds__(
                 reinterpret_cast<const std::int8_t*>(stage_base(kb & 1)) + kCausalPromptI8FastTileBytes;
             const __half* vs_s =
                 reinterpret_cast<const __half*>(v_s + kCausalPromptI8FastTileBytes) + Bc * Groups;
-            const __half2 mul   = __float2half2_rn(ldexpf(1.0f, -tile_shift));
-            const float unscale = ldexpf(1.0f, tile_shift);
+            const __half2 mul    = __float2half2_rn(ldexpf(1.0f, -tile_shift));
+            const float unscale  = ldexpf(1.0f, tile_shift);
+            const float a_scale0 = tile_shift != 0 ? ldexpf(tile_alpha0, -tile_shift) : tile_alpha0;
+            const float a_scale1 = tile_shift != 0 ? ldexpf(tile_alpha1, -tile_shift) : tile_alpha1;
 #pragma unroll
             for (int grp = 0; grp < Groups; ++grp) {
                 // Group scales of the keys each lane supplies: (2t, 2t+1) and (8+2t, 9+2t) per k-step.
@@ -585,11 +541,16 @@ __global__ __launch_bounds__(
 #pragma unroll
                 for (int pass = 0; pass < GroupDBlocks / PassDBlocks; ++pass) {
                     const int db0 = grp * GroupDBlocks + pass * PassDBlocks;
-                    unsigned h[PassDBlocks][2][2];
 #pragma unroll
                     for (int b = 0; b < PassDBlocks; ++b) {
 #pragma unroll
-                        for (int p = 0; p < 2; ++p) { h[b][p][0] = h[b][p][1] = 0u; }
+                        for (int p = 0; p < 2; ++p) {
+                            float (&a)[4] = acc[db0 + b][p];
+                            a[0] *= a_scale0;
+                            a[1] *= a_scale0;
+                            a[2] *= a_scale1;
+                            a[3] *= a_scale1;
+                        }
                     }
 #pragma unroll
                     for (int j = 0; j < PVKs; ++j) {
@@ -609,32 +570,26 @@ __global__ __launch_bounds__(
                                                                     odd_lo);
                                 causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc[j][1], even_hi,
                                                                     odd_hi);
-                                unsigned (&he)[2] = h[2 * q2 + b][0];
-                                unsigned (&ho)[2] = h[2 * q2 + b][1];
-                                causal_prompt_i8_fast_mma_f16_acc(he[0], he[1], pa[j][0], pa[j][1],
-                                                                  pa[j][2], pa[j][3], even_lo, even_hi);
-                                causal_prompt_i8_fast_mma_f16_acc(ho[0], ho[1], pa[j][0], pa[j][1],
-                                                                  pa[j][2], pa[j][3], odd_lo, odd_hi);
+                                float (&ae)[4] = acc[db + b][0];
+                                float (&ao)[4] = acc[db + b][1];
+                                mma_f16(ae[0], ae[1], ae[2], ae[3], pa[j][0], pa[j][1], pa[j][2],
+                                        pa[j][3], even_lo, even_hi);
+                                mma_f16(ao[0], ao[1], ao[2], ao[3], pa[j][0], pa[j][1], pa[j][2],
+                                        pa[j][3], odd_lo, odd_hi);
                             }
                         }
                     }
+                    if (tile_shift != 0) {
 #pragma unroll
-                    for (int b = 0; b < PassDBlocks; ++b) {
+                        for (int b = 0; b < PassDBlocks; ++b) {
 #pragma unroll
-                        for (int p = 0; p < 2; ++p) {
-                            float (&a)[4] = acc[db0 + b][p];
-                            float2 r0     = __half22float2(load_vec<__half2>(&h[b][p][0]));
-                            float2 r1     = __half22float2(load_vec<__half2>(&h[b][p][1]));
-                            if (tile_shift != 0) {
-                                r0.x *= unscale;
-                                r0.y *= unscale;
-                                r1.x *= unscale;
-                                r1.y *= unscale;
+                            for (int p = 0; p < 2; ++p) {
+                                float (&a)[4] = acc[db0 + b][p];
+                                a[0] *= unscale;
+                                a[1] *= unscale;
+                                a[2] *= unscale;
+                                a[3] *= unscale;
                             }
-                            a[0] = __fmaf_rn(a[0], tile_alpha0, r0.x);
-                            a[1] = __fmaf_rn(a[1], tile_alpha0, r0.y);
-                            a[2] = __fmaf_rn(a[2], tile_alpha1, r1.x);
-                            a[3] = __fmaf_rn(a[3], tile_alpha1, r1.y);
                         }
                     }
                 }

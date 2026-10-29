@@ -19,6 +19,8 @@ using K6144Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>;
 using K6144MidBulk =
     Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1>, 170, 4, 8>;
 using K6144Bulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+using K6144BulkG8 =
+    Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1, Fp8MmaRaster::Grouped, 8>, 170, 4, 8>;
 
 using K17408Tma32x64 = Fp8A8TmaMmaSchedule<32, 64, 128, 1, 2, 3, 2>;
 using K17408Small =
@@ -28,6 +30,8 @@ using K17408Wide =
     Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>, 170, 4, 8>;
 using K17408Bulk =
     Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+using K17408BulkG8 =
+    Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1, Fp8MmaRaster::Grouped, 8>, 170, 4, 8>;
 
 template <int K>
 void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
@@ -48,18 +52,22 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
         if (x.ne[1] <= 64) return launch.template operator()<K6144Tma32x64>();
         if (x.ne[1] <= 128) return launch.template operator()<Fp8A8T64R64K128>();
         if (x.ne[1] <= 192) return launch.template operator()<K6144Tma64x128>();
-        // The narrower row tile fills the GPU before the large-tile path reaches a full wave.
+        // The narrower row tile fills the 48-SM GPU (240 CTAs = 5 waves at T=768) before Bulk's
+        // 160-CTA split-K wave takes over at T >= 769; past T=3072, Grouped-8 raster avoids L2
+        // activation eviction on GB10's 24 MiB L2.
         if (x.ne[1] <= 768) return launch.template operator()<K6144MidBulk>();
-        launch.template operator()<K6144Bulk>();
+        if (x.ne[1] <= 3072) return launch.template operator()<K6144Bulk>();
+        launch.template operator()<K6144BulkG8>();
     } else {
         const int tokens = x.ne[1];
         if (tokens <= 64) return launch.template operator()<K17408Tma32x64>();
         if (tokens <= 128) return launch.template operator()<K17408Small>();
-        if (tokens <= 256) return launch.template operator()<K17408Mid>();
-        // Wider token tiles avoid an extra wave in the gaps between the bulk anchors.
-        if (tokens <= 384 || (tokens > 512 && tokens <= 768))
-            return launch.template operator()<K17408Wide>();
-        launch.template operator()<K17408Bulk>();
+        // On GB10 (48 SMs), 128x128 tiles give 120 CTAs at T=384 (2 waves + 24 split 2x) and
+        // 160 CTAs at T=512 (3 waves + 16 split 3x), avoiding Bulk's unsplit 80-CTA (48+32) tail.
+        if (tokens <= 512) return launch.template operator()<K17408Mid>();
+        if (tokens <= 768) return launch.template operator()<K17408Wide>();
+        if (tokens <= 2048) return launch.template operator()<K17408Bulk>();
+        launch.template operator()<K17408BulkG8>();
     }
 }
 } // namespace
@@ -69,8 +77,8 @@ std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t m
         if (max_tokens > 768) return K6144Bulk::kPartialBytes;
         return max_tokens > 192 ? K6144MidBulk::kPartialBytes : 0;
     }
-    if (max_tokens > 384) return K17408Bulk::kPartialBytes;
-    if (max_tokens > 256) return K17408Wide::kPartialBytes;
+    if (max_tokens > 768) return K17408Bulk::kPartialBytes;
+    if (max_tokens > 512) return K17408Wide::kPartialBytes;
     if (max_tokens > 128) return K17408Mid::kPartialBytes;
     return max_tokens > 64 ? K17408Small::kPartialBytes : 0;
 }

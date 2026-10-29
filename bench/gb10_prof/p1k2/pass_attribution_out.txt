@@ -1,0 +1,54 @@
+== full busy 2923.7 ms passes 198 trailing kernels after last head 26
+  main: 2344.5 ms (80.19 % of busy)
+     gate_up_kernel                        2784    509.2 ms  17.42%
+     q8_a16_stream_kernel                  4930    416.8 ms  14.26%
+     down_kernel                           2784    225.5 ms   7.71%
+     hc_down_partials_kernel               5626    207.5 ms   7.10%
+     q8_a16_simt_kernel                    2784    199.9 ms   6.84%
+     bf16_skinny_gemv_kernel                696    195.4 ms   6.68%
+     hc_up_collapse_kernel                 5626    164.0 ms   5.61%
+     projection_q8_kernel                    58    157.3 ms   5.38%
+     q8_linear_swiglu_stream_pair_kernel   2784     67.8 ms   2.32%
+     projection_kernel                     2784     45.8 ms   1.57%
+     recurrent_record_kernel               1512     28.5 ms   0.97%
+     route_kernel                          2784     16.3 ms   0.56%
+  draft: 577.8 ms (19.76 % of busy)
+     projection_q8_kernel                   140    371.5 ms  12.71%
+     gate_up_kernel                         140     41.4 ms   1.42%
+     recurrent_fold_kernel                   41     40.0 ms   1.37%
+     q8_a16_stream_kernel                   522     37.3 ms   1.28%
+     down_kernel                            140     20.2 ms   0.69%
+     q8_a16_simt_kernel                     312     14.9 ms   0.51%
+     hc_down_partials_kernel                477     14.1 ms   0.48%
+     hc_up_collapse_kernel                  477     10.1 ms   0.35%
+     top_logprobs_kernel                     83      7.3 ms   0.25%
+     q8_linear_swiglu_stream_pair_kernel    140      2.7 ms   0.09%
+     q8_a16_mma_kernel                       37      2.4 ms   0.08%
+     projection_kernel                      140      2.1 ms   0.07%
+== draft busy 2835.5 ms passes 193 trailing kernels after last head 26
+  main: 2530.5 ms (89.24 % of busy)
+     gate_up_kernel                        3072    540.7 ms  19.07%
+     q8_a16_stream_kernel                  5440    461.1 ms  16.26%
+     down_kernel                           3072    240.0 ms   8.46%
+     hc_down_partials_kernel               6208    221.2 ms   7.80%
+     q8_a16_simt_kernel                    3072    219.9 ms   7.75%
+     bf16_skinny_gemv_kernel                768    215.5 ms   7.60%
+     hc_up_collapse_kernel                 6208    172.3 ms   6.08%
+     projection_q8_kernel                    64    172.0 ms   6.06%
+     q8_linear_swiglu_stream_pair_kernel   3072     72.8 ms   2.57%
+     projection_kernel                     3072     50.1 ms   1.77%
+     recurrent_record_kernel               1872     33.2 ms   1.17%
+     route_kernel                          3072     17.9 ms   0.63%
+  draft: 303.6 ms (10.71 % of busy)
+     projection_q4_kernel                   129    100.7 ms   3.55%
+     recurrent_fold_kernel                   51     49.8 ms   1.76%
+     gate_up_kernel                         129     38.3 ms   1.35%
+     q8_a16_stream_kernel                   520     37.0 ms   1.30%
+     down_kernel                            129     18.8 ms   0.66%
+     q8_a16_simt_kernel                     278     13.7 ms   0.48%
+     hc_down_partials_kernel                450     13.5 ms   0.48%
+     hc_up_collapse_kernel                  450      9.5 ms   0.34%
+     top_logprobs_kernel                     66      3.1 ms   0.11%
+     q8_linear_swiglu_stream_pair_kernel    129      2.6 ms   0.09%
+     projection_kernel                      129      1.9 ms   0.07%
+     q8_a16_mma_kernel                       36      1.9 ms   0.07%

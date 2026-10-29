@@ -10,10 +10,9 @@
 #include "infernix/ops/linear_add.h"
 
 #include "core/device.h"
-#include "core/temporary_switches.h"
 #include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
-#include "roofline.h"
+#include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include <cuda_runtime.h>
 
@@ -28,14 +27,19 @@
 #include <vector>
 
 using namespace infernix;
-namespace roofline = infernix::bench::roofline;
 
 namespace {
 
 constexpr std::int32_t kRows           = 5120;
-constexpr std::size_t kDefaultFlushMiB = 256;
+// A MiB-valued default resolved on Options construction inside main(), never at static init.
+std::size_t default_flush_mib() { return static_cast<std::size_t>(infernix::bench::default_cold_flush_mib()); }
 constexpr int kDefaultWarmup           = 5;
 constexpr int kDefaultRepeat           = 50;
+constexpr double kDramSpecGBs = bench::kDramSpecGBs; // GB10 published spec (informational)
+constexpr double kEfficiencyGBs = bench::kSustainedReadGBs; // GB10 measured ceiling
+// GB10 measured dense BF16 with FP32 accumulation. SIMT and split-K routes report no
+// Tensor Core ratio.
+constexpr double kBf16Fp32AccumulateTFLOPs = bench::kDenseBf16Tflops;
 
 struct Options {
     std::int32_t hidden = 0;
@@ -44,12 +48,9 @@ struct Options {
     int repeat                = kDefaultRepeat;
     bool graph                = false;
     bool profile              = false;
-    std::uint64_t flush_bytes = kDefaultFlushMiB << 20;
+    bool candidates           = false;
+    std::uint64_t flush_bytes = static_cast<std::uint64_t>(default_flush_mib()) << 20;
     std::string csv_out;
-    // a16 (A16Only, batched-decode's routes) or invariant (A16ColumnInvariant, the default
-    // route's decode and verification); exact or q5-ksplit (LinearRoutes::Q5KSplit).
-    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
-    ops::LinearRoutes routes = ops::LinearRoutes::Exact;
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -80,10 +81,8 @@ void usage(const char* argv0) {
                 "  --execution MODE   eager (default) or graph; time one complete public Op.\n"
                 "  --flush-mib N      L2 eviction buffer size (default %zu MiB).\n"
                 "  --csv-out PATH     Write all measurement rows as CSV.\n"
-                "  --policy P         a16 (default) or invariant (the column-invariant policy).\n"
-                "  --routes R         exact (default) or q5-ksplit (the q5-ksplit-mma fast path).\n"
                 "  --profile          Report the public shape and workspace query for one T.\n",
-                argv0, kDefaultWarmup, kDefaultRepeat, kDefaultFlushMiB);
+                argv0, kDefaultWarmup, kDefaultRepeat, default_flush_mib());
 }
 
 Options parse_options(int argc, char** argv) {
@@ -117,24 +116,8 @@ Options parse_options(int argc, char** argv) {
                 << 20;
         } else if (argument == "--csv-out") {
             options.csv_out = std::string(next("--csv-out value"));
-        } else if (argument == "--policy") {
-            const std::string value(next("--policy value"));
-            if (value == "a16") {
-                options.policy = ops::LinearPolicy::A16Only;
-            } else if (value == "invariant") {
-                options.policy = ops::LinearPolicy::A16ColumnInvariant;
-            } else {
-                throw std::invalid_argument("--policy must be a16 or invariant");
-            }
-        } else if (argument == "--routes") {
-            const std::string value(next("--routes value"));
-            if (value == "exact") {
-                options.routes = ops::LinearRoutes::Exact;
-            } else if (value == "q5-ksplit") {
-                options.routes = ops::LinearRoutes::Q5KSplit;
-            } else {
-                throw std::invalid_argument("--routes must be exact or q5-ksplit");
-            }
+        } else if (argument == "--candidates") {
+            options.candidates = true;
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
@@ -222,13 +205,71 @@ int main(int argc, char** argv) {
         }
 
         std::printf("# execution=%s warmup=%d repeat=%d flush_bytes=%llu workspace_sweep_bytes=%zu "
-                    "op=linear_add qtype=q5_g64_fp16 rows=%d k=%d policy=%s routes=%s %s\n",
+                    "op=linear_add qtype=q5_g64_fp16 rows=%d k=%d\n",
                     options.graph ? "graph" : "eager", options.warmup, options.repeat,
                     static_cast<unsigned long long>(options.flush_bytes), workspace_capacity, kRows,
-                    options.hidden,
-                    options.policy == ops::LinearPolicy::A16Only ? "a16" : "invariant",
-                    options.routes == ops::LinearRoutes::Exact ? "exact" : "q5-ksplit",
-                    temporary_switches::describe(temporary_switches::Scope::Qwen3_5).c_str());
+                    options.hidden);
+
+        if (options.candidates) {
+            // Direct per-kernel cold sweep: call every public schedule launcher independently so
+            // each can be ranked per token count on this device, exactly like the Q8 candidate
+            // harness. Each launcher is exercised only over its admitted token range.
+            struct Cand {
+                const char* name;
+                std::int32_t lo;
+                std::int32_t hi;
+                void (*launch)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+            };
+            const Cand cands[]{
+                {"split2_exact", 1, 1, ops::detail::q5_linear_add_split2_exact_launch},
+                {"sliced_r16_t8", 1, 8, ops::detail::q5_linear_add_sliced_r16_t8_launch},
+                {"sliced_r16_t16", 1, 16, ops::detail::q5_linear_add_sliced_r16_t16_launch},
+                {"sliced_r16_t24", 1, 24, ops::detail::q5_linear_add_sliced_r16_t24_launch},
+                {"sliced_r32_t32_w4_s2", 1, 32, ops::detail::q5_linear_add_sliced_r32_t32_w4_s2_launch},
+                {"sliced_r32_t24_pairwise", 1, 48,
+                 ops::detail::q5_linear_add_sliced_r32_t24_pairwise_launch},
+                {"sliced_r32_t32_w4_s1", 1, 32, ops::detail::q5_linear_add_sliced_r32_t32_w4_s1_launch},
+                {"sliced_r32_t32_w2_s2", 1, 32, ops::detail::q5_linear_add_sliced_r32_t32_w2_s2_launch},
+                {"sliced_r32_t64_w2_s1", 1, 64, ops::detail::q5_linear_add_sliced_r32_t64_w2_s1_launch},
+                {"mma_r32_t32_k128", 1, std::numeric_limits<std::int32_t>::max(),
+                 ops::detail::q5_linear_add_mma_r32_t32_k128_launch},
+                {"mma_r32_t128", 1, std::numeric_limits<std::int32_t>::max(),
+                 ops::detail::q5_linear_add_mma_r32_t128_launch},
+                {"mma_r64_t128", 1, std::numeric_limits<std::int32_t>::max(),
+                 ops::detail::q5_linear_add_mma_r64_t128_launch},
+            };
+            std::FILE* cfile = nullptr;
+            if (!options.csv_out.empty()) {
+                cfile = std::fopen(options.csv_out.c_str(), "w");
+                std::fprintf(cfile, "path,k,T,median_us,min_us,p95_us\n");
+            }
+            for (const std::int32_t tokens : options.tokens) {
+                Tensor x(input.p, DType::BF16, {options.hidden, tokens});
+                Tensor out(residual.p, DType::BF16, {kRows, tokens});
+                const auto restore = [&](cudaStream_t prepare_stream) {
+                    residual_initial.restore(prepare_stream);
+                };
+                for (const Cand& cand : cands) {
+                    if (tokens < cand.lo || tokens > cand.hi) { continue; }
+                    const bench::ColdTiming timing = bench::measure_cold_launch_prepared(
+                        restore,
+                        [&](cudaStream_t launch_stream) {
+                            cand.launch(x, packed.weight, out, launch_stream);
+                        },
+                        flush, stream, options.warmup, options.repeat);
+                    std::printf("K=%-5d T=%-4d %-26s median=%9.3f us min=%9.3f p95=%9.3f\n",
+                                options.hidden, tokens, cand.name, timing.median_us, timing.min_us,
+                                timing.p95_us);
+                    if (cfile) {
+                        std::fprintf(cfile, "%s,%d,%d,%.3f,%.3f,%.3f\n", cand.name, options.hidden,
+                                     tokens, timing.median_us, timing.min_us, timing.p95_us);
+                    }
+                }
+            }
+            if (cfile) { std::fclose(cfile); }
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            return 0;
+        }
 
         std::vector<Row> rows;
         rows.reserve(options.tokens.size());
@@ -240,8 +281,8 @@ int main(int argc, char** argv) {
                 residual_initial.restore(prepare_stream);
             };
             const auto body = [&](cudaStream_t launch_stream) {
-                ops::linear_add(x, packed.weight, out, options.policy, workspace,
-                                launch_stream, options.routes);
+                ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
+                                launch_stream);
             };
 
             bench::TimedGraph graph;
@@ -304,7 +345,7 @@ int main(int argc, char** argv) {
                              row.timing.median_us, row.timing.min_us, row.timing.p95_us,
                              static_cast<unsigned long long>(row.weight_bytes),
                              static_cast<unsigned long long>(row.logical_bytes),
-                             row.projection_flops, gbs, gbs / roofline::kDramSpecGBs * 100.0,
+                             row.projection_flops, gbs, gbs / kEfficiencyGBs * 100.0,
                              row.projection_flops / seconds / 1.0e12, row.workspace_sweep_bytes,
                              row.workspace_exact_bytes, row.workspace_used_bytes);
             }

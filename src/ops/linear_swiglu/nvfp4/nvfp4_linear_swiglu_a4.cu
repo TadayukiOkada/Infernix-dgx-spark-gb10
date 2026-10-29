@@ -20,11 +20,11 @@ namespace infernix::ops::detail {
 namespace {
 
 using Geometry = Nvfp4N34816K5120;
-// Column tiles amortize gate/up decode over the complete speculative block. 64-row tiles at two
-// CTAs per SM (RTX 5090, cold weights, six interleaved passes, the same K order per output): up to
-// 32 tokens with a third stage, 65.3 instead of 66.1 us at 8 tokens and 64.9 instead of 66.1 at 12,
-// unchanged at 16-32; at 33-64 tokens with two stages, 66.1 instead of 68.0-68.2 us at 33-49 and no
-// slower at 56-64.
+// GB10 (sm_121a, 48 SMs) cold-weight sweeps over every A4 schedule candidate, quantize included.
+// These replace the earlier RTX 5090 fit. Column tiles amortize gate/up decode over the complete
+// speculative block; within a band the neighbours are within measurement noise, but the boundaries
+// below are separated by >10% (the resident schedules fall off a cliff once the wave spills past
+// what they can hide), so those boundaries are what matter.
 using M32N64S3 = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
 using M64N64   = Nvfp4A4MmaSchedule<64, 64, 256, 4, 2, 2, 2>;
 using M128N128 = Nvfp4A4MmaSchedule<128, 128, 256, 4, 4, 2, 1>;

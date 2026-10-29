@@ -31,7 +31,11 @@ public:
     // the working set, not page-locked for the device, since only read_rows' CPU copies read it, so it
     // stays outside Windows' limit on page-locked memory) with large unbuffered reads, and every
     // read_rows call is served from RAM; the row cache is not allocated.
-    NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident = false);
+    NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table, bool resident = false,
+                std::uint64_t requested_cache_bytes = 0);
+    ~NgramVolume();
+    NgramVolume(NgramVolume&&) noexcept;
+    NgramVolume& operator=(NgramVolume&&) noexcept;
 
     // Host bytes a resident table takes: its blocks (the 4 KiB padding included).
     [[nodiscard]] static std::uint64_t resident_bytes(const NgramTableConfig& table) noexcept {
@@ -40,7 +44,9 @@ public:
     [[nodiscard]] bool resident() const noexcept { return resident_ != nullptr; }
     // Empty when a resident table is locked in RAM; otherwise the OS's reason (it still serves rows, but
     // Windows may page it out under memory pressure).
-    [[nodiscard]] std::string resident_lock_failure() const { return resident_ ? resident_->lock_failure() : std::string(); }
+    [[nodiscard]] std::string resident_lock_failure() const {
+        return resident_ ? resident_->lock_failure() : std::string();
+    }
 
     [[nodiscard]] const NgramTableConfig& table() const noexcept { return table_; }
 
@@ -68,31 +74,59 @@ public:
     };
     [[nodiscard]] const Counters& counters() const noexcept { return counters_; }
 
-    // Bytes of the host row cache a volume of this geometry allocates.
-    [[nodiscard]] static std::uint64_t cache_bytes(const NgramTableConfig& table) noexcept {
-        return (std::uint64_t{1} << kCacheBits) * table.row_bytes;
+    // Power-of-two cache slot exponent (2^bits rows) and bytes of the host row cache.
+    [[nodiscard]] static unsigned cache_bits(const NgramTableConfig& table,
+                                             std::uint64_t requested_cache_bytes = 0) noexcept {
+        if (requested_cache_bytes == 0 || table.row_bytes == 0) { return kDefaultCacheBits; }
+        const std::uint64_t max_slots = requested_cache_bytes / table.row_bytes;
+        unsigned bits                 = kMinCacheBits;
+        while (bits < kMaxCacheBits && (std::uint64_t{1} << (bits + 1)) <= max_slots) { ++bits; }
+        return bits;
+    }
+    [[nodiscard]] static std::uint64_t cache_bytes(const NgramTableConfig& table,
+                                                   std::uint64_t requested_cache_bytes = 0) noexcept {
+        return (std::uint64_t{1} << cache_bits(table, requested_cache_bytes)) * table.row_bytes;
     }
 
 private:
-    static constexpr unsigned kCacheBits  = 20; // 2^20 rows, ~170 MB with 160-byte rows
+    static constexpr unsigned kDefaultCacheBits    = 20;  // default host row cache slots (2^20 = 1M rows)
+    static constexpr unsigned kMinCacheBits        = 16;  // minimum host row cache slots (2^16 = 64K rows)
+    static constexpr unsigned kMaxCacheBits        = 28;  // maximum host row cache slots (2^28 = 268M rows)
+    static constexpr unsigned kCacheWayBits        = 2;   // 4-way set-associative (4 ways per set)
+    static constexpr std::size_t kCacheWays        = std::size_t{1} << kCacheWayBits;
     static constexpr std::size_t kInFlight         = 64;  // blocks read at once (one thread)
     static constexpr std::size_t kReadThreads      = 8;   // threads of a large call
     static constexpr std::size_t kParallelInFlight = 16;  // blocks in flight per thread of a large call
-    static constexpr std::size_t kParallelBlocks = 512; // distinct blocks that make a call large
+    static constexpr std::size_t kParallelBlocks   = 16;  // distinct blocks that fan out across reader threads
+    struct ReaderPool;
+    // INFERNIX_TMP_NGRAM_PARALLEL_GATHER (candidates §8.3 GX-08): a RAM-mode call of at least this many
+    // rows gathers them on kReadThreads threads (the same bytes), not one.
+    static constexpr std::size_t kParallelGatherRows = 16384;
+    bool parallel_gather_ = false;
+    // INFERNIX_TMP_NGRAM_SCATTER (candidates BX-04, Basalt edbdde8): a large call's threads read its
+    // blocks in a scattered order (a stride permutation over the sorted blocks) instead of each sweeping
+    // one contiguous range. The rows read and the cache fill are the same.
+    bool scatter_ = false;
+    unsigned cache_bits_      = kDefaultCacheBits;
+    unsigned cache_set_shift_ = 32U - (kDefaultCacheBits - kCacheWayBits);
 
-    // The direct-mapped cache slot of a row.
-    static std::size_t slot_of(std::uint32_t row) noexcept {
-        return static_cast<std::size_t>((row * 2654435761U) >> (32U - kCacheBits));
+    // The 4-way cache set of a row.
+    [[nodiscard]] std::size_t set_of(std::uint32_t row) const noexcept {
+        return static_cast<std::size_t>((row * 2654435761U) >> cache_set_shift_);
     }
+    [[nodiscard]] std::size_t find_slot(std::uint32_t row) const noexcept;
+    void insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) const noexcept;
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
     std::unique_ptr<ResidentHostBuffer> resident_; // the whole table's blocks (RAM mode)
+    mutable std::unique_ptr<ReaderPool> pool_;     // persistent worker threads for multi-issuer volume reads
     mutable std::vector<std::byte> ring_storage_; // kInFlight blocks, 4 KiB-aligned at ring_
     mutable std::byte* ring_ = nullptr;
     mutable std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks
     mutable std::byte* parallel_ring_ = nullptr;
     mutable std::vector<std::uint32_t> tags_; // row id per cache slot, UINT32_MAX when empty
+    mutable std::vector<std::uint8_t> hand_;  // next way to replace per cache set
     mutable std::vector<std::byte> cache_;    // row codes per slot
     // One call's misses as (block << 32 | output index), sorted so each block's rows are adjacent;
     // the distinct blocks' offsets and where each block's misses begin.

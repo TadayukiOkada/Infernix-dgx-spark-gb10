@@ -13,6 +13,36 @@
 
 namespace infernix::ops::detail {
 
+// A8 GEMM schedules reachable for the 27B attention input projection shape, exposed as opaque ids so
+// the bench can drive every legal schedule directly (candidate sweep) instead of the production route.
+enum class Fp8AttnInputScheduleId {
+    A8T32R32K128,
+    A8T32R128K128,
+    A8Tma64x128,
+    A8Tma64x256,
+    A8Tma96x256,
+    A8Bulk,
+};
+
+struct Fp8AttnInputProblem {
+    std::int32_t input_rows;
+    std::int32_t query_rows;
+    std::int32_t kv_rows;
+    std::int32_t parent_rows;
+    std::int32_t padded_k;
+    std::int32_t cols;
+};
+
+const char* fp8_attn_input_schedule_name(Fp8AttnInputScheduleId schedule) noexcept;
+bool fp8_attn_input_candidate_is_legal(Fp8AttnInputScheduleId schedule,
+                                       const Fp8AttnInputProblem& problem) noexcept;
+void fp8_attn_input_execute_candidate(Fp8AttnInputScheduleId schedule, const Tensor& x,
+                                      const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                      Tensor& v, WorkspaceArena& workspace, cudaStream_t stream);
+// Largest split-K partial plane any candidate schedule may need, so a bench arena sized with this can
+// force Bulk at any token count without tripping the aligned-partials check.
+[[nodiscard]] std::size_t fp8_attn_input_candidate_partial_capacity_bytes();
+
 [[nodiscard]] std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens);
 
 inline constexpr int kFp8AttnInputLastSmallMmaT = 32;

@@ -51,6 +51,18 @@ bool q8_attn_input_admits(const Q8AttnInputProblem& problem) noexcept;
 Q8AttnInputPlan q8_attn_input_resolve_plan(const Q8AttnInputProblem& problem,
                                            bool column_invariant = false);
 
+// Candidate-sweep surface: force a specific schedule for a given shape so the bench can measure every
+// legal schedule directly instead of the production route. candidate_is_legal checks the schedule
+// belongs to the shape's allowed set (target / companion / dflash2).
+bool q8_attn_input_candidate_is_legal(Q8AttnInputScheduleId schedule,
+                                      const Q8AttnInputProblem& problem) noexcept;
+void q8_attn_input_execute_candidate(Q8AttnInputScheduleId schedule, const Tensor& x,
+                                     const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                     Tensor& v, cudaStream_t stream);
+void q8_attn_input_execute_candidate(Q8AttnInputScheduleId schedule, const Tensor& x,
+                                     const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                                     cudaStream_t stream);
+
 void q8_attn_input_execute_plan(const Q8AttnInputPlan& plan, const Tensor& x, const Weight& weight,
                                 Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream,
                                 bool column_invariant = false);

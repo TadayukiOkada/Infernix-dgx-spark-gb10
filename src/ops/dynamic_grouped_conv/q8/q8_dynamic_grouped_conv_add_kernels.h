@@ -7,7 +7,7 @@
 
 namespace infernix::ops::detail {
 
-enum class Q8DynamicConvAddSchedule { TiledMma, MmaK128 };
+enum class Q8DynamicConvAddSchedule { TiledMma, MmaK128, MmaT96, MmaT128 };
 
 void q8_dynamic_grouped_conv_add_materialized_launch(Q8DynamicConvAddSchedule schedule,
                                                      const Tensor& x, const Weight& weight,

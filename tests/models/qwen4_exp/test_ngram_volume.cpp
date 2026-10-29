@@ -6,7 +6,6 @@
 // blocks (a prefill chunk) takes the multi-threaded route: the same oracle, counters and cache.
 // resolve_ngram_volume accepts a volume of any format in place of the artifact's table and refuses mismatches.
 
-#include "test_temp_path.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 
 #include <algorithm>
@@ -222,7 +221,7 @@ void test_resolve(const std::filesystem::path& path) {
 } // namespace
 
 int main() {
-    const auto path = infernix::test::unique_temp_path("infernix_ngram_volume_test.ngram");
+    const auto path = std::filesystem::temp_directory_path() / "infernix_ngram_volume_test.ngram";
     try {
         const q4::NgramTableConfig table = make_volume(path);
         const q4::NgramVolume volume(path, table);
@@ -267,26 +266,15 @@ int main() {
         check(!volume.cached(with_new), "cached() reports a row not yet read");
         check(!volume.cached(std::vector<std::uint32_t>{static_cast<std::uint32_t>(kRows)}), "cached() rejects a row past the table");
 
-        // The startup read-rate probe times real reads and leaves the row cache and counters alone;
-        // a zero time limit stops it after its first read.
-        before                  = volume.counters();
-        const auto probe        = volume.probe_reads(64, 60.0);
-        const auto limited      = volume.probe_reads(1'000'000, 0.0);
-        check(probe.reads == 64 && probe.seconds > 0.0 && probe.reads_per_second() > 0.0,
-              "the read probe completes its reads and times them");
-        check(limited.reads == 1, "the read probe stops at its time limit");
-        check(volume.counters().rows == before.rows && volume.counters().reads == before.reads &&
-                  volume.counters().hits == before.hits && volume.cached(many) && !volume.cached(with_new),
-              "the read probe leaves the counters and the row cache unchanged");
-
-        // Two rows of one cache slot (the slot is a hash of the row id; brute-force a collision).
-        const auto slot_of = [](std::uint32_t row) { return (row * 2654435761U) >> 12U; };
-        std::uint32_t a = 0, b = 0;
-        for (std::uint32_t r = 1; r < kRows && b == 0; ++r) {
-            if (slot_of(r) == slot_of(0)) { b = r; }
+        // Five rows of one 4-way cache set (the set is a hash of the row id; brute-force a collision).
+        const auto set_of = [](std::uint32_t row) { return (row * 2654435761U) >> 14U; };
+        std::vector<std::uint32_t> set_rows{0};
+        for (std::uint32_t r = 1; r < kRows && set_rows.size() < 5; ++r) {
+            if (set_of(r) == set_of(0)) { set_rows.push_back(r); }
         }
-        check(b != 0, "the test found two rows sharing a cache slot");
-        const std::vector<std::uint32_t> pair{a, b, a, b};
+        check(set_rows.size() == 5, "the test found five rows sharing a 4-way cache set");
+        std::vector<std::uint32_t> pair;
+        for (int rep = 0; rep < 2; ++rep) { pair.insert(pair.end(), set_rows.begin(), set_rows.end()); }
         check(rows_match(pair, read(volume, pair)), "rows sharing a cache slot return their own bytes");
         check(rows_match(pair, read(volume, pair)), "and again after evicting each other");
 
@@ -308,32 +296,33 @@ int main() {
         check(volume.counters().reads - before.reads == large_blocks, "one read per distinct uncached block");
         check(rows_match(large, read(volume, large)), "the large call's rows again equal the oracle");
 
+        // Resident mode: multi-threaded volume load, small and prefill-sized multi-threaded RAM gather.
+        {
+            const q4::NgramVolume resident_vol(path, table, /*resident=*/true);
+            check(resident_vol.resident(), "resident volume reports resident()");
+            check(resident_vol.counters().reads == table.blocks, "resident load counts all blocks");
+            check(rows_match(rows, read(resident_vol, rows)), "resident small call equals the oracle");
+            check(rows_match(large, read(resident_vol, large)), "resident prefill-sized call equals the oracle");
+            check(resident_vol.cached(large), "resident cached() is true for valid rows");
+            bool resident_threw = false;
+            try {
+                (void)read(resident_vol, {static_cast<std::uint32_t>(kRows)});
+            } catch (const std::out_of_range&) { resident_threw = true; }
+            check(resident_threw, "resident small call past the table throws out_of_range");
+            std::vector<std::uint32_t> large_bad = large;
+            large_bad.back()                     = static_cast<std::uint32_t>(kRows);
+            resident_threw                       = false;
+            try {
+                (void)read(resident_vol, large_bad);
+            } catch (const std::out_of_range&) { resident_threw = true; }
+            check(resident_threw, "resident prefill-sized call past the table throws out_of_range");
+        }
+
         bool threw = false;
         try {
             (void)read(volume, {static_cast<std::uint32_t>(kRows)});
         } catch (const std::out_of_range&) { threw = true; }
         check(threw, "a row past the table throws out_of_range");
-
-        // RAM residency: the whole table read at open into memory locked for the CPU (not page-locked for
-        // the device); every call is served from it with the volume's bytes and no further reads.
-        {
-            const q4::NgramVolume ram(path, table, true);
-            check(ram.resident(), "a resident table reports its residency");
-            const auto opened = ram.counters();
-            check(rows_match(rows, read(ram, rows)) && rows_match(shared, read(ram, shared)) &&
-                      rows_match(many, read(ram, many)) && rows_match(large, read(ram, large)) &&
-                      rows_match(pair, read(ram, pair)),
-                  "resident rows equal the oracle");
-            check(ram.counters().reads == opened.reads, "a resident table reads nothing after its open");
-            if (const std::string why = ram.resident_lock_failure(); !why.empty()) {
-                std::printf("note: the resident table was not locked in RAM (%s)\n", why.c_str());
-            }
-            threw = false;
-            try {
-                (void)read(ram, {static_cast<std::uint32_t>(kRows)});
-            } catch (const std::out_of_range&) { threw = true; }
-            check(threw, "a resident row past the table throws out_of_range");
-        }
 
         q4::NgramTableConfig wrong = table;
         wrong.file_bytes += 4096;
@@ -342,7 +331,7 @@ int main() {
             const q4::NgramVolume bad(path, wrong);
         } catch (const std::runtime_error&) { threw = true; }
         check(threw, "a volume of the wrong size is refused at open");
-        const auto headers = infernix::test::unique_temp_path("infernix_ngram_resolve_test.ngram");
+        const auto headers = std::filesystem::temp_directory_path() / "infernix_ngram_resolve_test.ngram";
         test_resolve(headers); // its own file: the volume above holds `path` without write sharing
         std::error_code removed;
         std::filesystem::remove(headers, removed);

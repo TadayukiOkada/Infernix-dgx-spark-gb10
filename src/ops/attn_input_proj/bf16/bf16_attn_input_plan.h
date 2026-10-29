@@ -29,4 +29,33 @@ void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, 
                               Tensor& k, Tensor& v, cudaStream_t stream,
                               bool column_invariant = false);
 
+// Internal GEMM schedules that the projection selects per token band. Exposed so the bench can
+// sweep them directly and retune the band edges for the current device (GB10, 48 SMs). The HEAD
+// edges inherited 5090 tuning.
+enum class Bf16AttnInputScheduleId {
+    Decode,
+    SimtSmall,
+    SlicedR32T16W4,
+    MmaR32T32K128S3,
+    TmaR64T64K64S3,
+    MmaR64T32K64S3,
+    TmaR64T128K64S2,
+};
+
+struct Bf16AttnInputProblem {
+    std::int32_t input_rows;
+    std::int32_t query_rows;
+    std::int32_t kv_rows;
+    std::int32_t parent_rows;
+    std::int32_t padded_k;
+    std::int32_t cols;
+};
+
+const char* bf16_attn_input_schedule_name(Bf16AttnInputScheduleId schedule) noexcept;
+bool bf16_attn_input_candidate_is_legal(Bf16AttnInputScheduleId schedule,
+                                        const Bf16AttnInputProblem& problem) noexcept;
+void bf16_attn_input_execute_candidate(Bf16AttnInputScheduleId schedule, const Tensor& x,
+                                       const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                       Tensor& v, cudaStream_t stream);
+
 } // namespace infernix::ops::detail

@@ -249,7 +249,7 @@ def main(argv=None):
             if args.ngram_reuse is not None:
                 ngram_format = qwen4_exp.ngram_volume_format(base, args.ngram_reuse)
             if gguf_store is not None:
-                if ngram_format == "bf16":
+                if ngram_format != "fp8_e4m3fn":
                     raise ValueError("a GGUF import binds its own IQ4_NL volume; give it a BF16 volume at run "
                                      "time with --ngram-volume")
                 from . import qwen4_exp_gguf

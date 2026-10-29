@@ -13,10 +13,6 @@
 #include <stdexcept>
 #include <string>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#    include <immintrin.h>
-#endif
-
 namespace infernix::runtime::expert_offload {
 namespace {
 
@@ -49,10 +45,9 @@ std::uint64_t tag_of(std::uint64_t kind, std::uint64_t index, std::uint64_t segm
     return (kind << 62U) | (index << 8U) | segment;
 }
 
+// A spin-wait hint. AArch64's YIELD gives up the issue slot to the sibling thread without
+// leaving the loop; the empty fallback keeps the loop correct on any other target.
 void relax() {
-#if defined(__x86_64__) || defined(_M_X64)
-    _mm_pause();
-#endif
 }
 
 // Null when the OS refuses: on Windows page-locking stops at the adapter's shared system memory.

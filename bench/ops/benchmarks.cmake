@@ -35,6 +35,12 @@ infernix_add_op_bench(infernix_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/l
 infernix_add_op_bench(infernix_bf16_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_flash_next_sweep.cu")
 infernix_add_op_bench(infernix_fp8_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_flash_next_sweep.cu")
 infernix_add_op_bench(infernix_mxfp8_flash_next_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/mxfp8_flash_next_sweep.cu")
+infernix_add_op_bench(infernix_q8_gdn_decode_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_gdn_decode_sweep.cu")
+infernix_add_op_bench(infernix_q8_route_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_route_sweep.cu")
+infernix_add_op_bench(infernix_q4_route_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/q4_route_sweep.cu")
+infernix_add_op_bench(infernix_q5_route_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/q5_route_sweep.cu")
+infernix_add_op_bench(infernix_q6_route_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/q6_route_sweep.cu")
+infernix_add_op_bench(infernix_nvfp4_route_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_route_sweep.cu")
 infernix_add_op_bench(infernix_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_topk_bench.cu")
 infernix_add_op_bench(infernix_candidate_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/candidate_selector_bench.cu")
 infernix_add_op_bench(infernix_gdn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj_bench.cu")
@@ -58,6 +64,7 @@ infernix_add_op_bench(infernix_sliding_window_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/sliding_window_attention_bench.cu")
 infernix_add_op_bench(infernix_qsa_attention_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_attention_bench.cu")
 infernix_add_op_bench(infernix_kv_cache_append_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/kv_cache_append_bench.cu")
+infernix_add_op_bench(infernix_hc_mix_fused_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hc_mix_fused_bench.cu")
 infernix_add_op_bench(infernix_prepare_masked_block_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_masked_block_bench.cu")
 infernix_add_op_bench(infernix_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
@@ -66,6 +73,14 @@ infernix_add_op_bench(infernix_offloaded_moe_wide_bench SOURCES "${CMAKE_CURRENT
 infernix_add_op_bench(infernix_ggml_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/ggml_linear_bench.cu")
 infernix_add_op_bench(infernix_resident_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/resident_moe_bench.cu")
 infernix_add_op_bench(infernix_hyper_connection_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hyper_connection_bench.cu")
+infernix_add_op_bench(infernix_offloaded_moe_decode_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/offloaded_moe_decode_bench.cu")
+target_include_directories(infernix_offloaded_moe_decode_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+# CPU expert team core-placement throughput (host-only): compares pin policies at identical work.
+infernix_add_op_bench(infernix_offloaded_moe_team_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/offloaded_moe_team_bench.cpp")
+target_include_directories(infernix_offloaded_moe_team_bench PRIVATE "${PROJECT_SOURCE_DIR}/tests")
+target_link_libraries(infernix_offloaded_moe_team_bench PRIVATE infernix_core)
 infernix_add_op_bench(infernix_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 infernix_add_op_bench(infernix_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")

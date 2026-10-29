@@ -13,7 +13,7 @@ import threading
 
 import torch
 
-from tools.artifact.file_io import O_BINARY, discard_cached_pages
+from tools.artifact.file_io import IO_CHUNK_BYTES, O_BINARY, discard_cached_pages
 from .logical import LogicalSource
 
 _DTYPES = {
@@ -169,7 +169,20 @@ class SafetensorsSource:
             # until pread() and cache-discard complete so another worker cannot
             # invalidate this descriptor underneath us.
             fd = self._file(info.file)
-            raw = os.pread(fd, count, offset)
+            # A single pread caps just under 2 GiB on Linux (SSIZE_MAX), so an unbounded read
+            # short-reads any tensor region at or above that size. Read in fixed chunks instead,
+            # matching the Windows os.pread shim in file_io.py which already loops for this reason.
+            chunks: list[bytes] = []
+            remaining = count
+            position = offset
+            while remaining:
+                chunk = os.pread(fd, min(remaining, IO_CHUNK_BYTES), position)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                position += len(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
             if len(raw) != count:
                 raise ValueError(f"{name}: short source read")
             self.bytes_read += count

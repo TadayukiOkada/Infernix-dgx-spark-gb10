@@ -71,6 +71,20 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
     constexpr int kThreads    = 256;
     const std::int32_t written_tokens =
         Layout != Nvfp4ScaleLayout::RowMajor ? nvfp4_a4_padded_tokens(tokens, Layout) : tokens;
+    if (workspace.row_scales != nullptr) {
+        constexpr int kRowScaleThreads =
+            ActivationGeometry::kGroupsPerRow <= 160
+                ? 160
+                : (ActivationGeometry::kGroupsPerRow == 384 ? 192 : 256);
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(written_tokens), dim3(kRowScaleThreads), 0, stream},
+            nvfp4_a4_row_scaled_residual_quantize_kernel<ActivationGeometry, kRowScaleThreads, Terms,
+                                                         Layout>,
+            static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales,
+            workspace.row_scales, tokens, static_cast<std::int64_t>(workspace.code_plane),
+            static_cast<std::int64_t>(workspace.scale_plane)));
+        return;
+    }
     const int blocks =
         (written_tokens * ActivationGeometry::kGroupsPerRow + kThreads - 1) / kThreads;
     CUDA_CHECK(pdl::launch_consumer(
@@ -116,6 +130,9 @@ void launch_nvfp4_a4_residual_quantize(const Tensor& x, const Weight& weight,
         throw std::invalid_argument("nvfp4 A4 residual: planes smaller than the call");
     }
     switch (weight.k) {
+    case Nvfp4Activation2560Geometry::kInputRows:
+        launch_residual<Nvfp4Activation2560Geometry>(x, weight, workspace, layout, stream);
+        return;
     case Nvfp4Activation5120Geometry::kInputRows:
         launch_residual<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream);
         return;
@@ -155,6 +172,10 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
         }
     }
     switch (weight.k) {
+    case Nvfp4Activation2560Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation2560Geometry>(x, weight, workspace, layout, stream,
+                                                           reciprocal_quotient);
+        return;
     case Nvfp4Activation5120Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream,
                                                            reciprocal_quotient);

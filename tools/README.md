@@ -25,6 +25,7 @@ Python tools are independent of CMake; there is no `INFERNIX_BUILD_TOOLS` option
 | Check that no CUDA kernel's per-thread stack or local memory (register spills, local arrays) grew past the recorded allow-list; record a reviewed change | `python tools/cuda_stack/check_cuda_stack.py check\|update BINARY`; [`cuda_stack/`](cuda_stack/check_cuda_stack.py); CTest `infernix_cuda_stack_check` |
 | Prove a pure refactor changed no GPU instruction: every kernel's SASS of two builds compared, addresses and encodings removed | `python tools/cuda_stack/sass_identity.py BEFORE AFTER`; [`sass_identity.py`](cuda_stack/sass_identity.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
+| Profile decode/prefill kernels and A/B two `infernix_bench` builds on the MTP default (interleaved rounds, draft-token sweep) | [`kernel_ab/`](kernel_ab/README.md) |
 | Replay decode routing through VRAM expert-cache policies: Flash-Next's FreeToken traces or engine route traces of any offloaded model (geometry from the header); `--headroom` puts the engine's policy against Belady MIN with and without bypass per layer group and applies the 3-point policy-work rule (needs numpy) | `python -m tools.expert_cache_replay.replay TRACE_DIR\|TRACE... [--headroom]`; [`expert_cache_replay/`](expert_cache_replay/replay.py) |
 | Replay engine-captured route traces through the VRAM / RAM / SSD expert tiers: RAM policies, modes, priors, demotion allowance, prefill reserve, prompt seeding (`--prompt-seeds`; needs numpy) | `python tools/expert_cache_replay/host_tier.py TRACE [--validate]`; [`expert_cache_replay/host_tier.py`](expert_cache_replay/host_tier.py); traces from `infernix_qwen4_exp_route_trace_real_test`, `infernix-serve --route-trace FILE` or `infernix_decode_quality_gen ... route-trace=FILE` |
 | Measure the Flash-Next memory-track facts: DXGI/NVML/D3DKMT VRAM sources, VMM map/unmap cost and stalls, query cost; expert-record reads from the artifact in place, pinned-allocation time | CMake targets `infernix_vram_probe` and `infernix_expert_read_probe ARTIFACT` (built with the tests); [`flash_next_probe/`](flash_next_probe/) |
@@ -41,7 +42,7 @@ targets. Build it with the project's CUDA toolkit and run it from the repository
 
 ```bash
 mkdir -p build
-nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu \
+nvcc -O3 -std=c++17 -arch=sm_121a tools/hbm_bandwidth_probe.cu \
   -o build/hbm_bandwidth_probe
 ./build/hbm_bandwidth_probe
 ```

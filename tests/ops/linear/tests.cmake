@@ -88,6 +88,9 @@ infernix_add_family_op_test(infernix_tma_moe_overlap_test FAMILY linear
 infernix_add_family_op_test(infernix_linear_bf16_a16_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
   LIBRARIES infernix_linear_test_support)
+# Full-K FP64 reduction criteria over the wide vision shapes: overlapping GPU work changed the
+# compared outputs, so this entry runs alone.
+set_tests_properties(infernix_linear_bf16_a16_test PROPERTIES RUN_SERIAL TRUE)
 
 # FP32 vocabulary-head logits through ops::linear: Q6, Q8, row-FP8 and BF16 heads on every route, against
 # FP64 and the same call's BF16 output.

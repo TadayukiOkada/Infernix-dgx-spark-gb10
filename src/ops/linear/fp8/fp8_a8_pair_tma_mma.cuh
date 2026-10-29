@@ -42,11 +42,16 @@ struct Fp8A8TmaPairSchedule : Base {
     static_assert(kSharedBytes <= 99 * 1024);
 };
 
-// Up to kFp8A8PairNarrowTokens columns: 64-column tiles (more CTAs for short prompts); beyond,
-// 128-column tiles. Both use 128-row tiles, so every registered pair problem's N is whole tiles.
+// Up to kFp8A8PairNarrowTokens columns: 64-column tiles (more CTAs for short prompts); through
+// kFp8A8PairTokenFastMaxTokens, 128-column TokenFast tiles while both activation planes fit in
+// GB10's 24 MiB L2; beyond, Grouped-8 raster to reuse each activation tile across 8 weight row
+// tiles and prevent L2 thrashing.
 using Fp8A8PairT64  = Fp8A8TmaPairSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>>;
 using Fp8A8PairT128 = Fp8A8TmaPairSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>>;
-inline constexpr std::int32_t kFp8A8PairNarrowTokens = 256;
+using Fp8A8PairT128G8 =
+    Fp8A8TmaPairSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1, Fp8MmaRaster::Grouped, 8>>;
+inline constexpr std::int32_t kFp8A8PairNarrowTokens       = 256;
+inline constexpr std::int32_t kFp8A8PairTokenFastMaxTokens = 1024;
 
 struct alignas(128) Fp8TmaPairDescriptors {
     CUtensorMap activation_hi;
@@ -290,7 +295,12 @@ void launch_fp8_a8_pair(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Pair
             operands, scratch.codes_lo, scratch.scales_lo, output, stream);
         return;
     }
-    launch_fp8_a8_pair_tma_mma<Fp8ScheduleInstance<Fp8A8PairT128, Geometry::kInputRows>>(
+    if (x.ne[1] <= kFp8A8PairTokenFastMaxTokens) {
+        launch_fp8_a8_pair_tma_mma<Fp8ScheduleInstance<Fp8A8PairT128, Geometry::kInputRows>>(
+            operands, scratch.codes_lo, scratch.scales_lo, output, stream);
+        return;
+    }
+    launch_fp8_a8_pair_tma_mma<Fp8ScheduleInstance<Fp8A8PairT128G8, Geometry::kInputRows>>(
         operands, scratch.codes_lo, scratch.scales_lo, output, stream);
 }
 

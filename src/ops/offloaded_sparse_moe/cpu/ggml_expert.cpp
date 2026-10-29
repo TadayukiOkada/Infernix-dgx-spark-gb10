@@ -10,10 +10,10 @@
 #include <string>
 #include <type_traits>
 
-#include "ops/offloaded_sparse_moe/cpu/x86_mad.h"
+#include "ops/offloaded_sparse_moe/cpu/neon_mad.h"
 
-#if defined(INFERNIX_CPU_X86)
-#    define INFERNIX_GGML_X86 1
+#if defined(INFERNIX_CPU_NEON)
+#    define INFERNIX_GGML_NEON 1
 #endif
 
 namespace infernix::ops::offloaded_moe {
@@ -52,12 +52,17 @@ void row_sums_scalar(const std::uint8_t* matrix, int row_bytes, int slices, int 
     }
 }
 
-#if defined(INFERNIX_GGML_X86)
+#if defined(INFERNIX_GGML_NEON)
 
-// ------------------------------------------------------------------------- AVX2 slice decoding
+// ------------------------------------------------------------------------ NEON dot products
+//
+// A slice's 32 codes decode to two 16-byte vectors (elements 0-15 in q[0], 16-31 in q[1]). The
+// sub-scales go into the codes (|code * sub| <= 127 * 32 = 4064, a signed 16-bit word), so a
+// column's slice is a widening int16 multiply-add (smlal) against its two limb planes, folded into
+// one int32x4 accumulator per plane.
 
 struct Decoded {
-    __m256i q;      // 32 signed byte codes, element e in byte e
+    int8x16_t q[2]; // 32 signed byte codes, element e in byte e of q[e / 16]
     int sub0, sub1; // elements 0-15, 16-31
     std::uint16_t d;
 };
@@ -74,31 +79,38 @@ inline std::uint32_t u32(const std::uint8_t* p) {
     return v;
 }
 
-// 0xFF in byte e where bit e of `bits` is set.
-INFERNIX_TARGET("avx2")
-inline __m256i sign_mask(std::uint32_t bits) {
-    const __m256i v    = _mm256_set1_epi32(static_cast<int>(bits));
-    const __m256i shuf = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3,
-                                          3, 3, 3, 3, 3);
-    const __m256i bit  = _mm256_set1_epi64x(static_cast<long long>(0x8040201008040201ULL));
-    return _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(v, shuf), bit), bit);
+// Byte e (0-7: bits 8h+0..8h+7 below, 8-15: bits 8h+8..8h+15) : 0xFF where that bit of `bits` is
+// set. vtstq gives all-ones for a nonzero AND, so the per-byte test is one instruction.
+inline void apply_signs(int8x16_t (&q)[2], std::uint32_t bits) {
+    const uint8x16_t lane_bits = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    for (int h = 0; h < 2; ++h) {
+        const std::uint8_t b0 = static_cast<std::uint8_t>(bits >> (16 * h));
+        const std::uint8_t b1 = static_cast<std::uint8_t>(bits >> (16 * h + 8));
+        const uint8x16_t src  = vcombine_u8(vdup_n_u8(b0), vdup_n_u8(b1));
+        const int8x16_t mask  = vreinterpretq_s8_u8(vtstq_u8(src, lane_bits));
+        // (g ^ mask) - mask negates the byte where mask is 0xFF, exactly as _mm256_sub_epi8.
+        q[h] = vsubq_s8(veorq_s8(q[h], mask), mask);
+    }
 }
 
-INFERNIX_TARGET("avx2")
-inline __m256i apply_signs(__m256i g, std::uint32_t bits) {
-    const __m256i m = sign_mask(bits);
-    return _mm256_sub_epi8(_mm256_xor_si256(g, m), m);
+// kvalues_iq4nl of 16 bytes' low nibbles (q[0]) and high nibbles (q[1]).
+inline void iq4nl_codes(int8x16_t (&q)[2], const std::uint8_t* qs) {
+    const int8x16_t table = vld1q_s8(ggml::k_kvalues_iq4nl);
+    const uint8x16_t v    = vld1q_u8(qs);
+    q[0]                  = vqtbl1q_s8(table, vandq_u8(v, vdupq_n_u8(0x0F)));
+    q[1]                  = vqtbl1q_s8(table, vshrq_n_u8(v, 4));
 }
 
-// kvalues_iq4nl of 16 bytes' low nibbles (elements 0-15) and high nibbles (16-31).
-INFERNIX_TARGET("avx2")
-inline __m256i iq4nl_codes(const std::uint8_t* qs) {
-    const __m128i table = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ggml::k_kvalues_iq4nl));
-    const __m128i m4    = _mm_set1_epi8(0x0F);
-    const __m128i q     = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
-    const __m128i lo    = _mm_shuffle_epi8(table, _mm_and_si128(q, m4));
-    const __m128i hi    = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
-    return _mm256_set_m128i(hi, lo);
+// Eight little-endian 32-bit grid entries (4 codes each) as the slice's 32 codes.
+inline void codes_u32(int8x16_t (&q)[2], const std::uint32_t* g) {
+    q[0] = vreinterpretq_s8_u32(vld1q_u32(g));
+    q[1] = vreinterpretq_s8_u32(vld1q_u32(g + 4));
+}
+
+// Four little-endian 64-bit grid entries (8 codes each) as the slice's 32 codes.
+inline void codes_u64(int8x16_t (&q)[2], const std::uint64_t* g) {
+    q[0] = vreinterpretq_s8_u64(vld1q_u64(g));
+    q[1] = vreinterpretq_s8_u64(vld1q_u64(g + 2));
 }
 
 // The IQ grid entries are read by scalar loads, not vpgather (microcoded and slow on hybrid CPUs'
@@ -106,38 +118,35 @@ inline __m256i iq4nl_codes(const std::uint8_t* qs) {
 // artifact, MTP 4 + n-gram 7 at 4K: 202.0 against 200.2 tok/s, 2026-10-16), and gathers on P-cores only
 // gained nothing end to end (IQ3_S DFlash2 decode after 8K, 2026-10-28, candidates §27 CX-03).
 template <QType F>
-INFERNIX_TARGET("avx2")
 inline Decoded decode(const std::uint8_t* row, int s) {
     Decoded o;
     if constexpr (F == QType::GGML_IQ4_NL) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s) * 18;
         o.d    = u16(b);
         o.sub0 = o.sub1 = 1;
-        o.q    = iq4nl_codes(b + 2);
+        iq4nl_codes(o.q, b + 2);
     } else if constexpr (F == QType::GGML_IQ4_XS) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 136;
         const int ib          = s % 8;
         o.d                   = u16(b);
         const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((u16(b + 2) >> (2 * ib)) & 3) << 4);
         o.sub0 = o.sub1 = ls - 32;
-        o.q             = iq4nl_codes(b + 8 + 16 * ib);
+        iq4nl_codes(o.q, b + 8 + 16 * ib);
     } else if constexpr (F == QType::GGML_Q2_0) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s / 2) * 18;
         o.d    = u16(b);
         o.sub0 = o.sub1 = 1;
         std::uint64_t q;
         std::memcpy(&q, b + 2 + 8 * (s % 2), 8);
-        // Element 4i + j is bits 2j of byte i: t_j holds them in byte i, then the bytes interleave.
-        const __m128i m   = _mm_set1_epi8(3);
-        const __m128i v   = _mm_cvtsi64_si128(static_cast<long long>(q));
-        const __m128i t0  = _mm_and_si128(v, m);
-        const __m128i t1  = _mm_and_si128(_mm_srli_epi64(v, 2), m);
-        const __m128i t2  = _mm_and_si128(_mm_srli_epi64(v, 4), m);
-        const __m128i t3  = _mm_and_si128(_mm_srli_epi64(v, 6), m);
-        const __m128i t01 = _mm_unpacklo_epi8(t0, t1);
-        const __m128i t23 = _mm_unpacklo_epi8(t2, t3);
-        const __m256i u   = _mm256_set_m128i(_mm_unpackhi_epi16(t01, t23), _mm_unpacklo_epi16(t01, t23));
-        o.q               = _mm256_sub_epi8(u, _mm256_set1_epi8(1));
+        // Element 4i + j is bits 2j of byte i, minus 1.
+        std::int8_t c[32];
+        for (int i = 0; i < 8; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                c[4 * i + j] = static_cast<std::int8_t>(((q >> (8 * i + 2 * j)) & 3U) - 1U);
+            }
+        }
+        o.q[0] = vld1q_s8(c);
+        o.q[1] = vld1q_s8(c + 16);
     } else if constexpr (F == QType::GGML_IQ3_S) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 110;
         const int sb          = s % 8;
@@ -146,22 +155,25 @@ inline Decoded decode(const std::uint8_t* row, int s) {
         // Entry k: qs[k] | bit k of qh << 8.
         const std::uint8_t* qs = b + 2 + 8 * sb;
         const unsigned qh      = b[66 + sb];
-        const auto e = [&](int k) { return static_cast<int>(ggml::k_iq3s_grid[qs[k] | (((qh >> k) & 1U) << 8)]); };
-        o.q = apply_signs(_mm256_setr_epi32(e(0), e(1), e(2), e(3), e(4), e(5), e(6), e(7)), u32(b + 74 + 4 * sb));
+        std::uint32_t g[8];
+        for (int k = 0; k < 8; ++k) { g[k] = ggml::k_iq3s_grid[qs[k] | (((qh >> k) & 1U) << 8)]; }
+        codes_u32(o.q, g);
+        apply_signs(o.q, u32(b + 74 + 4 * sb));
     } else if constexpr (F == QType::GGML_IQ3_XXS) {
-        const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 98;
-        const int ib          = s % 8;
-        o.d                   = u16(b);
+        const std::uint8_t* b   = row + static_cast<std::size_t>(s / 8) * 98;
+        const int ib            = s % 8;
+        o.d                     = u16(b);
         const std::uint32_t aux = u32(b + 66 + 4 * ib);
         o.sub0 = o.sub1 = 2 * static_cast<int>(aux >> 28) + 1;
         const std::uint8_t* qs = b + 2 + 8 * ib;
-        const auto e           = [&](int k) { return static_cast<int>(ggml::k_iq3xxs_grid[qs[k]]); };
-        const __m256i g        = _mm256_setr_epi32(e(0), e(1), e(2), e(3), e(4), e(5), e(6), e(7));
+        std::uint32_t g[8];
+        for (int k = 0; k < 8; ++k) { g[k] = ggml::k_iq3xxs_grid[qs[k]]; }
+        codes_u32(o.q, g);
         const std::uint32_t signs = static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[aux & 127]) |
                                     static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 7) & 127]) << 8 |
                                     static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 14) & 127]) << 16 |
                                     static_cast<std::uint32_t>(ggml::k_ksigns_iq2xs[(aux >> 21) & 127]) << 24;
-        o.q = apply_signs(g, signs);
+        apply_signs(o.q, signs);
     } else if constexpr (F == QType::GGML_IQ2_S) {
         const std::uint8_t* b = row + static_cast<std::size_t>(s / 8) * 82;
         const int ib          = s % 8;
@@ -173,144 +185,111 @@ inline Decoded decode(const std::uint8_t* row, int s) {
         const unsigned qh      = b[66 + ib];
         const int i0 = qs[0] | ((qh << 8) & 0x300), i1 = qs[1] | ((qh << 6) & 0x300);
         const int i2 = qs[2] | ((qh << 4) & 0x300), i3 = qs[3] | ((qh << 2) & 0x300);
-        const __m256i g =
-            _mm256_setr_epi64x(static_cast<long long>(ggml::k_iq2s_grid[i0]), static_cast<long long>(ggml::k_iq2s_grid[i1]),
-                               static_cast<long long>(ggml::k_iq2s_grid[i2]), static_cast<long long>(ggml::k_iq2s_grid[i3]));
-        o.q = apply_signs(g, u32(b + 34 + 4 * ib));
+        const std::uint64_t g[4] = {ggml::k_iq2s_grid[i0], ggml::k_iq2s_grid[i1], ggml::k_iq2s_grid[i2],
+                                    ggml::k_iq2s_grid[i3]};
+        codes_u64(o.q, g);
+        apply_signs(o.q, u32(b + 34 + 4 * ib));
     }
     return o;
 }
 
-// ------------------------------------------------------------------------ AVX2 dot products
-//
-// The sub-scales go into the codes (|code * sub| <= 127 * 32 = 4064, a signed 16-bit word), so a
-// column's slice is four 16-bit multiply-adds (vpmaddwd, or vpdpwssd with VNNI) against its two
-// limb planes: per lane |w * x| < 2^24 per pair, below 2^29 over the four slices of a unit.
-
+// The slice's 32 weights (code * sub) as int16: elements 0-15 from sub0 (w[0], w[1]), 16-31 from
+// sub1 (w[2], w[3]).
 struct Weights {
-    __m256i lo, hi; // code * sub as int16: elements 0-15, 16-31
+    int16x8_t w[4];
 };
 
-INFERNIX_TARGET("avx2")
 inline Weights scaled(const Decoded& d) {
-    return {_mm256_mullo_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(d.q)), _mm256_set1_epi16(static_cast<short>(d.sub0))),
-            _mm256_mullo_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(d.q, 1)), _mm256_set1_epi16(static_cast<short>(d.sub1)))};
+    const int16x8_t s0 = vdupq_n_s16(static_cast<short>(d.sub0));
+    const int16x8_t s1 = vdupq_n_s16(static_cast<short>(d.sub1));
+    return {{vmulq_s16(vmovl_s8(vget_low_s8(d.q[0])), s0), vmulq_s16(vmovl_s8(vget_high_s8(d.q[0])), s0),
+             vmulq_s16(vmovl_s8(vget_low_s8(d.q[1])), s1), vmulq_s16(vmovl_s8(vget_high_s8(d.q[1])), s1)}};
 }
-
-using x86::Avx2Mad;
-using x86::AvxVnniMad;
-using x86::hsum8;
 
 // Slices per unit (one int32 accumulation), and units per block.
 template <QType F>
 inline constexpr int kUnitSlices = F == QType::GGML_IQ4_NL ? 1 : F == QType::GGML_Q2_0 ? 2 : 4;
 
+// accumulate acc += sum(w * x) over the eight int16 lanes of one register. Folding both halves
+// into the same four lanes keeps one accumulator per plane: its lanes hold disjoint products, so
+// the eventual vaddvq total is the exact integer sum (|w * x| <= 4064 * 2047 per element).
+inline void mad(int32x4_t& acc, int16x8_t w, const std::int16_t* x) {
+    const int16x8_t xl = vld1q_s16(x);
+    acc                = vmlal_s16(acc, vget_low_s16(w), vget_low_s16(xl));
+    acc                = vmlal_high_s16(acc, w, xl);
+}
 
-// ------------------------------------------------------------------- AVX-512 (512-bit vectors)
-//
-// A slice's 32 weights (code * sub, int16) are one zmm and each limb plane of a column one zmm, so
-// a column's slice is two vpdpwssd (the 256-bit routes take four), and all of a call's columns
-// (up to kMaxColumns, 16 accumulators of the 32 zmm registers) share each decoded slice: a call
-// decodes every slice once (the 256-bit routes take columns four at a time). A unit's 16 lanes
-// fold to 8 (lane i + lane i + 8: per lane at most 16 products, the 256-bit routes' bound) before
-// the same batch reduction, so every block's P is the same exact integer: the same bits.
-INFERNIX_TARGET("avx2,avx512f,avx512bw")
-inline __m256i fold16(__m512i v) { return _mm256_add_epi32(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1)); }
-
+// Rows [row_begin, row_end) against NC columns. Each unit's lane vectors reduce immediately (one
+// vaddvq per plane: NEON's horizontal add is a single instruction, unlike x86's hadd), and each
+// block's exact P = 2048 sum(w * hi) + sum(w * lo) (int64) enters R as mant(d) * P * 2^(e(d) - 1).
 template <QType F, int NC>
-INFERNIX_TARGET("avx2,avx512f,avx512bw,avx512vl,avx512vnni")
-void row_sums_avx512_n(const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,
-                       const CpuLimbSlice* const* columns, int ncols, ggml::I128* r) {
+void row_sums_neon_n(const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,
+                     const CpuLimbSlice* const* columns, int c0, int ncols, ggml::I128* r) {
     constexpr int kUnit          = kUnitSlices<F>;
     constexpr int kUnitsPerBlock = block_slices(F) / kUnit;
-    static_assert(8 % kUnitsPerBlock == 0, "a batch holds whole blocks");
-    const int units = slices / kUnit;
+    const int units              = slices / kUnit;
     for (int row = row_begin; row < row_end; ++row) {
         const std::uint8_t* w = matrix + static_cast<std::size_t>(row) * row_bytes;
         ggml::I128 out[NC];
-        __m256i batch_lo[NC][8], batch_hi[NC][8];
-        std::uint16_t batch_d[8];
-        int n = 0;
+        std::uint16_t block_d = 0;
+        std::int64_t block_p[NC];
+        for (int k = 0; k < NC; ++k) { block_p[k] = 0; }
         for (int u = 0; u < units; ++u) {
-            __m512i lo[NC], hi[NC];
-            for (int k = 0; k < NC; ++k) { lo[k] = hi[k] = _mm512_setzero_si512(); }
-            std::uint16_t d = 0;
+            int32x4_t acc_lo[NC], acc_hi[NC];
+            for (int k = 0; k < NC; ++k) { acc_lo[k] = acc_hi[k] = vdupq_n_s32(0); }
             for (int j = 0; j < kUnit; ++j) {
                 const int s      = u * kUnit + j;
                 const Decoded dw = decode<F>(w, s);
-                __m512i sub;
-                if constexpr (F == QType::GGML_IQ2_S) { // elements 0-15 and 16-31 have their own sub-scales
-                    sub = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(static_cast<short>(dw.sub0))),
-                                             _mm256_set1_epi16(static_cast<short>(dw.sub1)), 1);
-                } else {
-                    sub = _mm512_set1_epi16(static_cast<short>(dw.sub0));
-                }
-                const __m512i sw = _mm512_mullo_epi16(_mm512_cvtepi8_epi16(dw.q), sub);
-                d                = dw.d;
+                const Weights sw = scaled(dw);
+                block_d          = dw.d;
                 for (int k = 0; k < NC; ++k) {
-                    const CpuLimbSlice& l = columns[k][s];
-                    lo[k] = _mm512_dpwssd_epi32(lo[k], sw, _mm512_loadu_si512(l.lo));
-                    hi[k] = _mm512_dpwssd_epi32(hi[k], sw, _mm512_loadu_si512(l.hi));
+                    const CpuLimbSlice& l = columns[c0 + k][s];
+                    for (int i = 0; i < 4; ++i) {
+                        mad(acc_lo[k], sw.w[i], l.lo + 8 * i);
+                        mad(acc_hi[k], sw.w[i], l.hi + 8 * i);
+                    }
                 }
             }
             for (int k = 0; k < NC; ++k) {
-                batch_lo[k][n] = fold16(lo[k]);
-                batch_hi[k][n] = fold16(hi[k]);
+                block_p[k] += static_cast<std::int64_t>(vaddvq_s32(acc_hi[k])) * 2048 + vaddvq_s32(acc_lo[k]);
             }
-            batch_d[n++] = d;
-            if (n == 8 || u + 1 == units) {
+            if ((u + 1) % kUnitsPerBlock == 0 || u + 1 == units) {
+                std::int64_t mant;
+                int shift;
+                bool negative;
+                ggml::f16_parts(block_d, mant, shift, negative);
                 for (int k = 0; k < NC; ++k) {
-                    for (int b = n; b < 8; ++b) { batch_lo[k][b] = batch_hi[k][b] = _mm256_setzero_si256(); }
-                    alignas(32) std::int32_t sl[8], sh[8];
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(sl), hsum8(batch_lo[k]));
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(sh), hsum8(batch_hi[k]));
-                    for (int b = 0; b < n; b += kUnitsPerBlock) {
-                        std::int64_t p = 0;
-                        for (int i = 0; i < kUnitsPerBlock; ++i) { p += static_cast<std::int64_t>(sh[b + i]) * 2048 + sl[b + i]; }
-                        std::int64_t mant;
-                        int shift;
-                        bool negative;
-                        ggml::f16_parts(batch_d[b], mant, shift, negative);
-                        ggml::add_shifted(out[k], (negative ? -mant : mant) * p, shift);
-                    }
+                    ggml::add_shifted(out[k], (negative ? -mant : mant) * block_p[k], shift);
+                    block_p[k] = 0;
                 }
-                n = 0;
             }
         }
-        for (int k = 0; k < NC; ++k) { r[static_cast<std::size_t>(row - row_begin) * ncols + k] = out[k]; }
+        for (int k = 0; k < NC; ++k) { r[static_cast<std::size_t>(row - row_begin) * ncols + c0 + k] = out[k]; }
     }
 }
 
 template <QType F>
-void row_sums_avx512(const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,
-                     const CpuLimbSlice* const* columns, int ncols, ggml::I128* r) {
-    static_assert(kMaxColumns == 8, "one pass serves up to eight columns");
-    switch (ncols) {
-#    define INFERNIX_GGML_NC(n)                                                                                        \
-    case n: row_sums_avx512_n<F, n>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r); return;
-        INFERNIX_GGML_NC(1)
-        INFERNIX_GGML_NC(2)
-        INFERNIX_GGML_NC(3)
-        INFERNIX_GGML_NC(4)
-        INFERNIX_GGML_NC(5)
-        INFERNIX_GGML_NC(6)
-        INFERNIX_GGML_NC(7)
-    default: row_sums_avx512_n<F, 8>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r); return;
-#    undef INFERNIX_GGML_NC
+void row_sums_neon(const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,
+                   const CpuLimbSlice* const* columns, int ncols, ggml::I128* r) {
+    for (int c0 = 0; c0 < ncols; c0 += 4) {
+        switch (std::min(4, ncols - c0)) {
+        case 1: row_sums_neon_n<F, 1>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;
+        case 2: row_sums_neon_n<F, 2>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;
+        case 3: row_sums_neon_n<F, 3>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;
+        default: row_sums_neon_n<F, 4>(matrix, row_bytes, slices, row_begin, row_end, columns, c0, ncols, r); break;
+        }
     }
 }
 
-#endif // INFERNIX_GGML_X86
+#endif // INFERNIX_GGML_NEON
 
 // The ISAs without the tiled rows (AVX-512, scalar); the 256-bit ISAs take ggml_rows.
 template <QType F>
 void row_sums_format(CpuIsa isa, const std::uint8_t* matrix, int row_bytes, int slices, int row_begin, int row_end,
                      const CpuLimbSlice* const* columns, int ncols, ggml::I128* r) {
     switch (isa) {
-#if defined(INFERNIX_GGML_X86)
-    case CpuIsa::kAvx512Vnni:
-        row_sums_avx512<F>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r);
-        return;
+#if defined(INFERNIX_GGML_NEON)
+    case CpuIsa::kNeon: row_sums_neon<F>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r); return;
 #endif
     default:
         row_sums_scalar<F>(matrix, row_bytes, slices, row_begin, row_end, columns, ncols, r);

@@ -36,7 +36,7 @@ constexpr std::int32_t kQkHeads        = 16;
 constexpr std::int32_t kStateDim       = 128;
 constexpr std::int32_t kRecordCapacity = 8;
 constexpr std::int32_t kStateSlots     = 11;
-constexpr std::size_t kDefaultFlush    = 256ULL << 20;
+infernix::bench::ColdFlushBytes kDefaultFlush{};
 
 enum class ProfileSelection : std::uint8_t {
     Qwen27B,
@@ -146,7 +146,7 @@ void print_help(const char* program) {
                 "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
                 "  --warmup N                  Warmups per point (default 10).\n"
                 "  --repeat N                  Samples per point (default 50).\n"
-                "  --flush-mib N               Cold-L2 eviction storage (default 256 MiB).\n"
+                "  --flush-mib N               Cold-L2 eviction storage (default: sized to device L2).\n"
                 "  -h, --help                  Show this text.\n",
                 program);
 }

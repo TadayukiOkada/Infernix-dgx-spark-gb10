@@ -452,6 +452,89 @@ constexpr std::array kQualified{
     // and B fragments (3 of 3), pp4096 neutral.
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    // Dense8 and Recipe A: FP16 GDN prefill and fused QSA prepare across Flash-Next artifacts.
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Bf16, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Ggml, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Ggml, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Ggml, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Ggml, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Bf16, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Fp8Row, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    // NVFP4 dense, NVFP4 W4A4 experts: same expert bank and KV paths as Dense8 and Recipe A.
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::AdaptiveSpeculation, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::FreeCacheResume, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Preemption, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Preemption, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Preemption, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Preemption, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Preemption, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -562,6 +645,9 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Fp8A8Pair: return configuration.dense == DenseKernels::Fp8Row;
     case FastPath::Fp8A8PairBlock32:
         return configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8;
+    // W4Dense's NVFP4 dense projections run 16-bit activations (A16Only) at narrow widths and the
+    // two-term row-scaled A4 TMA route at prefill widths (T >= 128).
+    case FastPath::Nvfp4A4Pair: return configuration.dense == DenseKernels::Nvfp4;
     case FastPath::Q8SlicedK:
     case FastPath::GdnConvFused: return configuration.dense == DenseKernels::Q8;
     // The wide route of NVFP4 W4A16 experts: recipe C's weight-only export (FP8-row dense) and NVIDIA
@@ -633,6 +719,7 @@ bool FastPathSelection::request_invariant() const noexcept {
                path == FastPath::ExpertA4Residual || path == FastPath::ExpertA4Residual3 ||
                path == FastPath::ExpertA4ResidualDecode ||
                path == FastPath::Fp8A8Pair || path == FastPath::Fp8A8PairBlock32 ||
+               path == FastPath::Nvfp4A4Pair ||
                path == FastPath::GgmlBf16Prefill || path == FastPath::F16AccumulatePrefill ||
                path == FastPath::RouterMma || path == FastPath::ScreenedLmHead;
     });
@@ -644,6 +731,7 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     if (selected(FastPath::Fp8A8Pair)) { routes = routes | ops::LinearRoutes::Fp8A8Pair; }
     // Where several are set the FP8 dispatch takes f16-accumulate, then the block-scaled pair, then the pair.
     if (selected(FastPath::Fp8A8PairBlock32)) { routes = routes | ops::LinearRoutes::Fp8A8PairBlock32; }
+    if (selected(FastPath::Nvfp4A4Pair)) { routes = routes | ops::LinearRoutes::Nvfp4A4Pair; }
     // The prefill paths: prefill calls only.
     ops::LinearRoutes prefill = ops::LinearRoutes::Exact;
     if (selected(FastPath::GgmlBf16Prefill)) { prefill = prefill | ops::LinearRoutes::GgmlBf16Wide; }

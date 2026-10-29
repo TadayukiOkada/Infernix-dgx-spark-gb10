@@ -10,10 +10,8 @@
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
-#ifndef _WIN32
 #    include <sys/ioctl.h>
 #    include <unistd.h>
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -111,11 +109,7 @@ public:
             const std::time_t wall_seconds = std::chrono::system_clock::to_time_t(
                 std::chrono::system_clock::time_point(whole_seconds));
             std::tm local{};
-#ifdef _WIN32
-            localtime_s(&local, &wall_seconds);
-#else
             localtime_r(&wall_seconds, &local);
-#endif
             fmt::format_to(std::back_inserter(destination),
                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}  ", local.tm_year + 1900,
                            local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min,
@@ -187,18 +181,9 @@ struct TerminalSize {
 };
 
 TerminalSize stderr_terminal_size() noexcept {
-#ifdef _WIN32
-    CONSOLE_SCREEN_BUFFER_INFO info{};
-    if (::GetConsoleScreenBufferInfo(::GetStdHandle(STD_ERROR_HANDLE), &info) == 0) { return {}; }
-    return {
-        .columns = static_cast<std::size_t>(info.srWindow.Right - info.srWindow.Left + 1),
-        .rows    = static_cast<std::size_t>(info.srWindow.Bottom - info.srWindow.Top + 1),
-    };
-#else
     winsize size{};
     if (::ioctl(STDERR_FILENO, TIOCGWINSZ, &size) != 0) { return {}; }
     return {.columns = size.ws_col, .rows = size.ws_row};
-#endif
 }
 
 // SGR sequences matching spdlog's console level colours.
@@ -233,9 +218,6 @@ std::string_view level_colour(spdlog::level::level_enum level) noexcept {
 // can only be the single progress line, erased with spaces around spdlog's own console writes.
 class ProgressAwareStderrSink final : public spdlog::sinks::sink {
 public:
-    // The Windows color sink writes messages that carry a colour range through
-    // WriteConsoleA, which silently fails on a redirected handle; with
-    // color_mode::always every such message would vanish from file/pipe logs.
     // The formatter colours every service line's level, so any non-console
     // stderr must fall back to plain (uncoloured) writes.
     explicit ProgressAwareStderrSink(spdlog::color_mode color)

@@ -14,18 +14,25 @@ infernix_add_test(infernix_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 infernix_add_test(infernix_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_read_queue.cpp"
   LIBRARIES infernix_core)
 
+# Big.LITTLE core detection for the offloaded-expert CPU service (reads /sys, no GPU).
+infernix_add_test(infernix_cpu_topology_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cpu_topology.cpp"
+  LIBRARIES infernix_core)
+
 # Unbuffered block reads through a ring (CPU and disk only).
 infernix_add_test(infernix_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
   LIBRARIES infernix_core)
 
 set_tests_properties(infernix_device_test PROPERTIES
-  ENVIRONMENT_MODIFICATION "INFERNIX_CUDA_SYNC=unset:")
+  ENVIRONMENT_MODIFICATION "INFERNIX_CUDA_SYNC=unset:"
+  # The sync-policy modes are observed through device timing and queue behaviour; another test's
+  # concurrent GPU work changes what they measure.
+  RUN_SERIAL TRUE)
 set(sync_modes spin blocking yield auto)
 set(sync_flags 1 4 2 0)
 foreach(mode flags IN ZIP_LISTS sync_modes sync_flags)
   add_test(NAME infernix_device_sync_${mode}_test COMMAND infernix_device_test ${flags})
   set_tests_properties(infernix_device_sync_${mode}_test PROPERTIES
-    ENVIRONMENT "INFERNIX_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77)
+    ENVIRONMENT "INFERNIX_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endforeach()
 foreach(mode IN ITEMS invalid empty)
   add_test(NAME infernix_device_sync_${mode}_test COMMAND infernix_device_test --invalid-sync)
@@ -100,17 +107,6 @@ infernix_add_test(infernix_host_load_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_load.cpp"
   LIBRARIES infernix_core)
 
-infernix_add_test(infernix_cpu_topology_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cpu_topology.cpp"
-  LIBRARIES infernix_core)
-
-if(NOT WIN32)
-  # The WSL2 adapter facts through DXCore (skips outside WSL2 or without a CUDA device).
-  infernix_add_test(infernix_dxcore_adapter_test
-    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_dxcore_adapter.cpp"
-    LIBRARIES infernix_core)
-  set_tests_properties(infernix_dxcore_adapter_test PROPERTIES SKIP_RETURN_CODE 77)
-endif()
 
 infernix_add_test(infernix_jinja_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"

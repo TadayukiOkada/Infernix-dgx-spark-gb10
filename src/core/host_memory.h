@@ -28,6 +28,18 @@ struct HostMemorySnapshot {
 
 [[nodiscard]] HostMemorySnapshot host_memory_snapshot();
 
+// The part of the physical pool an allocation can obtain even though it is not free now: file cache
+// and reclaimable slabs the OS can evict. Linux: MemAvailable less MemFree (the kernel's own
+// estimate, already net of its low watermarks), lowered to what the process's cgroup still allows;
+// HugeTLB pages sit outside both readings and stay excluded because they are not reclaimable. Swap
+// is never included -- paged-out bytes are not device-speed memory. 0 on Windows, where
+// ullAvailPhys already counts what Windows reclaims.
+//
+// This is why a unified-memory GPU's driver reports less than the machine holds: on GB10
+// cudaMemGetInfo's free memory equals MemFree while tens of GiB of file cache sit in the same
+// LPDDR5x, and allocations past it succeed by evicting that cache.
+[[nodiscard]] std::uint64_t reclaimable_pool_bytes();
+
 // Keeps at least `bytes` of this process resident (Windows: a hard minimum working set), so a small
 // RAM reserve trims other programs before Infernix's own pageable memory. Empty on success and where
 // the OS has no such control (Linux); otherwise the OS's reason (non-fatal: the caller logs it).

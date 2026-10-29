@@ -5,6 +5,8 @@
 // butterfly) and writes bf16(SiLU(gate) * up) with gate and up in FP32. A column's result does not
 // depend on how many columns share the call.
 
+#include "core/device.h"
+#include "core/pdl.cuh"
 #include "core/weight.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -21,10 +23,9 @@ namespace {
 
 using bf16 = __nv_bfloat16;
 
-constexpr int kK          = 2560;
-constexpr int kChunks     = kK / 256;
-constexpr int kWarps      = 4; // output rows per CTA
-constexpr int kPassCols   = 8;
+constexpr int kK      = 2560;
+constexpr int kChunks = kK / 256;
+constexpr int kWarps  = 4; // output rows per CTA
 
 __device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) { value += __shfl_xor_sync(0xFFFFFFFFU, value, offset); }
@@ -38,6 +39,7 @@ __device__ __forceinline__ void decode8(uint2 code, float scale, float (&w)[8]) 
     }
 }
 
+template <int kPassCols, bool kExactSinglePass>
 __global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kernel(
     const bf16* __restrict__ x, const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     int m_rows, int padded_k, int columns, bf16* __restrict__ out) {
@@ -47,7 +49,7 @@ __global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kern
 
     // Weights first: gate row i and up row M + i.
     uint2 code[2][kChunks];
-    float scale[2][kChunks];
+    std::uint32_t scale_bits[2][kChunks / 2];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
         const std::int64_t row        = static_cast<std::int64_t>(h) * m_rows + i;
@@ -55,15 +57,19 @@ __global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kern
         const std::uint8_t* scale_row = scales + row * (padded_k / 32) * 2;
 #pragma unroll
         for (int m = 0; m < kChunks; ++m) {
-            const int kk = m * 256 + lane * 8;
-            code[h][m]   = ld_nc_na<uint2>(code_row + kk);
-            scale[h][m]  = __half2float(__ushort_as_half(ld_nc_na<std::uint16_t>(scale_row + (kk / 32) * 2)));
+            const int kk             = m * 256 + lane * 8;
+            code[h][m]               = ld_nc_na<uint2>(code_row + kk);
+            const std::uint32_t bits = ld_nc_na<std::uint16_t>(scale_row + (kk / 32) * 2);
+            if (m % 2 == 0) {
+                scale_bits[h][m / 2] = bits;
+            } else {
+                scale_bits[h][m / 2] |= bits << 16;
+            }
         }
     }
+    pdl::wait_for_dependencies();
 
-#pragma unroll 1
-    for (int c0 = 0; c0 < columns; c0 += kPassCols) {
-        const int pass = min(kPassCols, columns - c0);
+    if constexpr (kExactSinglePass) {
         float gate[kPassCols], up[kPassCols];
 #pragma unroll
         for (int c = 0; c < kPassCols; ++c) {
@@ -72,14 +78,52 @@ __global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kern
         }
 #pragma unroll
         for (int m = 0; m < kChunks; ++m) {
-            const int kk = m * 256 + lane * 8;
+            const int kk          = m * 256 + lane * 8;
+            const unsigned g_bits = (scale_bits[0][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
+            const unsigned u_bits = (scale_bits[1][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
             float wg[8], wu[8];
-            decode8(code[0][m], scale[0][m], wg);
-            decode8(code[1][m], scale[1][m], wu);
+            decode8(code[0][m], __half2float(__ushort_as_half(static_cast<unsigned short>(g_bits))), wg);
+            decode8(code[1][m], __half2float(__ushort_as_half(static_cast<unsigned short>(u_bits))), wu);
 #pragma unroll
             for (int c = 0; c < kPassCols; ++c) {
-                if (c < pass) {
-                    const uint4 values = load_ldg<uint4>(x + static_cast<std::int64_t>(c0 + c) * kK + kk);
+                const uint4 values = load_ldg<uint4>(x + static_cast<std::int64_t>(c) * kK + kk);
+                const float2 x0 = bf16x2_bits_to_float2(values.x), x1 = bf16x2_bits_to_float2(values.y);
+                const float2 x2 = bf16x2_bits_to_float2(values.z), x3 = bf16x2_bits_to_float2(values.w);
+                const float xv[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    gate[c] = fmaf(wg[j], xv[j], gate[c]);
+                    up[c]   = fmaf(wu[j], xv[j], up[c]);
+                }
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < kPassCols; ++c) {
+            const float g = warp_sum(gate[c]);
+            const float u = warp_sum(up[c]);
+            if (lane == 0) {
+                out[static_cast<std::int64_t>(c) * m_rows + i] = __float2bfloat16_rn(g / (1.0F + expf(-g)) * u);
+            }
+        }
+    } else {
+        float gate[kPassCols], up[kPassCols];
+#pragma unroll
+        for (int c = 0; c < kPassCols; ++c) {
+            gate[c] = 0.0F;
+            up[c]   = 0.0F;
+        }
+#pragma unroll
+        for (int m = 0; m < kChunks; ++m) {
+            const int kk          = m * 256 + lane * 8;
+            const unsigned g_bits = (scale_bits[0][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
+            const unsigned u_bits = (scale_bits[1][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
+            float wg[8], wu[8];
+            decode8(code[0][m], __half2float(__ushort_as_half(static_cast<unsigned short>(g_bits))), wg);
+            decode8(code[1][m], __half2float(__ushort_as_half(static_cast<unsigned short>(u_bits))), wu);
+#pragma unroll
+            for (int c = 0; c < kPassCols; ++c) {
+                if (c < columns) {
+                    const uint4 values = load_ldg<uint4>(x + static_cast<std::int64_t>(c) * kK + kk);
                     const float2 x0 = bf16x2_bits_to_float2(values.x), x1 = bf16x2_bits_to_float2(values.y);
                     const float2 x2 = bf16x2_bits_to_float2(values.z), x3 = bf16x2_bits_to_float2(values.w);
                     const float xv[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
@@ -93,11 +137,12 @@ __global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kern
         }
 #pragma unroll
         for (int c = 0; c < kPassCols; ++c) {
-            if (c < pass) {
+            if (c < columns) {
                 const float g = warp_sum(gate[c]);
                 const float u = warp_sum(up[c]);
                 if (lane == 0) {
-                    out[static_cast<std::int64_t>(c0 + c) * m_rows + i] = __float2bfloat16_rn(g / (1.0F + expf(-g)) * u);
+                    out[static_cast<std::int64_t>(c) * m_rows + i] =
+                        __float2bfloat16_rn(g / (1.0F + expf(-g)) * u);
                 }
             }
         }
@@ -111,12 +156,45 @@ void q8_linear_swiglu_stream_pair_launch(const Tensor& x, const Weight& w, Tenso
     if (x.ne[0] != kK || w.k != kK || w.n != 2 * m_rows || columns <= 0) {
         throw std::invalid_argument("Q8 LinearSwiGLU stream pair: unsupported problem");
     }
-    q8_linear_swiglu_stream_pair_kernel<<<(m_rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(
-        static_cast<const bf16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), m_rows, w.padded_shape[1], columns, static_cast<bf16*>(out.data));
-    const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-        throw std::runtime_error(std::string("Q8 LinearSwiGLU stream pair: ") + cudaGetErrorString(error));
+    const dim3 grid((m_rows + kWarps - 1) / kWarps), block(kWarps * 32);
+    const auto launch = [&]<int kPassCols, bool kExactSinglePass>() {
+        CUDA_CHECK(pdl::launch_consumer(
+            {grid, block, 0, stream}, q8_linear_swiglu_stream_pair_kernel<kPassCols, kExactSinglePass>,
+            static_cast<const bf16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), m_rows, w.padded_shape[1], columns,
+            static_cast<bf16*>(out.data)));
+    };
+    switch (columns) {
+    case 1:
+        launch.template operator()<1, true>();
+        break;
+    case 2:
+        launch.template operator()<2, true>();
+        break;
+    case 3:
+        launch.template operator()<3, true>();
+        break;
+    case 4:
+        launch.template operator()<4, true>();
+        break;
+    case 5:
+        launch.template operator()<5, true>();
+        break;
+    case 8:
+        launch.template operator()<8, true>();
+        break;
+    case 16:
+        launch.template operator()<16, true>();
+        break;
+    default:
+        if (columns <= 8) {
+            launch.template operator()<8, false>();
+        } else if (columns <= 16) {
+            launch.template operator()<16, false>();
+        } else {
+            launch.template operator()<8, false>();
+        }
+        break;
     }
 }
 

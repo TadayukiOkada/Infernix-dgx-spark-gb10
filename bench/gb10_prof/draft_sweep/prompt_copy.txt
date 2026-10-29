@@ -1,0 +1,18 @@
+Below is a source function. Reproduce it verbatim, exactly, with no changes, then briefly note what it does.
+
+```
+int clamp(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+float lerp(float a, float b, float t) {
+    return a + (b - a) * clamp(t, 0.0f, 1.0f);
+}
+
+int wrap(int i, int n) {
+    int m = i % n;
+    return m < 0 ? m + n : m;
+}
+```

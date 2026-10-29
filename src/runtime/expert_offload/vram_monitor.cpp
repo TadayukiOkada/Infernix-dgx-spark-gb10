@@ -4,12 +4,6 @@
 
 #include <algorithm>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace infernix::runtime::expert_offload {
 
@@ -52,26 +46,7 @@ VramSnapshot VramMonitor::refresh() {
 void VramMonitor::run() {
     // The source reads device free memory through the runtime, which needs the device current.
     if (cudaSetDevice(device_) != cudaSuccess) { return; }
-    void* budget_event = source_.change_event();
     for (;;) {
-#ifdef _WIN32
-        if (budget_event != nullptr) {
-            // Wake on a budget change or after the period, checking for stop in between.
-            const auto deadline = std::chrono::steady_clock::now() + period_;
-            for (;;) {
-                {
-                    const std::lock_guard<std::mutex> lock(mutex_);
-                    if (stopping_) { return; }
-                }
-                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline - std::chrono::steady_clock::now());
-                if (left.count() <= 0) { break; }
-                // Short slices bound the stop latency without a second event in the source.
-                const DWORD slice = static_cast<DWORD>(std::min<long long>(left.count(), 50));
-                if (::WaitForSingleObject(static_cast<HANDLE>(budget_event), slice) == WAIT_OBJECT_0) { break; }
-            }
-        } else
-#endif
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (stop_cv_.wait_for(lock, period_, [this] { return stopping_; })) { return; }

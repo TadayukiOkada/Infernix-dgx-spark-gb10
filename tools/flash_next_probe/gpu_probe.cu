@@ -11,7 +11,7 @@
 //   submit         host enqueue of k expert-record copies -> device-written completion flag visible
 //
 // Build (from the repository root; links only the CUDA runtime):
-//   nvcc -O3 -std=c++17 -arch=sm_120a tools/flash_next_probe/gpu_probe.cu -o build/flash_next_gpu_probe
+//   nvcc -O3 -std=c++17 -arch=sm_121a tools/flash_next_probe/gpu_probe.cu -o build/flash_next_gpu_probe
 //   ./build/flash_next_gpu_probe [section ...]        (default: every section)
 //
 // Run on a quiescent machine. Also record, under load, the negotiated link:

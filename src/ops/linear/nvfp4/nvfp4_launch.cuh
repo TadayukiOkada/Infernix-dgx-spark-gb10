@@ -86,4 +86,12 @@ void launch_nvfp4_a4(const Tensor& x, const Weight& weight, Tensor& out, Nvfp4A4
                              route.reciprocal_quantize);
     route.launch(weight, out, scratch, x.ne[1], stream);
 }
+
+inline void launch_nvfp4_a4_pair(const Tensor& x, const Weight& weight, Tensor& out,
+                                 Nvfp4A4Workspace scratch, cudaStream_t stream) {
+    launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled128, stream);
+    launch_nvfp4_a4_residual_tma_linear(
+        nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128),
+        static_cast<__nv_bfloat16*>(out.data), stream);
+}
 } // namespace infernix::ops::detail

@@ -79,3 +79,18 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+.venv-convert/
+bench/gb10_lab/results
+results/
+exp_logs/evidence
+cuda-kernel-toolkit/.ckt_cache/
+.ckt_cache/
+.qwen/
+.github/
+
+# Repository-pinned libjpeg-turbo binary: the global '*.a' rule above would hide the
+# checked-in archive that the build links, so re-include it.
+!third_party/libjpeg-turbo/usr/lib/**/*.a
+task_orchestrator.py
+TASK_ORCHESTRATOR.md
+.tandem/

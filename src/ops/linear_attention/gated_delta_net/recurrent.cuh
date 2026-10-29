@@ -783,21 +783,38 @@ run_recurrent_sequence(float (&state)[kDvPerWarp][kQkPerLane], const Access& acc
     Effects::observe_key(access, coord, 0, key);
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
 
+    // Gate and value for the next token are issued before this token's transition, so their
+    // global-memory latency overlaps the warp reductions. Values and reduction order are unchanged.
+    RawGatePair gate = access.load_gate(coord, 0);
+    RawValueLane value =
+        load_value_lane(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
     for (std::int32_t token = 0; token < valid; ++token) {
-        const RawGatePair gate = access.load_gate(coord, token);
-        const RawValueLane value =
-            load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
+        const bool has_next = token + 1 < valid;
+        // Issue every next-token load (key, gate and value) before this token's transition, so all
+        // three global-latency chains overlap the warp reductions instead of only gate/value. The
+        // key stays raw until observe_key records it and normalize_qk_lane runs, matching the
+        // reference's store-before-normalize order exactly; values and reduction order are unchanged.
+        RawQkLane next_key{};
+        RawGatePair next_gate{};
+        RawValueLane next_value{};
+        if (has_next) {
+            next_key   = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
+            next_gate  = access.load_gate(coord, token + 1);
+            next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
+        }
         Effects::observe_value_gate(access, coord, token, value, gate);
 
         apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
 
-        if (token + 1 < valid) {
-            key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
-            Effects::observe_key(access, coord, token + 1, key);
-            normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
+        if (has_next) {
+            Effects::observe_key(access, coord, token + 1, next_key);
+            normalize_qk_lane<NormalizeInputs>(next_key.value, coord.lane);
         }
 
         Effects::template publish_output<NormalizeInputs>(state, access, coord, token);
+        key   = next_key;
+        gate  = next_gate;
+        value = next_value;
     }
 }
 
@@ -946,22 +963,22 @@ inline constexpr std::int8_t kTreeWalkContinue = -1;
 inline constexpr std::int8_t kTreeWalkReplay   = -2;
 inline constexpr std::int8_t kTreeWalkNoSlot   = -1;
 
+struct TreeWalkPending {
+    int node;
+    int next;
+    int slot;
+};
+
 // Orders a tree row's columns depth first, every node's later-drawn children before its first
 // child (a main column's main-chain child), so a branch node holds a slot only while its side
 // subtrees run: a main column's slot is released when the walk returns to the main chain, and a
 // row with s side columns nests at most (s+1)/2 slots. A branch node beyond the Slots free slots
 // is rebuilt from the initial state when the walk returns to it. Returns the step count (nodes).
 template <int Slots>
-__device__ int build_tree_walk(const SpeculativeTreeRow& row, TreeWalkStep* steps) {
-    struct Pending {
-        int node;
-        int next;
-        int slot;
-    };
-
+__device__ int build_tree_walk(const SpeculativeTreeRow& row, TreeWalkStep* steps,
+                               TreeWalkPending* stack) {
     // A pending node has an unvisited child, so it is an inner node with at least two children:
     // a row has at most leaves-1 <= kSpeculativeTreeMaxPaths-1 of them.
-    Pending stack[kSpeculativeTreeMaxPaths];
     int depth           = 0;
     int count           = 0;
     unsigned free_slots = (1U << Slots) - 1U;
@@ -991,9 +1008,9 @@ __device__ int build_tree_walk(const SpeculativeTreeRow& row, TreeWalkStep* step
             continue;
         }
         if (depth == 0) { return count; }
-        Pending& top = stack[depth - 1];
-        node         = top.next;
-        restore      = top.slot >= 0 ? static_cast<std::int8_t>(top.slot) : kTreeWalkReplay;
+        TreeWalkPending& top = stack[depth - 1];
+        node                 = top.next;
+        restore              = top.slot >= 0 ? static_cast<std::int8_t>(top.slot) : kTreeWalkReplay;
         if (node == row.first_child[top.node]) {
             // The last child: the slot is read by this step before any later step saves into it.
             if (top.slot >= 0) { free_slots |= 1U << top.slot; }
@@ -1010,7 +1027,10 @@ struct TreeWalkShared {
     TreeWalkStep steps[kSpeculativeTreeMaxNodes];
     int count;
     // Slot s holds every thread's state tile, [s][r][thread] for row r of its tile.
-    float4 saved[Slots][kDvPerWarp][kWarpSize * kNumWarps];
+    union {
+        TreeWalkPending pending[kSpeculativeTreeMaxPaths];
+        float4 saved[Slots][kDvPerWarp][kWarpSize * kNumWarps];
+    };
 };
 
 __device__ __forceinline__ void save_state_tile(const float (&state)[kDvPerWarp][kQkPerLane],
@@ -1042,16 +1062,29 @@ __device__ void replay_root_path(float (&state)[kDvPerWarp][kQkPerLane],
                                  const RecordAccess<true, State>& access,
                                  const RecurrentCoordinates& coord, const SpeculativeTreeRow& row,
                                  int node) {
-    int path[kSpeculativeTreeMaxPathLength];
-    int length = 0;
-    for (int at = node; at >= 0; at = row.parent[at]) { path[length++] = at; }
+    static_assert(kSpeculativeTreeMaxPathLength <= 16);
+    static_assert(kSpeculativeTreeMaxNodes <= 255);
+    std::uint64_t path_lo = 0;
+    std::uint64_t path_hi = 0;
+    int length            = 0;
+    for (int at = node; at >= 0; at = row.parent[at]) {
+        const std::uint64_t byte = static_cast<std::uint64_t>(static_cast<std::uint8_t>(at));
+        if (length < 8) {
+            path_lo |= byte << (length * 8);
+        } else {
+            path_hi |= byte << ((length - 8) * 8);
+        }
+        ++length;
+    }
     load_state_tile(state, access.state_read_base(coord), coord);
     for (int i = length - 1; i >= 0; --i) {
-        RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, path[i]), coord.dqk_base);
+        const int step = static_cast<int>(
+            ((i < 8 ? path_lo >> (i * 8) : path_hi >> ((i - 8) * 8))) & 0xFFU);
+        RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, step), coord.dqk_base);
         normalize_qk_lane<true>(key.value, coord.lane);
-        const RawGatePair gate = access.load_gate(coord, path[i]);
+        const RawGatePair gate = access.load_gate(coord, step);
         const RawValueLane value =
-            load_value_lane(access.value_ptr(coord, path[i]), coord.lane, coord.dv_base);
+            load_value_lane(access.value_ptr(coord, step), coord.lane, coord.dv_base);
         apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
     }
 }
@@ -1072,7 +1105,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
     // verification forward, so the walk is ordered before waiting on the projection.
     if (thread == 0) {
         if (row.tree != 0) {
-            shared.count = build_tree_walk<Slots>(row, shared.steps);
+            shared.count = build_tree_walk<Slots>(row, shared.steps, shared.pending);
         } else {
             const std::int32_t valid = access.valid_columns[coord.batch];
             for (int c = 0; c < valid; ++c) {

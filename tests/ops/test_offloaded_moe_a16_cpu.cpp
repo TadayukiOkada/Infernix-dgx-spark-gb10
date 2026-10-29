@@ -157,7 +157,7 @@ void test_row_sums(const moe::ExpertShape& shape) {
         xp[c]   = &xb[static_cast<std::size_t>(c) * blocks];
     }
     std::vector<std::int64_t> s(static_cast<std::size_t>(groups) * 16 * ncols);
-    for (moe::CpuIsa isa : {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+    for (moe::CpuIsa isa : {moe::CpuIsa::kScalar, moe::CpuIsa::kNeon}) {
         if (!moe::cpu_isa_supported(isa)) { continue; }
         moe::rg16_row_sums_a16(isa, e.record.data(), blocks, 0, groups, xp, ncols, s.data());
         int bad = 0;
@@ -178,17 +178,16 @@ void test_row_sums(const moe::ExpertShape& shape) {
 
 void test_isa_equality(const moe::ExpertShape& shape) {
     std::mt19937 rng(42);
-    for (moe::CpuIsa isa : {moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+    for (moe::CpuIsa isa : {moe::CpuIsa::kNeon}) {
         std::printf("CPU ISA %-12s %s\n", moe::cpu_isa_name(isa), moe::cpu_isa_supported(isa) ? "tested" : "not supported on this host (skipped)");
     }
     const int hidden = shape.hidden;
     for (int trial = 0; trial < 4; ++trial) {
         const Expert e = fixtures::random_a16_expert(rng, shape);
         for (int ncols = 1; ncols <= moe::kMaxColumns; ++ncols) {
-            const auto x   = trial % 2 ? fixtures::wide_range_activations(rng, ncols, hidden)
-                                       : fixtures::random_activations(rng, ncols, hidden);
+            const auto x   = trial % 2 ? fixtures::wide_range_activations(rng, ncols, hidden) : fixtures::random_activations(rng, ncols, hidden);
             const auto ref = run(moe::CpuIsa::kScalar, shape, e, x, ncols);
-            for (moe::CpuIsa isa : {moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+            for (moe::CpuIsa isa : {moe::CpuIsa::kNeon}) {
                 if (!moe::cpu_isa_supported(isa)) { continue; }
                 check(run(isa, shape, e, x, ncols) == ref, "ISA output bit-identical to the scalar reference");
             }
@@ -320,7 +319,7 @@ std::uint64_t golden_hash(moe::CpuIsa isa, int ncols) {
 }
 
 void test_golden() {
-    for (moe::CpuIsa isa : {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
+    for (moe::CpuIsa isa : {moe::CpuIsa::kScalar, moe::CpuIsa::kNeon}) {
         if (!moe::cpu_isa_supported(isa)) { continue; }
         const std::uint64_t h1 = golden_hash(isa, 1), h4 = golden_hash(isa, 4);
         if (h1 != kGoldenA16_1 || h4 != kGoldenA16_4) {

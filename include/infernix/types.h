@@ -25,9 +25,9 @@ inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 // Physical Host memory Infernix leaves free for the OS and other programs after its weights, experts,
-// n-gram table and caches, when --ram-free-mib is not given (8 GiB since 2026-10-26: with 2 GiB a desktop paged
-// once Qwen3.8-Flash-Next's experts and n-gram table took the rest; Basalt's RAM-low guard sits at ~8.3 GiB).
+// n-gram table and caches, when --ram-free-mib is not given (8 GiB, after Strata v0.2.6's rule).
 inline constexpr std::uint64_t kDefaultRamFreeBytes = 8ULL << 30;
+inline constexpr std::uint64_t kDefaultRamHeadroomBytes = kDefaultRamFreeBytes;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
@@ -118,6 +118,10 @@ enum class FastPath : std::uint8_t {
     // exactly. It takes precedence where both are selected. It also serves MXFP8 dense weights (NVIDIA
     // FP4-Local), whose group scales are the MMA's weight scales.
     Fp8A8PairBlock32,
+    // NVFP4 weights whose permission is 16-bit activations (W4Dense): prefill-width projections
+    // carry the activation as two row-scaled NVFP4 terms on the 4-bit Tensor Core path
+    // (ops::LinearRoutes::Nvfp4A4Pair).
+    Nvfp4A4Pair,
     // Groupwise Q4 gate/up weights: prefill-width projections quantize activations to int8 per token
     // and fold each group's weight scale into its accumulator (ops::LinearRoutes::Q4W4A8).
     Q4W4A8,
@@ -298,11 +302,11 @@ enum class FastPath : std::uint8_t {
     GdnTreeClosedForm,
 };
 
-inline constexpr std::array<FastPath, 38> kFastPaths{
+inline constexpr std::array<FastPath, 39> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
-    FastPath::Fp8A8PairBlock32,
+    FastPath::Fp8A8PairBlock32,    FastPath::Nvfp4A4Pair,
     FastPath::Q4W4A8,              FastPath::SampledMtpDrafts,
     FastPath::GdnF16Accumulate,    FastPath::Q5KSplitMma,
     FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
@@ -348,6 +352,7 @@ inline constexpr std::array<FastPath, 38> kFastPaths{
     case FastPath::IdleWidePrefill: return "idle-wide-prefill";
     case FastPath::Fp8A8Pair: return "fp8-a8-pair";
     case FastPath::Fp8A8PairBlock32: return "fp8-a8-pair-block32";
+    case FastPath::Nvfp4A4Pair: return "nvfp4-a4-pair";
     case FastPath::Q4W4A8: return "q4-w4a8";
     case FastPath::SampledMtpDrafts: return "sampled-mtp-drafts";
     case FastPath::GdnF16Accumulate: return "gdn-f16-accumulate";
@@ -713,6 +718,9 @@ struct EngineOptions {
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
+    // Qwen3.8-Flash-Next's host row cache when the n-gram table is read from its volume (0 uses the
+    // default 2^20-row cache; a larger value rounds down to a power-of-two slot count).
+    std::uint64_t ngram_cache_bytes = 0;
     // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
     // before the first request (warm start), written at stop and every 10 minutes between requests.
     // Without a usable file (none given, a first start, another artifact's) the cache is seeded from the
@@ -746,9 +754,6 @@ struct EngineOptions {
     // Qwen3.8-Flash-Next: what the expert cache leaves for the display and other programs once
     // every fixed allocation is made (automatic: 1 GiB with a display attached, 256 MiB headless).
     std::optional<std::size_t> vram_headroom_bytes;
-    // Qwen3.8-Flash-Next on Windows: also size the expert cache into the physical VRAM the OS
-    // budget withholds (~0.6 GiB on an RTX 5090), measured at startup (--vram-past-budget). That
-    // memory may be moved to system memory when another program needs VRAM.
     bool vram_past_budget = false;
     // Qwen3.8-Flash-Next, approximate (--expert-tail-skip R, 1..9; 0 off): in decode and verification
     // rounds, a routed expert not resident in VRAM that every token of the round routes at top-10

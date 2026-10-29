@@ -1,12 +1,6 @@
 #include "core/direct_read_queue.h"
 #include "core/temporary_switches.h"
 
-#ifdef _WIN32
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#else
 #    include <cerrno>
 #    include <condition_variable>
 #    include <fcntl.h>
@@ -14,7 +8,6 @@
 #    include <sys/stat.h>
 #    include <sys/uio.h>
 #    include <unistd.h>
-#endif
 
 #include <algorithm>
 #include <deque>
@@ -60,20 +53,6 @@ int severity(DirectReadQueue::Status status) {
     return 3;
 }
 
-#ifdef _WIN32
-std::error_code win32_error(DWORD code) { return {static_cast<int>(code), std::system_category()}; }
-bool is_transient(const std::error_code& ec) {
-    if (ec.category() != std::system_category()) { return false; }
-    const auto v = static_cast<DWORD>(ec.value());
-    return v == ERROR_NO_SYSTEM_RESOURCES || v == ERROR_WORKING_SET_QUOTA || v == ERROR_NOT_ENOUGH_QUOTA ||
-           v == ERROR_NOT_ENOUGH_MEMORY;
-}
-bool is_cancellation(const std::error_code& ec) {
-    return ec.category() == std::system_category() && static_cast<DWORD>(ec.value()) == ERROR_OPERATION_ABORTED;
-}
-std::error_code cancellation_error() { return win32_error(ERROR_OPERATION_ABORTED); }
-std::error_code fault_error(bool transient) { return win32_error(transient ? ERROR_NO_SYSTEM_RESOURCES : ERROR_CRC); }
-#else
 std::error_code errno_error(int code) { return {code, std::generic_category()}; }
 bool is_transient(const std::error_code& ec) {
     return ec.category() == std::generic_category() &&
@@ -84,17 +63,12 @@ bool is_cancellation(const std::error_code& ec) {
 }
 std::error_code cancellation_error() { return errno_error(ECANCELED); }
 std::error_code fault_error(bool transient) { return errno_error(transient ? ENOBUFS : EIO); }
-#endif
 
 } // namespace
 
 struct DirectReadQueue::Impl {
     struct File {
-#ifdef _WIN32
-        HANDLE handle = INVALID_HANDLE_VALUE;
-#else
         int fd = -1;
-#endif
         std::uint64_t bytes = 0;
     };
 
@@ -111,18 +85,12 @@ struct DirectReadQueue::Impl {
     // One read of the device: a whole demand read or one prefetch sub-read. Never moves while
     // issued (a deque element), since Windows writes its OVERLAPPED.
     struct Io {
-#ifdef _WIN32
-        OVERLAPPED overlapped{};
-#endif
         std::size_t self = 0, request = 0;
         std::uint32_t file   = 0;
         std::uint64_t offset = 0;
         std::size_t bytes    = 0;
         std::byte* destination = nullptr;
         std::vector<Target> targets; // a scatter read's destinations (empty: `destination`)
-#ifdef _WIN32
-        std::vector<FILE_SEGMENT_ELEMENT> pages; // ReadFileScatter's page list, null-terminated
-#endif
         Priority priority      = Priority::Demand;
         std::uint32_t issues = 0, hard_failures = 0, timeouts = 0, transient_retries = 0;
         Clock::time_point issued{}, first_transient{}, not_before{};
@@ -155,9 +123,6 @@ struct DirectReadQueue::Impl {
     std::size_t live = 0;
     bool cancelling  = false;
 
-#ifdef _WIN32
-    HANDLE port = nullptr;
-#else
     struct Job {
         std::size_t io = 0;
         int fd         = -1;
@@ -172,7 +137,6 @@ struct DirectReadQueue::Impl {
     std::deque<Finished> done;
     bool stopping = false;
     std::vector<std::thread> workers;
-#endif
 
     explicit Impl(const Options& o) : options(o) {
         if (options.demand_depth == 0 || options.restore_depth == 0 || options.prefetch_depth == 0 ||
@@ -180,24 +144,11 @@ struct DirectReadQueue::Impl {
             options.restore_split < kAlignment || options.restore_split % kAlignment != 0) {
             throw std::invalid_argument("DirectReadQueue: depths must be positive and the splits positive multiples of 4 KiB");
         }
-#ifdef _WIN32
-        port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
-        if (port == nullptr) {
-            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "CreateIoCompletionPort");
-        }
-#else
         const std::uint32_t n = std::max<std::uint32_t>(1, options.posix_workers);
         for (std::uint32_t i = 0; i < n; ++i) { workers.emplace_back([this] { work(); }); }
-#endif
     }
 
     ~Impl() {
-#ifdef _WIN32
-        for (auto& f : files) {
-            if (f.handle != INVALID_HANDLE_VALUE) { ::CloseHandle(f.handle); }
-        }
-        if (port != nullptr) { ::CloseHandle(port); }
-#else
         {
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
@@ -207,33 +158,12 @@ struct DirectReadQueue::Impl {
         for (auto& f : files) {
             if (f.fd >= 0) { ::close(f.fd); }
         }
-#endif
     }
 
     // ---- platform
     std::uint32_t open_file(const std::filesystem::path& path) {
         File f;
-#ifdef _WIN32
-        // No write sharing: an in-place rewrite of the artifact fails while it is read. Delete
-        // sharing keeps a rename-replace possible (this handle keeps the old file).
-        f.handle = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
-        if (f.handle == INVALID_HANDLE_VALUE) {
-            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
-                                    "DirectReadQueue: CreateFileW " + path.string());
-        }
-        LARGE_INTEGER size{};
-        if (!::GetFileSizeEx(f.handle, &size) || ::CreateIoCompletionPort(f.handle, port, 0, 0) == nullptr) {
-            const DWORD error = ::GetLastError();
-            ::CloseHandle(f.handle);
-            throw std::system_error(static_cast<int>(error), std::system_category(), "DirectReadQueue: open " + path.string());
-        }
-        f.bytes = static_cast<std::uint64_t>(size.QuadPart);
-#else
         int flags = O_RDONLY | O_CLOEXEC;
-#    ifdef O_DIRECT
-        flags |= O_DIRECT;
-#    endif
         f.fd = ::open(path.c_str(), flags);
 #    ifdef O_DIRECT
         // A filesystem without direct I/O (tmpfs, 9p, some FUSE mounts and Docker bind mounts)
@@ -248,47 +178,17 @@ struct DirectReadQueue::Impl {
             throw std::system_error(error, std::generic_category(), "DirectReadQueue: fstat " + path.string());
         }
         f.bytes = static_cast<std::uint64_t>(st.st_size);
-#endif
         files.push_back(f);
         return static_cast<std::uint32_t>(files.size() - 1);
     }
 
     // Starts the device read of `io`; an immediate failure becomes a finished read.
     void platform_read(Io& io) {
-#ifdef _WIN32
-        io.overlapped            = OVERLAPPED{};
-        io.overlapped.Offset     = static_cast<DWORD>(io.offset & 0xffffffffULL);
-        io.overlapped.OffsetHigh = static_cast<DWORD>(io.offset >> 32U);
-        BOOL started = FALSE;
-        if (io.targets.empty()) {
-            started = ::ReadFile(files[io.file].handle, io.destination, static_cast<DWORD>(io.bytes), nullptr,
-                                 &io.overlapped);
-        } else {
-            // One element per 4 KiB page (the system page size on x64), then a null terminator.
-            io.pages.clear();
-            for (const Target& target : io.targets) {
-                auto* page = static_cast<std::byte*>(target.destination);
-                for (std::size_t at = 0; at < target.bytes; at += kAlignment) {
-                    FILE_SEGMENT_ELEMENT element{};
-                    element.Buffer = static_cast<void*>(page + at); // PVOID64 is void* on x64
-                    io.pages.push_back(element);
-                }
-            }
-            io.pages.push_back(FILE_SEGMENT_ELEMENT{});
-            started = ::ReadFileScatter(files[io.file].handle, io.pages.data(), static_cast<DWORD>(io.bytes), nullptr,
-                                        &io.overlapped);
-        }
-        if (!started) {
-            const DWORD error = ::GetLastError();
-            if (error != ERROR_IO_PENDING) { held.push_back({io.self, win32_error(error), 0, Clock::now()}); }
-        }
-#else
         {
             std::lock_guard<std::mutex> lock(mutex);
             jobs.push_back({io.self, files[io.file].fd, io.offset, io.bytes, io.destination, io.targets});
         }
         work_ready.notify_one();
-#endif
     }
 
     // Asks the device to abandon `io`; false when that is not possible (it completes normally).
@@ -298,44 +198,19 @@ struct DirectReadQueue::Impl {
             held.push_back({io.self, cancellation_error(), 0, Clock::now()});
             return true;
         }
-#ifdef _WIN32
-        return ::CancelIoEx(files[io.file].handle, &io.overlapped) != FALSE;
-#else
         return false;
-#endif
     }
 
     // Waits up to `wait` for device completions and appends them to `got`.
     void platform_wait(std::chrono::microseconds wait, std::vector<Finished>& got) {
-#ifdef _WIN32
-        OVERLAPPED_ENTRY entries[32];
-        ULONG n = 0;
-        const auto ms = static_cast<DWORD>(std::min<std::int64_t>((wait.count() + 999) / 1000, 60000));
-        if (!::GetQueuedCompletionStatusEx(port, entries, 32, &n, ms, FALSE)) {
-            const DWORD error = ::GetLastError();
-            if (error == WAIT_TIMEOUT) { return; }
-            throw std::system_error(static_cast<int>(error), std::system_category(), "GetQueuedCompletionStatusEx");
-        }
-        for (ULONG i = 0; i < n; ++i) {
-            Io* io      = CONTAINING_RECORD(entries[i].lpOverlapped, Io, overlapped);
-            DWORD bytes = 0;
-            std::error_code error;
-            if (!::GetOverlappedResult(files[io->file].handle, &io->overlapped, &bytes, FALSE)) {
-                error = win32_error(::GetLastError());
-            }
-            got.push_back({io->self, error, bytes, Clock::now()});
-        }
-#else
         std::unique_lock<std::mutex> lock(mutex);
         done_ready.wait_for(lock, wait, [&] { return !done.empty(); });
         while (!done.empty()) {
             got.push_back(done.front());
             done.pop_front();
         }
-#endif
     }
 
-#ifndef _WIN32
     void work() {
         for (;;) {
             Job job;
@@ -378,7 +253,6 @@ struct DirectReadQueue::Impl {
             done_ready.notify_one();
         }
     }
-#endif
 
     // ---- scheduling
     void submit(const Read& read) {

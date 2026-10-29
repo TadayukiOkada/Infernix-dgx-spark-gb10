@@ -49,6 +49,12 @@ struct LoadOptions {
     // (runtime/expert_offload/drafter_pool.h), where the model can pool them: Qwen4Exp, and Qwen3.5 with offloaded
     // experts, each with its measured slot count (Config::mtp_expert_slots). False: the bank is device-resident.
     bool mtp_expert_pool = false;
+    // Qwen4Exp on an integrated GPU (GB10) -- THE DEFAULT there since 2026-10-14: the routed expert
+    // banks land in device memory through the ordinary weight upload instead of being pinned in host
+    // memory. On unified DRAM that is one draw per byte instead of two (pinned bank plus its frame
+    // copies), nothing has to be streamed or staged, and the kernel reads records straight from
+    // their final home.
+    bool device_experts = false;
 
     bool operator==(const LoadOptions&) const = default;
 

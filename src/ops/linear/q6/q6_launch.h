@@ -23,6 +23,12 @@ void launch_q6_a16_sliced_r16_t32_w4_s2(const Tensor& x, const Weight& weight, T
                                         cudaStream_t stream);
 void launch_q6_a16_sliced_r32_t32_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream);
+void launch_q6_a16_mma_r32_t64_k128_s2_a1(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream);
+void launch_q6_a16_mma_r32_t128_k64_s2_a2(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream);
+void launch_q6_a16_mma_r32_t128_k128_s2_a1(const Tensor& x, const Weight& weight, Tensor& out,
+                                           cudaStream_t stream);
 void launch_q6_a16_mma_r64_t40_k128(const Tensor& x, const Weight& weight, Tensor& out,
                                     cudaStream_t stream);
 void launch_q6_a16_mma_r64_t48_k128(const Tensor& x, const Weight& weight, Tensor& out,
@@ -39,6 +45,8 @@ void launch_q6_a16_mma_r64_t96(const Tensor& x, const Weight& weight, Tensor& ou
                                cudaStream_t stream);
 void launch_q6_a16_mma_r64_t128(const Tensor& x, const Weight& weight, Tensor& out,
                                 cudaStream_t stream);
+void launch_q6_a16_mma_r64_t128_k128_s1_a1(const Tensor& x, const Weight& weight, Tensor& out,
+                                           cudaStream_t stream);
 void launch_q6_a16_mma_r64_t112(const Tensor& x, const Weight& weight, Tensor& out,
                                 cudaStream_t stream);
 } // namespace infernix::ops::detail

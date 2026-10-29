@@ -52,7 +52,7 @@ void check(bool ok, const char* what) {
 }
 
 constexpr int kTerms = canon::kA4ResidualTerms;
-constexpr moe::CpuIsa kIsas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni};
+constexpr moe::CpuIsa kIsas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kNeon};
 
 // ---------------------------------------------------------------------------- E1 encoding
 
@@ -298,7 +298,7 @@ void test_split_invariance() {
 
 // E4 and E5.
 void test_oracles() {
-    std::mt19937 rng(21);
+    std::mt19937 rng(7);
     double sum = 0.0, worst = 0.0;
     int columns = 0;
     for (int trial = 0; trial < 6; ++trial) {

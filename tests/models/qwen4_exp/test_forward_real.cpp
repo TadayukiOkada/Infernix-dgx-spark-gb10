@@ -77,13 +77,6 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <psapi.h>
-#endif
 
 using namespace infernix;
 namespace q4 = infernix::models::qwen4_exp;
@@ -114,15 +107,6 @@ std::vector<std::int32_t> parse_tokens(const std::string& argument) {
 // Host memory after each stage: the pinned weights are the bulk; the rest should stay small.
 void print_memory(const char* stage) {
     constexpr double gib = 1073741824.0;
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS_EX counters{};
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                                sizeof(counters))) {
-        std::printf("[memory] %s: private %.2f GiB, working set %.2f GiB, system available %.2f GiB\n", stage,
-                    counters.PrivateUsage / gib, counters.WorkingSetSize / gib, available_host_memory_bytes() / gib);
-        return;
-    }
-#endif
     std::printf("[memory] %s: system available %.2f GiB\n", stage, available_host_memory_bytes() / gib);
 }
 

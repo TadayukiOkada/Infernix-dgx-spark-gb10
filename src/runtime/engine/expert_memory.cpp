@@ -108,7 +108,7 @@ expert_offload::VramSizing check_expert_vram(const EngineOptions& options, const
             "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
             "--vram-headroom-mib, or free VRAM");
     }
-    if (check.frames < kFewExpertFrames) {
+    if (max_frames > 0 && check.frames < kFewExpertFrames) {
         report_engine(options, DiagnosticLevel::Warning,
                       "decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM (" +
                           std::to_string(kFewExpertFrames) +

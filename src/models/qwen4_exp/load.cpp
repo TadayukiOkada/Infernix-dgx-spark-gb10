@@ -8,6 +8,8 @@
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/registry.h"
 
+#include <cuda_runtime.h>
+
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -189,8 +191,9 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     out.convolution      = b.direct(p + "convolution", {c.ple.conv_kernel, width});
     // An FP8 table's per-tensor scale (BF16) or an NVFP4 table's multiplier (FP32); IQ4_NL and BF16 rows
     // carry their own.
-    if (c.ple.table.format == NgramRowFormat::Fp8E4m3) { out.ngram_scale = b.direct(p + "ngram_scale", {1}); }
-    if (c.ple.table.format == NgramRowFormat::Nvfp4) {
+    if (c.ple.table.format == NgramRowFormat::Fp8E4m3) {
+        out.ngram_scale = b.direct(p + "ngram_scale", {1});
+    } else if (c.ple.table.format == NgramRowFormat::Nvfp4) {
         out.ngram_scale = b.direct(p + "ngram_scale", {1}, QType::FP32);
     }
     return out;
@@ -496,7 +499,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->resources = bind_resources(binder, out->config);
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text,
-                             options.stream_experts ? Residency::Streamed : Residency::HostPinned);
+                             options.stream_experts   ? Residency::Streamed
+                             : options.device_experts ? Residency::Device
+                                                      : Residency::HostPinned);
     if (out->config.vision) {
         out->weights.vision = bind_vision(bindings, *out->config.vision, out->config.text,
                                           options.overlay_vision() ? Residency::HostPinned : Residency::Device);
@@ -759,10 +764,10 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                 ": an expert bank must be one complete parent");
         }
         ExpertBank bank;
+        const auto& parent = *view.parts.front().parent;
         if (streamed) {
             const auto& reference = data->pending.at(layers[i].moe.experts.index).reference;
             const auto object     = reference.binding.parts.front().object;
-            const auto& parent    = *view.parts.front().parent;
             std::vector<float> words(is_ggml_expert_layout(parent.geometry.layout)
                                          ? 0
                                          : parent.geometry.scale_bytes / sizeof(float));
@@ -781,6 +786,19 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             bank.planes.hidden != data->config.text.hidden_size ||
             bank.planes.intermediate != data->config.text.moe.intermediate) {
             throw ArtifactError("expert bank geometry differs from the text config");
+        }
+        // With the banks on device the scale tail travels with them; copy just the tail here so
+        // the alphas below can be computed on host without touching the rest. The copy must outlive
+        // the expert_scales call below, and planes.multipliers goes back to the device tail after.
+        const float* device_tail = bank.planes.multipliers;
+        std::vector<float> tail;
+        if (data->options.device_experts) {
+            tail.resize(parent.geometry.scale_bytes / sizeof(float));
+            if (cudaMemcpy(tail.data(), device_tail, parent.geometry.scale_bytes,
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                throw ArtifactError("copying the expert scale tail to Host failed");
+            }
+            bank.planes.multipliers = tail.data();
         }
         const bool exact = bank.planes.gate_up_format != QType::NVFP4_MUL;
         if (exact != data->config.text.exact_experts) {
@@ -803,6 +821,9 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             } catch (const std::invalid_argument& error) {
                 throw ArtifactError(error.what());
             }
+        }
+        if (data->options.device_experts) {
+            bank.planes.multipliers = device_tail; // point back at the stable device-side tail
         }
         banks.push_back(std::move(bank));
     }

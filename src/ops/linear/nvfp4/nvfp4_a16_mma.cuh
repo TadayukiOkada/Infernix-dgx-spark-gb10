@@ -45,7 +45,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     auto* code_shared =
         reinterpret_cast<std::uint8_t*>(activation_shared + Schedule::kActivationStages * BN * BK);
 
-    auto* scale_shared = code_shared + BM * (BK / 2);
+    auto* scale_shared = code_shared + Schedule::kActivationStages * BM * (BK / 2);
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -55,8 +55,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    const int row_begin   = static_cast<int>(blockIdx.x) * (BM / (RowPolicy::kPaired ? 2 : 1));
-    const int token_begin = token_offset + static_cast<int>(blockIdx.y) * BN;
+    const int tiles_m = static_cast<int>(gridDim.x);
+    const int tiles_n = static_cast<int>(gridDim.y);
+    int tile_m        = static_cast<int>(blockIdx.x);
+    int tile_n        = static_cast<int>(blockIdx.y);
+    if (tiles_n > 1 && tiles_m >= 8) {
+        constexpr int kGroupRows = 8;
+        const int linear         = tile_n * tiles_m + tile_m;
+        const int group_span     = kGroupRows * tiles_n;
+        const int group          = linear / group_span;
+        const int first_m        = group * kGroupRows;
+        const int active_m       = min(kGroupRows, tiles_m - first_m);
+        const int within         = linear - group * group_span;
+        tile_m                   = first_m + within % active_m;
+        tile_n                   = within / active_m;
+    }
+    const int row_begin    = tile_m * (BM / (RowPolicy::kPaired ? 2 : 1));
+    const int token_begin  = token_offset + tile_n * BN;
+    const bool full_tokens = FullTokens || (token_begin + BN <= tokens);
 
     float accumulators[MT][NT][4] = {};
 
@@ -77,7 +93,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             const int kk          = k8 * 8;
             auto* destination     = &activation_shared[stage * BN * BK + local_token * BK +
                                                    nvfp4_a16_shared_col_64(local_token, kk)];
-            if constexpr (FullTokens) {
+            if (FullTokens || full_tokens) {
                 cp_async<16, Schedule::kActivationCache>(
                     destination, x + static_cast<std::int64_t>(token) * K + k_begin + kk);
             } else {
@@ -90,58 +106,70 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     };
 
-    const auto stage_codes = [&](int k_tile) {
+    const auto stage_codes = [&](int stage, int k_tile) {
         const int k_begin = k_tile * BK;
+        auto* stage_code  = code_shared + stage * BM * (BK / 2);
+        auto* stage_scale = scale_shared + stage * BM * (BK / 16);
+#pragma unroll
         for (int item = tid; item < BM * (BK / 32); item += THREADS) {
             const int row = item / (BK / 32), chunk = item % (BK / 32);
             const int parent = row_policy.weight_row(row_begin, row, M);
-            cp_async<16, Schedule::kWeightCache>(code_shared + row * (BK / 2) + chunk * 16,
+            cp_async<16, Schedule::kWeightCache>(stage_code + row * (BK / 2) + chunk * 16,
                                                  weight_codes +
                                                      static_cast<std::int64_t>(parent) * (K / 2) +
                                                      k_begin / 2 + chunk * 16);
         }
+#pragma unroll
         for (int item = tid; item < BM * (BK / 64); item += THREADS) {
             const int row = item / (BK / 64), tile = item % (BK / 64);
             const int parent = row_policy.weight_row(row_begin, row, M);
-            cp_async<4>(scale_shared + row * (BK / 16) + tile * 4,
+            cp_async<4>(stage_scale + row * (BK / 16) + tile * 4,
                         weight_scales +
                             nvfp4_scale_byte_offset(parent, k_begin / 16 + tile * 4, K));
         }
     };
-    const auto widen_codes = [&]() {
-        const int half = lane >> 4, half_lane = lane & 15;
-        for (int pair = warp * 2; pair < BM; pair += Schedule::kWarps * 2) {
-            const int row = pair + half;
+    const auto widen_codes = [&](int stage) {
+        const auto* stage_code  = code_shared + stage * BM * (BK / 2);
+        const auto* stage_scale = scale_shared + stage * BM * (BK / 16);
+        const int lane_col8     = (tid & 7) * 8;
 #pragma unroll
-            for (int col32 = 0; col32 < BK; col32 += 32) {
-                const int col = col32 + half_lane * 2;
-                const unsigned widened =
-                    nvfp4_scaled_pair_bf16(code_shared[row * (BK / 2) + col / 2],
-                                           scale_shared[row * (BK / 16) + col / 16]);
+        for (int row = tid >> 3; row < BM; row += THREADS >> 3) {
+#pragma unroll
+            for (int col64 = 0; col64 < BK; col64 += 64) {
+                const int col = col64 + lane_col8;
+                const std::uint32_t codes4 =
+                    load_vec<std::uint32_t>(stage_code + row * (BK / 2) + col / 2);
+                const std::uint8_t scale = stage_scale[row * (BK / 16) + col / 16];
+                const uint4 widened      = nvfp4_scaled_oct_bf16(codes4, scale);
                 store_vec(weight_shared + row * BK + nvfp4_a16_shared_col_64(row, col), widened);
             }
         }
     };
 
     stage_activation(0, 0);
-    stage_codes(0);
+    stage_codes(0, 0);
     cp_commit();
 
     const int kTiles = K / BK;
 #pragma unroll 1
     for (int k_tile = 0; k_tile < kTiles; ++k_tile) {
         const int stage = k_tile % Schedule::kActivationStages;
+        const int next  = k_tile + 1;
         cp_wait<0>();
         __syncthreads();
 
-        widen_codes();
+        if constexpr (Schedule::kActivationStages == 2) {
+            if (next < kTiles) {
+                stage_activation(next & 1, next);
+                stage_codes(next & 1, next);
+                cp_commit();
+            }
+        }
+        widen_codes(stage);
         __syncthreads();
 
-        const int next = k_tile + 1;
-        if (next < kTiles) {
-            if constexpr (Schedule::kActivationStages == 2) { stage_activation(next & 1, next); }
-            stage_codes(next);
-            cp_commit();
+        if constexpr (Schedule::kActivationStages == 1) {
+            if (next < kTiles) { stage_codes(0, next); }
         }
 
         constexpr int kSlots =

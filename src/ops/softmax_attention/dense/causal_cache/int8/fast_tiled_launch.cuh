@@ -32,57 +32,48 @@ void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadV
     FastPromptPartials partials{};
     if (plan.splits > 1)
         partials = allocate_fast_prompt_partials(workspace, G::QHeads, p.width, plan.splits);
-    const auto invoke = [&]<class Metadata>(Metadata metadata, const std::int32_t* valid) {
-        const auto launch = [&]<int Warps, bool Pv8, bool Split>() {
-            using Shape = CausalPromptI8FastShape<Warps>;
-            constexpr auto kernel =
-                causal_attention_prompt_i8_fast_kernel<G, Metadata, Warps, Pv8, Split>;
-            static const auto status = cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
-            CUDA_CHECK(status);
-            const dim3 grid(div_up(p.width, Shape::Br), G::QHeads, plan.splits);
-            kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
-                p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
-                p.positions, p.scale, p.out, p.width, static_cast<float*>(partials.rows.data),
-                static_cast<float2*>(partials.stats.data));
-            CUDA_CHECK(cudaGetLastError());
-        };
-        if (plan.splits == 1) {
-            if (pv8) {
-                if (plan.warps == 4)
-                    launch.template operator()<4, true, false>();
-                else
-                    launch.template operator()<8, true, false>();
-            } else if (plan.warps == 4) {
-                launch.template operator()<4, false, false>();
-            } else {
-                launch.template operator()<8, false, false>();
-            }
-            return;
-        }
-        // Only eight-warp CTAs split.
-        if (pv8)
-            launch.template operator()<8, true, true>();
-        else
-            launch.template operator()<8, false, true>();
-        constexpr float Log2E = 1.4426950408889634074f;
-        causal_attention_prompt_fast_merge_kernel<G>
-            <<<dim3(p.width, G::QHeads), kCausalPromptHeadDim, 0, stream>>>(
-                static_cast<const float*>(partials.rows.data),
-                static_cast<const float2*>(partials.stats.data), valid, p.width, plan.splits,
-                p.scale * Log2E, p.out);
+    const PagedKVPromptMetadata metadata{cache.tables, cache.valid_columns, cache.table_rows,
+                                         cache.table_stride};
+    const std::int32_t* valid = cache.table_rows ? cache.valid_columns : nullptr;
+    const auto launch         = [&]<int Warps, bool Pv8, bool Split>() {
+        using Shape = CausalPromptI8FastShape<Warps>;
+        constexpr auto kernel =
+            causal_attention_prompt_i8_fast_kernel<G, PagedKVPromptMetadata, Warps, Pv8, Split>;
+        static const auto status = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
+        CUDA_CHECK(status);
+        const dim3 grid(div_up(p.width, Shape::Br), G::QHeads, plan.splits);
+        kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
+            p.q, cache.keys, cache.values, cache.key_scales, cache.value_scales, metadata,
+            p.positions, p.scale, p.out, p.width, static_cast<float*>(partials.rows.data),
+            static_cast<float2*>(partials.stats.data));
         CUDA_CHECK(cudaGetLastError());
     };
-    if (!cache.table_rows)
-        invoke(PagedKVDirectMetadata{cache.tables}, nullptr);
-    else if (cache.valid_columns)
-        invoke(PagedKVBatchMetadata<true>{cache.tables, cache.valid_columns, cache.table_rows,
-                                          cache.table_stride},
-               cache.valid_columns);
+    if (plan.splits == 1) {
+        if (pv8) {
+            if (plan.warps == 4)
+                launch.template operator()<4, true, false>();
+            else
+                launch.template operator()<8, true, false>();
+        } else if (plan.warps == 4) {
+            launch.template operator()<4, false, false>();
+        } else {
+            launch.template operator()<8, false, false>();
+        }
+        return;
+    }
+    // Only eight-warp CTAs split.
+    if (pv8)
+        launch.template operator()<8, true, true>();
     else
-        invoke(PagedKVBatchMetadata<false>{cache.tables, nullptr, cache.table_rows,
-                                           cache.table_stride},
-               nullptr);
+        launch.template operator()<8, false, true>();
+    constexpr float Log2E = 1.4426950408889634074f;
+    causal_attention_prompt_fast_merge_kernel<G>
+        <<<dim3(p.width, G::QHeads), kCausalPromptHeadDim, 0, stream>>>(
+            static_cast<const float*>(partials.rows.data),
+            static_cast<const float2*>(partials.stats.data), valid, p.width, plan.splits,
+            p.scale * Log2E, p.out);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace infernix::ops::detail

@@ -2,6 +2,7 @@
 
 #include "ops/common/canonical_math.h"
 #include "ops/ggml/ggml_a8.h"
+#include "ops/offloaded_sparse_moe/cpu/neon_mad.h"
 #include "ops/offloaded_sparse_moe/nvfp4_a8.h"
 
 #include <algorithm>
@@ -10,15 +11,13 @@
 #include <stdexcept>
 #include <vector>
 
+#include <sys/auxv.h>
+
 #if defined(__x86_64__) || defined(_M_X64)
 #    include <immintrin.h>
 #    define INFERNIX_MOE_X86 1
-#endif
-
-#if defined(_MSC_VER) && !defined(__clang__)
-#    define INFERNIX_TARGET(x)
-#else
-#    define INFERNIX_TARGET(x) __attribute__((target(x)))
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#    define INFERNIX_MOE_NEON 1
 #endif
 
 namespace infernix::ops::offloaded_moe {
@@ -278,6 +277,136 @@ INFERNIX_AVX2_ROWS_A8(rows_avxvnni, dot4_avxvnni)
 
 #endif // INFERNIX_MOE_X86
 
+#if defined(INFERNIX_MOE_NEON)
+
+inline void prefetch_unit(const std::uint8_t* unit, int distance) {
+    if (distance > 0) {
+        const char* p = reinterpret_cast<const char*>(unit) + distance;
+        __builtin_prefetch(p);
+        __builtin_prefetch(p + 64);
+        __builtin_prefetch(p + 128);
+    }
+}
+
+constexpr std::array<std::int8_t, 16> kBiasedCodes = {12, 13, 14, 15, 16, 18, 20, 24,
+                                                      12, 11, 10, 9,  8,  6,  4,  0};
+
+inline std::int32_t code_word(const std::int8_t* codes, int q) {
+    std::int32_t w;
+    std::memcpy(&w, codes + 4 * q, 4);
+    return w;
+}
+
+// The 16 per-row scales of a unit (16 e4m3 bytes at unit + 128) as four float32x4 for rows 0-3, 4-7,
+// 8-11 and 12-15: m << (e - 1), or m when e == 0.
+inline void unit_scales_f32(const std::uint8_t* s, float32x4_t (&out)[4]) {
+    const uint16x8_t lo   = vmovl_u8(vld1_u8(s));
+    const uint16x8_t hi   = vmovl_u8(vld1_u8(s + 8));
+    const uint32x4_t g[4] = {vmovl_u16(vget_low_u16(lo)), vmovl_u16(vget_high_u16(lo)),
+                             vmovl_u16(vget_low_u16(hi)), vmovl_u16(vget_high_u16(hi))};
+    for (int i = 0; i < 4; ++i) {
+        const uint32x4_t m    = vandq_u32(g[i], vdupq_n_u32(7));
+        const uint32x4_t e    = vandq_u32(vshrq_n_u32(g[i], 3), vdupq_n_u32(15));
+        const uint32x4_t norm =
+            vshlq_u32(vorrq_u32(m, vdupq_n_u32(8)), vreinterpretq_s32_u32(vsubq_u32(e, vdupq_n_u32(1))));
+        out[i] = vcvtq_f32_s32(vreinterpretq_s32_u32(vbslq_u32(vceqq_u32(e, vdupq_n_u32(0)), m, norm)));
+    }
+}
+
+#define INFERNIX_NEON_ROWS_A8(NAME, MAD, TARGET)                                                      \
+    template <int N>                                                                                  \
+    TARGET void NAME(const std::uint8_t* matrix, int blocks, int partials, int rg_begin, int rg_end,  \
+                     const CpuW4A8Slice* const* acts, float* out, int prefetch_bytes) {               \
+        const int8x16_t lut   = vld1q_s8(kBiasedCodes.data());                                        \
+        const uint8x16_t low4 = vdupq_n_u8(0x0F);                                                     \
+        const int last        = partials - 1;                                                         \
+        alignas(64) float acc[kMaxPartials][N][16];                                                   \
+        for (int rg = rg_begin; rg < rg_end; ++rg) {                                                  \
+            const std::uint8_t* units = matrix + static_cast<std::size_t>(rg) * blocks * kUnitBytes;  \
+            for (int b = 0; b < blocks; ++b) {                                                        \
+                const std::uint8_t* unit = units + static_cast<std::size_t>(b) * kUnitBytes;          \
+                prefetch_unit(unit, prefetch_bytes);                                                  \
+                const int s      = b >> 1, half = b & 1;                                              \
+                const bool fresh = half == 0 && s < partials;                                         \
+                uint8x16_t w[4][4]; /* [2 * n + win][q]: rows 0-3, 4-7, 8-11, 12-15 */                \
+                for (int q = 0; q < 4; ++q) {                                                         \
+                    for (int win = 0; win < 2; ++win) {                                               \
+                        const uint8x16_t raw = vld1q_u8(unit + 32 * q + 16 * win);                    \
+                        w[win][q] = vreinterpretq_u8_s8(vqtbl1q_s8(lut, vandq_u8(raw, low4)));        \
+                        w[2 + win][q] = vreinterpretq_u8_s8(                                          \
+                            vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(raw, 4), low4)));                     \
+                    }                                                                                 \
+                }                                                                                     \
+                float32x4_t sw[4];                                                                    \
+                unit_scales_f32(unit + 128, sw);                                                      \
+                float(*part)[16] = acc[s & last];                                                     \
+                for (int c = 0; c < N; ++c) {                                                         \
+                    const CpuW4A8Slice& a    = acts[c][s];                                            \
+                    const std::int8_t* codes = a.q + 16 * half;                                       \
+                    int32x4_t p[4];                                                                   \
+                    for (int g = 0; g < 4; ++g) { p[g] = vdupq_n_s32(a.bias[half]); }                 \
+                    for (int q = 0; q < 4; ++q) {                                                     \
+                        const int8x16_t x = vreinterpretq_s8_s32(vdupq_n_s32(code_word(codes, q)));   \
+                        for (int g = 0; g < 4; ++g) { p[g] = MAD::mad(p[g], w[g][q], x); }            \
+                    }                                                                                 \
+                    const float32x4_t d = vdupq_n_f32(a.d);                                           \
+                    for (int g = 0; g < 4; ++g) {                                                     \
+                        float* at              = part[c] + 4 * g;                                     \
+                        const float32x4_t base = fresh ? vdupq_n_f32(0.0F) : vld1q_f32(at);           \
+                        const float32x4_t m    = vmulq_f32(vcvtq_f32_s32(p[g]), d);                   \
+                        vst1q_f32(at, vfmaq_f32(base, m, sw[g]));                                     \
+                    }                                                                                 \
+                }                                                                                     \
+            }                                                                                         \
+            for (int o = partials / 2; o >= 1; o /= 2) {                                              \
+                for (int i = 0; i < o; ++i) {                                                         \
+                    for (int c = 0; c < N; ++c) {                                                     \
+                        for (int g = 0; g < 4; ++g) {                                                 \
+                            float* at = acc[i][c] + 4 * g;                                            \
+                            vst1q_f32(at, vaddq_f32(vld1q_f32(at), vld1q_f32(acc[i + o][c] + 4 * g)));\
+                        }                                                                             \
+                    }                                                                                 \
+                }                                                                                     \
+            }                                                                                         \
+            for (int r = 0; r < 16; ++r) {                                                            \
+                for (int c = 0; c < N; ++c) {                                                         \
+                    out[(static_cast<std::size_t>(rg - rg_begin) * 16 + r) * N + c] = acc[0][c][r];   \
+                }                                                                                     \
+            }                                                                                         \
+        }                                                                                             \
+    }
+
+INFERNIX_NEON_ROWS_A8(rows_neon_i8mm, neon::I8mmMad, INFERNIX_I8MM_TARGET)
+INFERNIX_NEON_ROWS_A8(rows_neon_asimd, neon::AsimdMad, /* baseline */)
+
+#undef INFERNIX_NEON_ROWS_A8
+
+#define INFERNIX_MOE_DISPATCH(CALL)                                                                   \
+    switch (ncols) {                                                                                  \
+    case 1: CALL(1); break;                                                                           \
+    case 2: CALL(2); break;                                                                           \
+    case 3: CALL(3); break;                                                                           \
+    case 4: CALL(4); break;                                                                           \
+    case 5: CALL(5); break;                                                                           \
+    case 6: CALL(6); break;                                                                           \
+    case 7: CALL(7); break;                                                                           \
+    case 8: CALL(8); break;                                                                           \
+    default: throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]");                   \
+    }
+
+bool has_i8mm() {
+    static const bool ok = [] {
+        const unsigned long hwcap2 = getauxval(AT_HWCAP2);
+#ifndef HWCAP2_I8MM
+#    define HWCAP2_I8MM (1UL << 13)
+#endif
+        return (hwcap2 & HWCAP2_I8MM) != 0;
+    }();
+    return ok;
+}
+
+#endif // INFERNIX_MOE_NEON
+
 } // namespace
 
 void encode_a8_slices(const std::uint16_t* v, int slice_begin, int slice_end, CpuW4A8Slice* out) {
@@ -325,6 +454,18 @@ void rg16_rows_a8(CpuIsa isa, const std::uint8_t* matrix, int blocks, int partia
 #    define INFERNIX_CALL(n) rows_avx2<n>(matrix, blocks, partials, rg_begin, rg_end, acts, out, prefetch_bytes)
         INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
 #    undef INFERNIX_CALL
+        return;
+#elif defined(INFERNIX_MOE_NEON)
+    case CpuIsa::kNeon:
+        if (has_i8mm()) {
+#    define INFERNIX_CALL(n) rows_neon_i8mm<n>(matrix, blocks, partials, rg_begin, rg_end, acts, out, prefetch_bytes)
+            INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
+#    undef INFERNIX_CALL
+        } else {
+#    define INFERNIX_CALL(n) rows_neon_asimd<n>(matrix, blocks, partials, rg_begin, rg_end, acts, out, prefetch_bytes)
+            INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
+#    undef INFERNIX_CALL
+        }
         return;
 #else
     default: break;

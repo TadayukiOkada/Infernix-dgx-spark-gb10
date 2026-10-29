@@ -4,4 +4,7 @@
 namespace infernix::ops::detail {
 void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId problem, const Nvfp4A4Operands& p,
                                 __nv_bfloat16* output, cudaStream_t stream);
+
+void launch_nvfp4_a4_residual_tma_linear(const Nvfp4A4Operands& p, __nv_bfloat16* output,
+                                         cudaStream_t stream);
 } // namespace infernix::ops::detail

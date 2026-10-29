@@ -1,0 +1,41 @@
+# cuda-kernel-toolkit sample configuration — NVIDIA GB10 (sm_121a).
+# Every key here can be overridden by command-line flags; CLI > file > defaults.
+# Pass this file with `--config` to any subcommand. The toolkit core is pure
+# stdlib Python, so this file needs no third-party dependencies to parse.
+
+# Absolute path to the benchmark executable whose kernels will be analysed.
+# The harness prints JSON timing records to stdout per launch (see README).
+exe: /tmp/ckt_kernels_build/ckt_kernels
+
+# Workloads to analyse. Each entry becomes one section of analysis.md/json/html.
+workloads:
+  - saxpy
+  - gemm_tiled
+  - reduce_block
+  - dependent_fma
+
+# Problem size passed to the harness as --size <n>. Powers-of-two cover the
+# grid-fill boundaries; non-power-of-two sizes exercise tail behaviour.
+problem_size: 4194304
+
+# Timing methodology (Stage A owns latency; NCU-replayed timings are NOT used).
+iterations: 50        # timed launches per measurement block
+warmup: 5             # untimed launches before each measurement block
+repeats: 5            # independent measurement blocks; median is reported
+
+# Correctness gate for the launch-parameter search (--verify must pass at
+# every candidate before it is benchmarked).
+atol: 1e-5
+rtol: 1e-4
+dtype: fp32
+
+# Launch-parameter search policy (`ckt.cli search`). Keys at top level are read
+# by _merged(); candidates are generated from these bounds and filtered against
+# hardware occupancy limits BEFORE any launch happens.
+strategy: model-guided        # exhaustive | coarse-to-fine | stratified | model-guided
+threads: [128, 256, 512]      # allowed threads-per-block values
+sm_multiples: [2, 4, 8, 16, 32, 48]   # blocks = SM_count * k
+shared_mem: [0]               # dynamic shared memory variants
+budget: 24                    # max candidates per search run
+baseline_blocks: 192          # reference launch configuration for reduce_block
+baseline_threads: 256

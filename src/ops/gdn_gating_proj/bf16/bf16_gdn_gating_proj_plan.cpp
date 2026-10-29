@@ -27,25 +27,36 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 6> k27Routes{{
+constexpr std::array<RouteSpec, 7> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
-    {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
-    // RTX 5090/170-SM performance policy: as token tiles double, halve SplitK to keep the preferred
-    // full grid near 192 CTAs. The launcher independently enforces actual-device residency.
-    {{9, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    // GB10/48-SM retune: MMA cooperative split8 already beats the SIMT small-T ladder from T=3
+    // (split8 tiles the whole batch in one wave at 48 SMs), so only T=2 keeps SmallTSplit10.
+    {{2, 2}, Bf16GdnGatingScheduleId::SmallTSplit10},
+    {{3, 512}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    // GB10 crossover moves left vs the 170-SM policy: split4 wins from ~513 (split8 loses its
+    // single-wave residency once 8*ceil(T/128) exceeds the 48-SM grid).
+    {{513, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    // Unsplit dominates the mid-prefill band on GB10; the cooperative partial-reduction overhead
+    // is not repaid until the batch grows past the full-grid point (~4.2K tokens).
+    {{2049, 4224}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    // Beyond ~4.2K tokens split2 reclaims residency and wins decisively (T=8192: 437us vs 759us).
+    {{4225, kAnyCols}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
 }};
 
-constexpr std::array<RouteSpec, 5> k35Routes{{
-    // RTX 5090/170-SM performance policy: this progression keeps the preferred full grid near
-    // 256 CTAs. The launcher independently enforces actual-device residency.
+constexpr std::array<RouteSpec, 6> k35Routes{{
+    // GB10/48-SM retune. The 170-SM policy kept a 256-CTA ladder; on 48 SMs the split-K crossovers
+    // move left and the unsplit band extends further before split2 reclaims residency.
     {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
-    {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    {{128, 256}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    // split4 beats split8 from ~257 (split8 loses single-wave residency past 48 SMs); T=1024:
+    // 26us vs 31us.
+    {{257, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    // Unsplit dominates the whole mid-prefill band on GB10 through ~6K tokens.
+    {{2049, 6144}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    // Beyond ~6K tokens split2 reclaims residency (T=8192: 176us vs 203us).
+    {{6145, kAnyCols}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
 }};
 
 template <std::size_t N>
@@ -421,7 +432,7 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-    if (is_27(problem) && problem.cols <= 42)
+    if (is_27(problem) && problem.cols <= 16)
         return {Bf16GdnNormGatingScheduleId::FusedSimt27, control, 0};
     // The 122B-A10B's fused SIMT route through 42 columns (decode, MTP and DFlash2 verification).
     if (is_122(problem) && problem.cols <= 42)
@@ -444,8 +455,8 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
     if ((heads == 48 && input_rows == 5120) || (heads == 64 && input_rows == 3072)) {
-        if (max_cols <= 42) return 0;
-        return bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, std::max(min_cols, 43),
+        if (max_cols <= 16) return 0;
+        return bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, std::max(min_cols, 17),
                                                         max_cols);
     }
     if (heads == 32 && input_rows == 2048 && min_cols <= 16) {

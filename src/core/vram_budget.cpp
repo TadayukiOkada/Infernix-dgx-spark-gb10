@@ -1,5 +1,7 @@
 #include "core/vram_budget.h"
 
+#include "core/host_memory.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -8,17 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <dxgi1_6.h>
-#else
-#    include "core/dxcore_adapter.h"
-
-#    include <dlfcn.h>
-#endif
+#include <dlfcn.h>
 
 namespace infernix {
 namespace {
@@ -37,15 +29,9 @@ std::function<VramSnapshot()>& fake_source() {
 class Nvml {
 public:
     explicit Nvml(const cudaDeviceProp& props) {
-#ifdef _WIN32
-        library_ = ::LoadLibraryA("nvml.dll");
-        if (library_ == nullptr) { return; }
-        const auto symbol = [&](const char* name) { return reinterpret_cast<void*>(::GetProcAddress(library_, name)); };
-#else
         library_ = ::dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
         if (library_ == nullptr) { return; }
         const auto symbol = [&](const char* name) { return ::dlsym(library_, name); };
-#endif
         init_         = reinterpret_cast<int (*)()>(symbol("nvmlInit_v2"));
         shutdown_     = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
         by_pci_       = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
@@ -94,19 +80,11 @@ private:
         initialized_ = false;
         device_      = nullptr;
         if (library_ == nullptr) { return; }
-#ifdef _WIN32
-        ::FreeLibrary(library_);
-#else
         ::dlclose(library_);
-#endif
         library_ = nullptr;
     }
 
-#ifdef _WIN32
-    HMODULE library_ = nullptr;
-#else
     void* library_ = nullptr;
-#endif
     int (*init_)()                         = nullptr;
     int (*shutdown_)()                     = nullptr;
     int (*by_pci_)(const char*, void**)    = nullptr;
@@ -118,46 +96,14 @@ private:
 
 class DeviceSource final : public VramBudgetSource {
 public:
-    DeviceSource(int device, bool past_budget) : device_(device) {
+    explicit DeviceSource(int device) : device_(device) {
         if (cudaGetDeviceProperties(&props_, device) != cudaSuccess) {
             throw std::runtime_error("VRAM budget: cannot read the device's properties");
         }
         nvml_ = std::make_unique<Nvml>(props_);
-#ifdef _WIN32
-        int devices      = 0;
-        several_devices_ = cudaGetDeviceCount(&devices) == cudaSuccess && devices > 1;
-        budget_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        open_adapter();
-        if (past_budget) {
-            const VramSnapshot now     = query();
-            const std::uint64_t usable = nvml_->usable_bytes();
-            if (now.has_budget && usable > now.local_budget + kPastBudgetMargin) {
-                allowance_ = usable - now.local_budget - kPastBudgetMargin;
-            }
-        }
-#else
-        (void)past_budget;
-        // CUDA's LUID is valid where its node mask is set; otherwise the only NVIDIA adapter.
-        dxcore_ = DxcoreAdapter::open(props_.luidDeviceNodeMask != 0
-                                          ? reinterpret_cast<const unsigned char*>(props_.luid)
-                                          : nullptr);
-#endif
     }
 
-    ~DeviceSource() override {
-#ifdef _WIN32
-        release_adapter();
-        if (budget_event_ != nullptr) { ::CloseHandle(budget_event_); }
-#endif
-    }
-
-    void* change_event() override {
-#ifdef _WIN32
-        return budget_event_;
-#else
-        return nullptr;
-#endif
-    }
+    ~DeviceSource() override = default;
 
     VramSnapshot query() override {
         const std::lock_guard<std::mutex> lock(mutex_);
@@ -168,45 +114,6 @@ public:
         }
         out.device_free  = free_bytes;
         out.device_total = total_bytes;
-#ifdef _WIN32
-        // An adapter's output list is a snapshot of its factory: recreate both after a hot-plug.
-        if (factory_ != nullptr && !factory_->IsCurrent()) {
-            release_adapter();
-            open_adapter();
-        }
-        if (adapter_ != nullptr) {
-            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-            if (SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
-                out.has_budget   = true;
-                out.local_budget = info.Budget;
-                out.local_usage  = info.CurrentUsage;
-                // Free memory as cudaMemGetInfo derives it on one visible device (budget less
-                // usage), from the wider budget past it. With several CUDA devices visible,
-                // cudaMemGetInfo fell below the budget less usage and stopped following allocations
-                // once 64 GiB of host memory was page-locked, so every frame chunk looked spilled
-                // and the expert cache started empty (RTX 5090 beside an RTX 3090, mdbro's fork,
-                // 2026-10-11): the budget less usage is read directly there too.
-                if (allowance_ != 0 || several_devices_) {
-                    out.budget_allowance = allowance_;
-                    out.local_budget += allowance_;
-                    out.device_free = out.local_budget > out.local_usage
-                                          ? static_cast<std::size_t>(out.local_budget - out.local_usage)
-                                          : 0;
-                }
-            }
-            if (shared_ != 0 && SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
-                out.shared_system  = shared_;
-                out.nonlocal_usage = info.CurrentUsage;
-            }
-            out.outputs = outputs_;
-        }
-#else
-        std::uint64_t nonlocal = 0;
-        if (dxcore_ != nullptr && dxcore_->nonlocal_usage(nonlocal)) {
-            out.shared_system  = dxcore_->shared_system();
-            out.nonlocal_usage = nonlocal;
-        }
-#endif
         const int active = nvml_->display_active();
         if (out.outputs > 0 || active == 1) {
             out.display = DisplayState::Attached;
@@ -217,71 +124,18 @@ public:
         } else {
             out.display = DisplayState::Unknown;
         }
+        out.integrated = props_.integrated != 0;
+        if (out.integrated) {
+            // Unified memory: the driver sees only the pool's free share, while an allocation may
+            // also take what the OS holds as reclaimable file cache (GB10 under a model load).
+            out.reclaimable = reclaimable_pool_bytes();
+        }
         return out;
     }
 
 private:
-#ifdef _WIN32
-    void open_adapter() {
-        IDXGIFactory4* factory = nullptr;
-        if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) { return; }
-        LUID luid{};
-        std::memcpy(&luid, props_.luid, sizeof(luid));
-        IDXGIAdapter3* adapter = nullptr;
-        if (FAILED(factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&adapter)))) {
-            factory->Release();
-            return;
-        }
-        factory_ = factory;
-        adapter_ = adapter;
-        DXGI_ADAPTER_DESC desc{};
-        shared_ = SUCCEEDED(adapter_->GetDesc(&desc)) ? desc.SharedSystemMemory : 0;
-        if (budget_event_ != nullptr &&
-            FAILED(adapter_->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_event_, &budget_cookie_))) {
-            budget_cookie_ = 0;
-        }
-        outputs_ = 0;
-        for (UINT i = 0;; ++i) {
-            IDXGIOutput* output  = nullptr;
-            const HRESULT status = adapter_->EnumOutputs(i, &output);
-            if (status == DXGI_ERROR_NOT_FOUND) { break; }
-            if (FAILED(status)) { // e.g. DXGI_ERROR_NOT_CURRENTLY_AVAILABLE in Session 0: unknown, not none
-                outputs_ = -1;
-                break;
-            }
-            if (output != nullptr) {
-                output->Release();
-                ++outputs_;
-            }
-        }
-    }
-
-    void release_adapter() noexcept {
-        if (adapter_ != nullptr && budget_cookie_ != 0) {
-            adapter_->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie_);
-            budget_cookie_ = 0;
-        }
-        if (adapter_ != nullptr) { adapter_->Release(); }
-        if (factory_ != nullptr) { factory_->Release(); }
-        adapter_ = nullptr;
-        factory_ = nullptr;
-        shared_  = 0;
-        outputs_ = -1;
-    }
-
-    IDXGIFactory4* factory_ = nullptr;
-    IDXGIAdapter3* adapter_ = nullptr;
-    std::uint64_t shared_   = 0; // the adapter's shared system memory
-    int outputs_            = -1;
-    HANDLE budget_event_    = nullptr;
-    DWORD budget_cookie_    = 0;
-#else
-    std::unique_ptr<DxcoreAdapter> dxcore_; // WSL2 only
-#endif
     int device_ = 0;
     std::uint64_t allowance_ = 0; // past the budget (measured at open); 0: the OS budget as reported
-    bool several_devices_ =
-        false; // more than one CUDA device visible (Windows: free memory from DXGI)
     cudaDeviceProp props_{};
     std::unique_ptr<Nvml> nvml_;
     std::mutex mutex_;
@@ -306,6 +160,12 @@ std::uint64_t spill_shortfall(std::uint64_t free_before, std::uint64_t free_afte
 }
 
 std::uint64_t SpillGuard::end(std::uint64_t bytes) {
+    // On a unified-memory device there is no separate system memory for the driver to demote into:
+    // every allocation draws on one pool, so a shortfall of free memory cannot mean a spill of this
+    // process's data (the pool never silently moves it elsewhere; an allocation that does not fit
+    // fails outright). The guard stays enabled for discrete GPUs, where WDDM can place bytes in
+    // shared system memory.
+    if (source_.query().integrated) { return 0; }
     after_ = source_.query();
     if (spill_shortfall(before_.device_free, after_.device_free, bytes) == 0) { return 0; }
     after_ = source_.query();
@@ -323,12 +183,12 @@ std::string SpillGuard::readings(std::uint64_t bytes) const {
     return out;
 }
 
-std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget) {
+std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool /*past_budget*/) {
     {
         const std::lock_guard<std::mutex> lock(fake_mutex());
         if (fake_source()) { return std::make_unique<FakeSource>(fake_source()); }
     }
-    return std::make_unique<DeviceSource>(device, past_budget);
+    return std::make_unique<DeviceSource>(device);
 }
 
 namespace testing {

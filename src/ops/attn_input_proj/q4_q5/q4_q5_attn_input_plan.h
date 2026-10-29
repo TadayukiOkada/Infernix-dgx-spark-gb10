@@ -39,6 +39,15 @@ bool q4_q5_attn_input_admits(const Q4Q5AttnInputProblem& problem) noexcept;
 Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& problem,
                                                 bool column_invariant = false);
 
+// Candidate-sweep API: run a specific schedule directly instead of the production route.
+// candidate_is_legal mirrors each kernel's hard column window so a sweep never throws.
+bool q4_q5_attn_input_candidate_is_legal(Q4Q5AttnInputScheduleId schedule,
+                                         const Q4Q5AttnInputProblem& problem) noexcept;
+void q4_q5_attn_input_execute_candidate(Q4Q5AttnInputScheduleId schedule, const Tensor& x,
+                                        const Weight& query_key_weight, const Weight& gate_value_weight,
+                                        Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                                        cudaStream_t stream);
+
 void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& x,
                                    const Weight& query_key_weight, const Weight& gate_value_weight,
                                    Tensor& q, Tensor& gate, Tensor& k, Tensor& v,

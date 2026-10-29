@@ -24,9 +24,10 @@ struct Nvfp4A4Operands {
     float alpha;
     Nvfp4ScaleLayout scale_layout;
     // Activation planes (Nvfp4A4Workspace): their count and byte strides.
-    int terms                = 1;
-    std::int64_t code_plane  = 0;
-    std::int64_t scale_plane = 0;
+    int terms                 = 1;
+    std::int64_t code_plane   = 0;
+    std::int64_t scale_plane  = 0;
+    const float* row_scales   = nullptr;
 };
 
 inline Nvfp4A16Operands nvfp4_a16_operands(const Tensor& x, const Weight& w) {
@@ -41,6 +42,9 @@ inline Nvfp4A16Operands nvfp4_a16_operands(const Tensor& x, const Weight& w) {
 
 inline Nvfp4A4Operands nvfp4_a4_operands(const Weight& w, Nvfp4A4Workspace x, int tokens,
                                          Nvfp4ScaleLayout layout) {
+    const float alpha = x.row_scales != nullptr
+                            ? (1.0f / w.weight_scale_divisor)
+                            : (1.0f / (w.input_scale_divisor * w.weight_scale_divisor));
     return {x.codes,
             x.scales,
             static_cast<const std::uint8_t*>(w.qdata),
@@ -48,11 +52,12 @@ inline Nvfp4A4Operands nvfp4_a4_operands(const Weight& w, Nvfp4A4Workspace x, in
             w.n,
             w.k,
             tokens,
-            1.0f / (w.input_scale_divisor * w.weight_scale_divisor),
+            alpha,
             layout,
             x.terms,
             static_cast<std::int64_t>(x.code_plane),
-            static_cast<std::int64_t>(x.scale_plane)};
+            static_cast<std::int64_t>(x.scale_plane),
+            x.row_scales};
 }
 
 template <class Schedule, class Operands>

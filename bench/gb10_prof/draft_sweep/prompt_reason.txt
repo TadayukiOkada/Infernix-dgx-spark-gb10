@@ -1,0 +1,1 @@
+Explain in detail how a gated delta net linear attention layer updates its recurrent state, including the role of the decay term, the delta rule, and why it is more expressive than a plain linear recurrence such as a linear RNN or a softmax-free attention variant. Provide a thorough multi-paragraph answer with concrete intuition.

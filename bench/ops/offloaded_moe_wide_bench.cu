@@ -470,7 +470,10 @@ int main(int argc, char** argv) {
                     wide_name(options.wide_a16), kStagingSlots);
         Fixture fixture(options.seed, options.a16, options.split_scales, options.ggml_a8);
         std::unique_ptr<bench::L2FlushBuffer> flush;
-        if (options.cold) { flush = std::make_unique<bench::L2FlushBuffer>(256ULL << 20); }
+        if (options.cold) {
+            flush = std::make_unique<bench::L2FlushBuffer>(
+                infernix::bench::default_cold_flush_bytes());
+        }
         for (const int tokens : options.tokens) { run_point(fixture, tokens, options, flush.get(), context.stream); }
         return 0;
     } catch (const std::exception& error) {

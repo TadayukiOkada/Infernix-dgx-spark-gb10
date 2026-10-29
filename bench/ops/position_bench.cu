@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
     if (warmup < 0 || repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    bench::L2FlushBuffer flush(cold_graph ? 256ULL << 20 : 1);
+    bench::L2FlushBuffer flush(cold_graph ? infernix::bench::default_cold_flush_bytes() : 1);
     bench::L2FlushBuffer* flush_ptr = cold_graph ? &flush : nullptr;
     for (const int value : tokens) { run(value, candidate_block, flush_ptr, warmup, repeat); }
     return 0;

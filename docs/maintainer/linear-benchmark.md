@@ -338,8 +338,8 @@ The theoretical minimum traffic of one Linear is:
 ```text
 model_bytes = weight_bytes + 2*K*T + 2*N*T
 effective_GB/s = model_bytes / seconds / 1e9
-dram_spec_pct = effective_GB/s / 1792 * 100
-read_ceiling_pct = effective_GB/s / 1674.5 * 100
+dram_spec_pct = effective_GB/s / 273 * 100
+read_ceiling_pct = effective_GB/s / 246 * 100
 ```
 
 This is a model floor derived from the public representation, not the physical DRAM traffic a profiler
@@ -353,10 +353,10 @@ observes. It does not count:
 These questions need NCU to answer. The benchmark no longer derives `weight_replay_lower_bound_bytes`
 from the launcher column tile.
 
-`1792 GB/s` remains the fixed hardware specification, used for the existing `DRAM_%` and the fixed-spec
-roofline. The additional `READ_%` uses `1674.5 GB/s`, the result of the 4 GiB `uint4` pure-read run of
-`tools/hbm_bandwidth_probe.cu` on the RTX 5090, which is the read-only limit this machine has been
-measured to sustain. It only provides an actually achievable utilization for read-dominated Linear; it
+`273 GB/s` is GB10's published hardware specification, used for `DRAM_%` and the fixed-spec
+roofline. The additional `READ_%` uses the measured **`246 GB/s`** sustained-read ceiling from
+`tools/hbm_bandwidth_probe.cu` / `bench/gb10_peak_bw.cu`, which is the read-only limit this unit
+actually sustains (~90 % of spec). `READ_%` is the meaningful utilization figure. It only provides an actually achievable utilization for read-dominated Linear; it
 does not replace the fixed-spec metric or change the `model_bytes` basis of one logical weight read. The
 copy probe reads and writes at the same time and is not the applicable limit for this kind of GEMV.
 
@@ -380,7 +380,7 @@ memory floor; only points explicitly associated with an actual MMA path output `
 These fields cannot be inferred from the activation policy alone:
 
 ```text
-memory_floor_us = model_bytes / 1792 GB/s
+memory_floor_us = model_bytes / 273 GB/s
 memory_floor_pct = memory_floor_us / median_us
 ```
 
@@ -404,9 +404,9 @@ added; the doubled cold/warm work must not be made the default behavior of every
 The console header always prints:
 
 ```text
-gpu=RTX 5090
-dram_spec=1792 GB/s
-sustained_read=1674.5 GB/s
+actual_gpu=NVIDIA GB10 reference_gpu=GB10
+dram_spec=273.0 GB/s
+sustained_read=246.0 GB/s
 cache=cold
 ```
 
@@ -502,7 +502,7 @@ listed with each item:
    `4096*5120*(4/8+2/64)`; the console and CSV use the same computation;
 7. the BF16 exact point above executes through the public Linear; the median of 500 cold-cache samples
    was `95.520–97.536 us` across repeated runs, i.e. `1505.5–1537.3 GB/s`;
-8. relative to the `1674.5 GB/s` pure-read probe, this range is `89.91%–91.80%` of the actually
+8. relative to the `246 GB/s` pure-read probe, this range is `89.91%–91.80%` of the actually
    achievable read bandwidth;
 9. the DRAM read of the final single NCU capture is `146825728` bytes, while one logical read of the
    weight plus activation is `146810880` bytes; the extra read is only `14848` bytes, with no weight

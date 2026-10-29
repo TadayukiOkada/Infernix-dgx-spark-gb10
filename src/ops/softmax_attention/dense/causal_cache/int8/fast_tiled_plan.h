@@ -23,12 +23,14 @@ inline constexpr std::int32_t kInt8FastPromptMaxSplits = 8;
 // without the split cost were up to 54 % slower over a few thousand keys.
 inline FastPromptPlan int8_fast_prompt_plan(std::int32_t q_heads, std::int32_t width,
                                             std::uint32_t max_visible_keys,
-                                            std::size_t split_budget) {
-    constexpr double kNarrowSweep      = 0.8;
-    constexpr double kSplitPerColumn   = 0.5 / 24.0;
-    const std::int64_t multiprocessors = fast_prompt_multiprocessors();
-    const std::int32_t pages           = fast_prompt_pages(max_visible_keys);
-    const double keys                  = static_cast<double>(max_visible_keys);
+                                            std::size_t split_budget,
+                                            int multiprocessor_count = 0) {
+    constexpr double kNarrowSweep    = 0.8;
+    constexpr double kSplitPerColumn = 3.5 / 24.0;
+    const std::int64_t multiprocessors =
+        multiprocessor_count > 0 ? multiprocessor_count : fast_prompt_multiprocessors();
+    const std::int32_t pages = fast_prompt_pages(max_visible_keys);
+    const double keys        = static_cast<double>(max_visible_keys);
 
     const std::int64_t narrow_ctas = static_cast<std::int64_t>(div_up(width, 64)) * q_heads;
     FastPromptPlan best{4, 1};
@@ -53,11 +55,12 @@ inline FastPromptPlan int8_fast_prompt_plan(std::int32_t q_heads, std::int32_t w
 inline std::size_t int8_fast_prompt_workspace_bytes(std::int32_t q_heads, std::int32_t first,
                                                     std::int32_t last,
                                                     std::uint32_t max_visible_keys,
-                                                    std::size_t split_budget) {
+                                                    std::size_t split_budget,
+                                                    int multiprocessor_count = 0) {
     std::size_t maximum = 0;
     for (std::int32_t width = first; width <= last; ++width) {
-        const FastPromptPlan plan =
-            int8_fast_prompt_plan(q_heads, width, max_visible_keys, split_budget);
+        const FastPromptPlan plan = int8_fast_prompt_plan(
+            q_heads, width, max_visible_keys, split_budget, multiprocessor_count);
         maximum = std::max(maximum, fast_prompt_split_bytes(q_heads, width, plan.splits));
     }
     return maximum;

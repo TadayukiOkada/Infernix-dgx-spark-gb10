@@ -4,7 +4,6 @@
 
 #include "core/device.h"
 #include "infernix_bench_common.h"
-#include "roofline.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -21,12 +20,13 @@
 #include <vector>
 
 using namespace infernix;
-namespace roofline = infernix::bench::roofline;
 
 namespace {
 
 constexpr std::int32_t kMaskId    = 248077;
-constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
+constexpr double kDramGBs = bench::kDramSpecGBs; // GB10 published spec (informational)
+constexpr double kEfficiencyGBs = bench::kSustainedReadGBs; // GB10 measured 
 
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -207,7 +207,7 @@ void report(const Result& result) {
                 "(%7.4f%% of %.0f)\n",
                 execution_name(result.execution), cache_name(result.cache), result.block_size,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
-                gbps / roofline::kDramSpecGBs * 100.0, roofline::kDramSpecGBs);
+                gbps / kEfficiencyGBs * 100.0, kEfficiencyGBs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {

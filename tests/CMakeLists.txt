@@ -36,4 +36,3 @@ endforeach()
 # All test executables share one per-config runtime directory; stage the shared
 # FFMPEG/curl DLL closure there once so fully-linked tests resolve their imports
 # (the Windows loader only searches the exe's own dir, system dirs and PATH).
-infernix_stage_test_runtime_dlls(infernix_device_test)

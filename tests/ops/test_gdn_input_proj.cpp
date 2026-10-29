@@ -234,7 +234,12 @@ int run_q8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 503U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 97}) { failures += run_q8_case(parent, tokens); }
+    // Straddle the decode/split-K edge (1/2), every split-K internal sub-edge (32/33, 48/49,
+    // 64/65 exact-launcher vs medium-launcher), the retuned split-K -> R64C128 crossover (64/65),
+    // and the upper split-K bound (96/97).
+    for (const std::int32_t tokens : {1, 2, 32, 33, 48, 49, 64, 65, 96, 97}) {
+        failures += run_q8_case(parent, tokens);
+    }
     // The column-invariant route: one column, the exact instances' range and its 32-column slices.
     for (const std::int32_t tokens : {1, 2, 32, 33, 64, 65, 512}) {
         failures += run_q8_case(parent, tokens, ops::LinearPolicy::A16ColumnInvariant);
@@ -261,24 +266,34 @@ int run_flash_next_parent_case(DevicePackedWeight& parent, const char* format, s
     Tensor qkv_output    = qkv.tensor();
     Tensor z_output      = z.tensor();
     Tensor packed_output = packed.tensor();
-    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr, routes);
-    WorkspaceArena workspace(256);
+    const std::size_t capacity = ops::linear_workspace_capacity_bytes(
+        parent.view().qtype, kRows, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+    if (routes == ops::LinearRoutes::Nvfp4A4Pair) {
+        ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, ops::LinearPolicy::A16Only,
+                            workspace, nullptr, routes);
+    } else {
+        ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr, routes);
+    }
     ops::linear(x, parent.view(), packed_output, ops::LinearPolicy::A16Only, workspace, nullptr, routes);
     cuda_synchronize();
 
     const std::string suffix = std::string(" ") + format + " [16384,2560] T=" + std::to_string(tokens) +
-                               (routes == ops::LinearRoutes::Q8SlicedK ? " fast" : "");
+                               (routes != ops::LinearRoutes::Exact ? " fast" : "");
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
     // The form is linear's [16384,2560] result, so linear's A16 criterion applies: one BF16 unit
-    // roundoff in relative L2, two in the gross bound.
+    // roundoff in relative L2, two in the gross bound (or the A4 tolerance for Nvfp4A4Pair).
     constexpr ReductionCriterion kLinearA16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+    const ReductionCriterion& criterion =
+        (routes == ops::LinearRoutes::Nvfp4A4Pair && tokens >= 128) ? kGdnInputProjA4Tolerance
+                                                                    : kLinearA16;
     failures += verify_output_range("gdn qkv" + suffix, qkv, kQkvRows, 0, kQkvRows, parent.host, 0,
-                                    activation, kHidden, tokens, kLinearA16);
+                                    activation, kHidden, tokens, criterion);
     failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
-                                    activation, kHidden, tokens, kLinearA16);
+                                    activation, kHidden, tokens, criterion);
     const std::vector<std::uint16_t> linear_bits = packed.bits(), qkv_bits = qkv.bits(), z_bits = z.bits();
     std::int64_t mismatches = 0;
     for (std::int32_t t = 0; t < tokens; ++t) {
@@ -322,6 +337,17 @@ int run_mxfp8_flash_next() {
     for (const std::int32_t tokens : {1, 2, 8, 9, 10, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 300, 513}) {
         failures += run_flash_next_parent_case(parent, "MXFP8", tokens, ops::LinearRoutes::Exact);
     }
+    quantized_weight::PatternedWeightOptions nvfp4_options;
+    nvfp4_options.weight_scale_divisor = 0.125F;
+    nvfp4_options.input_scale_divisor  = 3.5F;
+    DevicePackedWeight nvfp4_parent(
+        quantized_weight::make_patterned_weight(QType::NVFP4, 16384, 2560, 523U, nvfp4_options));
+    for (const std::int32_t tokens : {1, 2, 3, 8, 16, 17, 24, 32, 33, 64, 65, 256, 257}) {
+        failures += run_flash_next_parent_case(nvfp4_parent, "NVFP4", tokens, ops::LinearRoutes::Exact);
+    }
+    for (const std::int32_t tokens : {127, 128, 129, 256}) {
+        failures += run_flash_next_parent_case(nvfp4_parent, "NVFP4", tokens, ops::LinearRoutes::Nvfp4A4Pair);
+    }
     return failures;
 }
 
@@ -357,8 +383,18 @@ double silu_fp64(double value) {
 // convolution weight. Projections are O(20) for this parent at the fixture's activation, so the
 // weight and history ranges keep all four convolution taps of comparable size.
 struct Fixture {
-    Fixture()
-        : parent(quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kRows, kHidden, 509U)) {
+    static quantized_weight::PatternedWeightOptions default_options(QType qtype) {
+        quantized_weight::PatternedWeightOptions options;
+        if (qtype == QType::NVFP4) {
+            options.weight_scale_divisor = 0.125F;
+            options.input_scale_divisor  = 3.5F;
+        }
+        return options;
+    }
+
+    explicit Fixture(QType qtype = QType::Q8_G32_FP16)
+        : parent(quantized_weight::make_patterned_weight(qtype, kRows, kHidden, 509U,
+                                                         default_options(qtype))) {
         for (const std::int32_t row : sampled_rows(kQueryRows, kSamples)) channels.push_back(row);
         for (const std::int32_t row : sampled_rows(kKeyRows, kSamples)) channels.push_back(kQueryRows + row);
         for (const std::int32_t row : sampled_rows(kValueRows, kSamples))
@@ -614,6 +650,13 @@ int run_q8_flash_next_conv_snapshot() {
         }
     }
     failures += flash_next_conv::run_rejections(fixture);
+    flash_next_conv::Fixture nvfp4_fixture(QType::NVFP4);
+    for (std::int32_t batch = 1; batch <= 8; ++batch) {
+        failures += flash_next_conv::run_case(nvfp4_fixture, batch, ops::LinearRoutes::Exact, false, false);
+    }
+    for (const std::int32_t batch : {1, 2, 5, 8}) {
+        failures += flash_next_conv::run_case(nvfp4_fixture, batch, ops::LinearRoutes::Exact, true, true);
+    }
     return failures;
 }
 
@@ -717,6 +760,24 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
+    // GB10 A4 retune band edges: 32/33 (M32N64 -> M64N128), 64/65 (M64N128 -> pipelined),
+    // 128 (pipelined fills exactly one 128-wide tile; the pipelined->TMA crossover is at 128/129,
+    // pinned by the bench candidate sweep since T=129 activations are tiny near-cancellations whose
+    // gross pointwise term is sampling-fragile). 192/255/257/300/384/511 confirm the TMA lane stays
+    // numerically correct across exact and ragged widths above the crossover (byte-identical to the
+    // tile schedules).
+    failures += run_nvfp4_case(parent, 32, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 33, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 64, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 65, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 128, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 192, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 255, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 257, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 300, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 384, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 511, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 512, ops::LinearPolicy::AllowA4);
     // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
     // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
     // single real token, which is the emptiest grid this route ever runs.

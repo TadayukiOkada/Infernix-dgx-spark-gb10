@@ -3,9 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#if defined(_M_X64) || defined(__x86_64__)
-#include <immintrin.h>
-#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -408,9 +405,8 @@ void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t by
 }
 
 void publish_pinned_word(std::uint32_t* pinned_ready, std::uint32_t value) noexcept {
-#if defined(_M_X64) || defined(__x86_64__)
-    _mm_sfence();
-#endif
+    // The release fence orders the prior writes before the ready flag on every target, and on
+    // AArch64 it lowers to the DMB ISHST that makes them visible to the device.
     std::atomic_thread_fence(std::memory_order_release);
     *static_cast<volatile std::uint32_t*>(pinned_ready) = value;
 }

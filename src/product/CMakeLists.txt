@@ -3,9 +3,6 @@ add_library(infernix_media_acquire STATIC
 )
 infernix_internal_includes(infernix_media_acquire)
 target_link_libraries(infernix_media_acquire PRIVATE ${INFERNIX_CURL_TARGET})
-if(WIN32)
-  target_link_libraries(infernix_media_acquire PRIVATE ws2_32)
-endif()
 
 add_library(infernix_product_prompt_input STATIC
   prompt_input/prompt_input.cpp

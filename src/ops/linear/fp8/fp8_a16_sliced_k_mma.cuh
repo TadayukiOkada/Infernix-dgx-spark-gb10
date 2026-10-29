@@ -75,15 +75,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
 
     const auto stage_activation = [&](int stage, int group_k0) {
         constexpr auto kActivationCache = Schedule::kActivationCache;
-        constexpr bool kPadded     = Schedule::kActivationStage == Fp8ActivationStage::PaddedZero;
-        constexpr int kStageTokens = kPadded ? kBlockTokens : ActiveTokens;
-        constexpr int kItems       = kStageTokens * (kTileK / 8);
-        for (int item = lane; item < kItems; item += 32) {
+        constexpr bool kPadded          = Schedule::kActivationStage == Fp8ActivationStage::PaddedZero;
+        const int stage_tokens          = kPadded ? kBlockTokens : live_columns;
+        const int items                 = stage_tokens * (kTileK / 8);
+        for (int item = lane; item < items; item += 32) {
             const int token = item / (kTileK / 8);
             const int k8    = item - token * (kTileK / 8);
             auto* destination =
                 &x_shared[stage][warp][token * kTileK + fp8_a16_shared_col_64(token, k8 * 8)];
-            if constexpr (!MaskedColumns && (!kPadded || ActiveTokens == kBlockTokens)) {
+            if constexpr (!kPadded || (!MaskedColumns && ActiveTokens == kBlockTokens)) {
                 cp_async<16, kActivationCache>(
                     destination, x + static_cast<std::int64_t>(token_begin + token) * kHidden +
                                      group_k0 + warp * kTileK + k8 * 8);

@@ -72,4 +72,18 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
 
+// Candidate API: force a specific (D3, D4) schedule pair so a benchmark sweep can
+// re-measure the GB10 crossover bands independent of resolve_sparse_moe_small_t_plan.
+[[nodiscard]] bool sparse_moe_small_t_candidate_is_legal(std::int32_t tokens, QType routed_gate_up,
+                                                         QType routed_down,
+                                                         SparseMoeSmallTD3Schedule d3_schedule,
+                                                         SparseMoeSmallTD4Schedule d4_schedule) noexcept;
+
+void sparse_moe_small_t_execute_candidate(const Tensor& x, const SparseMoeWeights& weights,
+                                          Tensor& destination, std::int32_t tokens,
+                                          SparseMoeSmallTD3Schedule d3_schedule,
+                                          SparseMoeSmallTD4Schedule d4_schedule,
+                                          const SparseMoeSmallTWorkspace& workspace,
+                                          cudaStream_t stream);
+
 } // namespace infernix::ops::detail

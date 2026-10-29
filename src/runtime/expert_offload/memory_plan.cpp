@@ -78,6 +78,22 @@ std::optional<std::uint64_t> pin_room(const VramSnapshot& snapshot) {
     return saturating_sub(snapshot.shared_system, snapshot.nonlocal_usage + kPinRoomMarginBytes);
 }
 
+// Whether the snapshot leaves room for full mode after everything else planned. Exported for the
+// engine's integrated-device decision (the ledger itself applies only to caps).
+bool fits_full(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand) {
+    const std::uint64_t pinned_other =
+        with_lock_overhead(demand.other_pinned + demand.later_pinned + demand.prefix_cache, demand.lock_overhead);
+    const std::uint64_t planned   = pinned_other + demand.pageable + demand.load_staging + demand.process_growth;
+    const std::uint64_t full_need = with_lock_overhead(demand.expert_banks, demand.lock_overhead) + demand.full_margin;
+    return saturating_sub(snapshot.available_physical, demand.reserve + planned) >= full_need;
+}
+
+std::uint64_t shared_host_claim(const HostMemoryDemand& demand, std::uint64_t host_expert_bytes) {
+    const std::uint64_t pinned =
+        with_lock_overhead(demand.other_pinned + demand.later_pinned + demand.prefix_cache, demand.lock_overhead);
+    return pinned + host_expert_bytes + demand.pageable + demand.load_staging + demand.process_growth + demand.reserve;
+}
+
 std::string HostMemoryLedger::describe() const {
     char pins[96] = "pin room unlimited";
     if (demand.pin_room) { std::snprintf(pins, sizeof(pins), "pin room %.2f", gib(*demand.pin_room)); }
@@ -162,6 +178,12 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
     out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic);
     const auto signed_bytes = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
     std::int64_t room = signed_bytes(snapshot.device_free) - signed_bytes(demand.fixed) - signed_bytes(out.headroom);
+    if (snapshot.integrated) {
+        // Unified memory: the driver reports only the pool's free share, while an allocation may
+        // also take what the OS holds as reclaimable file cache. Both are charged once, together with
+        // everything this process's Host side still draws from the pool and the RAM reserve.
+        room += signed_bytes(snapshot.reclaimable) - signed_bytes(demand.shared_host_bytes);
+    }
     if (snapshot.has_budget) {
         const std::int64_t budget = signed_bytes(snapshot.local_budget) - signed_bytes(snapshot.local_usage) -
                                     signed_bytes(demand.fixed) - signed_bytes(kVramBudgetMarginBytes);
@@ -171,6 +193,14 @@ VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& de
         }
     }
     out.frame_bytes = room - signed_bytes(out.reserve);
+    if (snapshot.integrated && demand.pinned_banks > 0) {
+        // Unified memory: the pinned banks draw on the same pool the frames would take.
+        out.frame_bytes -= signed_bytes(demand.pinned_banks);
+    }
+    if (demand.frame_pool_cap > 0 && out.frame_bytes > 0) {
+        // Ceiling independent of the reported free memory (integrated GPUs under-report it).
+        out.frame_bytes = std::min<std::int64_t>(out.frame_bytes, signed_bytes(demand.frame_pool_cap));
+    }
     if (out.frame_bytes > 0 && demand.frame_bytes > 0) {
         const std::uint64_t frames = static_cast<std::uint64_t>(out.frame_bytes) / demand.frame_bytes;
         out.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, demand.max_frames));
@@ -204,6 +234,9 @@ std::uint64_t VramControl::reserve_left(const VramSnapshot& snapshot, std::uint6
 std::int64_t VramControl::frame_bytes(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const {
     const auto s = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
     std::int64_t room = s(snapshot.device_free) + s(pool_bytes) - s(headroom(snapshot.display));
+    if (snapshot.integrated) {
+        room += s(snapshot.reclaimable) - s(demand_.shared_host_bytes);
+    }
     if (snapshot.has_budget) {
         room = std::min(room, s(snapshot.local_budget) - s(snapshot.local_usage) + s(pool_bytes) -
                                   s(kVramBudgetMarginBytes));
@@ -212,7 +245,12 @@ std::int64_t VramControl::frame_bytes(const VramSnapshot& snapshot, std::uint64_
 }
 
 std::uint32_t VramControl::target(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const {
-    const std::int64_t bytes = frame_bytes(snapshot, pool_bytes);
+    std::int64_t bytes = frame_bytes(snapshot, pool_bytes);
+    // The ceiling applies at runtime too: the monitor re-derives the target from each reading,
+    // which would otherwise regrow the pool past the sized bound.
+    if (demand_.frame_pool_cap > 0 && bytes > static_cast<std::int64_t>(demand_.frame_pool_cap)) {
+        bytes = static_cast<std::int64_t>(demand_.frame_pool_cap);
+    }
     if (bytes <= 0) { return 0; }
     // Whole chunks: the pool maps and releases in chunks.
     const std::uint64_t chunks = static_cast<std::uint64_t>(bytes) / chunk_;
@@ -224,7 +262,10 @@ VramControl::Decision VramControl::decide(const VramSnapshot& snapshot, std::uin
     Decision out;
     out.frames = frames;
     const std::uint64_t headroom_bytes = headroom(snapshot.display);
-    out.pressure = snapshot.device_free < headroom_bytes / 2 ||
+    // On a unified-memory card the OS reclaims file cache for an allocation, so a low MemFree is not
+    // pressure; what matters is the pool an allocation can actually reach.
+    const std::uint64_t reachable = snapshot.device_free + (snapshot.integrated ? snapshot.reclaimable : 0);
+    out.pressure = reachable < headroom_bytes / 2 ||
                    (snapshot.has_budget && snapshot.local_usage > snapshot.local_budget);
     const std::int64_t bytes = frame_bytes(snapshot, pool_bytes);
     if (out.pressure) {
@@ -266,11 +307,17 @@ std::string VramSizing::describe() const {
         std::snprintf(budget, sizeof(budget), "; OS budget %llu MiB, used %llu", mib(snapshot.local_budget),
                       mib(snapshot.local_usage));
     }
-    char line[512];
+    char reclaim[96] = "";
+    if (snapshot.integrated) {
+        std::snprintf(reclaim, sizeof(reclaim), ", %llu reclaimable (%llu allocatable), Host-side claim %llu",
+                      mib(snapshot.reclaimable), mib(snapshot.device_free + snapshot.reclaimable),
+                      mib(demand.shared_host_bytes));
+    }
+    char line[640];
     std::snprintf(line, sizeof(line),
-                  "VRAM sizing: free %llu of %llu MiB; %s%s; to allocate %llu; reserve %llu (%u graphs); headroom "
+                  "VRAM sizing: free %llu of %llu MiB%s; %s%s; to allocate %llu; reserve %llu (%u graphs); headroom "
                   "%llu (%s) -> expert frames %u (%.2f GiB)%s%s",
-                  mib(snapshot.device_free), mib(snapshot.device_total), display, budget, mib(demand.fixed),
+                  mib(snapshot.device_free), mib(snapshot.device_total), reclaim, display, budget, mib(demand.fixed),
                   mib(reserve), demand.graphs, mib(headroom), demand.headroom ? "set" : "auto", frames,
                   gib(static_cast<std::uint64_t>(frames) * demand.frame_bytes),
                   budget_limited ? ", limited by the OS budget" : "",

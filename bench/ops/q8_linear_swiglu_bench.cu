@@ -5,6 +5,7 @@
 
 #include "core/device.h"
 #include "infernix_bench_common.h"
+#include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -26,7 +27,7 @@ using namespace infernix;
 
 namespace {
 
-constexpr std::size_t kFlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kFlushBytes{};
 
 struct Problem {
     const char* name;
@@ -37,6 +38,7 @@ struct Problem {
 
 constexpr Problem kCompanion{"companion", 12288, 6144, 2048};
 constexpr Problem kDFlash2{"dflash2", 34816, 17408, 5120};
+constexpr Problem kFlashNextShared{"flash_next_shared", 1280, 640, 2560};
 
 struct Options {
     std::vector<std::int32_t> t_sweep;
@@ -46,9 +48,12 @@ struct Options {
     std::string problem = kCompanion.name;
     bool profile        = false;
     bool graph          = false;
+    bool candidates     = false;
+    bool production_only = false;
 };
 
 struct Result {
+    std::string path;
     std::int32_t t;
     bench::ColdTiming timing;
     std::size_t workspace_bytes;
@@ -99,8 +104,12 @@ Options parse_options(int argc, char** argv) {
             if (mode != "eager" && mode != "graph")
                 throw std::invalid_argument("execution must be eager or graph");
             options.graph = mode == "graph";
+        } else if (arg == "--candidates") {
+            options.candidates = true;
+        } else if (arg == "--production-only") {
+            options.production_only = true;
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--problem companion|dflash2] [--t-sweep 1,2,...] "
+            std::printf("Usage: %s [--problem companion|dflash2|flash_next_shared] [--t-sweep 1,2,...] "
                         "[--warmup N] [--repeat N] [--csv-out PATH] [--profile] "
                         "[--execution eager|graph]\n",
                         argv[0]);
@@ -112,8 +121,9 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    if (options.problem != kCompanion.name && options.problem != kDFlash2.name) {
-        throw std::invalid_argument("--problem must be companion or dflash2");
+    if (options.problem != kCompanion.name && options.problem != kDFlash2.name &&
+        options.problem != kFlashNextShared.name) {
+        throw std::invalid_argument("--problem must be companion, dflash2, or flash_next_shared");
     }
     if (options.t_sweep.empty()) {
         if (options.problem == kDFlash2.name) {
@@ -135,18 +145,19 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-void append(std::vector<Result>& results, const Problem& problem, int t, bench::ColdTiming timing,
-            std::size_t weight_bytes, std::size_t workspace_bytes, std::size_t graph_nodes,
-            bool graph) {
+void append(std::vector<Result>& results, const Problem& problem, const char* path, int t,
+            bench::ColdTiming timing, std::size_t weight_bytes, std::size_t workspace_bytes,
+            std::size_t graph_nodes, bool graph) {
     const double flops = 2.0 * problem.gate_up_rows * problem.hidden * t;
     const double bytes = static_cast<double>(weight_bytes) +
                          2.0 * (static_cast<double>(problem.hidden) + problem.output_rows) * t;
-    std::printf("entry=linear_swiglu problem=%s T=%d execution=%s graph_nodes=%zu workspace=%zu "
-                "median=%.3f us min=%.3f us p95=%.3f us logical=%.1f GB/s math=%.2f TFLOP/s\n",
-                problem.name, t, graph ? "graph" : "eager", graph_nodes, workspace_bytes,
+    std::printf("entry=linear_swiglu problem=%s path=%s T=%d execution=%s graph_nodes=%zu "
+                "workspace=%zu median=%.3f us min=%.3f us p95=%.3f us logical=%.1f GB/s "
+                "math=%.2f TFLOP/s\n",
+                problem.name, path, t, graph ? "graph" : "eager", graph_nodes, workspace_bytes,
                 timing.median_us, timing.min_us, timing.p95_us, bytes / timing.median_us / 1e3,
                 flops / timing.median_us / 1e6);
-    results.push_back({t, timing, workspace_bytes, graph_nodes});
+    results.push_back({path, t, timing, workspace_bytes, graph_nodes});
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -155,10 +166,10 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     std::ofstream out(path);
     if (!out) throw std::runtime_error("cannot open timing CSV");
-    out << "problem,entry,T,execution,workspace_bytes,graph_nodes,median_us,min_us,p95_us,warmup,"
-           "repeat,flush_bytes\n";
+    out << "problem,entry,path,T,execution,workspace_bytes,graph_nodes,median_us,min_us,p95_us,"
+           "warmup,repeat,flush_bytes\n";
     for (const auto& r : results) {
-        out << options.problem << ",linear_swiglu," << r.t << ','
+        out << options.problem << ",linear_swiglu," << r.path << ',' << r.t << ','
             << (options.graph ? "graph" : "eager") << ',' << r.workspace_bytes << ',';
         if (r.graph_nodes) out << r.graph_nodes;
         out << ',' << r.timing.median_us << ',' << r.timing.min_us << ',' << r.timing.p95_us << ','
@@ -170,7 +181,9 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
 int main(int argc, char** argv) {
     try {
         const Options options  = parse_options(argc, argv);
-        const Problem& problem = options.problem == kDFlash2.name ? kDFlash2 : kCompanion;
+        const Problem& problem = options.problem == kDFlash2.name
+                                     ? kDFlash2
+                                     : (options.problem == kFlashNextShared.name ? kFlashNextShared : kCompanion);
         DeviceContext context;
         const cudaStream_t stream = context.stream;
         std::printf("# gpu=%s sm=%d%d cuda_runtime=%d cache=cold\n", context.props.name,
@@ -219,16 +232,81 @@ int main(int argc, char** argv) {
                 CUDA_CHECK(cudaProfilerStop());
                 continue;
             }
-            const auto timing = options.graph
-                                    ? bench::measure_cold_graph(graph, flush, stream,
-                                                                options.warmup, options.repeat)
-                                    : bench::measure_cold_launch(body, flush, stream,
-                                                                 options.warmup, options.repeat);
-            const auto exact  = ops::linear_swiglu_workspace_capacity_bytes(
+            const auto prod_timing =
+                options.graph ? bench::measure_cold_graph(graph, flush, stream, options.warmup,
+                                                          options.repeat)
+                              : bench::measure_cold_launch(body, flush, stream, options.warmup,
+                                                           options.repeat);
+            const auto exact = ops::linear_swiglu_workspace_capacity_bytes(
                 QType::Q8_G32_FP16, problem.gate_up_rows, problem.hidden,
                 ops::LinearPolicy::A16Only, t, t);
-            append(results, problem, t, timing, packed.model_weight_bytes(), exact, graph.nodes(),
-                   options.graph);
+            append(results, problem, "production", t, prod_timing, packed.model_weight_bytes(),
+                   exact, graph.nodes(), options.graph);
+            if (!options.candidates || options.production_only) { continue; }
+
+            const auto run = [&](const char* path, auto&& launch) {
+                const auto timing =
+                    bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
+                append(results, problem, path, t, timing, packed.model_weight_bytes(), 0, 0, false);
+            };
+
+            if (problem.name == std::string(kDFlash2.name)) {
+                if (t >= 1 && t <= 40) {
+                    run("dflash2_small_t", [&](cudaStream_t cs) {
+                        ops::detail::q8_dflash2_linear_swiglu_small_t_launch(x, packed.weight, out,
+                                                                             cs);
+                    });
+                }
+#define RUN_DFLASH2_MMA(NAME)                                                                      \
+    run(#NAME, [&](cudaStream_t cs) {                                                              \
+        ops::detail::q8_dflash2_linear_swiglu_##NAME##_launch(x, packed.weight, out, cs);         \
+    })
+                RUN_DFLASH2_MMA(mma_r32_c64_k128);
+                RUN_DFLASH2_MMA(mma_r64_c64_k128);
+                RUN_DFLASH2_MMA(mma_r64_c80_k128);
+                RUN_DFLASH2_MMA(mma_r64_c96_k128);
+#undef RUN_DFLASH2_MMA
+                run("generic_mma_r64_c128", [&](cudaStream_t cs) {
+                    ops::detail::q8_linear_swiglu_mma_r64_c128_launch(x, packed.weight, out, cs);
+                });
+            } else {
+                if (problem.name == std::string(kFlashNextShared.name)) {
+                    if (t >= 1 && t <= 16) {
+                        run("stream_pair", [&](cudaStream_t cs) {
+                            ops::detail::q8_linear_swiglu_stream_pair_launch(x, packed.weight, out, cs);
+                        });
+                    }
+                } else {
+                    if (t == 1) {
+                        run("decode_pair_r16", [&](cudaStream_t cs) {
+                            ops::detail::q8_linear_swiglu_decode_pair_r16_launch(x, packed.weight, out,
+                                                                                 cs);
+                        });
+                    }
+                    if (t >= 2 && t <= 48) {
+                        run("splitk_exact_t", [&](cudaStream_t cs) {
+                            ops::detail::q8_linear_swiglu_splitk_exact_t_launch(x, packed.weight, out,
+                                                                                cs);
+                        });
+                    }
+                }
+#define RUN_SWIGLU_MMA(NAME)                                                                       \
+    run(#NAME, [&](cudaStream_t cs) {                                                              \
+        ops::detail::q8_linear_swiglu_##NAME##_launch(x, packed.weight, out, cs);                  \
+    })
+                RUN_SWIGLU_MMA(mma_r32_c32);
+                RUN_SWIGLU_MMA(mma_r32_c48);
+                RUN_SWIGLU_MMA(mma_r32_c64);
+                RUN_SWIGLU_MMA(mma_r32_c80);
+                RUN_SWIGLU_MMA(mma_r32_c96);
+                RUN_SWIGLU_MMA(mma_r32_c128);
+                RUN_SWIGLU_MMA(mma_r64_c64);
+                RUN_SWIGLU_MMA(mma_r64_c96);
+                RUN_SWIGLU_MMA(mma_r64_c128);
+                RUN_SWIGLU_MMA(mma_r128_c64);
+                RUN_SWIGLU_MMA(mma_r128_c80);
+#undef RUN_SWIGLU_MMA
+            }
         }
         write_csv(options, results);
         return 0;

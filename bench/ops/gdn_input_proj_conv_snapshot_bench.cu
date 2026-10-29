@@ -40,7 +40,7 @@ constexpr std::int32_t kZRows              = 6144;
 constexpr std::int32_t kQkRows             = kQueryRows + kKeyRows;
 constexpr std::int32_t kValueZRows         = kValueRows + kZRows;
 constexpr std::int32_t kChannels           = kQueryRows + kKeyRows + kValueRows;
-constexpr std::uint64_t kDefaultFlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kDefaultFlushBytes{};
 
 enum class Execution : std::uint8_t {
     Graph,
@@ -251,7 +251,7 @@ void usage(const char* argv0) {
                  "  --cache cold|warm|both        Default both; cold matches layer-to-layer use.\n"
                  "  --warmup N                    Warmup replays per point (default 10).\n"
                  "  --repeat N                    Measured samples per point (default 100).\n"
-                 "  --flush-mib N                 L2 eviction storage (default 256 MiB).\n"
+                 "  --flush-mib N                 L2 eviction storage (default: sized to device L2).\n"
                  "  --csv-out PATH                Write result rows as CSV.\n"
                  "  -h, --help                    Show this text.\n",
                  argv0);

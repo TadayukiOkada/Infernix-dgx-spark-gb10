@@ -1,6 +1,5 @@
 #include "media/decode/decode.h"
 #include "media/decode/jpeg_decode.h"
-#include "media/decode/png_decode.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -663,11 +662,6 @@ void forward_library_log(void* context, int level, const char* format, std::va_l
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-#ifdef INFERNIX_MEDIA_NATIVE_PNG
-    if (is_png(bytes)) {
-        return png_image_info(bytes, policy.max_decoded_pixels);
-    }
-#endif
     if (is_jpeg(bytes)) {
         ImageInfo result = inspect_jpeg(bytes, policy);
         if (exif_orientation(bytes) >= 5) { std::swap(result.width, result.height); }
@@ -711,15 +705,6 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    // Some FFmpeg builds (the Windows vcpkg tree) ship without the png decoder; the
-    // native path decodes png directly so those builds accept png images too.
-#ifdef INFERNIX_MEDIA_NATIVE_PNG
-    if (is_png(bytes)) {
-        return decode_png(bytes, policy.max_decoded_pixels);
-    }
-#endif
-    // JPEG through libjpeg with Pillow's settings, so the pixels equal the reference processors';
-    // other formats through FFmpeg.
     if (is_jpeg(bytes)) {
         return apply_orientation(decode_jpeg(bytes, policy), exif_orientation(bytes));
     }

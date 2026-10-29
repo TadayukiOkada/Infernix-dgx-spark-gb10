@@ -258,11 +258,7 @@ std::string safe_component(std::string_view value) {
 std::string timestamp() {
     const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
-#ifdef _WIN32
-    gmtime_s(&utc, &now);
-#else
     gmtime_r(&now, &utc);
-#endif
     std::ostringstream out;
     out << std::put_time(&utc, "%Y%m%d-%H%M%S");
     return out.str();
@@ -702,9 +698,6 @@ int main(int argc, char** argv) {
          .level        = options.log_level,
          .presentation = infernix::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-#ifdef INFERNIX_BUILD_ID
-    logger->info("build {}", INFERNIX_BUILD_ID);
-#endif
     infernix::product::StartupLogRenderer startup_log(logging);
     try {
         return run(options, logger, startup_log, logging.terminal_progress());

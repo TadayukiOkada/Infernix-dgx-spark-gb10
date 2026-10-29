@@ -50,6 +50,42 @@ The `dev` configure preset also enables all benchmarks, alongside products and t
 [Build system](../docs/maintainer/build-system.md) for presets and dependencies. Tests use a
 Python interpreter; a benchmark-only configuration does not require one.
 
+## Focused operator investigations
+
+### Focused offloaded-MoE decode benchmark
+
+`infernix_offloaded_moe_decode_bench` measures device-resident `ops::moe_experts`
+using CUDA-event graph replay, excluding routing/setup. It is distinct from
+`infernix_sparse_moe_bench`, which exercises a different operator. Build its named
+target and run it with optional `--repeat N` and `--tokens 1|4|8`; defaults are 100
+samples and all three token counts. Ten distinct experts are selected for every
+token, deliberately exercising repeated columns. Both equal and distinct gate/up
+input scales are covered. BF16 outputs are compared bit-for-bit with the CPU
+oracle before timing and after each timing mode. Warm and cold measurements are
+separate; cold samples read a 256 MiB eviction buffer outside the timed interval.
+This synthetic operator measurement is not an end-to-end decode throughput test.
+
+See [the gate/up staging experiment](../docs/experiments/moe-decode-staging.md)
+for the paired kernel and single-request model results.
+
+### Exact Q8 GDN decode sweep
+
+`infernix_q8_gdn_decode_sweep` screens ten schedules for N=16384, K=2560,
+T=1..8. Build its named target; options are `--repeat N` (default 50) and
+`--warmup N` (default 5). CSV goes to stdout. Every output is checked bitwise
+against public `ops::linear` before timing and after warm/cold graph replay.
+Cold eviction reads 256 MiB outside the timed interval. This checks schedule
+equivalence, not an independent CPU oracle. See the
+[GDN experiment](../docs/experiments/q8-gdn-decode-sweep.md) for the rejected
+one-row-per-warp candidate and single-request model gate.
+
+`infernix_bf16_flash_next_sweep --shape head --decode-only` also covers the
+BF16/Q8 FP32 vocabulary head. Its bandwidth reference defaults to the **measured
+GB10 sustained-read ceiling of 246 GB/s**; a non-GB10 device requires a finite
+positive `--dram-gbps` override. Use the measured value, not the 273 GB/s
+published specification, so the reported fraction is attainable.
+See the retained [Q8 head preload](../docs/experiments/q8-head-preload.md).
+
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
@@ -89,7 +125,7 @@ infernix_bench --weights <artifact.ninfer>
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
           [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
           [--reproducible] [--fast-path <name>]...
-          [--spec <mtp|dflash|dflash2|auto> --draft-tokens <n|auto>] [--lm-head-draft]
+          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -117,10 +153,10 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..5, DFlash/DFlash2
-K=1..15), or let the Engine pick the artifact's drafter with `--spec auto --draft-tokens auto` (the
-report records the backend it chose); `--lm-head-draft` selects the optimized proposal head. CUDA
-Graph decode is enabled by default.
+Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..7, DFlash/DFlash2
+K=1..15); models bound themselves below where needed. `--lm-head-draft` selects the optimized
+proposal head. CUDA Graph decode is
+enabled by default.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
@@ -201,10 +237,8 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   DFlash2 with 7 drafts and the optimized proposal head, INT8 KV, CUDA Graph decode, prefix reuse
   off. `ngram` adds the production n-gram drafting (15 drafts, minimum match 12); `mtp` drafts with
   the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path, and `auto` with it lets each
-  round choose its length (`--draft-tokens auto`), whose one-row rounds of argmax drafts stop at the
-  cumulative acceptance cut; `min-p=P` (`--spec-min-p`) cuts the fixed length's (the Engine refuses it
-  with `auto`);
-  `plain` drafts nothing
+  round choose its length with the `--spec-min-p` 0.5 cut (`--draft-tokens auto`), `min-p=P` sets that
+  cut for the fixed length; `plain` drafts nothing
   (one token per round through the single-column decode kernels). Fast paths run as in
   `infernix-serve`; `reproducible` runs the reproducible route and `path=NAME` also runs a candidate fast path.
   It writes one line per segment: the corpus token offset, the prompt length and the generated
@@ -445,13 +479,14 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction read completes before
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. Every Op benchmark takes its RTX 5090 peaks from `bench/ops/roofline.h`; the memory
-reference is `1792 GB/s` DRAM bandwidth. Tensor Core utilization
+behavior. The fixed GB10 memory reference is the measured `246 GB/s` sustained-read ceiling
+(`bench/ops/gpu_reference.h`). Tensor Core utilization
 is reported only for registered shape/policy/extent combinations with a known MMA profile; the
 activation policy alone does not identify that profile. MXFP8 with FP32 accumulation uses the
-`838 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model
-bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
-the practical utilization measure for read-dominated points. Physical traffic and instruction
+`220 TFLOP/s` dense reference. `READ_%` additionally compares the same one-read model
+bytes with the same measured `246 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
+the practical utilization measure for read-dominated points, and on GB10 `DRAM_%` and `READ_%`
+now differ only by the spec-vs-measured denominator (273 vs 246). Physical traffic and instruction
 utilization still require NCU.
 
 ## GGUF projection and expert 8-bit wide routes
@@ -473,8 +508,8 @@ cmake --build build -j --target infernix_ggml_linear_bench infernix_offloaded_mo
 `infernix_offloaded_moe_wide_bench` covers the routed experts' 8-bit wide route (`WideA16::kA8`) on both bank
 kinds: `--activation a8` gives NVFP4 W4A16 banks `NarrowA16::kA8` with `WideA16::kA8` (against `--activation a16`,
 the exact W4A16 wide route, or `a16x2`, expert-a4-residual), and `--bank ggml --formats GU,DOWN --ggml-wide
-exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 stage-decode tiles from 4,096 columns,
-`kGgmlStageDecodeMinColumns`, the exact tiles below it).
+exact|bf16|a8` GGUF records at Flash-Next's geometry (`bf16` takes the BF16 planes only from `MoeGgmlTiles`'
+14,336-column threshold, the exact tiles below it).
 
 ```bash
 ./build/bench/infernix_offloaded_moe_wide_bench --activation a16 --tokens 512,2048,4096 --placement frames
@@ -812,7 +847,7 @@ Use ordinary benchmark latency `t`, not profiler replay duration, for effective 
 `unique_kv_bytes / (t * peak_bandwidth)` and
 `(qk_flops / peak_qk_ops + pv_flops / peak_pv_ops) / t`, with consistent units and explicitly stated
 hardware peaks. Current INT8 QK uses native INT8, FP8/K8V4 QK uses unit-scale MXFP8
-(838 TFLOP/s at the RTX 5090 reference boost clock), and BF16/NVFP4 QK
+(220 TFLOP/s measured dense on GB10), and BF16/NVFP4 QK
 and all PV use 16-bit Tensor Core throughput references. In particular, NVFP4 KV storage does not
 imply native FP4 QK. These useful-work fractions differ from profiler pipeline activity and actual
 DRAM traffic; use targeted profiling to explain the remaining gap.
@@ -1008,7 +1043,7 @@ cmake --build build --parallel --target infernix_nvfp4_linear_swiglu_bench
 `infernix_fp8_linear_swiglu_bench` measures the public row-scaled FP8 `[34816,5120] ->
 [17408,T]` profile. `--policy a8` measures the production resolver, including caller-owned
 activation workspace and the fused SwiGLU output; `--policy a16` measures the public A16 form.
-The Tensor Core percentage uses the RTX 5090 dense MXFP8/FP32-accumulate reference of 838 TFLOP/s
+The Tensor Core percentage uses the measured GB10 dense MXFP8/FP32-accumulate reference of 220 TFLOP/s
 only for extents that the production resolver sends to A8.
 
 ```bash
@@ -1091,7 +1126,7 @@ including activation quantization, caller-owned workspace, contraction, residual
 in-place BF16 write. `--policy a8` follows the independent production resolver of the selected
 semantic Op: `[5120,6144]` uses A16 below `T=22`, while `[5120,17408]` uses A16 below `T=25`; larger
 extents use FP8/FP32-accumulate Tensor Core contraction. `TC_%` is reported only when that A8 route
-actually executes, against the RTX 5090 unit-scale MXFP8/FP32-accumulate 838 TFLOP/s reference.
+actually executes, against the measured GB10 unit-scale MXFP8/FP32-accumulate 220 TFLOP/s reference.
 
 ```bash
 cmake --build build --parallel --target infernix_fp8_linear_add_bench

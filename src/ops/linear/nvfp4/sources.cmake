@@ -7,6 +7,16 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n34816_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n16384_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n13952_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n12800_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k6144.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n2048_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n6144_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n512_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n128_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n10240_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k2560.cu"
 )
 
 target_sources(infernix_nvfp4_non_rdc PRIVATE

@@ -30,8 +30,40 @@ int run_nvfp4_a16() {
                           {5120, 6144, 705U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 17408, 707U, Comparison::Sampled, true, invocations});
+    // Qwen3.8-Flash-Next dense Tier-1 shapes: exercise the decode ladder (GEMV t=1, SIMT t<=2,
+    // sliced-K t<=8/16/32) that single-stream MTP actually hits, plus one wider MMA rung.
+    std::vector<Invocation> decode_invocations;
+    for (int t = 1; t <= 8; ++t) decode_invocations.push_back({t});
+    for (int t : {16, 32}) decode_invocations.push_back({t});
+    decode_invocations.push_back({1, CallForm::A16Convenience});
+    decode_invocations.push_back({4, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {16384, 2560, 711U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {13952, 2560, 713U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {12800, 2560, 719U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2560, 6144, 721U, Comparison::Sampled, true, decode_invocations});
+    // Qwen3.8-Flash-Next W4-dense tier (recipe `qwen3_8_flash_next_nvfp4_w4dense`):
+    // the dense packed-projection classes that move from q8_g32_fp16 to nvfp4.
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2048, 2560, 723U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {6144, 2560, 727U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {512, 2560, 729U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {128, 2560, 733U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {10240, 2560, 739U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2560, 2560, 743U, Comparison::Sampled, true, decode_invocations});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
-                        std::pair{5120, 6144}, std::pair{5120, 17408}}) {
+                        std::pair{5120, 6144}, std::pair{5120, 17408}, std::pair{16384, 2560},
+                        std::pair{13952, 2560}, std::pair{12800, 2560}, std::pair{2560, 6144},
+                        std::pair{2048, 2560}, std::pair{6144, 2560}, std::pair{512, 2560},
+                        std::pair{128, 2560}, std::pair{10240, 2560}, std::pair{2560, 2560}}) {
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
     return failures;

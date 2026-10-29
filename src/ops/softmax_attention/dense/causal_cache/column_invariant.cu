@@ -30,7 +30,13 @@ struct PermutationBatch {
 // blockIdx.y selects the tensor; each thread copies 4-byte words of destination rows.
 __global__ void columns_permute_kernel(PermutationBatch batch_tensors, std::int32_t width,
                                        std::int32_t batch, bool to_columns) {
-    const CausalColumnPermutation tensor = batch_tensors.tensors[blockIdx.y];
+    // Selected through the four constant offsets rather than `tensors[blockIdx.y]`: indexing the
+    // array by a runtime value forces the whole 96-byte parameter array into local memory.
+    // blockIdx.y < gridDim.y, which the launcher sets to the tensor count (1..4).
+    const CausalColumnPermutation tensor = blockIdx.y == 0 ? batch_tensors.tensors[0]
+                                         : blockIdx.y == 1 ? batch_tensors.tensors[1]
+                                         : blockIdx.y == 2 ? batch_tensors.tensors[2]
+                                                           : batch_tensors.tensors[3];
     const std::int64_t words_per_row     = tensor.row_bytes / 4;
     const std::int64_t words             = words_per_row * width * batch;
     const auto* source                   = static_cast<const std::uint32_t*>(tensor.source);

@@ -13,11 +13,7 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#include <process.h>
-#else
 #include <unistd.h>
-#endif
 
 namespace {
 
@@ -25,11 +21,7 @@ using namespace infernix::serve;
 using Json = nlohmann::json;
 
 long long test_process_id() {
-#ifdef _WIN32
-    return _getpid();
-#else
     return ::getpid();
-#endif
 }
 
 int check(bool condition, const char* message) {

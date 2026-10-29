@@ -183,6 +183,8 @@ class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
+    [[nodiscard]] static std::unique_ptr<detail::NgramProposer>
+    take_ngram_index(PreparedPrompt& prompt) noexcept;
 };
 
 } // namespace infernix::models::qwen3_5

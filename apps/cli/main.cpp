@@ -378,6 +378,7 @@ int main(int argc, char** argv) {
         engine_options.ngram_volume_path        = cli.ngram_volume_path;
         engine_options.expert_stripe_path       = cli.expert_stripe_path;
         engine_options.ngram_residency          = cli.ngram_residency;
+        engine_options.ngram_cache_bytes        = cli.ngram_cache_bytes;
         engine_options.expert_state_path        = cli.expert_state ? *cli.expert_state
                                                                    : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
         engine_options.expert_state_off         = cli.expert_state && cli.expert_state->empty(); // --expert-state off
@@ -390,7 +391,6 @@ int main(int argc, char** argv) {
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;
-        engine_options.vram_past_budget         = cli.vram_past_budget;
         engine_options.expert_tail_skip         = cli.expert_tail_skip;
         engine_options.expert_a4_activations    = cli.expert_a4_activations;
         engine_options.a8_activations           = cli.a8_activations;

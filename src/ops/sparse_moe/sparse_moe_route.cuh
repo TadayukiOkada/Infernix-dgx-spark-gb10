@@ -76,15 +76,29 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
         const int id = lane + item * 32;
         local[item]  = {sparse_moe_bf16_logit(scores[id]), id};
     }
+    // Batcher's sorting network over the lane's run: every compare-exchange pair is a compile-time
+    // constant, so the run stays in registers. An insertion sort reaches the same order, but its
+    // moving index forces the whole array into local memory (a 64 B stack frame here). Ranking is a
+    // total order over distinct expert ids, so any correct network gives this lane the same run.
 #pragma unroll
-    for (int i = 1; i < kSparseMoeTopK; ++i) {
-        const SparseMoeRankedValue value = local[i];
-        int position                     = i;
-        while (position > 0 && sparse_moe_ranked_better(value, local[position - 1])) {
-            local[position] = local[position - 1];
-            --position;
+    for (int block = 2; block <= kSparseMoeTopK; block <<= 1) {
+#pragma unroll
+        for (int stride = block >> 1; stride > 0; stride >>= 1) {
+#pragma unroll
+            for (int item = 0; item < kSparseMoeTopK; ++item) {
+                const int other = item ^ stride;
+                if (other <= item) { continue; }
+                // The low half of each block sorts best-first, so the run ends descending.
+                const bool low_first = (item & block) == 0;
+                const bool exchange  = low_first
+                                           ? sparse_moe_ranked_better(local[other], local[item])
+                                           : sparse_moe_ranked_better(local[item], local[other]);
+                if (!exchange) { continue; }
+                const SparseMoeRankedValue swap = local[item];
+                local[item]                     = local[other];
+                local[other]                    = swap;
+            }
         }
-        local[position] = value;
     }
     sparse_moe_merge_ranked_runs(local);
 

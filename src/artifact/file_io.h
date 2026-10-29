@@ -28,12 +28,8 @@ public:
 
 private:
     std::filesystem::path path_;
-#ifdef _WIN32
-    infernix::ReadOnlyFile file_;
-#else
     int fd_                = -1;
     mutable int direct_fd_ = -1;
-#endif
     std::uint64_t bytes_   = 0;
 };
 

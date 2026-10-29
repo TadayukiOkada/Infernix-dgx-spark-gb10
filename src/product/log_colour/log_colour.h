@@ -22,11 +22,7 @@
 #include <string_view>
 #include <unordered_map>
 
-#ifdef _WIN32
-#    include <windows.h>
-#else
-#    include <unistd.h>
-#endif
+#include <unistd.h>
 
 namespace infernix::product::log_colour {
 
@@ -115,58 +111,19 @@ inline constexpr std::size_t kFamilySize        = kPalette.size() / kColorableFa
 }
 
 // True when stderr is an interactive console (not redirected to a file/pipe).
-// The check is on the Win32 console handle itself: GetConsoleMode succeeds only
-// for a real console and fails for a redirected handle, so it is the ground
-// truth for "this window will render the colour". (The C runtime's _isatty is
-// not used: it has been observed to report 0 on a genuine console, which would
-// silently suppress the colour.)
 [[nodiscard]] inline bool stderr_is_console() noexcept {
-#ifdef _WIN32
-    const HANDLE handle = ::GetStdHandle(STD_ERROR_HANDLE);
-    if (handle == INVALID_HANDLE_VALUE || handle == 0) { return false; }
-    DWORD mode           = 0;
-    return ::GetConsoleMode(handle, &mode) != 0;
-#else
     return ::isatty(STDERR_FILENO) == 1;
-#endif
 }
 
-// Windows: allow the console to interpret VT escape sequences on stderr, and
-// report whether that succeeded (i.e. this is a real console whose build honours
-// the flag). A successful enable means the console is Win10 1607+ (incl. Win11)
-// or Windows Terminal — both render the full 256-colour palette. Returns false
-// when stderr is not a console (GetConsoleMode fails) or predates VT support.
-[[nodiscard]] inline bool enable_stderr_vt_processing() noexcept {
-#ifdef _WIN32
-    static const bool done = [] {
-        const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
-        DWORD mode          = 0;
-        if (handle == INVALID_HANDLE_VALUE || handle == 0) { return false; }
-        if (::GetConsoleMode(handle, &mode) == 0) { return false; }
-        if ((mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) { return true; } // already on
-        return ::SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
-    }();
-    return done;
-#else
-    return true; // POSIX terminals: VT + 256-colour assumed, nothing to enable
-#endif
-}
+// POSIX terminals interpret VT escape sequences already: there is nothing to
+// enable, so the answer is always true.
+[[nodiscard]] inline bool enable_stderr_vt_processing() noexcept { return true; }
 
-// True when the console can render the rich 256-colour palette. Windows Terminal
-// sets WT_SESSION; a legacy conhost (Win10 1607+ / Win11) supports 256-colour
-// once VT processing is enabled on stderr, which enable_stderr_vt_processing()
-// reports. POSIX terminals always support 256 colours. (Older conhosts that
-// reject the VT flag fall back to the basic 16-colour palette.)
+// True when the console can render the rich 256-colour palette. POSIX terminals
+// support 256 colours; the flag is assumed on rather than probed, because there
+// is no portable query for it and every terminal in use answers plausible.
 [[nodiscard]] inline bool rich_colour_supported() noexcept {
-#ifdef _WIN32
-#    pragma warning(push)
-#    pragma warning(disable : 4996) // MSVC flags std::getenv; only used for env lookup
-    const bool rich = ::std::getenv("WT_SESSION") != nullptr || enable_stderr_vt_processing();
-#    pragma warning(pop)
-    return rich;
-#else
     return true;
-#endif
 }
 
 // Stable first-appearance colour slot for a statistic name (process-wide). The

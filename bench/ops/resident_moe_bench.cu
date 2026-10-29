@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
         const Bank down(kExperts * kHidden, kInter, options.q8, rng);
         const double code_bytes = options.q8 ? 1.0 : 0.5, scale_bytes = 2.0 / (options.q8 ? 32 : 64);
         const double expert_bytes = 3.0 * kHidden * kInter * (code_bytes + scale_bytes);
-        bench::L2FlushBuffer flush(256ULL << 20);
+        bench::L2FlushBuffer flush(infernix::bench::default_cold_flush_bytes());
         std::printf("# gpu=%s timed=resident_moe_experts (L2 flushed before each call) codec=%s experts=%d top_k=%d "
                     "H=%d I=%d expert=%.2f MB\n",
                     context.props.name, options.q8 ? "q8" : "q4", kExperts, kTopK, kHidden, kInter, expert_bytes / 1e6);

@@ -23,7 +23,7 @@ struct ProjectionFp32Output {
     }
 };
 
-using HeadSchedule = Bf16A16SlicedR32T16W4;
+using HeadSchedule = Bf16A16SlicedKMmaSchedule<32, 16, 4, 64, 2, Cache::cg, Cache::ca, 2>;
 
 } // namespace
 

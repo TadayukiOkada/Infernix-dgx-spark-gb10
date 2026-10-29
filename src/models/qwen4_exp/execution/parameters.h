@@ -44,6 +44,9 @@ struct AttentionParameters {
     // [q | gate | k | v, H] here and [index q | index k, H] in index_projection.
     LinearParameters projection;
     std::optional<LinearParameters> index_projection;
+    // Slice views for K/V-only calls (MTP prefill chunks and catch-up): [k | v, H] and [index k, H].
+    std::optional<LinearParameters> kv_projection;
+    std::optional<LinearParameters> index_key_projection;
     Tensor query_norm, key_norm, index_query_norm, index_key_norm;
     LinearParameters output;
 };

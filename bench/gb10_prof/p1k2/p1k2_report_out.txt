@@ -1,0 +1,138 @@
+==============================================================================
+FULL proposal head (retained comparison config): node_r1n.sqlite
+  kernel records      80475
+  busy (sum of durations)   2923.71 ms
+  span (first start..last end) 2968.74 ms
+  idle inside span       1.52 %
+  gaps > 20 us           77  total 32.1 ms  max 691.5 us
+  main-model forwards   58   widths {1: 16, 2: 4, 3: 22, 4: 16}
+  draft-module head calls 140  widths {1: 140}
+  main seg kernels 1264-1276, seg ms 28.84-49.24
+  draft seg kernels 38-64, seg ms 1.04-2.75, gating {0}, moe {2}
+  mean main verify width 2.655
+  closure sum(T-1)*count = 96  vs JSON drafted_tokens 96
+
+  head instances (base, grid.x, dynS bytes, regs, local/thread): calls total_ms min/med/max us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS   5120 regs 110 local/thr    0  n= 156 total   413.8 ms   2620.9 /  2641.7 /  2821.4 us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS  10240 regs 110 local/thr    0  n=   4 total    10.8 ms   2642.3 /  2662.1 /  2835.0 us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS  15360 regs 110 local/thr    0  n=  22 total    59.7 ms   2670.6 /  2692.3 /  2950.3 us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS  20480 regs 110 local/thr    0  n=  16 total    44.5 ms   2726.5 /  2740.7 /  3118.2 us
+
+  total head cost 528.8 ms = 18.09 % of busy
+
+  family table (share of busy kernel time)
+    kernel                              calls  total ms   share   min us   med us   max us
+    projection_q8_kernel                  198     528.8  18.09%   2620.9   2644.7   3118.2
+    gate_up_kernel<(int)1>               2784     509.2  17.42%     85.0    194.6    631.4
+    q8_a16_stream_kernel                 5454     454.3  15.54%      9.0     13.2    495.4
+    down_kernel<(int)1>                  2784     225.5   7.71%     41.4     84.5    195.2
+    hc_down_partials_kernel              6104     221.6   7.58%     23.3     36.8    180.7
+    q8_a16_simt_kernel                   3096     214.7   7.35%     14.1     70.6    143.0
+    hc_up_collapse_kernel                6104     174.2   5.96%     17.7     29.2    268.0
+    bf16_skinny_gemv_kernel<(int)3, (int)8, (int)2, (int)0>    264      74.2   2.54%    273.7    278.9    410.9
+    q8_linear_swiglu_stream_pair_kernel   2924      70.5   2.41%     17.7     24.1     76.3
+    bf16_skinny_gemv_kernel<(int)4, (int)8, (int)2, (int)0>    192      54.4   1.86%    273.4    279.7    371.9
+    bf16_skinny_gemv_kernel<(int)1, (int)8, (int)2, (int)0>    192      53.3   1.82%    273.2    276.4    322.5
+    projection_kernel<(int)128, (int)1>   2924      48.0   1.64%     13.8     16.1     55.5
+    gate_up_kernel                        140      41.4   1.42%    291.5    293.9    346.6
+    recurrent_fold_kernel                  42      40.9   1.40%    941.2    968.7   1094.0
+    recurrent_record_kernel<(bool)0>     1512      28.5   0.97%     14.8     18.9     58.5
+    down_kernel                           140      20.2   0.69%    141.0    142.4    179.8
+    route_kernel                         2924      17.1   0.59%      5.5      5.7     68.8
+    bf16_skinny_gemv_kernel<(int)2, (int)8, (int)2, (int)0>     48      13.5   0.46%    274.4    278.5    344.7
+    attention_kernel<(infernix::KvCacheStorage)1, (int)12, (bool)1, (int)1>    836      13.3   0.45%      4.7     16.4     65.0
+    inject_kernel                        6046      13.1   0.45%      1.5      1.7     35.0
+    split_vector_kernel                  7216      12.9   0.44%      1.1      1.7     28.4
+    top_logprobs_kernel<(int)256>         140      12.2   0.42%     83.2     84.8    274.3
+    recurrent_batch_update_kernel<(bool)1>    576       8.7   0.30%     13.4     13.8     43.2
+    stage_kernel                         2784       7.2   0.24%      2.0      2.3     27.1
+    bf16_a16_simt_kernel                 1512       6.5   0.22%      3.6      3.8     78.0
+    combine_kernel                       2924       5.2   0.18%      1.3      1.8     38.6
+
+  MoE instances (raw name, grid, dynS, regs): calls avg us
+    n=1056 grid (40, 30, 1) dynS  26336 regs  74 avg   201.6 us  infernix::ops::gate_up_kernel<
+    n=1056 grid (80, 30, 1) dynS  14368 regs  48 avg    89.1 us  infernix::ops::down_kernel<
+    n= 768 grid (40, 10, 1) dynS  26336 regs  74 avg   100.6 us  infernix::ops::gate_up_kernel<
+    n= 768 grid (80, 10, 1) dynS  14368 regs  48 avg    45.7 us  infernix::ops::down_kernel<
+    n= 768 grid (40, 40, 1) dynS  26336 regs  74 avg   246.6 us  infernix::ops::gate_up_kernel<
+    n= 768 grid (80, 40, 1) dynS  14368 regs  48 avg   108.0 us  infernix::ops::down_kernel<
+    n= 192 grid (40, 20, 1) dynS  26336 regs  74 avg   154.5 us  infernix::ops::gate_up_kernel<
+    n= 192 grid (80, 20, 1) dynS  14368 regs  48 avg    69.4 us  infernix::ops::down_kernel<
+    n= 140 grid (40, 10, 1) dynS      0 regs  48 avg   295.7 us  infernix::ops::gate_up_kernel<infernix::ops::Q4>
+    n= 140 grid (80, 10, 1) dynS      0 regs  45 avg   143.9 us  infernix::ops::down_kernel<infernix::ops::Q4>
+
+  head bandwidth model (codes + scales streamed once per call)
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=1 traffic   675.4 MB floor  2.474 ms  measured  2.642 ms   255.7 GB/s =  93.7 % of 273
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=2 traffic   675.4 MB floor  2.474 ms  measured  2.662 ms   253.7 GB/s =  92.9 % of 273
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=3 traffic   675.4 MB floor  2.474 ms  measured  2.692 ms   250.9 GB/s =  91.9 % of 273
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=4 traffic   675.4 MB floor  2.474 ms  measured  2.741 ms   246.4 GB/s =  90.3 % of 273
+==============================================================================
+OPTIMIZED proposal head (--lm-head-draft): node_r1n_draft.sqlite
+  kernel records      87885
+  busy (sum of durations)   2835.52 ms
+  span (first start..last end) 2885.32 ms
+  idle inside span       1.73 %
+  gaps > 20 us           80  total 35.9 ms  max 714.0 us
+  main-model forwards   64   widths {1: 12, 2: 15, 3: 29, 4: 8}
+  draft-module head calls 129  widths {1: 129}
+  main seg kernels 1265-1277, seg ms 28.85-50.11
+  draft seg kernels 39-64, seg ms 1.00-2.92, gating {0}, moe {2}
+  mean main verify width 2.516
+  closure sum(T-1)*count = 97  vs JSON drafted_tokens 97
+
+  head instances (base, grid.x, dynS bytes, regs, local/thread): calls total_ms min/med/max us
+    infernix.ops.<unnamed>.projection_q4_kernel grid   4096 dynS   5120 regs  40 local/thr    0  n= 129 total   100.7 ms    754.2 /   767.0 /   948.0 us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS   5120 regs 110 local/thr    0  n=  12 total    32.2 ms   2611.7 /  2625.8 /  2969.2 us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS  10240 regs 110 local/thr    0  n=  15 total    40.2 ms   2627.3 /  2643.3 /  2827.6 us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS  15360 regs 110 local/thr    0  n=  29 total    77.8 ms   2652.4 /  2673.2 /  2843.7 us
+    infernix.ops.<unnamed>.projection_q8_kernel grid   7760 dynS  20480 regs 110 local/thr    0  n=   8 total    21.8 ms   2710.3 /  2723.3 /  2736.6 us
+
+  total head cost 272.6 ms = 9.61 % of busy
+
+  family table (share of busy kernel time)
+    kernel                              calls  total ms   share   min us   med us   max us
+    gate_up_kernel<(int)1>               3072     540.7  19.07%     84.0    177.5    375.5
+    q8_a16_stream_kernel                 5962     498.3  17.57%      9.0     13.0    318.6
+    down_kernel<(int)1>                  3072     240.0   8.46%     41.6     76.5    442.3
+    hc_down_partials_kernel              6659     234.8   8.28%     23.0     35.3    168.5
+    q8_a16_simt_kernel                   3350     233.5   8.23%     14.3     70.8    210.0
+    hc_up_collapse_kernel                6659     181.8   6.41%     18.0     28.3    188.3
+    projection_q8_kernel                   64     172.0   6.06%   2611.7   2671.7   2969.2
+    projection_q4_kernel                  129     100.7   3.55%    754.2    767.0    948.0
+    bf16_skinny_gemv_kernel<(int)3, (int)8, (int)2, (int)0>    348      97.7   3.44%    274.0    279.8    334.3
+    q8_linear_swiglu_stream_pair_kernel   3201      75.4   2.66%     17.9     23.2     69.3
+    projection_kernel<(int)128, (int)1>   3201      52.0   1.84%     13.7     16.1     66.7
+    recurrent_fold_kernel                  52      50.8   1.79%    939.3    952.5   1442.9
+    bf16_skinny_gemv_kernel<(int)2, (int)8, (int)2, (int)0>    180      50.4   1.78%    274.6    279.4    338.1
+    bf16_skinny_gemv_kernel<(int)1, (int)8, (int)2, (int)0>    144      40.1   1.41%    273.2    277.1    321.2
+    gate_up_kernel                        129      38.3   1.35%    293.2    293.9    490.0
+    recurrent_record_kernel<(bool)0>     1872      33.2   1.17%     14.8     17.3     50.8
+    bf16_skinny_gemv_kernel<(int)4, (int)8, (int)2, (int)0>     96      27.3   0.96%    274.4    282.0    325.9
+    down_kernel                           129      18.8   0.66%    141.0    142.5    227.8
+    route_kernel                         3201      18.6   0.66%      5.6      5.7     30.6
+    inject_kernel                        6595      14.3   0.50%      1.5      1.7     35.3
+    split_vector_kernel                  7937      14.0   0.50%      1.1      1.7     27.3
+    attention_kernel<(infernix::KvCacheStorage)1, (int)12, (bool)1, (int)1>    897      13.7   0.48%      4.8     15.0     47.1
+    bf16_a16_simt_kernel                 1872       7.8   0.28%      3.6      3.7     38.7
+    stage_kernel                         3072       7.7   0.27%      2.0      2.4     15.2
+    recurrent_batch_update_kernel<(bool)1>    432       6.4   0.22%     13.4     13.7     41.7
+    top_logprobs_kernel<(int)256>         129       6.0   0.21%     44.6     45.6     83.7
+
+  MoE instances (raw name, grid, dynS, regs): calls avg us
+    n=1392 grid (40, 30, 1) dynS  26336 regs  74 avg   198.1 us  infernix::ops::gate_up_kernel<
+    n=1392 grid (80, 30, 1) dynS  14368 regs  48 avg    87.4 us  infernix::ops::down_kernel<
+    n= 720 grid (40, 20, 1) dynS  26336 regs  74 avg   150.8 us  infernix::ops::gate_up_kernel<
+    n= 720 grid (80, 20, 1) dynS  14368 regs  48 avg    66.1 us  infernix::ops::down_kernel<
+    n= 576 grid (40, 10, 1) dynS  26336 regs  74 avg    99.7 us  infernix::ops::gate_up_kernel<
+    n= 576 grid (80, 10, 1) dynS  14368 regs  48 avg    45.5 us  infernix::ops::down_kernel<
+    n= 384 grid (40, 40, 1) dynS  26336 regs  74 avg   257.6 us  infernix::ops::gate_up_kernel<
+    n= 384 grid (80, 40, 1) dynS  14368 regs  48 avg   116.2 us  infernix::ops::down_kernel<
+    n= 129 grid (40, 10, 1) dynS      0 regs  48 avg   296.9 us  infernix::ops::gate_up_kernel<infernix::ops::Q4>
+    n= 129 grid (80, 10, 1) dynS      0 regs  45 avg   145.5 us  infernix::ops::down_kernel<infernix::ops::Q4>
+
+  head bandwidth model (codes + scales streamed once per call)
+    infernix.ops.<unnamed>.projection_q4_kernel rows  131072 T=1 traffic   178.3 MB floor  0.653 ms  measured  0.767 ms   232.4 GB/s =  85.1 % of 273
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=1 traffic   675.4 MB floor  2.474 ms  measured  2.626 ms   257.2 GB/s =  94.2 % of 273
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=2 traffic   675.4 MB floor  2.474 ms  measured  2.643 ms   255.5 GB/s =  93.6 % of 273
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=3 traffic   675.4 MB floor  2.474 ms  measured  2.673 ms   252.7 GB/s =  92.6 % of 273
+    infernix.ops.<unnamed>.projection_q8_kernel rows  248320 T=4 traffic   675.4 MB floor  2.474 ms  measured  2.723 ms   248.0 GB/s =  90.8 % of 273

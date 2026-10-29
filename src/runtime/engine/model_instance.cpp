@@ -563,7 +563,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     if (plan.offloaded_experts()) {
-        const auto vram   = open_vram_budget_source(device.device, options.vram_past_budget);
+        const auto vram   = open_vram_budget_source(device.device);
         auto demand = expert_ram_demand(
             options, {.expert_banks = plan.pinned_expert_bytes(), .other_pinned = plan.pinned_other_bytes()},
             options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(0U) : 0U,
@@ -594,7 +594,6 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         offload_options.emplace();
         auto& o              = offload_options->engine;
         o.vram_headroom      = options.vram_headroom_bytes;
-        o.vram_past_budget   = options.vram_past_budget;
         o.expert_tail_skip   = options.expert_tail_skip;
         o.route_trace        = options.route_trace_path.empty() ? runtime::expert_offload::testing::route_trace()
                                                                 : options.route_trace_path;
@@ -646,7 +645,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     std::optional<SpillGuard> spill;
     std::uint64_t dense_bytes = 0;
     if (expert_ram) {
-        spill_source              = open_vram_budget_source(device.device, options.vram_past_budget);
+        spill_source              = open_vram_budget_source(device.device);
         dense_bytes               = plan.materialization().device_capacity_bytes;
         const VramSnapshot before = spill_source->query();
         const std::uint64_t headroom =
@@ -731,7 +730,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    const std::size_t base_headroom = options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes);
+    const std::size_t default_headroom =
+        device.props.integrated != 0 ? 0ULL : kDefaultKvCapacityHeadroomBytes;
+    const std::size_t base_headroom = options.vram_headroom_bytes.value_or(default_headroom);
     std::size_t retry_headroom      = 0;
     // Offloaded experts take the VRAM the Program leaves (their frames are sized after its fixed
     // allocations), so an automatic KV capacity is every lane's full context, as on

@@ -59,7 +59,7 @@ __host__ __device__ inline int mxfp8_tiled_active_splits(const CausalKvPartition
         const int waves = (ctas * splits + sms - 1) / sms;
         float cost =
             static_cast<float>(waves) * static_cast<float>(visible) / static_cast<float>(splits);
-        if (splits > 1) cost += (0.5F / 24.0F) * static_cast<float>(width * splits * heads);
+        if (splits > 1) cost += (3.5F / 24.0F) * static_cast<float>(width * splits * heads);
         if (splits == 1 || cost < best_cost) {
             best      = splits;
             best_cost = cost;

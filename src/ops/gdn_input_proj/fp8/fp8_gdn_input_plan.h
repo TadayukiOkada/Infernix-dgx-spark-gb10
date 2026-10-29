@@ -16,6 +16,34 @@ namespace infernix::ops::detail {
 // Two registered parents: fp8_e4m3fn_row_bf16 [16384,5120] (q/k/v 10240, z 6144) and the
 // Qwen3.5-122B-A10B static-scale fp8_e4m3fn_row_f32 [20480,3072] (q/k/v 12288, z 8192), told apart
 // by K. The latter's A8 route encodes with the parent's input scale and has no residual profile.
+enum class Fp8GdnInputScheduleId {
+    A8T32R32K128,
+    A8T64R128K256,
+    A8Tma64x128,
+    A8Tma192x128,
+    A8MidBulk,
+    A8Bulk,
+};
+
+struct Fp8GdnInputProblem {
+    std::int32_t input_rows;
+    std::int32_t qkv_rows;
+    std::int32_t z_rows;
+    std::int32_t parent_rows;
+    std::int32_t padded_k;
+    std::int32_t cols;
+};
+
+const char* fp8_gdn_input_schedule_name(Fp8GdnInputScheduleId schedule) noexcept;
+bool fp8_gdn_input_candidate_is_legal(Fp8GdnInputScheduleId schedule,
+                                      const Fp8GdnInputProblem& problem) noexcept;
+void fp8_gdn_input_execute_candidate(Fp8GdnInputScheduleId schedule, const Tensor& x,
+                                     const Weight& weight, Tensor& qkv, Tensor& z,
+                                     WorkspaceArena& workspace, cudaStream_t stream);
+// Largest split-K partial plane any candidate schedule may need, so a bench arena sized with this
+// can force MidBulk/Bulk at any token count without tripping the aligned-partials check.
+[[nodiscard]] std::size_t fp8_gdn_input_candidate_partial_capacity_bytes();
+
 [[nodiscard]] std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens);
 [[nodiscard]] std::size_t fp8_gdn_input_n20480_partial_capacity_bytes(std::int32_t max_tokens);
 // The A8 partials of the parent with this K.

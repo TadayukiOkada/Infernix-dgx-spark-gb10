@@ -26,4 +26,28 @@ void launch_q8_a16_sliced_r16_t32_w4_s2(const Tensor& x, const Weight& w, Tensor
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
         LinearIdentityEpilogue{}, stream);
 }
+
+void launch_q8_a16_sliced_r16_t8_w16_s2(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q8_a16_sliced_k_mma<q8_instances::SlicedR16T8W16S2>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q8_a16_sliced_r32_t16_w4_s2(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q8_a16_sliced_k_mma<q8_instances::SlicedR32T16W4S2>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q8_a16_sliced_r32_t16_w8_s2(const Tensor& x, const Weight& w, Tensor& out,
+                                        cudaStream_t stream) {
+    launch_q8_a16_sliced_k_mma<q8_instances::SlicedR32T16W8S2>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
 } // namespace infernix::ops::detail

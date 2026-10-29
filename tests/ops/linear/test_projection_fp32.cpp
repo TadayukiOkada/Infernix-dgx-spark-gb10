@@ -150,7 +150,7 @@ void quantized_case(infernix::QType qtype, std::int32_t n, std::int32_t k, std::
     std::vector<std::uint16_t> wide_bits;
     std::vector<float> wide_values;
     random_activations(k, 17, seed + 1, wide_bits, wide_values);
-    for (const std::int32_t t : {1, 3, 8, 9, 16, 17}) {
+    for (const std::int32_t t : {1, 3, 4, 8, 9, 16, 17}) {
         std::vector<std::uint16_t> bits(wide_bits.begin(), wide_bits.begin() + static_cast<std::ptrdiff_t>(k) * t);
         std::vector<float> values(wide_values.begin(), wide_values.begin() + static_cast<std::ptrdiff_t>(k) * t);
         const auto out = run_q8(weight, bits, k, t);
@@ -466,6 +466,9 @@ INFERNIX_OP_TEST(projection_fp32) {
         router_mma_case({256, 1}, 3072, 256, 59);
         router_mma_case({256, 1}, 3072, 4096, 61);
         bf16_tall_case(40000, 2560, 47);  // the tall mapping (a vocabulary head's width)
+        quantized_case(infernix::QType::Q8_G32_FP16, 33, 8, 51, false); // inactive lanes and row tail
+        quantized_case(infernix::QType::Q8_G32_FP16, 33, 264, 53, false); // partial last lane chunk, padded K
+        quantized_case(infernix::QType::Q8_G32_FP16, 33, 3072, 59, false); // all twelve preload slots
         quantized_case(infernix::QType::Q8_G32_FP16, 1000, 2560, 17, false);
         quantized_case(infernix::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows
         quantized_case(infernix::QType::Q4_G64_FP16, 1000, 2560, 23, false);

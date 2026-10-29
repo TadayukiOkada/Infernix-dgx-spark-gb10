@@ -17,8 +17,8 @@
 
 #include "models/qwen4_exp/program/program_impl.h"
 
-#include "core/cpu_topology.h"
 #include "core/host_load.h"
+#include "core/temporary_switches.h"
 
 #include <algorithm>
 #include <chrono>
@@ -73,16 +73,13 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         measured = !held[l].empty();
     }
     if (measured) {
-        // The service's team and placement (its worker 0, the service thread, is this thread here).
         moe::CpuExpertTeam team({.workers    = static_cast<int>(cpu_workers()),
                                  .max_jobs   = kRateJobs,
                                  .activation = layers.front().moe.bank->activation,
-                                 .narrow_a16 = cpu_narrow_a16(), // the service's arithmetic sets its rates
                                  .ggml       = ggml_format(*layers.front().moe.bank).valid(),
                                  .ggml_a8    = cpu_ggml_a8(), // decode's misses take the 8-bit route
                                  .nvfp4_a8   = cpu_narrow_a16() == moe::NarrowA16::kA8, // likewise
-                                 .cpus       = placement_.cpus});
-        const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+                                 .cpus       = moe::CpuExpertTeam::placement_cpus(static_cast<int>(cpu_workers()))});
         std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * kNarrowColumns);
         std::vector<std::uint16_t> y(static_cast<std::size_t>(moe::kHidden) * kRateJobs * kNarrowColumns);
         for (std::size_t i = 0; i < x.size(); ++i) { x[i] = static_cast<std::uint16_t>(0x3C00U + (i * 7919U) % 640U); }
@@ -97,7 +94,6 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
                 auto& job  = jobs[static_cast<std::size_t>(k)];
                 job.record = record_of(layer, expert);
                 job.ggml   = ggml_format(bank);
-                job.a8     = cpu_ggml_a8() || cpu_narrow_a16() == moe::NarrowA16::kA8;
                 job.scales = job.ggml.valid() ? moe::ExpertScales{} : bank.scales[expert];
                 job.ncols  = columns;
                 for (int c = 0; c < columns; ++c) {
@@ -119,7 +115,7 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
             for (int repeat = 0; repeat < kRepeats; ++repeat) {
                 for (int i = 0; i < kLoadCopies; ++i) {
                     const auto& first = held.front();
-                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % plan_.staging_slots) * record_stride,
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % kStagingSlots) * record_stride,
                                                record_of(0, first[static_cast<std::size_t>(i) % first.size()]),
                                                source_stride, cudaMemcpyHostToDevice, stream));
                 }
@@ -153,7 +149,6 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
         }
         cpu_expert_rate_ = expert_rate;
         cpu_column_rate_ = column_rate;
-        (void)set_current_thread_cpus(caller_cpus);
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
     std::string how = measured ? (tier_ ? "measured on the SSD tier's RAM copies" : "measured")

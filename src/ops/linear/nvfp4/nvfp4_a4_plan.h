@@ -27,6 +27,7 @@ struct Nvfp4A4Workspace {
     int terms               = 1;
     std::size_t code_plane  = 0;
     std::size_t scale_plane = 0;
+    float* row_scales       = nullptr;
 };
 
 // LinearPolicy::AllowA4Residual's term count. Two terms passed the decode gate with DFlash2 and
@@ -46,7 +47,8 @@ inline std::size_t nvfp4_a4_checked_bytes(std::int32_t tokens, std::size_t bytes
 
 template <class Arena>
 Nvfp4A4Workspace allocate_nvfp4_a4_workspace(Arena& arena, std::int32_t tokens,
-                                             std::int32_t input_rows, int terms = 1) {
+                                             std::int32_t input_rows, int terms = 1,
+                                             bool row_scaled = false) {
     if (input_rows <= 0 || (input_rows % 64) != 0) {
         throw std::invalid_argument("nvfp4 A4 workspace: invalid K");
     }
@@ -63,8 +65,14 @@ Nvfp4A4Workspace allocate_nvfp4_a4_workspace(Arena& arena, std::int32_t tokens,
             nvfp4_a4_padded_tokens(tokens), static_cast<std::size_t>(input_rows) / 16);
         const DeviceSpan codes  = arena.alloc_bytes(code_bytes * terms, 256);
         const DeviceSpan scales = arena.alloc_bytes(scale_plane * terms, 256);
+        float* row_scales       = nullptr;
+        if (row_scaled) {
+            const DeviceSpan rs =
+                arena.alloc_bytes(nvfp4_a4_checked_bytes(tokens, sizeof(float)), 256);
+            row_scales = static_cast<float*>(rs.data);
+        }
         return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data),
-                scale_plane * terms, terms, code_bytes, scale_plane};
+                scale_plane * terms, terms, code_bytes, scale_plane, row_scales};
     }
     // The tiled layout addresses whole tiles, so the scale plane is allocated for the padded token
     // count: at most 255 tokens of scales, under 0.3 MiB on the widest registered K, and paid
@@ -78,9 +86,9 @@ Nvfp4A4Workspace allocate_nvfp4_a4_workspace(Arena& arena, std::int32_t tokens,
 }
 
 inline std::size_t nvfp4_a4_workspace_capacity_bytes(std::int32_t tokens, std::int32_t input_rows,
-                                                     int terms = 1) {
+                                                     int terms = 1, bool row_scaled = false) {
     WorkspaceLayoutBuilder layout;
-    (void)allocate_nvfp4_a4_workspace(layout, tokens, input_rows, terms);
+    (void)allocate_nvfp4_a4_workspace(layout, tokens, input_rows, terms, row_scaled);
     return layout.peak_bytes(1);
 }
 

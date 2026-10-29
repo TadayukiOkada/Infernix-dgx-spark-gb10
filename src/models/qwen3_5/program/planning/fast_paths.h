@@ -52,6 +52,7 @@ struct FastPathConfiguration {
     case FastPath::QsaPrepareFused:
     case FastPath::Fp8A8Pair:
     case FastPath::Fp8A8PairBlock32:
+    case FastPath::Nvfp4A4Pair:
     case FastPath::Q4W4A8:
     case FastPath::SampledMtpDrafts:
     case FastPath::GdnF16Accumulate:

@@ -18,18 +18,15 @@ void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q
         launch_bf16_a16_tma_mma<Bf16ScheduleInstance<S, 5120>>(p, output, LinearIdentityEpilogue{},
                                                                stream);
     };
+    // GB10 (sm_121a, 48 SM) retune: candidate sweep + edge sweeps show a single
+    // mid-tile lane (mma.r32.t32.k128.s3) dominates a much wider band than the
+    // 5090-inherited cutoffs assumed. mma.r64.t32.k64.s3 never wins and is dropped.
     if (p.tokens <= 16)
         launch_bf16_a16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedR32T16W4, 5120>>(
             p, output, LinearIdentityEpilogue{}, stream);
-    else if (p.tokens <= 32)
+    else if (p.tokens <= 146)
         mma.template operator()<Bf16A16MmaR32T32K128S3>();
-    else if (p.tokens <= 64)
-        tma.template operator()<Bf16A16TmaR64T64K64S3>();
-    else if (p.tokens <= 96)
-        mma.template operator()<Bf16A16MmaR64T32K64S3>();
-    else if (p.tokens <= 128)
-        tma.template operator()<Bf16A16TmaR64T128K64S2>();
-    else if (p.tokens <= 192)
+    else if (p.tokens <= 320)
         tma.template operator()<Bf16A16TmaR64T64K64S3>();
     else
         tma.template operator()<Bf16A16TmaR64T128K64S2>();

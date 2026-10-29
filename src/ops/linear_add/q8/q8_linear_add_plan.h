@@ -14,7 +14,6 @@ enum class Q8LinearAddScheduleId {
     SplitKMmaExactT,
     SplitKMmaCapacity,
     GroupedSplitK,
-    MediumSplitK,
     SimtR8C4,
     MmaR32C64,
     MmaR32C80,

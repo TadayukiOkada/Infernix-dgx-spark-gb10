@@ -9,6 +9,18 @@
 
 namespace infernix::ops::detail {
 
+template <int Bytes, auto Kernel>
+int q4_prepare_mma_shared() {
+    if constexpr (Bytes > 48 * 1024) {
+        static const cudaError_t attribute =
+            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
+        CUDA_CHECK(attribute);
+        return Bytes;
+    } else {
+        return 0;
+    }
+}
+
 template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue>
 void launch_q4_a16_mma(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
                        cudaStream_t stream) {
@@ -24,11 +36,15 @@ void launch_q4_a16_mma(const Q4LinearOperands& operands, Output output, Epilogue
                           count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&
                           operands.k % Schedule::kBlockK == 0;
         if (full) {
-            q4_a16_mma_kernel<Schedule, true><<<grid, Schedule::kThreads, 0, stream>>>(
+            constexpr auto kernel = q4_a16_mma_kernel<Schedule, true, Output, Epilogue>;
+            const int shared      = q4_prepare_mma_shared<Schedule::kSharedBytes, kernel>();
+            kernel<<<grid, Schedule::kThreads, shared, stream>>>(
                 x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
                 count, operands.padded_k, offset);
         } else {
-            q4_a16_mma_kernel<Schedule, false><<<grid, Schedule::kThreads, 0, stream>>>(
+            constexpr auto kernel = q4_a16_mma_kernel<Schedule, false, Output, Epilogue>;
+            const int shared      = q4_prepare_mma_shared<Schedule::kSharedBytes, kernel>();
+            kernel<<<grid, Schedule::kThreads, shared, stream>>>(
                 x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
                 count, operands.padded_k, offset);
         }

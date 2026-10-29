@@ -27,7 +27,7 @@ constexpr std::int32_t kMaxSteps         = 15;
 constexpr std::int32_t kRank             = 256;
 constexpr std::int32_t kCodebookRows     = 248320;
 constexpr std::int32_t kTokenDomain      = 248077;
-constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
+infernix::bench::ColdFlushBytes kDefaultFlushBytes{};
 
 enum class Mode : std::uint8_t {
     Greedy,

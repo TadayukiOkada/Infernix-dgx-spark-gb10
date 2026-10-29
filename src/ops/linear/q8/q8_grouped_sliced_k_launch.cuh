@@ -28,11 +28,17 @@ void launch_q8_a16_grouped_sliced_k_mma(const Q8LinearOperands& operands, Output
                                                                  count);
             CUDA_CHECK(cudaGetLastError());
         };
-        if (operands.rows % 16 == 0 && operands.k == operands.padded_k &&
-            operands.k % Schedule::kBlockK == 0)
+        if constexpr (Schedule::kStaticK > 0) {
+            if (operands.rows % 16 != 0)
+                throw std::invalid_argument(
+                    "Q8 grouped sliced-K static K requires rows aligned to 16");
             launch.template operator()<true>();
-        else
+        } else if (operands.rows % 16 == 0 && operands.k == operands.padded_k &&
+                   operands.k % Schedule::kBlockK == 0) {
+            launch.template operator()<true>();
+        } else {
             launch.template operator()<false>();
+        }
     });
 }
 } // namespace infernix::ops::detail

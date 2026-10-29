@@ -26,7 +26,26 @@ Plan resolve_plan(int hidden, int input_rows, int width, int batch) {
         throw std::invalid_argument("linear dynamic grouped conv add: invalid W/B profile");
     const int columns = width * batch;
     using S           = Q8DynamicConvAddSchedule;
-    const S schedule  = columns <= 88 ? S::TiledMma : S::MmaK128;
+    S schedule        = S::TiledMma;
+    if (input_rows == 17408) {
+        if (columns <= 32) {
+            schedule = S::TiledMma;
+        } else if (columns <= 64) {
+            schedule = S::MmaK128;
+        } else if (columns <= 96) {
+            schedule = S::MmaT96;
+        } else {
+            schedule = S::MmaT128;
+        }
+    } else {
+        if (columns <= 64) {
+            schedule = S::TiledMma;
+        } else if (columns <= 96) {
+            schedule = S::MmaT96;
+        } else {
+            schedule = S::MmaT128;
+        }
+    }
     return {schedule, static_cast<std::size_t>(hidden) * columns * sizeof(std::uint16_t)};
 }
 } // namespace
@@ -48,6 +67,10 @@ const char* q8_linear_dynamic_grouped_conv_add_route_name(int hidden, int input_
         return "dynamic_grouped_conv_add.q8.tiled_mma.materialized_bf16";
     case Q8DynamicConvAddSchedule::MmaK128:
         return "dynamic_grouped_conv_add.q8.r64_c64_k128.materialized_bf16";
+    case Q8DynamicConvAddSchedule::MmaT96:
+        return "dynamic_grouped_conv_add.q8.r64_c96.materialized_bf16";
+    case Q8DynamicConvAddSchedule::MmaT128:
+        return "dynamic_grouped_conv_add.q8.r64_c128.materialized_bf16";
     }
     throw std::logic_error("linear dynamic grouped conv add: invalid production schedule");
 }

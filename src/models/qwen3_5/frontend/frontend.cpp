@@ -879,6 +879,12 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     return std::move(*data);
 }
 
+std::unique_ptr<detail::NgramProposer>
+PreparedPromptAccess::take_ngram_index(PreparedPrompt& prompt) noexcept {
+    if (prompt.data_ == nullptr) { return {}; }
+    return std::move(prompt.data_->ngram_index.index);
+}
+
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
 }

@@ -84,6 +84,7 @@ constexpr std::array kCliOptions{
     CliOption{"--chat-template"},
     CliOption{"--ngram-volume"},
     CliOption{"--ngram-residency"},
+    CliOption{"--ngram-cache-mib"},
     CliOption{"--expert-state"},
     CliOption{"--expert-stripe"},
     CliOption{"--grammar-file"},
@@ -249,10 +250,6 @@ std::string usage_text(const char* argv0) {
            "                           (default = --max-context; auto sizes to free\n"
            "                           VRAM less --vram-headroom-mib; offloaded experts:\n"
            "                           auto = --max-context)\n"
-           "  --vram-past-budget       Qwen3.8-Flash-Next on Windows: also use the VRAM the\n"
-           "                           OS budget withholds (~0.6 GiB more expert cache on\n"
-           "                           an RTX 5090; may move to system memory if another\n"
-           "                           program needs VRAM)\n"
            "  --expert-tail-skip R     Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B):\n"
            "                           trade quality for decode speed by skipping a routed\n"
            "                           expert missing from VRAM that every token of a decode\n"
@@ -260,21 +257,16 @@ std::string usage_text(const char* argv0) {
            "                           10 on Flash-Next, 8 on the 122B). Changes the output; not\n"
            "                           with --reproducible. Default off; Strata's\n"
            "                           default is 7\n"
+           "                           default is 7\n"
            "  --vram-headroom-mib N|auto\n"
            "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
-           "                           after --kv-capacity auto (auto " +
+           "                           after --kv-capacity auto (auto: 0 on unified\n"
+           "                           memory, else " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           "); Qwen3.8-\n"
-           "                           Flash-Next, after the expert cache, for the display\n"
-           "                           and other programs (auto: 1024 with a display on\n"
-           "                           the GPU, else 256)\n"
-           "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2;\n"
-           "                           bf16 stores K as BF16 and V as FP16 (exact for\n"
-           "                           2^-17 <= |v| < 2^16), with --lossless V as BF16\n"
-           "  --logits-dtype T         fp32 (default) | bf16: the head's logits the sampler,\n"
-           "                           greedy choice, draft acceptance and scoring read;\n"
-           "                           bf16 rounds each once, as Transformers returns them\n"
-           "                           (near-equal logits then tie), for comparisons\n"
+           "); Qwen3.8-Flash-Next, after\n"
+           "                           the expert cache, for the display and other\n"
+           "                           programs (auto: 0 on unified memory, 1024 with a\n"
+           "                           display on the GPU, else 256)\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
@@ -344,7 +336,11 @@ std::string usage_text(const char* argv0) {
            "  --draft-model FILE       Qwen3.8-Flash-Next dflash2 (or auto): the DFlash2\n"
            "                           drafter's companion artifact (Qwen3.5/3.6 artifacts\n"
            "                           bundle theirs)\n"
-           "  --lm-head-draft          use the optimized proposal head\n"
+           "  --lm-head-draft          use the optimized proposal head: validated\n"
+           "                           +9.540% decode on Qwen3.8-Flash-Next\n"
+           "                           artifacts carrying a proposal head, with\n"
+           "                           byte-identical greedy output; startup fails\n"
+           "                           when the artifact has none\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"
            "                           only), Qwen3.8-Flash-Next dflash2: one-request rounds\n"
            "                           verify drafts only up to the first below probability P,\n"
@@ -434,6 +430,8 @@ Options parse_options(int argc, char** argv) {
             options.ngram_volume_path = value(arg);
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = parse_ngram_residency(value(arg));
+        } else if (arg == "--ngram-cache-mib") {
+            options.ngram_cache_bytes = parse_u64(value(arg), "ngram-cache-mib") << 20;
         } else if (arg == "--expert-state") {
             const std::string path = value(arg);
             options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
@@ -460,8 +458,6 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
-        } else if (arg == "--vram-past-budget") {
-            options.vram_past_budget = true;
         } else if (arg == "--expert-tail-skip") {
             options.expert_tail_skip = parse_u32(value(arg), "expert-tail-skip", true);
         } else if (arg == "--vram-headroom-mib") {

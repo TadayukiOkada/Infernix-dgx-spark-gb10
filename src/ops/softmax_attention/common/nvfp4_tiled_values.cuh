@@ -12,33 +12,11 @@ struct Nvfp4G16TiledValues {
     static constexpr int kScaleItems  = 16;
     static constexpr bool kE4m3Values = true;
 
-    // A 64-key FP16 PV partial is bounded by 64 * 6 * max_scale. UE4M3 codes order like their
-    // values and 0x70 encodes exactly 128, so a tile whose largest scale is at most 128 stays
-    // under 49152; larger scales are (128, 256) or [256, 448], and one or two halvings bring
-    // them back to 128. The 64 keys' 16 scale bytes are 32 bytes per lane.
+    // With FP32 PV accumulation, only individual decoded V values (at most 6 * 448 = 2688) must
+    // fit in FP16, so no tile shift is needed.
     template <int Keys>
-    __device__ __forceinline__ static int tile_shift(const Scale* scales, int lane) {
-        static_assert(Keys * kScaleItems == 32 * 32);
-        const uint4 s0  = load_vec<uint4>(scales + 32 * lane);
-        const uint4 s1  = load_vec<uint4>(scales + 32 * lane + 16);
-        unsigned code   = 0;
-        const auto fold = [&](unsigned w) {
-            code =
-                max(code, max(max(w & 0xFFU, (w >> 8) & 0xFFU), max((w >> 16) & 0xFFU, w >> 24)));
-        };
-        fold(s0.x);
-        fold(s0.y);
-        fold(s0.z);
-        fold(s0.w);
-        fold(s1.x);
-        fold(s1.y);
-        fold(s1.z);
-        fold(s1.w);
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            code = max(code, __shfl_xor_sync(0xffffffffU, code, offset));
-        }
-        return code <= 0x70U ? 0 : (code < 0x78U ? 1 : 2);
+    __device__ __forceinline__ static int tile_shift(const Scale*, int) {
+        return 0;
     }
 
     // The 8-bit PV form: the largest scale lies in [2^e, 2^(e+1)) for UE4M3 exponent field e

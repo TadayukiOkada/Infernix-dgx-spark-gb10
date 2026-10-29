@@ -470,7 +470,7 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
         ++failures;
     }
     for (const auto bounds :
-         std::vector<std::pair<int, int>>{{1, 42}, {40, 43}, {1, 128}, {120, 129}, {1, 256}}) {
+         std::vector<std::pair<int, int>>{{1, 16}, {14, 17}, {1, 42}, {40, 43}, {1, 128}, {120, 129}, {1, 256}}) {
         std::size_t witness = 0;
         for (int t = bounds.first; t <= bounds.second; ++t)
             witness = std::max(witness, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
@@ -499,19 +499,23 @@ INFERNIX_OP_TEST(gdn_gating_proj) {
     const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1024, 2048, 4096, 4097, 4224, 4225, 8192});
+    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097, 6144, 6145, 8192});
 
-    // Every registered 27B projection route, including predicated and full token tiles.
-    for (const std::int32_t tokens : {1, 8, 9, 1024, 1025, 2049, 4097}) {
+    // Every registered 27B projection route, including predicated and full token tiles. Boundary
+    // lists track k27Routes in bf16_gdn_gating_proj_plan.cpp (start-1/start/start+1 per band edge).
+    // The GB10 retune moves T=3..512 from SIMT SmallTSplit10 to MMA Split8, so the whole small-T
+    // ladder (4,5,6,8,9) is a genuine SIMT->MMA arithmetic change and is probed explicitly.
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 8, 9, 16, 512, 513, 1024, 1025, 2048, 2049, 4224, 4225, 4097}) {
         failures += run_projection_case(kQwen27, tokens,
                                         0x1000u + static_cast<std::uint32_t>(tokens), execution);
     }
     // The Qwen3.8 parent changes only the public storage boundary. One direct oracle case proves
     // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
     failures += run_projection_case(kQwen38Parent, 1, 0x1801u, execution);
-    // Every registered 35B projection route and its contiguous-parent storage contract.
-    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
+    // Every registered 35B projection route and its contiguous-parent storage contract. Boundary
+    // lists track k35Routes (start-1/start/start+1 per band edge).
+    for (const std::int32_t tokens : {1, 127, 128, 256, 257, 1024, 1025, 2048, 2049, 6144, 6145, 4097}) {
         failures += run_projection_case(kQwen35, tokens,
                                         0x2000u + static_cast<std::uint32_t>(tokens), execution);
     }

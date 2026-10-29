@@ -1,14 +1,24 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
+# Architecture configuration:
+# DGX Spark (NVIDIA GB10, compute capability 12.1): target sm_121a.
+# Warp-specialized kernels use setmaxnreg, so the family-specific 'a' suffix is required.
+# Plain 121 / 121-real (recommended by the DGX Spark porting guide) is normalized to 121a so
+# PTXAS enables setmaxnreg.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 121a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+
+# Normalize porting-guide syntax to the architecture-accelerated 'a' variant
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(121|121-real)$")
+  message(STATUS "Normalizing CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} to 121a (GB10 / DGX Spark)")
+  set(CMAKE_CUDA_ARCHITECTURES 121a CACHE STRING "CUDA architectures to build" FORCE)
+endif()
+
+# Validate that the requested architecture is DGX Spark (121a)
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^121a$")
   message(FATAL_ERROR
-    "Infernix supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "Infernix supports CMAKE_CUDA_ARCHITECTURES=121a (GB10 / DGX Spark); got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
@@ -27,25 +37,27 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
-if(MSVC)
-  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
-  # Sources are UTF-8. Without /utf-8 MSVC reads them in the system code page, and the bundled fmt
-  # rejects any code page but UTF-8 (a stock English or German Windows uses 1252).
-  add_compile_options(
-    $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
-  # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
-  # the project-wide /MD runtime. Keep one CRT in the final process.
-  add_link_options($<HOST_LINK:/NODEFAULTLIB:LIBCMT>)
-endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Host CPU architecture optimizations for ARM64 (DGX Spark Cortex-X925 / Cortex-A725)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:-march=armv9-a+simd+sve+sve2+i8mm+bf16>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-march=armv9-a+simd+sve+sve2+i8mm+bf16>
+  )
+endif()
+
 if(CMAKE_GENERATOR MATCHES "Ninja")
-  set_property(GLOBAL PROPERTY JOB_POOLS infernix_link=1)
+  # Linking dominates an incremental rebuild: one CUDA object change relinks every executable
+  # that includes it (242 links for a 12-file change was measured on the 20-core GB10 host), and
+  # a serialized link pool left the machine ~63% idle for 347 s. A link peaks at ~0.5 GB RSS, so
+  # a small depth multiplies throughput at negligible memory cost. Set INFERNIX_LINK_JOBS=1 to
+  # restore strict serialization if a link ever exhausts memory.
+  set(INFERNIX_LINK_JOBS 8 CACHE STRING
+      "Concurrent link jobs for Ninja (1 serializes every link)")
+  set_property(GLOBAL PROPERTY JOB_POOLS infernix_link=${INFERNIX_LINK_JOBS})
   set(CMAKE_JOB_POOL_LINK infernix_link)
 endif()
 

@@ -1,50 +1,21 @@
 #include "core/host_load.h"
 
-#if defined(_WIN32)
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#else
 #    include <sys/resource.h>
 #    include <unistd.h>
 
 #    include <cstdio>
-#endif
 
 #include <algorithm>
 
 namespace infernix {
 namespace {
 
-#if defined(_WIN32)
-std::uint64_t filetime_ns(const FILETIME& t) noexcept {
-    return ((static_cast<std::uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime) * 100ULL;
-}
-#endif
 
 } // namespace
 
 HostCpuTimes host_cpu_times() noexcept {
     HostCpuTimes out;
     out.at = std::chrono::steady_clock::now();
-#if defined(_WIN32)
-    FILETIME idle{}, kernel{}, user{};
-    if (GetSystemTimes(&idle, &kernel, &user)) {
-        // Kernel time includes the idle time.
-        const std::uint64_t total = filetime_ns(kernel) + filetime_ns(user);
-        const std::uint64_t idle_ns = filetime_ns(idle);
-        out.busy_ns = total > idle_ns ? total - idle_ns : 0;
-    }
-    FILETIME created{}, exited{}, own_kernel{}, own_user{};
-    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &own_kernel, &own_user)) {
-        out.own_ns = filetime_ns(own_kernel) + filetime_ns(own_user);
-    }
-    out.cpus = std::max<std::uint32_t>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
-#else
     if (std::FILE* stat = std::fopen("/proc/stat", "r")) {
         unsigned long long user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
         if (std::fscanf(stat, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &user, &nice, &system, &idle, &iowait,
@@ -64,7 +35,6 @@ HostCpuTimes host_cpu_times() noexcept {
     }
     const long cpus = sysconf(_SC_NPROCESSORS_ONLN);
     out.cpus = cpus > 0 ? static_cast<std::uint32_t>(cpus) : 1U;
-#endif
     return out;
 }
 

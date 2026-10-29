@@ -27,8 +27,11 @@ namespace infernix::ops {
  * the oracle is the formula in FP64.
  */
 
-/// rows: U8 [W, heads, T] FP8 E4M3FN codes; scale: BF16 [1]. out: BF16 [heads*W, T],
-/// out[h*W + j, t] = bf16(e4m3(rows[j, h, t]) * scale).
+/// rows: U8 [W, heads, T] n-gram codes; scale: [1]. out: BF16 [heads*head_width, T],
+/// out[h*head_width + d, t] = the decoded cell times the global scale. With a BF16 scale, W is
+/// head_width FP8 E4M3FN codes and the cell is e4m3(rows[h, t][d]) * scale. With an FP32 scale, W
+/// is head_width/2 packed E2M1 codes followed by head_width/16 E4M3FN block scales (one per 16
+/// codes) and the cell is e2m1(code[d]) * e4m3(scale[d / 16]) * scale.
 void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_t stream);
 
 /// NVFP4 rows (NVIDIA FP4-Local's table): rows U8 [W/2 + W/16, heads, T], each row its W/2 code

@@ -2,7 +2,6 @@
 #include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 
-#include "ops/softmax_attention/dense/causal_cache/int8/fast_tiled_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
@@ -88,7 +87,7 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
     static_assert(!ParallelQueries || !CacheInput::writes_cache);
     const int kv_head      = ParallelQueries ? blockIdx.x % Geometry::KVHeads : blockIdx.x;
     const int column_begin = ParallelQueries ? (blockIdx.x / Geometry::KVHeads) * TokenTile : 0;
-    const int tile_tokens = ParallelQueries ? min(TokenTile, full_width - column_begin) : TokenTile;
+    const int tile_tokens  = min(TokenTile, full_width - column_begin);
     const int partial_width = full_width;
     const int partial_begin = column_begin;
     const int split         = static_cast<int>(blockIdx.y);

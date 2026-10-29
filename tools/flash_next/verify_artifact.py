@@ -60,7 +60,11 @@ _FP8_ROWS = "fp8_e4m3fn_row_bf16"
 _FP8_GROUPS = "fp8_e4m3fn_g32_e8m0"
 
 _WORD = {"bf16": (torch.bfloat16, 2), "fp32": (torch.float32, 4), "int32": (torch.int32, 4)}
-_REQUANTIZED = {"q8_g32_fp16", "q4_g64_fp16", "q2_g64_fp16"}
+# Formats the recipe produces by re-quantizing a BF16/FP32 source rather than
+# storing it verbatim. `nvfp4` appears only in the W4 dense tier of
+# `qwen3_8_flash_next_nvfp4_w4dense` (design §6.1), where the dense packed
+# projections move from q8_g32_fp16/bf16 to a 4-bit MSE codec.
+_REQUANTIZED = {"q8_g32_fp16", "q4_g64_fp16", "q2_g64_fp16", "nvfp4"}
 
 
 def _binding_formats(artifact: Artifact, binding: dict) -> set[str]:

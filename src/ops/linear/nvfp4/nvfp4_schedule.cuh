@@ -134,7 +134,7 @@ struct Nvfp4A4MmaSchedule {
 
 template <int BlockTokens, int Stages, int MinBlocksPerSm,
           CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE,
-          int Terms = 1>
+          int Terms = 1, int BlockRows = 128>
 struct Nvfp4A4TmaMmaSchedule {
     static constexpr int kStaticK = 0;
     // Terms > 1 is the A4 residual profile: each stage holds that many activation planes, each
@@ -147,13 +147,18 @@ struct Nvfp4A4TmaMmaSchedule {
     static constexpr auto kScaleLayout =
         BlockTokens == 128 ? Nvfp4ScaleLayout::Tiled128 : Nvfp4ScaleLayout::Tiled256;
     static_assert(BlockTokens == 128 || BlockTokens == 256);
+    static_assert(BlockRows == 64 || BlockRows == 128);
     static_assert(Stages >= 2 && Stages <= 4);
     static_assert(MinBlocksPerSm > 0);
+    static_assert(BlockTokens != 256 || MinBlocksPerSm == 1,
+                  "BlockTokens=256 TMA uses setmaxnreg.inc 232 (64.5 KiB regs/CTA) and requires 1 CTA/SM");
+    static_assert(BlockRows != 128 || MinBlocksPerSm == 1,
+                  "BlockRows=128 TMA needs >128 regs/consumer thread and spills under MinBlocksPerSm>=2");
 
     static constexpr auto kWeightCodePromotion = WeightCodePromotion;
 
     static constexpr int kBlockTokens      = BlockTokens;
-    static constexpr int kBlockRows        = 128;
+    static constexpr int kBlockRows        = BlockRows;
     static constexpr int kBlockK           = 128;
     static constexpr int kStages           = Stages;
     static constexpr int kWarpsTokens      = 4;
@@ -211,7 +216,7 @@ struct Nvfp4A16MmaSchedule {
     static constexpr int kSharedBytes =
         kBlockRows * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
         kActivationStages * kBlockTokens * kBlockK * static_cast<int>(sizeof(__nv_bfloat16)) +
-        kBlockRows * (kBlockK / 2 + kBlockK / 16);
+        kActivationStages * kBlockRows * (kBlockK / 2 + kBlockK / 16);
 
     static_assert(kBlockRows > 0 && kBlockTokens > 0 && kBlockK > 0);
     static_assert((kBlockRows % kWarpRows) == 0 && (kBlockTokens % kWarpTokens) == 0);
@@ -227,15 +232,18 @@ enum class Nvfp4ActivationStage : std::uint8_t { ActiveOnly, PaddedZero };
 
 template <int KWarps, int TileTokens, int MinBlocksPerSm, Cache ActivationCache = Cache::ca,
           Cache WeightCache                    = Cache::cg,
-          Nvfp4ActivationStage ActivationStage = Nvfp4ActivationStage::ActiveOnly, int Stages = 1>
+          Nvfp4ActivationStage ActivationStage = Nvfp4ActivationStage::ActiveOnly, int Stages = 1,
+          int RowTiles = 1>
 struct Nvfp4A16SlicedKMmaSchedule {
     static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens > 0 && TileTokens % 8 == 0);
     static_assert(Stages == 1 || Stages == 2);
+    static_assert(RowTiles == 1 || RowTiles == 2);
     static_assert(MinBlocksPerSm > 0);
     static constexpr int kStaticK           = 0;
     static constexpr int kTokenCapacity     = TileTokens;
     static constexpr bool kExactTokens      = false;
+    static constexpr int kRowTiles          = RowTiles;
     static constexpr int kKWarps            = KWarps;
     static constexpr int kBlockTokens       = TileTokens;
     static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
@@ -246,11 +254,11 @@ struct Nvfp4A16SlicedKMmaSchedule {
     static constexpr int kThreads           = KWarps * 32;
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kBlockK            = KWarps * kTileKPerWarp;
-    static constexpr int kBlockRows         = 16;
-    static constexpr int kRowsPerLoaderWarp = 16 / KWarps;
+    static constexpr int kBlockRows         = 16 * RowTiles;
+    static constexpr int kRowsPerLoaderWarp = kBlockRows / KWarps;
     static constexpr int kStagingBytes =
-        Stages * (16 * (kBlockK / 2 + kBlockK / 16) + KWarps * TileTokens * 64 * 2);
-    static constexpr int kPartialBytes = KWarps * (TileTokens / 8) * 32 * 4 * 4;
+        Stages * (kBlockRows * (kBlockK / 2) + KWarps * TileTokens * 64 * 2);
+    static constexpr int kPartialBytes = KWarps * RowTiles * (TileTokens / 8) * 32 * 4 * 4;
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
     static_assert(kSharedBytes <= 99 * 1024);

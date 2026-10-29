@@ -7,7 +7,7 @@ namespace infernix::ops::detail::q6_instances {
 using SimtR8T4 = Q6A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
 using GemvR4W2G16      = Q6A16GemvSchedule<4, 2, 16, 2, Cache::ca, 1>;
-using SlicedR16T8W4S2  = Q6A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
+using SlicedR16T8W4S2  = Q6A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 3>;
 using SlicedR32T16W4S2 = Q6A16SlicedKMmaSchedule<32, 16, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W4S1 = Q6A16SlicedKMmaSchedule<32, 32, 4, 1, Cache::cg, Cache::ca, 2>;
 using SlicedR32T64W2S1 = Q6A16SlicedKMmaSchedule<32, 64, 2, 1, Cache::cg, Cache::ca, 2>;
@@ -35,5 +35,15 @@ using MmaR64T112 = Q6A16MmaSchedule<64, 112, 64, 16, 112, 2, 1, Q6MmaFragmentPip
                                     Cache::cg, Cache::cg, Q6ScaleLoad::Pair32>;
 using MmaR64T128 = Q6A16MmaSchedule<64, 128, 64, 64, 32, 2, 1, Q6MmaFragmentPipeline::Serial,
                                     Cache::cg, Cache::cg, Q6ScaleLoad::Pair32>;
+
+// GB10-optimal BlockK=128 2-blocks/SM & 1-block/SM MMA schedules
+using MmaR32T64K128S2A1  = Q6A16MmaSchedule<32, 64, 128, 16, 16, 2, 2, Q6MmaFragmentPipeline::Serial,
+                                            Cache::cg, Cache::cg, Q6ScaleLoad::Pair32, 1>;
+using MmaR32T128K64S2A2  = Q6A16MmaSchedule<32, 128, 64, 32, 32, 2, 1, Q6MmaFragmentPipeline::Serial,
+                                            Cache::cg, Cache::cg, Q6ScaleLoad::Pair32>;
+using MmaR32T128K128S2A1 = Q6A16MmaSchedule<32, 128, 128, 16, 32, 2, 1, Q6MmaFragmentPipeline::Serial,
+                                            Cache::cg, Cache::cg, Q6ScaleLoad::Pair32, 1>;
+using MmaR64T128K128S1A1 = Q6A16MmaSchedule<64, 128, 128, 32, 32, 1, 1, Q6MmaFragmentPipeline::Serial,
+                                            Cache::cg, Cache::cg, Q6ScaleLoad::Pair32, 1>;
 
 } // namespace infernix::ops::detail::q6_instances

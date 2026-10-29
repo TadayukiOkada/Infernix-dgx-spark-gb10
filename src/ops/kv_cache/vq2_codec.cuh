@@ -69,6 +69,9 @@ __device__ __forceinline__ uint2 kv_cache_vq2_decode_word(std::uint32_t code,
     const unsigned sign = kv_cache_vq2_sign_mask(code);
     const unsigned lo   = kv_cache_vq2_byte_mask(sign & 0xfu);
     const unsigned hi   = kv_cache_vq2_byte_mask(sign >> 4);
+    // __vsub4 (emulated on sm_121a) is required here, not a poor choice: unlike the Q4 levels, the
+    // VQ2 codebook magnitudes can be zero (vq2_codebook.inc contains 0 entries), and the carry-free
+    // manual negate ((mag ^ mask) + mask_one) overflows a byte lane when mag == 0. Keep __vsub4.
     return make_uint2(__vsub4(magnitude.x ^ lo, lo), __vsub4(magnitude.y ^ hi, hi));
 }
 

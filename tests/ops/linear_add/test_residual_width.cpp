@@ -1,4 +1,7 @@
 // A column of a fused residual projection must not change its bits with the batch width
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize ("no-tree-vectorize")
+#endif
 // (NInfer issue Neroued/ninfer#374).
 //
 // The NVFP4 A4 and FP8 A8 routes launch a FullTokens kernel instance when the width fills whole

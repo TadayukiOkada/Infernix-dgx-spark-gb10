@@ -19,17 +19,38 @@ void launch_q8_a16_stream(const Q8LinearOperands& operands, Output output, Epilo
     for_each_token_slice(operands.tokens, Schedule::kMaxCols, [&](int offset, int count) {
         const dim3 grid(div_up(operands.rows, Schedule::kBlockRows), div_up(count, Schedule::kMaxCols));
         const auto* x = operands.x + static_cast<std::int64_t>(offset) * operands.k;
-        const auto launch = [&]<bool FullRows>() {
-            constexpr auto kernel = q8_a16_stream_kernel<Schedule, FullRows, Output, Epilogue>;
-            const int shared      = q8_prepare_shared<Schedule::kSharedBytes, kernel>();
-            CUDA_CHECK(pdl::launch_consumer({grid, dim3(Schedule::kThreads), static_cast<std::size_t>(shared), stream},
+        const auto launch = [&]<bool FullRows, class S = Schedule>() {
+            constexpr auto kernel = q8_a16_stream_kernel<S, FullRows, Output, Epilogue>;
+            const int shared      = q8_prepare_shared<S::kSharedBytes, kernel>();
+            CUDA_CHECK(pdl::launch_consumer({grid, dim3(S::kThreads), static_cast<std::size_t>(shared), stream},
                                             kernel, x, operands.codes, operands.scales, output, epilogue,
                                             operands.rows, operands.padded_k, count, offset));
         };
-        if (operands.rows % Schedule::kBlockRows == 0)
-            launch.template operator()<true>();
-        else
-            launch.template operator()<false>();
+        const auto dispatch_rows = [&]<class S = Schedule>() {
+            if (operands.rows % S::kBlockRows == 0)
+                launch.template operator()<true, S>();
+            else
+                launch.template operator()<false, S>();
+        };
+        if constexpr (Schedule::kPasses == 1) {
+            switch (count) {
+                case 1:
+                    if constexpr (Schedule::kColsPerPass >= 1)
+                        return dispatch_rows.template operator()<typename Schedule::template with_cols<1>>();
+                    break;
+                case 2:
+                    if constexpr (Schedule::kColsPerPass >= 2)
+                        return dispatch_rows.template operator()<typename Schedule::template with_cols<2>>();
+                    break;
+                case 5:
+                    if constexpr (Schedule::kColsPerPass >= 5 && Schedule::kChunks <= 5)
+                        return dispatch_rows.template operator()<typename Schedule::template with_cols<5>>();
+                    break;
+                default:
+                    break;
+            }
+        }
+        dispatch_rows.template operator()<Schedule>();
     });
 }
 
