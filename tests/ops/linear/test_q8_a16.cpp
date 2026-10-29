@@ -1,6 +1,7 @@
 #include "ops/op_family.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
+#include "core/arena.h"
 
 #include <cuda_runtime.h>
 
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -76,6 +78,18 @@ int q8_a16_conformance() {
                     {t, CallForm::Policy, infernix::ops::LinearPolicy::A16ColumnInvariant});
             }
         }
+        if ((shape.k == 2560 &&
+             (shape.n == 1280 || shape.n == 2560 || shape.n == 12800 || shape.n == 13952 ||
+              shape.n == 16384)) ||
+            (shape.n == 10240 && shape.k == 320) || (shape.n == 320 && shape.k == 10240) ||
+            (shape.n == 2560 && shape.k == 640)) {
+            // The Flash-Next shapes' fixed sliced-K column-invariant families, including the
+            // token-slice seams of the capacity ladder.
+            for (int t : {1, 2, 5, 8, 16, 33, 48, 64}) {
+                calls.push_back(
+                    {t, CallForm::Policy, infernix::ops::LinearPolicy::A16ColumnInvariant});
+            }
+        }
         if (shape.n == 2048 && shape.k == 16384) {
             for (int t : {383,  384,  385,  479,  480,  481,  639,  640,  641,  703,
                           704,  705,  959,  960,  961,  1343, 1344, 1345, 1679, 1680,
@@ -115,16 +129,12 @@ int q8_a16_conformance() {
 // width), and as far as each Flash-Next shape keeps the register-streamed route beyond 8 (passes,
 // token slices and K-split warps): 64 for the hyper-connection and final-mixer downs, 48 for the
 // shared expert gate/up, 16 for its down.
-int q8_a16_column_invariance() {
-    int failures = 0;
-    for (const auto& [shape, kColumns] :
-         {std::pair{Geometry{324, 10240, 401U}, 64},  std::pair{Geometry{320, 10240, 403U}, 64},
-          std::pair{Geometry{10240, 320, 419U}, 8},   std::pair{Geometry{16384, 2560, 421U}, 8},
-          std::pair{Geometry{2560, 6144, 431U}, 8},   std::pair{Geometry{1280, 2560, 433U}, 48},
-          std::pair{Geometry{2560, 640, 439U}, 16},   std::pair{Geometry{12800, 2560, 443U}, 8},
-          std::pair{Geometry{13952, 2560, 449U}, 8},  std::pair{Geometry{2560, 2560, 457U}, 8},
-          std::pair{Geometry{2560, 4096, 409U}, 8}}) {
-        const auto host = make_q8_g32_fp16_weight(shape.n, shape.k, shape.seed);
+// One shape's column invariance: every output column is bit-identical computed alone or beside
+// other columns. Without a policy the call takes the shape's default (a16) route; otherwise the
+// explicit policy's route.
+int column_invariance_once(const Geometry& shape, int kColumns,
+                           std::optional<infernix::ops::LinearPolicy> policy) {
+    const auto host = make_q8_g32_fp16_weight(shape.n, shape.k, shape.seed);
         std::vector<std::uint16_t> activation(static_cast<std::size_t>(shape.k) * kColumns);
         std::uint32_t state = shape.seed;
         for (auto& bits : activation) {
@@ -145,13 +155,25 @@ int q8_a16_column_invariance() {
             cudaMemcpy(x, activation.data(), activation.size() * 2, cudaMemcpyHostToDevice),
             "upload activation");
         const infernix::Weight w = host.device_weight(weight);
+        const std::size_t capacity = policy.has_value()
+                                         ? infernix::ops::linear_workspace_capacity_bytes(
+                                               w.qtype, shape.n, shape.k, *policy, 1, kColumns)
+                                         : 0;
+        infernix::DeviceArena workspace(capacity > 256 ? capacity : 256);
+        const auto call = [&](const infernix::Tensor& input, infernix::Tensor& output) {
+            if (policy.has_value())
+                infernix::ops::linear(input, w, output, *policy, workspace, nullptr);
+            else
+                infernix::ops::linear(input, w, output, nullptr);
+        };
+        int failures = 0;
         std::vector<std::uint16_t> alone(static_cast<std::size_t>(shape.n) * kColumns);
         for (int column = 0; column < kColumns; ++column) {
             infernix::Tensor input(static_cast<std::uint16_t*>(x) +
                                      static_cast<std::size_t>(column) * shape.k,
                                  infernix::DType::BF16, {shape.k, 1});
             infernix::Tensor output(y, infernix::DType::BF16, {shape.n, 1});
-            infernix::ops::linear(input, w, output, nullptr);
+            call(input, output);
             infernix::test::cuda_check(
                 cudaMemcpy(alone.data() + static_cast<std::size_t>(column) * shape.n, y,
                            static_cast<std::size_t>(shape.n) * 2, cudaMemcpyDeviceToHost),
@@ -160,7 +182,7 @@ int q8_a16_column_invariance() {
         for (int t = 2; t <= kColumns; ++t) {
             infernix::Tensor input(x, infernix::DType::BF16, {shape.k, t});
             infernix::Tensor output(y, infernix::DType::BF16, {shape.n, t});
-            infernix::ops::linear(input, w, output, nullptr);
+            call(input, output);
             std::vector<std::uint16_t> together(static_cast<std::size_t>(shape.n) * t);
             infernix::test::cuda_check(
                 cudaMemcpy(together.data(), y, together.size() * 2, cudaMemcpyDeviceToHost),
@@ -168,14 +190,44 @@ int q8_a16_column_invariance() {
             std::size_t differing = 0;
             for (std::size_t i = 0; i < together.size(); ++i) differing += together[i] != alone[i];
             if (differing != 0) {
-                std::cerr << "Q8_A16 [" << shape.n << "," << shape.k << "] T=" << t << ": "
-                          << differing << " outputs differ from the columns computed alone\n";
+                std::cerr << "Q8_A16 [" << shape.n << "," << shape.k << "] T=" << t
+                          << (policy.has_value() ? " invariant" : "") << ": " << differing
+                          << " outputs differ from the columns computed alone\n";
                 ++failures;
             }
         }
         cudaFree(weight);
         cudaFree(x);
         cudaFree(y);
+    return failures;
+}
+
+int q8_a16_column_invariance() {
+    int failures = 0;
+    for (const auto& [shape, kColumns] :
+         {std::pair{Geometry{324, 10240, 401U}, 64},  std::pair{Geometry{320, 10240, 403U}, 64},
+          std::pair{Geometry{10240, 320, 419U}, 8},   std::pair{Geometry{16384, 2560, 421U}, 8},
+          std::pair{Geometry{2560, 6144, 431U}, 8},   std::pair{Geometry{1280, 2560, 433U}, 48},
+          std::pair{Geometry{2560, 640, 439U}, 16},   std::pair{Geometry{12800, 2560, 443U}, 8},
+          std::pair{Geometry{13952, 2560, 449U}, 8},  std::pair{Geometry{2560, 2560, 457U}, 8},
+          std::pair{Geometry{2560, 4096, 409U}, 8}}) {
+        failures += column_invariance_once(shape, kColumns, std::nullopt);
+    }
+    return failures;
+}
+
+// The explicit A16ColumnInvariant route: each Flash-Next shape's fixed sliced-K family (the SIMT
+// pair where the rows are not 16-row multiples) must reproduce the single-column bits at every
+// width the family serves.
+int q8_a16_column_invariance_invariant() {
+    int failures = 0;
+    for (const auto& [shape, kColumns] :
+         {std::pair{Geometry{324, 10240, 401U}, 64},  std::pair{Geometry{320, 10240, 403U}, 64},
+          std::pair{Geometry{10240, 320, 419U}, 8},   std::pair{Geometry{16384, 2560, 421U}, 8},
+          std::pair{Geometry{1280, 2560, 433U}, 48},  std::pair{Geometry{2560, 640, 439U}, 16},
+          std::pair{Geometry{12800, 2560, 443U}, 8},  std::pair{Geometry{13952, 2560, 449U}, 8},
+          std::pair{Geometry{2560, 2560, 457U}, 8}}) {
+        failures += column_invariance_once(shape, kColumns, infernix::ops::LinearPolicy::A16ColumnInvariant);
     }
     return failures;
 }
@@ -187,7 +239,8 @@ INFERNIX_OP_TEST(linear_q8_a16) {
         return 77;
     }
     try {
-        const int failures = q8_a16_conformance() + q8_a16_column_invariance();
+        const int failures = q8_a16_conformance() + q8_a16_column_invariance() +
+                             q8_a16_column_invariance_invariant();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

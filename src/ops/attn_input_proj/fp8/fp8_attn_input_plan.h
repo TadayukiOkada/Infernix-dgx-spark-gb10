@@ -93,4 +93,33 @@ void fp8_attn_input_n17408_dispatch(const Tensor& x, const Weight& weight, Tenso
                                     Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
                                     WorkspaceArena* workspace, cudaStream_t stream);
 
+// A8 GEMM schedules reachable for the 122B [17408,3072] shape, exposed as opaque ids so the bench
+// can drive every legal schedule directly (candidate sweep) instead of the production route. The
+// Wave48 split-K ids carry the GB10-resident-grid wave model (48 SMs) instead of the [170]-SM one.
+enum class Fp8AttnInputN17408ScheduleId {
+    A8T32R32K128,
+    A8T32R128K128,
+    A8Tma64x128,
+    A8Tma64x128G8,
+    A8Tma64x256,
+    A8Tma64x256G8,
+    A8Tma96x256,
+    A8Tma96x256G8,
+    A8Tma128x128G8,
+    A8Bulk,
+    A8BulkG8,
+    A8BulkG8Wave48,
+};
+
+const char* fp8_attn_input_n17408_schedule_name(Fp8AttnInputN17408ScheduleId schedule) noexcept;
+bool fp8_attn_input_n17408_candidate_is_legal(Fp8AttnInputN17408ScheduleId schedule,
+                                              const Fp8AttnInputProblem& problem) noexcept;
+void fp8_attn_input_n17408_execute_candidate(Fp8AttnInputN17408ScheduleId schedule,
+                                             const Tensor& x, const Weight& weight, Tensor& q,
+                                             Tensor& gate, Tensor& k, Tensor& v,
+                                             WorkspaceArena& workspace, cudaStream_t stream);
+// Largest split-K partial plane any candidate schedule may need, so a bench arena sized with this
+// can force any split-K schedule at any token count.
+[[nodiscard]] std::size_t fp8_attn_input_n17408_candidate_partial_capacity_bytes();
+
 } // namespace infernix::ops::detail

@@ -49,39 +49,74 @@ fp8_a16_ring_compute_stage(const unsigned char* activation_stage, const std::uin
     const int a_byte            = (a_matrix >> 1) * 16;
     const int b_row_offset      = lane >> 2;
     const int b_byte            = 2 * (lane & 3);
+    if constexpr (Schedule::kMmaTokens * Schedule::kMmaRows >= 16 && Schedule::kMinBlocksPerSm >= 2) {
+#pragma unroll 1
+        for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
+            unsigned a[Schedule::kMmaTokens][4];
 #pragma unroll
-    for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
-        unsigned a[Schedule::kMmaTokens][4];
-#pragma unroll
-        for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-            const int row     = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
-            const int logical = (k_step % kStepsPerHalf) * 32 + a_byte;
-            ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
-                        smem_addr(activation_stage +
-                                  (k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes +
-                                  row * kRowBytes + (logical ^ ((row & 7) << 4))));
-        }
-        unsigned b[Schedule::kMmaRows][2];
-#pragma unroll
-        for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-            const int row        = warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
-            const int low        = k_step * 16 + b_byte;
-            const auto code_pair = [&](int logical) {
-                return static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(
-                    weight_stage + row * Schedule::kBlockK +
-                    fp8_mma_shared_byte<Schedule>(row, logical)));
-            };
-            b[mma_row][0] = fp8_e4m3x2_to_bf16x2_bits(code_pair(low));
-            b[mma_row][1] = fp8_e4m3x2_to_bf16x2_bits(code_pair(low + 8));
-        }
-#pragma unroll
-        for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+                const int row     = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
+                const int logical = (k_step % kStepsPerHalf) * 32 + a_byte;
+                ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
+                            smem_addr(activation_stage +
+                                      (k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes +
+                                      row * kRowBytes + (logical ^ ((row & 7) << 4))));
+            }
 #pragma unroll
             for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                mma_bf16(accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
-                         accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
-                         a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
-                         b[mma_row][0], b[mma_row][1]);
+                const int row        = warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
+                const int low        = k_step * 16 + b_byte;
+                const auto code_pair = [&](int logical) {
+                    return static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(
+                        weight_stage + row * Schedule::kBlockK +
+                        fp8_mma_shared_byte<Schedule>(row, logical)));
+                };
+                const unsigned b0 = fp8_e4m3x2_to_bf16x2_bits(code_pair(low));
+                const unsigned b1 = fp8_e4m3x2_to_bf16x2_bits(code_pair(low + 8));
+#pragma unroll
+                for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+                    mma_bf16(accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
+                             accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
+                             a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
+                             b0, b1);
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
+            unsigned a[Schedule::kMmaTokens][4];
+#pragma unroll
+            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+                const int row     = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
+                const int logical = (k_step % kStepsPerHalf) * 32 + a_byte;
+                ldmatrix_x4(a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
+                            smem_addr(activation_stage +
+                                      (k_step / kStepsPerHalf) * Schedule::kActivationHalfBytes +
+                                      row * kRowBytes + (logical ^ ((row & 7) << 4))));
+            }
+            unsigned b[Schedule::kMmaRows][2];
+#pragma unroll
+            for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
+                const int row        = warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
+                const int low        = k_step * 16 + b_byte;
+                const auto code_pair = [&](int logical) {
+                    return static_cast<unsigned>(*reinterpret_cast<const std::uint16_t*>(
+                        weight_stage + row * Schedule::kBlockK +
+                        fp8_mma_shared_byte<Schedule>(row, logical)));
+                };
+                b[mma_row][0] = fp8_e4m3x2_to_bf16x2_bits(code_pair(low));
+                b[mma_row][1] = fp8_e4m3x2_to_bf16x2_bits(code_pair(low + 8));
+            }
+#pragma unroll
+            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
+#pragma unroll
+                for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
+                    mma_bf16(accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
+                             accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
+                             a[mma_token][0], a[mma_token][1], a[mma_token][2], a[mma_token][3],
+                             b[mma_row][0], b[mma_row][1]);
+                }
             }
         }
     }

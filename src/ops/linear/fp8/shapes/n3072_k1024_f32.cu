@@ -39,7 +39,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     if (tokens <= 16) return sliced<Fp8SlicedInstance<16, 8, 2>>(x, weight, out, stream);
     if (tokens <= 32) return sliced<Fp8SlicedInstance<32, 4, 2>>(x, weight, out, stream);
     if (tokens <= 64) return sliced<Fp8SlicedInstance<64, 4, 1>>(x, weight, out, stream);
-    if (tokens <= 256) return ring<Fp8A16RingT32R64S3>(x, weight, out, stream);
+    if (tokens <= 320) return ring<Fp8A16RingT32R64S3>(x, weight, out, stream);
     ring<Fp8A16RingT64R128>(x, weight, out, stream);
 }
 

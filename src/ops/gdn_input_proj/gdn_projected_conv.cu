@@ -121,9 +121,15 @@ __global__ __launch_bounds__(Threads) void gdn_projected_conv_tree_kernel(
             std::int32_t at = token;
 #pragma unroll
             for (int j = 0; j < 3; ++j) {
-                at             = at >= 0 ? parent[at] : -1;
-                const int back = j + 1 - depth[token];
-                source[j]      = at >= 0 ? inputs[at][tid] : history[3 - back];
+                at = at >= 0 ? parent[at] : -1;
+                // Past the root the walk continues into the pre-tree history: the hop's slot is
+                // 3 - (j + 1 - depth) = j's constant-folded 2 - j + depth. The unrolled j keeps
+                // the slot a runtime value, and a constant-index ternary chain over `history`
+                // holds it in registers: indexing it with that value localizes history to a 16 B
+                // stack frame. Only 0..2 occur when the walk leaves the tree at its root.
+                const int hist = 2 - j + depth[token];
+                const float past = hist <= 0 ? history[0] : hist == 1 ? history[1] : history[2];
+                source[j]      = at >= 0 ? inputs[at][tid] : past;
             }
             float conv = fmaf(w0, source[2], 0.0F);
             conv       = fmaf(w1, source[1], conv);

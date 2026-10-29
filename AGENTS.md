@@ -94,6 +94,36 @@ Keep stable requirements in their existing active reference. Temporary plans are
 active work; remove them when completed or abandoned. Maintain one current authority rather than
 parallel `final`, `v2`, or `new-design` documents.
 
+### GB10 branch changelog and rebase tracking (`docs/gb10/`)
+
+To support ongoing and future rebases onto upstream (`origin/main`) while preserving GB10 (`sm_121a`)
+architectural adaptations, maintain dated changelog files in `docs/gb10/` following the pattern:
+
+```text
+docs/gb10/YYYYMMDD-changelog.md
+```
+
+(Example: `docs/gb10/20261028-changelog.md`). Whenever rebasing, completing a campaign milestone, or
+introducing architectural changes:
+
+1. **Commit range & accounting**: Record the base commit (`origin/main`), current HEAD, total files changed,
+   insertions, and deletions. Exclude `cuda-kernel-toolkit/` from file-by-file enumeration (note it as an
+   intentionally excluded integrated toolkit).
+2. **Architectural rationale ("Why")**: Explicitly document the GB10 hardware invariants necessitating code
+   divergence from upstream (48 SMs wave sizing, 128 GiB unified LPDDR5X UMA zero-staging / full device-resident
+   MoE, Grace 20-core big.LITTLE ARMv9.2 CPU threading, 1:1 FP32 accumulation Tensor Core parity, `__vsub4`
+   emulation / FMA contraction quirks, memory-bandwidth-bound decode amortization & speculative decoding parameters).
+3. **Subsystem breakdown**: Group changed files by subsystem (`include/` & core runtime, ops & quantization,
+   model & MoE offload, converter & tools, tests & benchmarks) with action codes (`A`/`M`/`D`) and specific
+   mechanism explanations.
+4. **Rebase conflict resolution policy**: State the default conflict resolution rules per subsystem (e.g.
+   preserve GB10 unified memory defaults and device-resident MoE over upstream host-offloading; preserve GB10
+   1:1 FP32 accumulation over FP16 accumulation; preserve GB10 sliced-K and launch bounds over upstream 170-SM
+   constants; accept upstream math/config fixes with adaptations).
+
+Task lists and roadmaps follow the companion naming pattern `docs/tasks/YYYYMMDD-<short-description>-tasks.md`
+(e.g., `docs/tasks/20261029-gb10-post-rebase-perf-tasks.md`).
+
 ## Verification and completion
 
 Select evidence to support the changed behavior and material claims. Tests should protect supported
@@ -200,6 +230,8 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md`, `docs/gb10_roadmap.md` |
+| GB10 branch changelogs and rebase tracking | `docs/gb10/YYYYMMDD-changelog.md` (e.g. `docs/gb10/20261028-changelog.md`) |
+| Active task lists and optimization roadmaps | `docs/tasks/YYYYMMDD-<short-description>-tasks.md` |
 | In-tree C++ interface | `include/infernix/engine.h`, `include/infernix/types.h` |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.

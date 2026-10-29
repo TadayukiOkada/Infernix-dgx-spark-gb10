@@ -545,7 +545,16 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     artifact::Reader& reader = *opened;
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options, models::Architecture::Qwen3_5));
+    auto load = models::load_options(options, models::Architecture::Qwen3_5);
+    // The drafter pool on a unified-memory (integrated) GPU: its device slots would copy the
+    // drafter's pinned-RAM experts within the same physical pool -- pure duplicate memory beside
+    // the KV and context caches, for a copy that saves no transfer. Qwen4Exp gates its pool on
+    // device_experts (its config); Qwen3.5's offload has no device-resident mode, so the pool is
+    // off here: slots 0, the drafter's banks bound Device as on the unpooled routes.
+    if (load.mtp_expert_pool && open_vram_budget_source(device.device)->query().integrated) {
+        load.mtp_expert_pool = false;
+    }
+    auto plan = models::qwen3_5::plan_load(reader, load);
     // Offloaded experts (Qwen3.5-122B-A10B design §11.2): the RAM ledger places the routed banks in
     // pinned RAM or in the SSD tier before anything is pinned or read.
     std::optional<ExpertRamPlan> expert_ram;
@@ -580,9 +589,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
                             !options.expert_ram_bytes;
         expert_ram        = plan_expert_ram(options, demand, host_memory_snapshot(), exclusive_experts);
         if (expert_ram->tier) {
-            auto streamed           = models::load_options(options, models::Architecture::Qwen3_5);
+            auto streamed       = load;
             streamed.stream_experts = true;
-            plan                    = models::qwen3_5::plan_load(reader, streamed);
+            plan                = models::qwen3_5::plan_load(reader, streamed);
         }
         plan.set_host_reserve(options.ram_free_bytes, expert_ram->demand.later_pinned);
     } else {

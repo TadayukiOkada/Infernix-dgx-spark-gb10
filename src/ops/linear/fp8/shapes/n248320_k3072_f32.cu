@@ -60,6 +60,11 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     if (tokens <= kSlicedKTokens) return launch_ksplit(x, weight, out, stream);
     if (tokens <= Tail96::kBlockTokens) return launch_schedule<Tail96>(x, weight, out, stream);
     if (tokens <= Main128::kBlockTokens) return launch_schedule<Main128>(x, weight, out, stream);
+    // The [248320,5120] head's measured packing intervals: two whole 96-token GEMMs beat a
+    // 128-token prefix plus a second full weight pass through the tail launch.
+    if ((tokens >= 161 && tokens <= 192) || (tokens >= 257 && tokens <= 288)) {
+        return launch_schedule<Tail96>(x, weight, out, stream);
+    }
     const std::int32_t tail = tokens % Main128::kBlockTokens;
     if (tail == 0 || tail > Tail96::kBlockTokens) return launch_schedule<Main128>(x, weight, out, stream);
     const std::int32_t prefix = tokens - tail;

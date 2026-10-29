@@ -88,17 +88,13 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults() {
                     ContextTransferCost{
                         .batch_ns = 10'441, .operation_ns = 2'539, .ns_per_byte_q32 = 30'671'379},
                 },
-            .prefill =
-                {
-                    {"200f57efee7b0fe1172dfd4a06b1e6e0b2dbc36dfcd6a242fea35338bb5ff0d2",
-                     kGroupwise27bPrefill},
-                    {"badf2271162e72c8c51a91da02cbb4343d4b7574d037a014ca6862ff2862638b",
-                     kGroupwise27bPrefill},
-                    {"e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
-                     kNvfp4Fp8Prefill},
-                    {"953e22d9b9a6639c09f7389d49084b059dea07720bc0121dfd9c154002459915",
-                     kNvfp4Fp8Prefill},
-                },
+            // No compiled prefill binding: the RTX 5090 signature entries copied here priced
+            // recomputation 3.5..6x below GB10's actual prefill, and no artifact whose prefill is
+            // measurable on this machine reproduces those signatures (measured 2026-10-29; a
+            // Qwen3.8-Flash-Next fit was rejected by the calibration's own error gate). Text
+            // configs on GB10 resolve the generic prefill estimate until
+            // infernix_context_cost_bench --suite prefill --preset-out records a real one.
+            .prefill = {},
         },
     };
     return defaults;

@@ -77,11 +77,14 @@ inline constexpr std::uint32_t kVqGroupedSmemLimit = 101376;
 //     the limit, while vq2's 64-byte K rows need 96128 B;
 //   * H16/KV2 has twice the rows per column tile, so only 32-key tiles fit there.
 template <KVCacheVqKeyCodec KeyCodec, int KeyRows, int TokenTile, int GroupSize>
-inline constexpr std::uint32_t vq_kv_grouped_smem_bytes() {
-    constexpr int Br    = (TokenTile * GroupSize + 15) / 16 * 16;
-    constexpr int QKNt  = KeyRows / 8;
+__host__ __device__ inline constexpr std::uint32_t vq_kv_grouped_smem_bytes() {
+    constexpr int Br     = (TokenTile * GroupSize + 15) / 16 * 16;
+    constexpr int QKNt   = KeyRows / 8;
+    // Two or more row tiles cannot hold the scales in registers at the two-block register cap,
+    // so every CTA that wide pays for the shared array (the 16-warp CTAs already did).
+    constexpr int QScale = TokenTile * GroupSize > 16 ? Br * kKVCacheInt8Groups * 4 : 0;
     return VqKvGroupedShape<KeyCodec, KeyRows>::kArenaBytes + Br * 256 + Br * KeyRows * 2 + Br * 4 +
-           Br * QKNt * 4;
+           Br * QKNt * 4 + QScale;
 }
 
 // Columns of one wide ParallelQueries CTA (128 query rows: sixteen columns, eight at GQA group 16;
@@ -120,8 +123,9 @@ inline CausalKvPartition vq_merge_partition(int splits) {
 
 template <class Geometry, int TokenTile, bool MultiBatch, bool Masked, KVCacheVqKeyCodec KeyCodec,
           int KeyRows, bool ParallelQueries, bool Tree>
-__launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geometry, TokenTile> == 16 ? 1 : 2)
-    __global__
+// One CTA per SM: the 256-thread instances at two CTAs pin REG to 128 and spill; the two-block
+// occupancy was measured (E2E decode A/B 2026-10-30) to buy nothing on GB10.
+__launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, 1) __global__
     void vq_kv_grouped_kernel(const __nv_bfloat16* q, const std::int32_t* pos, VqKvCacheView cache,
                               std::int32_t full_width, std::int32_t logical_capacity,
                               CausalKvPartition partition, std::int32_t window_splits,
@@ -163,8 +167,12 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     __shared__ __align__(16) __half p_s[Br * Bc];
     __shared__ float alpha_s[Br];
     __shared__ __align__(16) float exchange_s[Br * QKNt];
+    // A CTA with two or more row tiles reads the scales straight from shared: the register
+    // copy would cost WarpRowTiles * 2 * Groups registers for its whole QK loop.
+    constexpr bool kQScaleShared = Wc == 16 || RowTiles >= 2;
+    __shared__ float q_scale_shared[kQScaleShared ? Br * Groups : 1];
     // One block must hold the arena and these arrays: the per-block opt-in limit of the target.
-    static_assert(Shape::kArenaBytes + Br * D + Br * Bc * 2 + Br * 4 + Br * QKNt * 4 <=
+    static_assert(vq_kv_grouped_smem_bytes<KeyCodec, KeyRows, TokenTile, Geometry::GroupSize>() <=
                       kVqGroupedSmemLimit,
                   "grouped kernel: shared memory exceeds one block on this target");
     std::int8_t* q_i8    = q_s;
@@ -180,7 +188,11 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     std::uint8_t* kept    = reinterpret_cast<std::uint8_t*>(arena + Shape::kKeptOffset);
     std::int8_t* codebook = arena + Shape::kCodebookOffset;
     uint2* sign_masks     = reinterpret_cast<uint2*>(arena + Shape::kSignOffset);
-    float* q_scale_tmp    = reinterpret_cast<float*>(arena + Shape::kQScaleOffset);
+    // The query scales pass through q_scale_shared on the wide CTAs (every 16-warp CTA and every
+    // 8-warp CTA with two or more row tiles), or the arena region on the narrow ones: after the
+    // split redesign a window CTA's first tile fills the second stage while Q is encoded.
+    float* q_scale_tmp = kQScaleShared ? q_scale_shared
+                                       : reinterpret_cast<float*>(arena + Shape::kQScaleOffset);
     static_assert(Shape::kQScaleOffset + RowCount * kKVCacheInt8Groups * 4 <=
                   Shape::kCodebookOffset);
 
@@ -555,31 +567,26 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
     // QK warp state: column block nt, row tiles row_tile(j), and per row tile the two rows a lane
-    // holds (gid, gid + 8): query scales, positions, tree masks, running maximum and sum.
+    // holds (gid, gid + 8): query scales (in registers on 8-warp CTAs, shared on 16-warp CTAs),
+    // running maximum and sum.
     const bool qk_warp = warp < QKWarps;
     const int nt       = warp & (QKNt - 1);
     const auto row_tile = [&](int j) { return (warp / QKNt) + j * TileGroups; };
-    float q_scale_r[WarpRowTiles][2][Groups];
-    int qabs_r[WarpRowTiles][2];
-    std::uint32_t tree_r[WarpRowTiles][2];
+    float q_scale_r[kQScaleShared ? 1 : WarpRowTiles][2][Groups];
     float m_r[WarpRowTiles][2];
     float l_r[WarpRowTiles][2];
 #pragma unroll
     for (int j = 0; j < WarpRowTiles; ++j) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int t   = row_tile(j);
-            const int row = t * 16 + gid + 8 * h;
-            const bool on = qk_warp && t < RowTiles && row < tile_tokens * Geometry::GroupSize;
+            if constexpr (!kQScaleShared) {
+                const int t   = row_tile(j);
+                const int row = t * 16 + gid + 8 * h;
+                const bool on = qk_warp && t < RowTiles && row < tile_tokens * Geometry::GroupSize;
 #pragma unroll
-            for (int g = 0; g < Groups; ++g)
-                q_scale_r[j][h][g] = on && row < RowCount ? q_scale_tmp[row * Groups + g] : 0.0f;
-            int q_head = 0, token = 0;
-            causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
-            qabs_r[j][h] = on ? pos[token] : -1;
-            tree_r[j][h] = on ? causal_tree_mask<Tree>(cache.tree_masks, batch, full_width,
-                                                       column_begin + token)
-                              : ~0u;
+                for (int g = 0; g < Groups; ++g)
+                    q_scale_r[j][h][g] = on && row < RowCount ? q_scale_tmp[row * Groups + g] : 0.0f;
+            }
             m_r[j][h] = -CUDART_INF_F;
             l_r[j][h] = 0.0f;
         }
@@ -627,28 +634,27 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
         if (qk_warp) {
             const __nv_bfloat16* k_b16 = reinterpret_cast<const __nv_bfloat16*>(tile_k);
             const int key0             = k0 + nt * 8 + 2 * lid;
-            float ks0[Groups], ks1[Groups];
-#pragma unroll
-            for (int g = 0; g < Groups; ++g) {
-                ks0[g] = __half2float(tile_ks[(nt * 8 + 2 * lid) * Groups + g]);
-                ks1[g] = __half2float(tile_ks[(nt * 8 + 2 * lid + 1) * Groups + g]);
-            }
-            // This warp's 8 keys as B fragments of every 32-dimension chunk.
-            unsigned bf[Groups * GroupKc][2];
-#pragma unroll
-            for (int k = 0; k < Groups * GroupKc; ++k) {
-                const int brow = nt * 8 + b_rin;
-                const int bcol = k * 16 + b_koff;
-                ldmatrix_x2(bf[k][0], bf[k][1],
-                            smem_addr(&k_b16[brow * DB16 + causal_swizzle(brow, bcol)]));
-            }
 #pragma unroll
             for (int j = 0; j < WarpRowTiles; ++j) {
                 score[j][0] = score[j][1] = score[j][2] = score[j][3] = 0.0f;
-                const int t = row_tile(j);
-                if (t >= RowTiles) continue;
+            }
 #pragma unroll
-                for (int g = 0; g < Groups; ++g) {
+            for (int g = 0; g < Groups; ++g) {
+                const float ks0 = __half2float(tile_ks[(nt * 8 + 2 * lid) * Groups + g]);
+                const float ks1 = __half2float(tile_ks[(nt * 8 + 2 * lid + 1) * Groups + g]);
+                unsigned bf[GroupKc][2];
+#pragma unroll
+                for (int kk = 0; kk < GroupKc; ++kk) {
+                    const int k    = g * GroupKc + kk;
+                    const int brow = nt * 8 + b_rin;
+                    const int bcol = k * 16 + b_koff;
+                    ldmatrix_x2(bf[kk][0], bf[kk][1],
+                                smem_addr(&k_b16[brow * DB16 + causal_swizzle(brow, bcol)]));
+                }
+#pragma unroll
+                for (int j = 0; j < WarpRowTiles; ++j) {
+                    const int t = row_tile(j);
+                    if (t >= RowTiles) continue;
                     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
 #pragma unroll
                     for (int kk = 0; kk < GroupKc; ++kk) {
@@ -658,24 +664,51 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
                         ldmatrix_x4(af[0], af[1], af[2], af[3],
                                     smem_addr(&q_b16[(t * 16 + a_rowoff) * DB16 +
                                                      causal_swizzle(t * 16 + a_rowoff, acol)]));
-                        mma_s8(c0, c1, c2, c3, af[0], af[1], af[2], af[3], bf[k][0], bf[k][1]);
+                        mma_s8(c0, c1, c2, c3, af[0], af[1], af[2], af[3], bf[kk][0], bf[kk][1]);
                     }
-                    score[j][0] += q_scale_r[j][0][g] * ks0[g] * static_cast<float>(c0);
-                    score[j][1] += q_scale_r[j][0][g] * ks1[g] * static_cast<float>(c1);
-                    score[j][2] += q_scale_r[j][1][g] * ks0[g] * static_cast<float>(c2);
-                    score[j][3] += q_scale_r[j][1][g] * ks1[g] * static_cast<float>(c3);
+                    const float qs0 = kQScaleShared ? q_scale_shared[(t * 16 + gid) * Groups + g]
+                                                    : q_scale_r[j][0][g];
+                    const float qs1 = kQScaleShared ? q_scale_shared[(t * 16 + gid + 8) * Groups + g]
+                                                    : q_scale_r[j][1][g];
+                    score[j][0] += qs0 * ks0 * static_cast<float>(c0);
+                    score[j][1] += qs0 * ks1 * static_cast<float>(c1);
+                    score[j][2] += qs1 * ks0 * static_cast<float>(c2);
+                    score[j][3] += qs1 * ks1 * static_cast<float>(c3);
                 }
+            }
+#pragma unroll
+            for (int j = 0; j < WarpRowTiles; ++j) {
+                const int t = row_tile(j);
+                if (t >= RowTiles) continue;
                 // A code tile below every column's window is kept whole by each live row.
-                const auto keeps = [&](int key, int h) {
-                    const int qabs = qabs_r[j][h];
-                    if (full_tile) return qabs >= 0;
-                    return key <= qabs && role_keeps(key, qabs) &&
-                           (!Tree || causal_tree_visible(key, row_first, tree_r[j][h]));
+                const auto keeps_row = [&](int h, bool& k0_ok, bool& k1_ok) {
+                    const int row = t * 16 + gid + 8 * h;
+                    const bool on = row < tile_tokens * Geometry::GroupSize;
+                    if (!on) {
+                        k0_ok = k1_ok = false;
+                        return;
+                    }
+                    int q_head = 0, token = 0;
+                    causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
+                    const int qabs = pos[token];
+                    if (full_tile) {
+                        k0_ok = k1_ok = (qabs >= 0);
+                        return;
+                    }
+                    const std::uint32_t tree =
+                        causal_tree_mask<Tree>(cache.tree_masks, batch, full_width, column_begin + token);
+                    k0_ok = key0 <= qabs && role_keeps(key0, qabs) &&
+                            (!Tree || causal_tree_visible(key0, row_first, tree));
+                    k1_ok = (key0 + 1) <= qabs && role_keeps(key0 + 1, qabs) &&
+                            (!Tree || causal_tree_visible(key0 + 1, row_first, tree));
                 };
-                score[j][0] = keeps(key0, 0) ? score[j][0] * scale : -CUDART_INF_F;
-                score[j][1] = keeps(key0 + 1, 0) ? score[j][1] * scale : -CUDART_INF_F;
-                score[j][2] = keeps(key0, 1) ? score[j][2] * scale : -CUDART_INF_F;
-                score[j][3] = keeps(key0 + 1, 1) ? score[j][3] * scale : -CUDART_INF_F;
+                bool k00 = false, k01 = false, k10 = false, k11 = false;
+                keeps_row(0, k00, k01);
+                keeps_row(1, k10, k11);
+                score[j][0] = k00 ? score[j][0] * scale : -CUDART_INF_F;
+                score[j][1] = k01 ? score[j][1] * scale : -CUDART_INF_F;
+                score[j][2] = k10 ? score[j][2] * scale : -CUDART_INF_F;
+                score[j][3] = k11 ? score[j][3] * scale : -CUDART_INF_F;
                 const float bm0 = warp_max<4>(fmaxf(score[j][0], score[j][1]), FullMask);
                 const float bm1 = warp_max<4>(fmaxf(score[j][2], score[j][3]), FullMask);
                 if (lid == 0) {
@@ -740,8 +773,7 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
                 }
             }
         }
-#pragma unroll
-        for (int j = 0; j < PVKs; ++j) {
+        auto pv_step = [&](int j) {
             const int key = j * 16 + 2 * lid;
             __half2 lo_scale = __halves2half2(tile_vs[key * Groups + v_group],
                                               tile_vs[(key + 1) * Groups + v_group]);
@@ -784,6 +816,13 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, kVqGroupedWarps<Geo
                     }
                 }
             }
+        };
+        if constexpr (RowTiles >= 3) {
+#pragma unroll 1
+            for (int j = 0; j < PVKs; ++j) { pv_step(j); }
+        } else {
+#pragma unroll
+            for (int j = 0; j < PVKs; ++j) { pv_step(j); }
         }
     }
     finish_append();

@@ -14,11 +14,16 @@
 //
 // Usage:
 //   infernix_mxfp8_flash_next_sweep [--shape LABEL] [--t-list 1,2,...] [--warmup N] [--repeat N]
-//       [--tolerance-pct P] [--dram-gbps G] [--csv PATH]
+//       [--tolerance-pct P] [--dram-gbps G] [--flush-mib M] [--csv PATH]
+//       [--routes-compare [--route-t-list 256,384,...]]   (skip the schedule sweep; time the three
+//        production routes of each shape through ops::linear, at the admissions the engine uses)
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/weight.h"
+#include "infernix/ops/linear.h"
 #include "infernix_bench_common.h"
 #include "ops/linear/mxfp8/mxfp8_launch.cuh"
+#include "ops/linear/mxfp8/mxfp8_shapes.h"
 #include "roofline.h"
 
 #include <cuda_bf16.h>
@@ -136,7 +141,11 @@ struct Options {
     int repeat          = 7;
     double tolerance    = 0.02;
     double dram_gbps    = roofline::kDramSpecGBs;
+    std::uint64_t flush_mib = infernix::bench::default_cold_flush_mib(); // cold-sized to the device's L2.
     std::string csv;
+    // Time the three production routes instead of sweeping the exact route's schedules.
+    bool routes_compare = false;
+    std::vector<int> route_ts{256, 384, 512, 768, 1024, 2048, 3072, 4096, 8192};
 };
 
 std::vector<int> parse_list(const char* text) {
@@ -177,14 +186,24 @@ Options parse(int argc, char** argv) {
             options.tolerance = std::atof(next()) / 100.0;
         } else if (arg == "--dram-gbps") {
             options.dram_gbps = std::atof(next());
+        } else if (arg == "--flush-mib") {
+            options.flush_mib = std::stoull(next());
+            if (options.flush_mib == 0 || options.flush_mib > (1ULL << 17))
+                throw std::invalid_argument("--flush-mib must be between 1 and 131072");
         } else if (arg == "--csv") {
             options.csv = next();
+        } else if (arg == "--routes-compare") {
+            options.routes_compare = true;
+        } else if (arg == "--route-t-list") {
+            options.route_ts = parse_list(next());
         } else {
             throw std::invalid_argument("unknown argument " + arg);
         }
     }
     if (options.warmup < 0 || options.repeat <= 0 || options.tolerance < 0)
         throw std::invalid_argument("invalid warmup/repeat/tolerance");
+    if (options.route_ts.empty() || options.route_ts.front() < 1)
+        throw std::invalid_argument("invalid --route-t-list");
     return options;
 }
 
@@ -341,6 +360,78 @@ std::vector<Interval> select_intervals(const std::vector<int>& ts, const std::ve
     return result;
 }
 
+// The registered problem behind a swept shape, for its route admissions.
+const Mxfp8LinearShape* mxfp8_record(int n, int k) {
+    if (k == 2560) {
+        switch (n) {
+        case 16384: return &kMxfp8N16384K2560;
+        case 13952: return &kMxfp8N13952K2560;
+        case 1280: return &kMxfp8N1280K2560;
+        default: return nullptr;
+        }
+    }
+    if (n != 2560) { return nullptr; }
+    return k == 6144 ? &kMxfp8N2560K6144 : k == 640 ? &kMxfp8N2560K640 : nullptr;
+}
+
+// The three production routes of one registered MXFP8 problem, timed through the public ops::linear with
+// a real WorkspaceArena, so each flag runs the route the engine's own admission picks (below a route's
+// admission the flag still runs the exact route, which the line says rather than leaving a tie to read
+// as a measurement). Cold-L2 CUDA graphs, like the schedule sweep.
+void compare_routes(const Shape& shape, const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream) {
+    struct Case {
+        const char* name;
+        ops::LinearRoutes routes;
+    };
+    static constexpr Case kCases[]{{"exact", ops::LinearRoutes::Exact},
+                                   {"f16-accumulate", ops::LinearRoutes::F16Accumulate},
+                                   {"block32-pair", ops::LinearRoutes::Fp8A8PairBlock32}};
+    const Mxfp8LinearShape* record = mxfp8_record(shape.n, shape.k);
+    if (record == nullptr) { throw std::runtime_error("shape is not a registered MXFP8 problem"); }
+    const HostWeight host = checkpoint_like(shape.n, shape.k, static_cast<std::uint32_t>(shape.n) * 31U + shape.k);
+    const int max_t       = options.route_ts.back();
+    DeviceBuffer storage(host.payload.size());
+    CUDA_CHECK(cudaMemcpy(storage.p, host.payload.data(), host.payload.size(), cudaMemcpyHostToDevice));
+    const Weight weight = device_weight(host, storage.p, shape.n, shape.k);
+    std::vector<std::uint16_t> x_host(static_cast<std::size_t>(shape.k) * max_t);
+    std::uint32_t state = 0x2545F491U ^ static_cast<std::uint32_t>(shape.k);
+    for (auto& bits : x_host) {
+        state                 = state * 1664525U + 1013904223U;
+        const std::uint32_t r = state;
+        bits = static_cast<std::uint16_t>(((r >> 31) << 15) | ((107U + (r >> 8) % 25U) << 7) | (r & 0x7FU));
+    }
+    DeviceBuffer x(x_host.size() * 2);
+    CUDA_CHECK(cudaMemcpy(x.p, x_host.data(), x_host.size() * 2, cudaMemcpyHostToDevice));
+    DeviceBuffer out(static_cast<std::size_t>(shape.n) * max_t * 2);
+
+    std::printf("\n## routes %s [%d,%d] (admissions: f16-accumulate >= %d, block32-pair >= %d columns)\n",
+                shape.label, shape.n, shape.k, record->f16_min_tokens, record->pair_min_tokens);
+    for (const int t : options.route_ts) {
+        Tensor xt(x.p, DType::BF16, {shape.k, t});
+        Tensor ot(out.p, DType::BF16, {shape.n, t});
+        const std::size_t capacity = ops::linear_workspace_capacity_bytes(
+            weight.qtype, shape.n, shape.k, ops::LinearPolicy::A16Only, t, t);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        double base = 0.0;
+        for (std::size_t c = 0; c < std::size(kCases); ++c) {
+            // Each case sets exactly one flag, so a route runs at its own admission (the dispatch's
+            // f16-over-pair precedence only matters when a caller sets both).
+            const bool admitted = c == 0 || (c == 1 && t >= record->f16_min_tokens) ||
+                                  (c == 2 && t >= record->pair_min_tokens);
+            const auto timing = time_route(
+                [&](cudaStream_t s) {
+                    ops::linear(xt, weight, ot, ops::LinearPolicy::A16Only, workspace, s, kCases[c].routes);
+                },
+                flush, stream, options);
+            if (c == 0) { base = timing.median_us; }
+            std::printf("  T=%-5d %-16s %10.2f us  %+7.1f%% vs exact   p95 %10.2f   scratch %5zu KiB%s\n", t,
+                        kCases[c].name, timing.median_us, base > 0.0 ? (timing.median_us / base - 1.0) * 100.0 : 0.0,
+                        timing.p95_us, capacity / 1024, admitted ? "" : "   (below this route's admission: runs exact)");
+        }
+        std::fflush(stdout);
+    }
+}
+
 void sweep_shape(const Shape& shape, const std::vector<Candidate>& list, const Options& options, std::FILE* csv,
                  bench::L2FlushBuffer& flush, cudaStream_t stream) {
     constexpr int kCheckT = 300;
@@ -457,11 +548,22 @@ int main(int argc, char** argv) {
             csv = std::fopen(options.csv.c_str(), "w");
             if (csv == nullptr) throw std::runtime_error("cannot open " + options.csv);
         }
-        std::fprintf(csv, "shape,N,K,T,route,median_us,min_us,p95_us\n");
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        bench::L2FlushBuffer flush(256ULL << 20);
+        bench::L2FlushBuffer flush(options.flush_mib << 20);
         bool matched = false;
+        if (options.routes_compare) {
+            for (const Shape& shape : kShapes) {
+                if (!options.shape.empty() && options.shape != shape.label) continue;
+                matched = true;
+                compare_routes(shape, options, flush, stream);
+            }
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            if (csv != stdout) std::fclose(csv);
+            if (!matched) throw std::invalid_argument("unknown --shape " + options.shape);
+            return 0;
+        }
+        std::fprintf(csv, "shape,N,K,T,route,median_us,min_us,p95_us\n");
         for (const Shape& shape : kShapes) {
             if (!options.shape.empty() && options.shape != shape.label) continue;
             matched = true;

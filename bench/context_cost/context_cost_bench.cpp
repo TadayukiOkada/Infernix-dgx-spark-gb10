@@ -290,14 +290,44 @@ cost::FitResult fit_prefill(const cost::PrefillSuiteResult& samples) {
             .validation = sample.validation,
         });
     }
-    return cost::fit_nonnegative_model(
-        points,
-        {"chunk_ns", "token_ns_q32", "attention_pair_ns_q32", "vision_item_ns",
-         "vision_patch_ns_q32"},
-        {cost::CoefficientEncoding::IntegerNanoseconds, cost::CoefficientEncoding::Q32Nanoseconds,
-         cost::CoefficientEncoding::Q32Nanoseconds, cost::CoefficientEncoding::IntegerNanoseconds,
-         cost::CoefficientEncoding::Q32Nanoseconds},
-        kMaximumPrefillP95, kOrderingSignificance);
+    // Fit the observable coefficients only: a Text-only artifact's Vision features are zero at
+    // every point, so those columns carry no information (the generic fitter rejects them). The
+    // omitted coefficients price work this configuration cannot perform and become exact zeros.
+    std::array<bool, 5> observable{false, false, false, false, false};
+    for (const cost::RegressionPoint& point : points) {
+        for (std::size_t column = 0; column < observable.size(); ++column) {
+            observable[column] = observable[column] || point.features[column] != 0.0;
+        }
+    }
+    constexpr std::array<const char*, 5> kNames{"chunk_ns", "token_ns_q32", "attention_pair_ns_q32",
+                                                "vision_item_ns", "vision_patch_ns_q32"};
+    constexpr std::array<cost::CoefficientEncoding, 5> kEncodings{
+        cost::CoefficientEncoding::IntegerNanoseconds, cost::CoefficientEncoding::Q32Nanoseconds,
+        cost::CoefficientEncoding::Q32Nanoseconds, cost::CoefficientEncoding::IntegerNanoseconds,
+        cost::CoefficientEncoding::Q32Nanoseconds};
+    std::vector<std::string> names;
+    std::vector<cost::CoefficientEncoding> encodings;
+    std::vector<cost::RegressionPoint> reduced;
+    for (const cost::RegressionPoint& point : points) {
+        cost::RegressionPoint fitted;
+        fitted.label      = point.label;
+        fitted.elapsed_ns = point.elapsed_ns;
+        fitted.validation = point.validation;
+        std::size_t at    = 0;
+        for (std::size_t column = 0; column < observable.size(); ++column) {
+            if (!observable[column]) { continue; }
+            fitted.features[at++] = point.features[column];
+        }
+        reduced.push_back(fitted);
+    }
+    for (std::size_t column = 0; column < observable.size(); ++column) {
+        if (observable[column]) {
+            names.push_back(kNames[column]);
+            encodings.push_back(kEncodings[column]);
+        }
+    }
+    return cost::fit_nonnegative_model(reduced, names, encodings, kMaximumPrefillP95,
+                                       kOrderingSignificance);
 }
 
 std::array<infernix::runtime::ContextTransferCost, 3>
@@ -313,15 +343,21 @@ runtime_transfer_cost(const std::array<cost::FitResult, 3>& fits) {
 }
 
 infernix::runtime::ContextPrefillCost runtime_prefill_cost(const cost::FitResult& fit) {
-    const auto& values = fit.quantized_coefficients;
-    if (values.size() != 5) { throw std::logic_error("incomplete prefill fit"); }
-    return infernix::runtime::ContextPrefillCost{
-        .chunk_ns              = values[0],
-        .token_ns_q32          = values[1],
-        .attention_pair_ns_q32 = values[2],
-        .vision_item_ns        = values[3],
-        .vision_patch_ns_q32   = values[4],
-    };
+    // A Text-only calibration fits the Text coefficients only; every unfitted coefficient prices
+    // work that configuration cannot perform, so it stays at its exact zero.
+    infernix::runtime::ContextPrefillCost cost;
+    for (std::size_t index = 0; index < fit.quantized_coefficients.size(); ++index) {
+        const std::string_view name = fit.coefficient_names.at(index);
+        std::uint64_t* field        = nullptr;
+        if (name == "chunk_ns") { field = &cost.chunk_ns; }
+        else if (name == "token_ns_q32") { field = &cost.token_ns_q32; }
+        else if (name == "attention_pair_ns_q32") { field = &cost.attention_pair_ns_q32; }
+        else if (name == "vision_item_ns") { field = &cost.vision_item_ns; }
+        else if (name == "vision_patch_ns_q32") { field = &cost.vision_patch_ns_q32; }
+        else { throw std::logic_error("unknown prefill coefficient name"); }
+        *field = fit.quantized_coefficients[index];
+    }
+    return cost;
 }
 
 void write_report(const std::filesystem::path& path, const std::string& text) {

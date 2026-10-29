@@ -343,24 +343,6 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
 #pragma unroll
             for (int local_k64 = 0; local_k64 < S::kK64PerStage; ++local_k64) {
                 if (live_mma == 0) { break; } // an idle warp only releases the stage
-                unsigned a_fragments[S::kTerms][S::kMmaTokens][4];
-                unsigned a_scales[S::kTerms][S::kMmaTokens];
-#pragma unroll
-                for (int term = 0; term < S::kTerms; ++term) {
-#pragma unroll
-                    for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
-                        if (mma_m >= live_mma) { continue; }
-                        const int row          = ctx.warp_m * S::kWarpTokens + mma_m * 16 + a_row_offset;
-                        const int logical_byte = local_k64 * 32 + a_column_byte;
-                        const int physical_byte = ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
-                        ldmatrix_x4(a_fragments[term][mma_m][0], a_fragments[term][mma_m][1], a_fragments[term][mma_m][2],
-                                    a_fragments[term][mma_m][3],
-                                    smem_addr(shared.a_codes[stage][term] + row * S::kCodeRowBytes + physical_byte));
-                        const int scale_row = ctx.warp_m * S::kWarpTokens + mma_m * 16 + sfa_row;
-                        a_scales[term][mma_m] = shared.a_scales[stage][term][scale_row * S::kScaleWordsPerRow +
-                                                                             (k_tile & 1) * 2 + local_k64];
-                    }
-                }
                 unsigned b_fragments[S::kMmaRows][2];
                 unsigned b_scales[S::kMmaRows];
 #pragma unroll
@@ -370,17 +352,27 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
                     rg16_fragments(units, ctx.group, ctx.tig, b_fragments[2 * g], b_fragments[2 * g + 1],
                                    b_scales[2 * g], b_scales[2 * g + 1]);
                 }
-#pragma unroll
+                // The three-term residual schedule at the 96-register cap spills when all three
+                // terms' fragments stay live together.
+#pragma unroll (S::kTerms == 3 ? 1 : S::kTerms)
                 for (int term = 0; term < S::kTerms; ++term) {
 #pragma unroll
                     for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
                         if (mma_m >= live_mma) { continue; }
+                        unsigned a_fragments[4];
+                        const int row          = ctx.warp_m * S::kWarpTokens + mma_m * 16 + a_row_offset;
+                        const int logical_byte = local_k64 * 32 + a_column_byte;
+                        const int physical_byte = ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
+                        ldmatrix_x4(a_fragments[0], a_fragments[1], a_fragments[2], a_fragments[3],
+                                    smem_addr(shared.a_codes[stage][term] + row * S::kCodeRowBytes + physical_byte));
+                        const int scale_row = ctx.warp_m * S::kWarpTokens + mma_m * 16 + sfa_row;
+                        const unsigned a_scale = shared.a_scales[stage][term][scale_row * S::kScaleWordsPerRow +
+                                                                              (k_tile & 1) * 2 + local_k64];
 #pragma unroll
                         for (int r = 0; r < S::kMmaRows; ++r) {
                             mma_nvfp4_e4m3(acc[mma_m][r][0], acc[mma_m][r][1], acc[mma_m][r][2], acc[mma_m][r][3],
-                                           a_fragments[term][mma_m][0], a_fragments[term][mma_m][1],
-                                           a_fragments[term][mma_m][2], a_fragments[term][mma_m][3], b_fragments[r][0],
-                                           b_fragments[r][1], a_scales[term][mma_m], b_scales[r]);
+                                           a_fragments[0], a_fragments[1], a_fragments[2], a_fragments[3],
+                                           b_fragments[r][0], b_fragments[r][1], a_scale, b_scales[r]);
                         }
                     }
                 }

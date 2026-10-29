@@ -78,7 +78,7 @@ struct A8Routes {
     bool ggml_dense    = false;
     bool ggml_experts  = false;
     bool nvfp4_experts = false;
-    // Prefill calls: a GGUF import's dense projections in calls of 32 or more columns on the same codec
+    // Prefill calls: a GGUF import's dense projections in calls of 128 or more columns on the same codec
     // (ops::LinearRoutes::GgmlA8Wide, ahead of ggml-bf16-prefill's BF16 tiles); MXFP8 dense projections
     // (NVIDIA FP4-Local) on fp8-a8-pair-block32's route, two E4M3 terms per 32 activation values
     // (ops::LinearRoutes::Fp8A8PairBlock32, from 33 to 1,025 columns by problem), in place of

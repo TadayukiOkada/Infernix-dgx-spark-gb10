@@ -862,7 +862,7 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
     blocks, and the NVFP4 W4A16 experts of the uncensored and FP4-Local artifacts) in calls of up to 128
     columns with the misses the CPU computes for them (bit for bit the GPU's, so where an expert is
     computed still changes nothing).
-  - Prefill calls: a GGUF import's dense projections in calls of 32 or more columns and the same routed
+  - Prefill calls: a GGUF import's dense projections in calls of 128 or more columns and the same routed
     experts in calls of more than 128 columns take the same codes and slice scales on 8-bit tensor cores
     (ahead of `ggml-bf16-prefill`'s BF16 tiles and of `expert-a4-residual`'s A4 terms), and FP4-Local's
     MXFP8 dense projections take two E4M3 terms per 32 activation values (`fp8-a8-pair-block32`'s route,

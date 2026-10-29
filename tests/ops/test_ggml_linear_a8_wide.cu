@@ -15,15 +15,16 @@
 // column holding Inf or NaN must give NaN rows.
 //
 // Coverage: every format on ggml_rows_v1 and the four ggml_tiles16_v1 formats, the scaling classes (one sub-scale
-// per slice, Q6_K and IQ2_S's per 16 elements, the K-quants' min term), widths at the route's boundary (32, 33),
-// at the CTA tile's (127, 128, 129) and wider, FP32 and BF16 outputs, outputs split at bounds inside segments,
+// per slice, Q6_K and IQ2_S's per 16 elements, the K-quants' min term), widths at the route's 128-column admission
+// and the CTA tile's edge (128, 129) and wider, FP32 and BF16 outputs, outputs split at bounds inside segments,
 // several formats in one call, the input permutation (16-byte and scalar encoder loads), zero and sub-threshold
 // slices, Inf and NaN, a call whose planes need three passes, a call of two column batches, and the IQ3_S import's
 // dense shapes at prefill widths (512, 2048, 4096; sampled rows against the oracle, every row for the invariances).
 // Every call has a workspace of exactly ggml_linear_workspace_bytes. Invariances, bit for bit: a column's outputs
 // are the same at every width of the route (each width against the widest) and with every other column changed;
 // repeated calls under a side stream's traffic are identical (op_tester.h verify_repeatable); with GgmlBf16Wide
-// also set the route's bits are unchanged (it takes precedence); calls of 31 columns keep the other routes' bits.
+// also set the route's bits are unchanged (it takes precedence); calls below the route's admission (31, 64, 127
+// columns) keep the other routes' bits (the exact route's, and the narrow 8-bit route's with GgmlA8).
 
 #include "ops/op_family.h"
 #include "core/device.h"
@@ -512,19 +513,24 @@ void run_problem(const Problem& problem, std::mt19937& rng, const std::vector<in
     std::printf("info a8 wide %s: worst error / bound %.3f, error / M %.2e\n", p.p.what.c_str(), p.worst, p.worst_rel);
 }
 
-// The flags around the route: GgmlBf16Wide beside GgmlA8Wide keeps the route's bits; 31 columns keep the exact (and
-// with GgmlA8 the narrow 8-bit) route's bits.
+// The flags around the route: at its admission (128 columns) GgmlBf16Wide beside GgmlA8Wide keeps the route's
+// bits; calls below the admission (31, 64, 127 columns) keep the exact (and with GgmlA8 the narrow 8-bit) route's
+// bits.
 void check_flags(const Problem& problem, std::mt19937& rng) {
     const Prepared p = prepare(problem, rng);
     using ops::LinearRoutes;
-    check(run(p, false, 64, false, Outputs::One, LinearRoutes::GgmlA8Wide | LinearRoutes::GgmlBf16Wide) ==
-              run(p, false, 64, false, Outputs::One, LinearRoutes::GgmlA8Wide),
-          "a8 wide " + problem.what + " T=64: GgmlBf16Wide changed the route's bits");
-    check(run(p, false, 31, false, Outputs::One, LinearRoutes::GgmlA8Wide) == run(p, false, 31, false, Outputs::One, LinearRoutes::Exact),
-          "a8 wide " + problem.what + " T=31: the flag changed the exact route's bits");
-    check(run(p, false, 31, false, Outputs::One, LinearRoutes::GgmlA8Wide | LinearRoutes::GgmlA8) ==
-              run(p, false, 31, false, Outputs::One, LinearRoutes::GgmlA8),
-          "a8 wide " + problem.what + " T=31: the flag changed the narrow 8-bit route's bits");
+    check(run(p, false, 128, false, Outputs::One, LinearRoutes::GgmlA8Wide | LinearRoutes::GgmlBf16Wide) ==
+              run(p, false, 128, false, Outputs::One, LinearRoutes::GgmlA8Wide),
+          "a8 wide " + problem.what + " T=128: GgmlBf16Wide changed the route's bits");
+    for (const int columns : {31, 64, 127}) {
+        const std::string t = " T=" + std::to_string(columns);
+        check(run(p, false, columns, false, Outputs::One, LinearRoutes::GgmlA8Wide) ==
+                  run(p, false, columns, false, Outputs::One, LinearRoutes::Exact),
+              "a8 wide " + problem.what + t + ": the flag changed the exact route's bits");
+        check(run(p, false, columns, false, Outputs::One, LinearRoutes::GgmlA8Wide | LinearRoutes::GgmlA8) ==
+                  run(p, false, columns, false, Outputs::One, LinearRoutes::GgmlA8),
+              "a8 wide " + problem.what + t + ": the flag changed the narrow 8-bit route's bits");
+    }
 }
 
 // Repeated calls under a side stream's traffic return the same bits (the cp.async rings, op_tester.h).
@@ -564,7 +570,7 @@ INFERNIX_OP_TEST(ggml_linear_a8_wide) {
     try {
         using ops::GgmlLayout;
         std::mt19937 rng(20261028);
-        const std::vector<int> boundary = {32, 33, 64, 127, 128, 129, 300};
+        const std::vector<int> boundary = {128, 129, 300};
         const QType formats[] = {QType::GGML_Q2_0, QType::GGML_Q4_K, QType::GGML_Q5_K, QType::GGML_Q6_K, QType::GGML_IQ2_S,
                                  QType::GGML_IQ3_XXS, QType::GGML_IQ3_S, QType::GGML_IQ4_XS, QType::GGML_IQ4_NL};
         const QType tiled[] = {QType::GGML_Q4_K, QType::GGML_Q5_K, QType::GGML_Q6_K, QType::GGML_IQ4_XS};
@@ -578,53 +584,54 @@ INFERNIX_OP_TEST(ggml_linear_a8_wide) {
             const int k      = small ? 640 : 2560;
             const std::string name = format_name(q);
             run_problem({name + " rows k=" + std::to_string(k), k, {{q, 70}}, GgmlLayout::Rows, 0, Scales::Wide}, rng, boundary);
-            run_problem({name + " rows f32", k, {{q, 200}}, GgmlLayout::Rows, 0, Scales::Wide, false, 130}, rng, {32, 130}, true);
-            run_problem({name + " rows three", k, {{q, 150}}, GgmlLayout::Rows, 0, Scales::Narrow, false, 64}, rng, {33, 64}, false,
+            run_problem({name + " rows f32", k, {{q, 200}}, GgmlLayout::Rows, 0, Scales::Wide, false, 130}, rng, {128, 130}, true);
+            run_problem({name + " rows three", k, {{q, 150}}, GgmlLayout::Rows, 0, Scales::Narrow, false, 130}, rng, {128, 130}, false,
                         Outputs::Three);
-            run_problem({name + " rows perm128", k, {{q, 37}}, GgmlLayout::Rows, 128, Scales::Narrow, false, 64}, rng, {40, 64});
-            run_problem({name + " rows perm4", k, {{q, 21}}, GgmlLayout::Rows, 4, Scales::Narrow, false, 48}, rng, {48});
+            run_problem({name + " rows perm128", k, {{q, 37}}, GgmlLayout::Rows, 128, Scales::Narrow, false, 130}, rng, {128, 130});
+            run_problem({name + " rows perm4", k, {{q, 21}}, GgmlLayout::Rows, 4, Scales::Narrow, false, 128}, rng, {128});
             run_problem({name + " rows k=" + std::to_string(small ? 2560 : 6144), small ? 2560 : 6144, {{q, 37}}, GgmlLayout::Rows,
                          0, Scales::Narrow, false, 160},
-                        rng, {32, 160});
+                        rng, {128, 160});
         }
         // ggml_tiles16_v1: two matrices (the second at an odd output row), partial tiles, three outputs cut at whole
         // tiles, the permutation at K = 6144.
         for (const QType q : tiled) {
             const std::string name = format_name(q);
             run_problem({name + " tiled", 2560, {{q, 93}, {q, 16}}, GgmlLayout::Tiles16, 0, Scales::Wide}, rng, boundary);
-            run_problem({name + " tiled three", 2560, {{q, 61}, {q, 20}}, GgmlLayout::Tiles16, 0, Scales::Narrow, false, 64}, rng,
-                        {32, 64}, false, Outputs::Three);
+            run_problem({name + " tiled three", 2560, {{q, 61}, {q, 20}}, GgmlLayout::Tiles16, 0, Scales::Narrow, false, 130}, rng,
+                        {128, 130}, false, Outputs::Three);
             run_problem({name + " tiled perm k=6144", 6144, {{q, 37}}, GgmlLayout::Tiles16, 128, Scales::Wide, false, 130}, rng,
-                        {32, 130}, true);
+                        {128, 130}, true);
         }
         // Several formats in one call (per-part outputs and one output).
         const std::pair<QType, QType> mixed[] = {{QType::GGML_Q6_K, QType::GGML_IQ4_XS}, {QType::GGML_Q4_K, QType::GGML_Q6_K},
                                                  {QType::GGML_Q5_K, QType::GGML_IQ4_XS}};
         for (const auto& [q0, q1] : mixed) {
             const std::string name = format_name(q0) + "+" + format_name(q1);
-            run_problem({name + " rows", 2560, {{q0, 33}, {q1, 70}}, GgmlLayout::Rows, 0, Scales::Narrow, false, 200}, rng, {32, 200},
+            run_problem({name + " rows", 2560, {{q0, 33}, {q1, 70}}, GgmlLayout::Rows, 0, Scales::Narrow, false, 200}, rng, {128, 200},
                         false, Outputs::PerPart);
             run_problem({name + " tiled", 2560, {{q0, 40}, {q1, 136}}, GgmlLayout::Tiles16, 0, Scales::Narrow, false, 200}, rng,
-                        {64, 200});
+                        {128, 200});
         }
         // Zero and sub-threshold slices, Inf and NaN columns, large values.
-        run_problem({"edges Q6_K tiled", 2560, {{QType::GGML_Q6_K, 45}}, GgmlLayout::Tiles16, 0, Scales::Narrow, true, 64}, rng, {32, 64});
-        run_problem({"edges Q4_K rows", 2560, {{QType::GGML_Q4_K, 45}}, GgmlLayout::Rows, 0, Scales::Narrow, true, 64}, rng, {33, 64});
-        run_problem({"edges IQ4_NL rows", 640, {{QType::GGML_IQ4_NL, 45}}, GgmlLayout::Rows, 0, Scales::Narrow, true, 64}, rng, {64});
+        run_problem({"edges Q6_K tiled", 2560, {{QType::GGML_Q6_K, 45}}, GgmlLayout::Tiles16, 0, Scales::Narrow, true, 130}, rng,
+                    {128, 130});
+        run_problem({"edges Q4_K rows", 2560, {{QType::GGML_Q4_K, 45}}, GgmlLayout::Rows, 0, Scales::Narrow, true, 130}, rng, {128, 130});
+        run_problem({"edges IQ4_NL rows", 640, {{QType::GGML_IQ4_NL, 45}}, GgmlLayout::Rows, 0, Scales::Narrow, true, 128}, rng, {128});
         // A call of two column batches (2,048 and 52) and one whose planes take three passes (K = 8192, 16,384 rows:
         // slabs of 5,952 rows), the slab bounds among the checked rows.
         run_problem({"Q4_K two batches", 2560, {{QType::GGML_Q4_K, 300}}, GgmlLayout::Rows, 0, Scales::Narrow, false, 2100}, rng,
-                    {32, 2100});
+                    {128, 2100});
         {
-            Problem passes{"Q6_K three passes k=8192", 8192, {{QType::GGML_Q6_K, 16384}}, GgmlLayout::Tiles16, 0, Scales::Narrow, false, 40,
-                           93};
-            run_problem(passes, rng, {33, 40});
+            Problem passes{"Q6_K three passes k=8192", 8192, {{QType::GGML_Q6_K, 16384}}, GgmlLayout::Tiles16, 0, Scales::Narrow, false,
+                           130, 93};
+            run_problem(passes, rng, {128, 130});
         }
         // The flags around the route, and repeated calls under traffic.
         check_flags({"IQ4_XS+Q6_K tiled flags", 2560, {{QType::GGML_IQ4_XS, 64}, {QType::GGML_Q6_K, 32}}, GgmlLayout::Tiles16, 0,
-                     Scales::Narrow, false, 64},
+                     Scales::Narrow, false, 130},
                     rng);
-        check_flags({"Q5_K rows flags", 2560, {{QType::GGML_Q5_K, 70}}, GgmlLayout::Rows, 0, Scales::Narrow, false, 64}, rng);
+        check_flags({"Q5_K rows flags", 2560, {{QType::GGML_Q5_K, 70}}, GgmlLayout::Rows, 0, Scales::Narrow, false, 130}, rng);
         check_repeat({"gdn q/k/v/z repeat", 2560, {{QType::GGML_Q6_K, 4096}, {QType::GGML_IQ4_XS, 2048}}, GgmlLayout::Tiles16, 0,
                       Scales::Narrow, false, 1024, 211},
                      rng, 1024);

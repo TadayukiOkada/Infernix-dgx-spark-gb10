@@ -211,7 +211,9 @@ __device__ __forceinline__ void compute(Shared& sm, const std::uint8_t* const (&
         ops::cp_commit();
         const int buf = st % kStages;
         const auto& cs = *reinterpret_cast<const tile::CodeStage*>(sm.image[buf][wr]);
-#pragma unroll
+        // The min-term formats' extra xs/xsum/mn live sets exceed the tile route's register cap
+        // when the whole stage unrolls: the slice loop stays rolled there.
+#pragma unroll (S == Scaling::kMin ? 1 : kSlices)
         for (int j = 0; j < kSlices; ++j) {
             uint4 b[kNTiles];
 #pragma unroll
@@ -366,6 +368,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
         const int elems         = 32 * min(tile::kUnitSlices, slices - u * tile::kUnitSlices);
         const int bytes         = elems / kBlockElems * kBlockBytes;
         const std::size_t begin = static_cast<std::size_t>(u) * kUnitBytes<F>;
+#pragma unroll 1
         for (int i = tid; i < kRows * kRawChunks<F>; i += kThreads) {
             const int r = i / kRawChunks<F>, chunk = i % kRawChunks<F>;
             const std::uint8_t* src = row_of(r) + begin;
@@ -414,7 +417,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
         ops::cp_commit();
         if (st % kUnitStages == 0 && (unit + 1) * tile::kUnitSlices < slices) { issue_unit(unit + 1, ubuf ^ 1); }
         ops::cp_commit();
-#pragma unroll
+#pragma unroll 1
         for (int k = 0; k < 2; ++k) {
             const int task = warp + (kThreads / 32) * k;
             const int j = task / kRowGroups, m = task % kRowGroups;
@@ -451,7 +454,9 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
             }
         }
         __syncthreads(); // the stage's codes and scales are stored
-#pragma unroll
+        // The stage decode runs at the 2-CTA/SM register cap: every format spills with the
+        // slice loop unrolled.
+#pragma unroll 1
         for (int j = 0; j < kSlices; ++j) {
             uint4 b[NT];
 #pragma unroll

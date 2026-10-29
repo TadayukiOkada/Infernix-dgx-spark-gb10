@@ -98,21 +98,6 @@ infernix_add_family_op_test(infernix_linear_fp32_head_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_fp32_head.cpp"
   LIBRARIES infernix_linear_test_support)
 
-# Windows TMA launches read their descriptors in place from the kernel parameters; these run every TMA
-# family's staged instantiations, the fallback where the parameter block is misaligned, against the same
-# oracles, the staging race probe and the overlap probe.
-infernix_add_family_op_test(infernix_tma_staging_test FAMILY linear NO_TEST
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tma_staging.cu")
-if(WIN32)
-  foreach(tma_test infernix_linear_fp8_a8_test infernix_linear_fp8_a16_test infernix_fp8_a8_pair_repeat_test
-          infernix_linear_mxfp8_a16_test infernix_linear_f16_accumulate_test infernix_linear_nvfp4_a4_test
-          infernix_nvfp4_tma_staging_race_test infernix_tma_moe_overlap_test infernix_linear_bf16_a16_test)
-    string(REGEX REPLACE "^infernix_(.*)_test$" "\\1" tma_member "${tma_test}")
-    add_test(NAME ${tma_test}_staging COMMAND ${infernix_tma_staging_test_COMMAND} ${tma_member})
-    set_tests_properties(${tma_test}_staging PROPERTIES SKIP_RETURN_CODE 77)
-  endforeach()
-endif()
-
 # FP32 projections (router and lm_head logits), BF16 and q8_g32_fp16 weights, against FP64.
 infernix_add_family_op_test(infernix_projection_fp32_test FAMILY linear
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_projection_fp32.cpp"

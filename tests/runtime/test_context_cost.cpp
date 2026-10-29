@@ -189,8 +189,24 @@ void test_resolution_and_atomic_upserts() {
         });
         expect(gb10_compiled.summary.transfer_source ==
                        infernix::ContextCostPresetSource::CompiledDefault &&
-                   gb10_compiled.model.transfer[0].ns_per_byte_q32 == 183'965'911,
+                   gb10_compiled.model.transfer[0].ns_per_byte_q32 == 183'965'911 &&
+                   gb10_compiled.model.transfer[1].ns_per_byte_q32 == 220'829'326 &&
+                   gb10_compiled.model.transfer[2] ==
+                       infernix::runtime::ContextTransferCost{
+                           .batch_ns = 10'441, .operation_ns = 2'539, .ns_per_byte_q32 = 30'671'379},
                "GB10 compiled transfer default did not resolve");
+        // The GB10 preset must not carry copied 5090 prefill bindings: those signatures resolve to
+        // the generic prefill estimate on GB10 (they still select their compiled cost on the 5090
+        // machine, checked above) until a GB10 calibration records a measured entry.
+        const auto gb10_foreign_prefill = infernix::runtime::resolve_context_machine_cost({
+            .hardware_class    = "nvidia-gb10-sm121",
+            .prefill_signature = "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
+        });
+        expect(gb10_foreign_prefill.summary.prefill_source ==
+                       infernix::ContextCostPresetSource::GenericDefault &&
+                   gb10_foreign_prefill.summary.transfer_source ==
+                       infernix::ContextCostPresetSource::CompiledDefault,
+               "GB10 preset resolved a copied 5090 prefill binding");
 
         const infernix::runtime::ContextCostIdentity unknown{
             .hardware_class    = "unmeasured-machine",

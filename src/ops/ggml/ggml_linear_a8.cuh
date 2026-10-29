@@ -195,7 +195,7 @@ __device__ __forceinline__ void unit_terms(float (&acc)[NT][4], const std::uint8
                                            int unit_slices, const ColumnTiles<NT>& ct, int live, int t) {
     constexpr int kBlockElems = static_cast<int>(ggml_block_elems(F));
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
-#pragma unroll
+#pragma unroll 1
     for (int j = 0; j < kUnitSlices; ++j) {
         if (j >= unit_slices) { break; } // uniform: a Rows matrix's short last unit
         const int e = 32 * j + 8 * t;    // the lane's chunk of slice j within the unit
@@ -307,9 +307,13 @@ __device__ __forceinline__ void mma_body(const Slot& seg, int slices, const std:
             unsigned char* dst = ring + (i % stages) * slot_bytes;
             if constexpr (Tiled) {
                 const std::uint8_t* src = tile_base + static_cast<std::size_t>(u) * 16 * kBlockBytes;
+                // Unrolling this copy loop hoists cp.async addresses plus the 64-bit L2 policy
+                // register across the ring wait and spills the tiled instances.
+#pragma unroll 1
                 for (int c = lane; c < kBlockBytes; c += 32) { cp_async16_hint(dst + 16 * c, src + 16 * c, policy); }
             } else {
                 const int bytes = ggml::mma_rows::unit_row_bytes<F>(u, slices);
+#pragma unroll 1
                 for (int c = lane; c < 16 * kChunks; c += 32) {
                     const int r = c / kChunks, cc = c % kChunks;
                     const std::uint8_t* src = row(r) + static_cast<std::size_t>(u) * kUnitBytes;
@@ -401,10 +405,11 @@ __device__ __forceinline__ void mma_body(const Slot& seg, int slices, const std:
 // ---- the mma route's CTA shape (ggml_linear.cu's tiled narrow rule, the same structure)
 //
 // The first of kShapes whose CTAs all fit in one wave (cudaOccupancyMaxActiveBlocksPerMultiprocessor x SMs)
-// and whose split either keeps the call within kWarpBudget warps or leaves each warp kMinUnits units; a call
-// no shape fits in one wave takes kManyWaves. The exact route measured this rule on the RTX 5090 at the IQ3_S
-// import's dense calls (a second wave costs a narrow call 25-30 %; more warps help small calls); the 8-bit
-// kernels keep its per-warp rings and split, so the same reasons hold (their own timing is still owed).
+// and whose split either keeps the call within the whole-machine warp cap (kBudgetWarps per SM) or leaves
+// each warp kMinUnits units; a call no shape fits in one wave takes kManyWaves. The exact route measured
+// this rule on the RTX 5090 at the IQ3_S import's dense calls (a second wave costs a narrow call 25-30 %;
+// more warps help small calls); the 8-bit kernels keep its per-warp rings and split, and GB10 set the cap
+// itself (see kBudgetWarps).
 struct Shape {
     int warps  = 4;
     int split  = 1;
@@ -412,8 +417,27 @@ struct Shape {
 };
 constexpr Shape kShapes[] = {{8, 8, 2}, {4, 4, 2}, {2, 2, 2}, {4, 2, 2}, {4, 1, 2}, {2, 1, 2}};
 constexpr Shape kManyWaves{4, 1, 2};
-constexpr int kWarpBudget = 1024;
+// The whole-machine warp cap a K-split may spend (kBudgetWarps per SM). GB10 (48 SMs) retune
+// 2026-10-29: the 5090's 1024 was 170 SMs x 6 warps, and a cap that counts CTAs across the whole GPU
+// has to scale with its SMs - on 48 SMs it lets a narrow call spend 21.3 warps per SM, so choose_shape
+// keeps a wide split it cannot fill and pays the second wave. A budget sweep over the IQ3_S import's
+// eight dense shapes at T = 1..31 put 288 = 48 x 6 first (its per-point losses sat inside the cold-L2
+// noise; see the ratchet note on the MXFP8 retune), and the interleaved A/B of the two caps (nine
+// rounds, 15 cold-L2 repetitions) found the cap inert at seven of the eight shapes: at these K no
+// candidate's tiles x split sits between 288 and 1024 with the units clause also binding, so both caps
+// select the same shape (all ten non-shexp points WITHIN_NOISE, |delta| <= 0.06 %). The one cap-sensitive
+// shape is the 1,280-row (80-tile) shared-expert gate_up, where the scaled cap rejects the split-8
+// shape {8,8} (80 x 8 = 640 warps) on the units clause and falls to a 40-CTA split that leaves eight SMs
+// idle: the 5090 cap is 10.9 % faster at 16 columns, 19.1 % at 31 and 4.5 % at 1 (SNR 1.04-3.6). So a
+// call of at most two tiles per SM - which can fill the machine only by splitting K - takes no cap
+// beyond the wave-fit check below; the others keep the machine-scaled one.
+constexpr int kBudgetWarps = 6;
 constexpr int kMinUnits   = 4;
+constexpr int kMaxSplit   = 8; // kShapes' widest split
+
+inline int warp_budget(int sms, int tiles) {
+    return tiles <= 2 * sms ? kMaxSplit * tiles : sms * kBudgetWarps; // small calls: the cap never binds
+}
 
 // The rings are the CTA's only shared memory (the partials reuse them).
 [[nodiscard]] inline std::size_t mma_shared_bytes(const Shape& s, int slot_bytes) {
@@ -471,7 +495,7 @@ int resident(Kernel kernel, int threads, std::size_t shared) {
 template <class Kernel>
 Shape choose_shape(Kernel kernel, int tiles, int units, int slot_bytes, const Device& dev) {
     for (const Shape& s : kShapes) {
-        if (s.split > 1 && tiles * s.split > kWarpBudget && units < kMinUnits * s.split) { continue; }
+        if (s.split > 1 && tiles * s.split > warp_budget(dev.sms, tiles) && units < kMinUnits * s.split) { continue; }
         const std::size_t shared = mma_shared_bytes(s, slot_bytes);
         if (shared > static_cast<std::size_t>(dev.limit)) { continue; }
         const int per_cta = s.warps / s.split;

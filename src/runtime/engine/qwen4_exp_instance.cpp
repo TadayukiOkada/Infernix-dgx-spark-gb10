@@ -181,6 +181,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         auto load           = models::load_options(options, models::Architecture::Qwen4Exp);
         load.stream_experts = stream_experts;
         load.device_experts = device_experts;
+        if (integrated) { load.mtp_expert_pool = false; }
         if (load.dflash2() && load.draft_model.empty()) {
             load.draft_model = default_dflash2_model(options.artifact_path);
         }

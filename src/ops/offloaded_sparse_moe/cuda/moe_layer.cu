@@ -614,10 +614,10 @@ __device__ __forceinline__ void route_pooled_column(const float* __restrict__ lo
 
 // The drafter pool: the pool's slot-table writes and demand drain (moe_pool_write, moe_pool_drain).
 __global__ void pool_write_kernel(std::int32_t* __restrict__ slot_of, MoePoolWrites writes) {
-    const int i = static_cast<int>(threadIdx.x);
     // Each thread reads its write through loop-index-constant accesses only: dynamic indexing
     // into the by-value kernel-parameter struct makes ptxas stage the whole struct (72 B) into a
     // local-memory frame.
+    const int i = static_cast<int>(threadIdx.x);
     std::int32_t expert = 0, value = 0;
 #pragma unroll
     for (int j = 0; j < kMoePoolWrites; ++j) {

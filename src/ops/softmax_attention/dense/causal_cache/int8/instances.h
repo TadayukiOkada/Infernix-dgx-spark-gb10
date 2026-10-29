@@ -20,7 +20,7 @@ struct Int8KvGroupedInstance {
                                               kWideKeys        ? 4 * kRowTiles
                                                                : kRowTiles <= 2 ? 8
                                                                                 : 2 * kRowTiles,
-                                              kWideKeys ? 64 : 32, kWideKeys ? 1 : 2>;
+                                              kWideKeys ? 64 : 32, 1>;
     using Merge                     = Int8KvMergeSchedule<G::QHeads == 24 ? 256 : 64>;
 };
 

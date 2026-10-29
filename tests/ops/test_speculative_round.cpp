@@ -2737,8 +2737,13 @@ INFERNIX_OP_TEST(speculative_round) {
     failures += batched_sampling_workspace_stride_case();
     failures += sample_sparse_drafts_case();
     std::size_t sparse_peak = 0;
-    for (int k = 1; k <= 31; ++k) {
-        for (int batch = 1; batch <= 8; ++batch) {
+    // Each row is one warp whose K + 1 lanes are the draft columns, so K is swept over the lane-layout
+    // boundaries (1-2, the power-of-two edges 7-9 and 15-17, a full warp at 30-31) and a spread between;
+    // the rows of a batch are independent warps, so batch 1, 2, an odd 3 and the widest 8 (which sets the
+    // workspace peak checked below). The exhaustive K 1..31 x batch 1..8 sweep (248 suites, 42 s) passed
+    // when this set was chosen (2026-10-30).
+    for (const int k : {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 30, 31}) {
+        for (const int batch : {1, 2, 3, 8}) {
             SparseAcceptSuite suite(k, batch);
             failures += suite.sparse_greedy_direct_case();
             failures += suite.generated_general_case();

@@ -1,5 +1,5 @@
 // ops::ggml_linear's wide 8-bit activation route (LinearRoutes::GgmlA8Wide, `--a8-activations` at prefill widths:
-// LOSSY, opt-in; docs/maintainer/qwen3_8-flash-next-design.md §19.3.31): calls of 32 or more columns over GGUF block
+// LOSSY, opt-in; docs/maintainer/qwen3_8-flash-next-design.md §19.3.31): calls of 128 or more columns over GGUF block
 // weights on int8 tensor cores. The arithmetic and the tiles are ops/ggml/ggml_a8_tile.cuh's (compute_plane).
 //
 // A call runs the exact and BF16 wide routes' structure (ggml_linear.cu): the segments' rows in slabs whose decoded
@@ -305,7 +305,8 @@ void ggml_linear_a8_wide(const Tensor& x, std::span<const GgmlSegment> segments,
                          cudaStream_t stream) {
     using namespace a8_wide;
     const int k = x.ne[0], columns = x.ne[1];
-    require(columns >= kA8WideMinColumns && k % 64 == 0, "the wide 8-bit route takes calls of 32 or more columns of K a multiple of 64");
+    require(columns >= kA8WideMinColumns && k % 64 == 0,
+            "the wide 8-bit route takes calls of kA8WideMinColumns or more columns of K a multiple of 64");
     const DType dtype = outs.front()->dtype;
     const bool sums   = std::any_of(segments.begin(), segments.end(), [](const GgmlSegment& s) { return min_format(s.format); });
     const int stride  = column_stride(k, sums);

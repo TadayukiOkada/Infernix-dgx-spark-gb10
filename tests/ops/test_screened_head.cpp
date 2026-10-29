@@ -351,6 +351,12 @@ ColumnScreen column_screen(const Packed& screen, std::int32_t rows, const std::u
     return c;
 }
 
+// The screen's persistent grid for calls of `columns` columns: the Op's own, so the CTA rows this
+// oracle checks are the rows the kernel actually shares a candidate list with.
+int screen_grid_for(std::int32_t rows, std::int32_t columns) {
+    return infernix::ops::screened_head_screen_grid(rows, columns);
+}
+
 // Whether the selection policy (include/infernix/ops/screened_head.h) alone keeps `row` out of a column's
 // P_t, judged on the FP64 screen scores with every comparison clear of both rows' FP32 bounds: at least 8
 // rows of its CTA (the screen's grid takes 16-row items round-robin) clearly above it, a score clearly more
@@ -622,8 +628,8 @@ void logits_case(LogitsHead& head, std::uint64_t seed) {
         for (std::int32_t r = 0; r < head.rows; ++r) { rescored += std::memcmp(&got[r], &exact[r], 4) == 0; }
         check(rescored == 64, head.label + ": a wide margin rescores exactly `rescored` rows");
     }
-    // Informational: the 1- and 8-column calls against the exact head.
-    for (const std::int32_t T : {1, 8}) {
+    // Informational: the full decode/MTP column range against the exact head.
+    for (const std::int32_t T : {1, 2, 4, 5, 8}) {
         const Tensor x(dx.p, DType::BF16, {K, T});
         DeviceArray<float> out(static_cast<std::size_t>(head.rows) * T);
         Tensor logits(out.p, DType::FP32, {head.rows, T});
@@ -687,10 +693,8 @@ void top_case(std::uint64_t seed) {
         tokens_out   = mapped ? tokens.host() : std::vector<std::int32_t>{};
     };
 
-    // The screen's grid (one CTA per SM, at most 256) and each fixture column's FP64 screen scores, once.
-    int sms = 0;
-    cuda(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0), "SM count");
-    const int grid = std::clamp(sms, 1, 256);
+    // Each fixture column's FP64 screen scores, once. The screen's grid is the Op's own
+    // (screened_head_screen_grid): the 1..8-column ring fits two co-resident CTAs per SM.
     std::vector<std::unique_ptr<ColumnScreen>> oracles(32);
     const auto oracle = [&](const std::vector<std::uint16_t>& xbits, int slot, std::int32_t t) -> const ColumnScreen& {
         auto& c = oracles[static_cast<std::size_t>(slot + t)];
@@ -726,7 +730,7 @@ void top_case(std::uint64_t seed) {
             };
             for (int j = 0; j < 4; ++j) {
                 const bool missing = !returned(top[j], 4, rows4) || (j == 0 && rows1[t] != top[0]);
-                if (missing && !selection_excludes(oracle(xbits, slot, t), top[j], grid, p)) { ++stats.unexplained; }
+                if (missing && !selection_excludes(oracle(xbits, slot, t), top[j], screen_grid_for(R, T), p)) { ++stats.unexplained; }
             }
             // Rows the screen returned carry exact logits: their rank differences are the exact BF16
             // differences, whichever rows they are; the normalizer is an approximation.

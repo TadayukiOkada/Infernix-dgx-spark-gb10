@@ -165,7 +165,10 @@ __device__ __forceinline__ int tile_offset(int row, int byte) {
 // ---------------------------------------------------------------------------------------------
 // The fused gate/up W4A8 GEMM with the SwiGLU epilogue.
 
-__global__ __launch_bounds__(kThreads, 2) void q4_linear_swiglu_w4a8_kernel(
+// No min-blocks hint: forcing two 512-thread CTAs per SM caps registers at 64 and spills 32 B of
+// live MMA accumulators in the inner K loop; one unspilled CTA per SM (108 regs) measures
+// 7.5..13.5% faster across T = 256..4096 on GB10 (89..94 vs 78..86 TFLOP/s).
+__global__ __launch_bounds__(kThreads) void q4_linear_swiglu_w4a8_kernel(
     const std::int8_t* __restrict__ xq, const float* __restrict__ xs,
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, std::int32_t intermediate, std::int32_t k, std::int32_t t) {

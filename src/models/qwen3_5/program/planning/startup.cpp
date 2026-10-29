@@ -1174,10 +1174,12 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
     }
-    // The RAM ledger, not the options, decides whether offloaded banks stay in the artifact (the SSD
-    // tier): the loaded model's choice stands.
-    auto expected           = models::load_options(options, Architecture::Qwen3_5);
-    expected.stream_experts = parameters.model.options().stream_experts;
+    // The RAM ledger and UMA residency policy, not the raw options, decide whether offloaded banks stay
+    // in the artifact (the SSD tier) and whether MTP drafter experts use a host-pinned pool: the loaded
+    // model's choice stands.
+    auto expected            = models::load_options(options, Architecture::Qwen3_5);
+    expected.stream_experts  = parameters.model.options().stream_experts;
+    expected.mtp_expert_pool = parameters.model.options().mtp_expert_pool;
     if (parameters.model.options() != expected) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");

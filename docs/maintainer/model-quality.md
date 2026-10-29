@@ -1592,7 +1592,9 @@ without `preemption`).
 
 **`ggml-bf16-prefill`: BF16 tensor-core tiles in Flash-Next's GGUF prefill (IQ3_S with INT8, FP8,
 NVFP4, K8V4, VQ2 or K4V2 KV, qualified 2026-10-19; BF16 KV, 2026-10-20).**
-- **What changes:** eager prefill calls of 32 or more columns run the GGUF dense projections
+- **What changes:** eager prefill calls of 128 or more columns (the GB10 retune of 2026-10-29 moved the
+  admission from 32: below the BF16 tile's width the route loses to the exact route's wide A16 tiles) run the
+  GGUF dense projections
   (`ops::ggml_linear`, `LinearRoutes::GgmlBf16Wide`) as BF16 m16n8k16 MMAs with FP32 accumulation over
   the exact route's decoded planes: each code is exact in BF16, x is read as stored, each
   sub-block's FP32 sum is scaled by d · sub (exact in binary32), the K-quants subtract

@@ -3,6 +3,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/common/sincos_reduced.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/common/warp.cuh"
 #include <array>
@@ -40,12 +41,8 @@ struct DeviceLayers {
 // dflash_rope_sincos's range reduction over the call's frequencies.
 __device__ __forceinline__ void rope_sincos(const DeviceLayers& layers, const int* positions,
                                             int token, int pair, float* sine, float* cosine) {
-    constexpr double kInvTwoPi = 1.59154943091895336e-01;
-    constexpr double kTwoPi    = 6.28318530717958648e+00;
-    const double angle  = static_cast<double>(positions[token]) * layers.inv_frequency[pair];
-    const double turns  = angle * kInvTwoPi;
-    const float reduced = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
-    sincosf(reduced, sine, cosine);
+    const double angle = static_cast<double>(positions[token]) * layers.inv_frequency[pair];
+    sincos_turns(angle, sine, cosine);
 }
 
 __device__ __forceinline__ void store_key_head(const float* input, const DeviceLayers& layers,

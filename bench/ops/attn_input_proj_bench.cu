@@ -46,12 +46,14 @@ infernix::bench::ColdFlushBytes kFlushBytes{};
 enum class Format : std::uint8_t { Q4Q5, Q8Qgkv, Q8Qkv, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
+enum class Fp8Problem : std::uint8_t { TwentySevenB, OneTwentyTwoB };
 
 struct Options {
     Format format                  = Format::All;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
     ops::LinearPolicy q4q5_policy  = ops::LinearPolicy::A16Only;
+    Fp8Problem fp8_problem         = Fp8Problem::TwentySevenB;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
@@ -59,6 +61,7 @@ struct Options {
     bool profile     = false;
     bool graph       = false;
     bool candidates  = false;
+    std::string cand_filter;  // --candidates: keep only schedules with this exact name
     std::string csv_out;
 };
 
@@ -87,6 +90,7 @@ struct Measurement {
                  "usage: infernix_attn_input_proj_bench "
                  "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
                  "[--nvfp4-policy a16|a4|invariant] [--fp8-policy a16|a8|a8r|invariant] "
+                 "[--fp8-problem 27b|122b] "
                  "[--q4q5-policy a16|invariant] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
@@ -181,6 +185,14 @@ Options parse_options(int argc, char** argv) {
                 options.fp8_policy = ops::LinearPolicy::A16ColumnInvariant;
             else
                 usage("--fp8-policy expects a16, a8, a8r or invariant");
+        } else if (argument == "--fp8-problem") {
+            const std::string_view value(next("--fp8-problem requires a value"));
+            if (value == "27b")
+                options.fp8_problem = Fp8Problem::TwentySevenB;
+            else if (value == "122b")
+                options.fp8_problem = Fp8Problem::OneTwentyTwoB;
+            else
+                usage("--fp8-problem expects 27b or 122b");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -203,6 +215,8 @@ Options parse_options(int argc, char** argv) {
             options.graph = value == "graph";
         } else if (argument == "--candidates") {
             options.candidates = true;
+        } else if (argument == "--cand-filter") {
+            options.cand_filter = std::string(next("--cand-filter requires a value"));
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -529,6 +543,14 @@ void run_nvfp4_candidates(const Options& options, bench::L2FlushBuffer& flush, c
 
 void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
              std::vector<Result>& results) {
+    if (options.fp8_problem == Fp8Problem::OneTwentyTwoB) {
+        // Qwen3.5-122B-A10B (Ornith-1.5-122B-NVFP4): fp8_e4m3fn_row_f32 parent [17408,3072],
+        // query 8192, key 512, gate 8192, value 512.
+        auto weight = bench::make_fp8_weight(17408, 3072, 0x51U, 0.05F, true);
+        run_four_output(options, "fp8-f32", QType::FP8_E4M3FN_ROW_F32, options.fp8_policy, false,
+                        3072, 8192, 512, 17408, weight, flush, stream, results);
+        return;
+    }
     auto weight = bench::make_fp8_weight(14336, 5120);
     run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16, options.fp8_policy, false, 5120,
                     6144, 1024, 14336, weight, flush, stream, results);
@@ -585,6 +607,77 @@ void run_fp8_candidates(const Options& options, bench::L2FlushBuffer& flush, cud
                                           tensor_bytes(kOutputRows, tokens);
             const double flops = 2.0 * static_cast<double>(kOutputRows) * kHidden * tokens;
             append_result(results, "fp8", ops::detail::fp8_attn_input_schedule_name(schedule), tokens,
+                          CacheState::Cold, 0, logical, flops, measurement);
+        }
+    }
+}
+
+// Candidate sweep for the 122B [17408,3072] fp8_e4m3fn_row_f32 A8 bands. Same shape semantics as
+// run_fp8_candidates: every legal schedule is driven directly and the argmin per T is the ground
+// truth for route retuning.
+void run_fp8_122b_candidates(const Options& options, bench::L2FlushBuffer& flush,
+                             cudaStream_t stream, std::vector<Result>& results) {
+    constexpr std::int32_t kHidden     = 3072;
+    constexpr std::int32_t kQueryRows  = 8192;
+    constexpr std::int32_t kKvRows     = 512;
+    constexpr std::int32_t kOutputRows = 2 * kQueryRows + 2 * kKvRows;
+    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
+    bench::PackedQuantizedWeight parent = bench::make_fp8_weight(kOutputRows, kHidden, 0x51U, 0.05F, true);
+    const std::size_t candidate_partials =
+        ops::detail::fp8_attn_input_n17408_candidate_partial_capacity_bytes();
+    const std::size_t maximum_workspace =
+        ops::detail::fp8_a8_workspace_capacity_bytes(max_tokens, kHidden, candidate_partials);
+    WorkspaceArena workspace(std::max<std::size_t>(maximum_workspace, 256));
+    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 107U);
+    DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer gate(static_cast<std::size_t>(kQueryRows) * max_tokens * 2);
+    DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+    DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
+
+    constexpr std::array<ops::detail::Fp8AttnInputN17408ScheduleId, 12> kSchedules{{
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8T32R32K128,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8T32R128K128,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Tma64x128,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Tma64x128G8,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Tma64x256,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Tma64x256G8,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Tma96x256,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Tma96x256G8,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Tma128x128G8,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8Bulk,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8BulkG8,
+        ops::detail::Fp8AttnInputN17408ScheduleId::A8BulkG8Wave48,
+    }};
+
+    for (const std::int32_t tokens : options.tokens) {
+        const ops::detail::Fp8AttnInputProblem problem{kHidden, kQueryRows, kKvRows, kOutputRows,
+                                                       kHidden, tokens};
+        for (const auto schedule : kSchedules) {
+            if (!ops::detail::fp8_attn_input_n17408_candidate_is_legal(schedule, problem)) {
+                continue;
+            }
+            const char* schedule_name =
+                ops::detail::fp8_attn_input_n17408_schedule_name(schedule);
+            if (!options.cand_filter.empty() && options.cand_filter != schedule_name) {
+                continue;
+            }
+            const auto launch = [&](cudaStream_t launch_stream) {
+                Tensor x(input.p, DType::BF16, {kHidden, tokens});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tg(gate.p, DType::BF16, {kQueryRows, tokens});
+                Tensor tk(k.p, DType::BF16, {kKvRows, tokens});
+                Tensor tv(v.p, DType::BF16, {kKvRows, tokens});
+                ops::detail::fp8_attn_input_n17408_execute_candidate(schedule, x, parent.weight, tq,
+                                                                     tg, tk, tv, workspace,
+                                                                     launch_stream);
+            };
+            const Measurement measurement =
+                measure_public(launch, CacheState::Cold, flush, stream, options.warmup,
+                               options.repeat, false);
+            const std::uint64_t logical = parent.model_weight_bytes() + tensor_bytes(kHidden, tokens) +
+                                          tensor_bytes(kOutputRows, tokens);
+            const double flops = 2.0 * static_cast<double>(kOutputRows) * kHidden * tokens;
+            append_result(results, "fp8-f32", schedule_name, tokens,
                           CacheState::Cold, 0, logical, flops, measurement);
         }
     }
@@ -947,7 +1040,11 @@ int main(int argc, char** argv) {
         }
         if (selected(options.format, Format::Fp8)) {
             if (options.candidates) {
-                run_fp8_candidates(options, flush, stream, results);
+                if (options.fp8_problem == Fp8Problem::OneTwentyTwoB) {
+                    run_fp8_122b_candidates(options, flush, stream, results);
+                } else {
+                    run_fp8_candidates(options, flush, stream, results);
+                }
             } else {
                 run_fp8(options, flush, stream, results);
             }

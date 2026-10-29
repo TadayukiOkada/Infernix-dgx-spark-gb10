@@ -29,14 +29,19 @@ struct Mxfp8LinearShape {
     std::int32_t pair_min_tokens = 0;
 };
 
-// The f16-accumulate route's admission (prefill widths). Not yet timed: the op bench (linear_bench
-// --qtype mxfp8 --routes f16) sets it per problem.
+// The f16-accumulate route's admission (prefill widths). Timed on GB10 on 2026-10-29 against the retuned
+// exact route (48 MiB cold-L2, 21 reps; docs/gb10/20261029-changelog.md): this one width is wrong for the
+// family — the route is 5.3-36.2 % slower from 256 columns on four of the five problems and faster only on
+// [13952,2560] from 4096 — so no configuration registers the fast path on GB10
+// (qwen4_exp/program/fast_paths.cpp). Each problem's own admission is the field to fix, per measurement.
 inline constexpr std::int32_t kMxfp8F16MinTokens = 256;
 
 // The block32 pair's admission per problem: recipe C's measured column-scaled pair admissions for the
-// same [N,K] (fp8/shapes, kPairMinTokens; [13952,2560] takes [13312,2560]'s). Not yet timed on MXFP8, whose
-// A16 route is a BF16 MMA rather than recipe C's A16 one: the op bench (linear_bench --qtype mxfp8
-// --routes block32) sets them.
+// same [N,K] (fp8/shapes, kPairMinTokens; [13952,2560] takes [13312,2560]'s). Timed on GB10 on 2026-10-29
+// (same method, opt-in --a8-activations route): slower than the retuned exact route at every width measured
+// above its admission on all five problems except [13952,2560] at 4096 columns (-4.9 %) and 8192 (-0.1 %),
+// and by up to +87.1 % on [2560,6144] at 8192. Left as recipe C's values pending the A8 campaign
+// (docs/tasks/20261029-gb10-post-rebase-perf-tasks.md T2), which retunes these tiles for 48 SMs.
 inline constexpr std::int32_t kMxfp8PairMinTokensN16384 = 33;
 inline constexpr std::int32_t kMxfp8PairMinTokensN13952 = 97;
 inline constexpr std::int32_t kMxfp8PairMinTokensN2560  = 513;

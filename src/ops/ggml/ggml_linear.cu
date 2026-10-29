@@ -33,6 +33,11 @@ constexpr int kWarps          = kGgmlWarps;
 constexpr int kEncodeThreads  = 256;
 constexpr int kColumns        = kGgmlColumns;
 constexpr int kTileMinColumns = 32;
+// The narrowest call of the BF16 wide route. GB10 (48 SMs) retune 2026-10-29: like the 8-bit wide route
+// it is slower than the exact route's wide A16 tiles until the 128-column tile is filled (gdn_qkvz
+// T=32: 774.0 us against exact's 343.9; T=64: 771.9 against 454.6), and from 128 columns it wins
+// (861.0 against 1037.2), so it starts at its tile width rather than at the exact route's.
+constexpr int kBf16WideMinColumns = 128;
 constexpr int kEncodeColumns  = 2048;
 constexpr std::size_t kPlaneBytes = 64ULL << 20;
 
@@ -201,14 +206,27 @@ __device__ __forceinline__ void mma_rows_body(const GroupSlot& seg, int row_byte
     }
 }
 
-// Four resident CTAs (128 threads) are intentional: the 23 KiB staged-row arena caps the fit at
-// four and the register cap 65536 / (128 * 4) = 128 binds at the same count, so ptxas keeps an
-// 8-32 B live-set frame instead of dropping to three CTAs. There is no register or shared-memory
-// headroom for a fifth, so relaxing the bound only loses a resident CTA (occupancy 4 -> 3) while
-// emptying the frame; the spill is on the stack allow-list as load-bearing, not a defect. The
-// sibling int8 grouped-attention schedule measured a +15% regression from the same relaxation.
+// Four resident CTAs (128 threads) are intentional where the staged-row arena fits: on the 23.5 KiB
+// formats, four blocks fit in 102,400 B (1,024 B driver-reserved per block) and the register cap
+// 65536 / (128 * 4) = 128 binds at the same count, so ptxas keeps an 8-32 B live-set frame instead
+// of dropping to three CTAs (the sibling int8 grouped-attention schedule measured a +15% regression
+// from that relaxation). Q6_K stages 37.9 KiB per CTA, capping physical residency at two CTAs/SM;
+// clamping the hint to the shared-memory fit raises Q6_K's register budget to 255 and empties its
+// frame without losing occupancy.
+constexpr std::size_t kSmSharedBytes        = 102400;
+constexpr std::size_t kDriverSharedPerBlock = 1024;
+
+constexpr int mma_rows_min_blocks(std::size_t staged_bytes) {
+    const std::size_t block_smem =
+        ((sizeof(MmaPartial) + staged_bytes + 127) & ~std::size_t{127}) + kDriverSharedPerBlock;
+    const int max_by_smem = static_cast<int>(kSmSharedBytes / block_smem);
+    return max_by_smem < 4 ? max_by_smem : 4;
+}
+
 template <QType F, bool OutF32, int Stage = kStaged>
-__global__ void __launch_bounds__(kMmaWarps * 32, 4)
+__global__ void __launch_bounds__(
+    kMmaWarps * 32,
+    mma_rows_min_blocks(Stage == kStaged ? sizeof(ggml::mma_rows::StagedRows<F>) * kMmaWarps : 0))
     mma_rows_kernel(RowsGroup grp, int row_bytes, int slices, const std::int32_t* __restrict__ encoded,
                     const std::int32_t* __restrict__ emax, int columns) {
     __shared__ MmaPartial partial;
@@ -217,7 +235,11 @@ __global__ void __launch_bounds__(kMmaWarps * 32, 4)
 }
 
 template <QType F0, QType F1, bool OutF32>
-__global__ void __launch_bounds__(kMmaWarps * 32, 4)
+__global__ void __launch_bounds__(
+    kMmaWarps * 32,
+    mma_rows_min_blocks(std::max(sizeof(ggml::mma_rows::StagedRows<F0>),
+                                 sizeof(ggml::mma_rows::StagedRows<F1>)) *
+                        kMmaWarps))
     mma_rows_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
                           const std::int32_t* __restrict__ emax, int columns) {
     __shared__ MmaPartial partial;
@@ -694,11 +716,11 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
     const std::size_t out_bytes = dtype == DType::FP32 ? 4 : 2;
     auto scope                  = workspace.scope();
     const bool wide_route       = wide_call(k, columns);
-    if (wide_route && has_route(routes, LinearRoutes::GgmlA8Wide)) {
+    if (wide_route && columns >= kA8WideMinColumns && has_route(routes, LinearRoutes::GgmlA8Wide)) {
         ggml_linear_a8_wide(x, segments, outs, input_perm, perm_block, workspace, stream);
         return;
     }
-    if (wide_route && has_route(routes, LinearRoutes::GgmlBf16Wide)) {
+    if (wide_route && columns >= kBf16WideMinColumns && has_route(routes, LinearRoutes::GgmlBf16Wide)) {
         linear_bf16(x, segments, outs, input_perm, perm_block, workspace, stream);
         return;
     }

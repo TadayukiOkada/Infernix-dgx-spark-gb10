@@ -231,7 +231,7 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
         for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++it) {
             const int stage = it % S::kStages;
             cta_mbarrier_wait(&shared.full[stage], (static_cast<unsigned>(it) / S::kStages) & 1U);
-#pragma unroll
+#pragma unroll 1
             for (int u = 0; u < S::kUnitsPerKTile; ++u) { // one 16-element block per record unit
                 // [H1 | H0] and [L1 | L0] of rows group and group + 8 (a0, a1 at K 0-15; a2, a3 at 16-31).
                 unsigned high[S::kMmaTokens][4], low[S::kMmaTokens][4];

@@ -11048,7 +11048,8 @@ a span's non-resident experts, so the walk stages nothing), nor were the 16,384-
 the time is in the exact three-limb integer kernels.
 
 **`ggml-bf16-prefill`: BF16 tensor-core tiles over the exact route's planes (fast path, a kernel
-path that couples requests).** `ops/ggml/ggml_bf16_tile.cuh`. Prefill calls of 32 or more columns
+path that couples requests).** `ops/ggml/ggml_bf16_tile.cuh`. Prefill calls of 128 or more columns (the GB10
+retune of 2026-10-29: below the BF16 tile's width the route loses to the exact route's wide A16 tiles)
 (`LinearRoutes::GgmlBf16Wide`, eager calls only: `Forward::dense_routes`) decode their slabs into
 the same `CodeStage` planes the exact tiles read and run m16n8k16 BF16 MMAs with FP32 accumulation
 on them: each code converts exactly to BF16, each product is exact, and only the sums round. Per
@@ -11355,7 +11356,9 @@ the narrowed flag is re-measured in its own A/B (x_a8). Tests: (1)-(3)'s,
 `models/qwen3_5/program/planning/fast_paths.h`) sets each route, decode or prefill, on one line, which withdraws
 it per format; the engines accept the flag where any route applies, refuse it where none does, and log what
 takes 8-bit activations in decode and in prefill. The prefill routes: (4) a GGUF import's dense projections in
-calls of 32 or more columns on (1)'s codec (`LinearRoutes::GgmlA8Wide`, ahead of ggml-bf16-prefill's BF16
+calls of 128 or more columns (the GB10 retune of 2026-10-29: below its 128-column tile width the route loses to
+the exact route's wide A16 tiles on every IQ3_S dense shape) on (1)'s codec (`LinearRoutes::GgmlA8Wide`, ahead of
+ggml-bf16-prefill's BF16
 tiles); (5) NVIDIA FP4-Local's MXFP8 dense projections on
 fp8-a8-pair-block32's route (two E4M3 terms per 32 values with UE8M0 scales, the weights' group scales in the
 same block-scaled MMA; from 33, 97, 513, 513 and 1,025 columns on [16384,2560], [13952,2560], [2560,6144],

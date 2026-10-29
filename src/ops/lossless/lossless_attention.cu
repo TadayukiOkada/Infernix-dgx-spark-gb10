@@ -891,9 +891,9 @@ __global__ __launch_bounds__(kThreads, M == kMaxima ? 2 : 1) void attention_kern
         // Pass B: p, sum p (int128 at 2^-87; p <= 1) and the thread's 16 channels' sum p v (int128 at
         // 2^(vmax_c - 203): p on its 2^-48 grid, v on its channel's grid).
         // This thread's channels: sub + 16 cc (the row's 16 threads read 16 banks of a value row).
-        I128 num[16];
-#pragma unroll
-        for (int cc = 0; cc < 16; ++cc) { num[cc] = I128{0ULL, 0LL}; }
+        // Value-init rather than an unrolled zero loop: this statement is statically unreachable in the
+        // kMaxima instantiation (pass A returns above) and nvcc flags the constant-iteration loop.
+        I128 num[16] = {};
         I128 den{0ULL, 0LL};
         float den_err = 0.0F;
         double p_err  = 0.0; // the p grid's dropped bits (each below 2^-49), summed over this thread's keys

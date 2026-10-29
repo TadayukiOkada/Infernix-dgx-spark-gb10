@@ -4,6 +4,9 @@
 
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
+#include "infernix/ops/sigmoid_mul.h"
+#include "ops/common/math.cuh"
+#include "ops/common/sincos_reduced.cuh"
 
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
@@ -80,19 +83,16 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
 // text token (three equal axes) rotates exactly as by its 1-D position.
 __device__ __forceinline__ void rope_angle(const std::int32_t* rope, std::int64_t stride, int i, int rotary,
                                            float theta, const PreparedRope& yarn, float& c, float& s) {
-    float angle;
+    double angle;
     if (yarn.factor == 1.0F) {
         const float inv = 1.0F / powf(theta, static_cast<float>(2 * i) / static_cast<float>(rotary));
-        angle           = static_cast<float>(rope[(i % 3) * stride]) * inv;
+        angle           = static_cast<double>(rope[(i % 3) * stride]) * static_cast<double>(inv);
     } else {
         // YaRN: the attention rotation's coefficients (ops/kernel/rope.cuh PreparedRopeCoefficients): the
         // angle in FP64, reduced to one turn, FP32 sincos, both scaled by the attention scale.
-        constexpr double kInvTwoPi = 1.59154943091895336e-01;
-        constexpr double kTwoPi    = 6.28318530717958648e+00;
-        const double raw           = static_cast<double>(rope[(i % 3) * stride]) * yarn.inverse[i];
-        angle                      = static_cast<float>(raw - nearbyint(raw * kInvTwoPi) * kTwoPi);
+        angle = static_cast<double>(rope[(i % 3) * stride]) * yarn.inverse[i];
     }
-    sincosf(angle, &s, &c);
+    sincos_turns(angle, &s, &c);
     if (yarn.factor != 1.0F) {
         s *= yarn.attention_scale;
         c *= yarn.attention_scale;

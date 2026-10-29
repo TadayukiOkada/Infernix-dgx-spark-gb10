@@ -21,7 +21,12 @@ namespace infernix::ops {
 // The widest call of the narrow route (ggml_linear's narrow calls: one below its tiles' kTileMinColumns).
 inline constexpr std::int32_t kA8MaxColumns = 31;
 // The narrowest call of the wide route (ggml_linear's wide calls, whose K is also a multiple of 64).
-inline constexpr std::int32_t kA8WideMinColumns = 32;
+// GB10 (48 SMs) retune 2026-10-29: the wide tile is 128 rows x 128 columns, so a 32- or 64-column call
+// fills a quarter to a half of it and runs 1.65x-2.25x slower than the exact route's wide A16 tiles on
+// every IQ3_S dense shape (gdn_qkvz [16384,2560] T=32: 749.3 us against 343.9 us; T=64: 751.7 against
+// 454.6). From 128 columns the int8 tiles over their own planes win everywhere instead (T=128: 747.4
+// against 1037.2; T=4096: 5677.9 against 16582.5), so the admission sits at the tile's own width.
+inline constexpr std::int32_t kA8WideMinColumns = 128;
 // Columns the wide route encodes at once (a call of more runs its tiles batch by batch over the same planes).
 inline constexpr std::int32_t kA8WideBatchColumns = 2048;
 // Workspace of the wide route's decoded planes (the exact and BF16 wide routes' kPlaneBytes).

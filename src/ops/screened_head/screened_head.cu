@@ -11,10 +11,12 @@
 // reads at most `rescored` rows per column.
 //
 // Kernels, in launch order:
-//   screen     persistent CTAs (one per SM), four warps splitting K per 16-row item, a four-stage
-//              cp.async ring of items (11.5 KB each), the column quantized to int8 per 64-group in
-//              shared memory. Per column it keeps the CTA's best kListLength rows and (top form) the
-//              online softmax partial of its rows; the logits form writes every screen score.
+//   screen     persistent CTAs (as many per SM as the ring's shared memory admits: two at 1..8
+//              columns, one at 9..16), four warps splitting K per 16-row item, a cp.async ring of
+//              items (11.5 KB each, two deep at 1..8 columns and four at 9..16), the column
+//              quantized to int8 per 64-group in shared memory. Per column it keeps the CTA's best
+//              kListLength rows and (top form) the online softmax partial of its rows; the logits
+//              form writes every screen score.
 //   select     one CTA per column: the best screen score M, the rows within the margin of it (at most
 //              `rescored`, the best first, at least the ranks), by radix selection on (score, row)
 //              keys when the count is out of bounds.
@@ -53,10 +55,16 @@ using bf16 = __nv_bfloat16;
 
 constexpr int kGroups        = kHidden / 64;     // 40 weight groups of 64 per row
 constexpr int kScreenWarps   = 4;                // K split of an item: warp w takes groups [10w, 10w + 10)
-constexpr int kWarpGroups    = kGroups / kScreenWarps;
 constexpr int kScreenThreads = kScreenWarps * 32;
 constexpr int kItemRows      = 16;               // one m16 row tile
-constexpr int kStages        = 4;
+// The ring depth pairs with the co-residency the shared memory admits (select_ring below): the deep
+// ring prefetches three items and runs one 71 KiB CTA per SM; the narrow ring prefetches one and
+// fits two 48 KiB CTAs, whose mutual barrier coverage measured faster on GB10's LPDDR5X UMA
+// (2026-10-29: +1.1..2.8% at T=1..8 against the deep ring; a wider K split measured no gain and
+// would break the column's bit-exact width invariance, so every form keeps the four-warp group
+// spans). The 9..16-column form runs the MMA deeper than it streams and always takes the deep ring.
+template <int Tiles, bool NarrowRing>
+constexpr int kRingStages = NarrowRing ? 2 : 4;
 constexpr int kCodeRowBytes  = kHidden / 4;      // 640: four 2-bit codes per byte
 constexpr int kCodePitch     = kCodeRowBytes + 16; // rows g and g + 8 of a quad's word on distinct banks
 constexpr int kScaleRowBytes = kGroups * 2;      // 80
@@ -66,9 +74,9 @@ constexpr int kColumnPitch    = kHidden + 64;    // a column's int8 copy; 16 ban
 constexpr int kSelectThreads  = 512;
 constexpr int kSelectWarps    = kSelectThreads / 32;
 constexpr int kMaxRescored    = 256;
-constexpr int kMaxEntries     = kMaxGrid * kListLength; // candidates of one column
-constexpr int kEntriesPerThread = kMaxEntries / kSelectThreads;
-static_assert(kGroups % kScreenWarps == 0 && kMaxEntries % kSelectThreads == 0);
+constexpr int kEntriesPerThread = kMaxGrid * kListLength / kSelectThreads; // candidates of one column
+static_assert(kGroups % kScreenWarps == 0);
+static_assert(kMaxGrid * kListLength % kSelectThreads == 0);
 static_assert(kScreenThreads == 128 && kStageBytes % 16 == 0 && kStageCodeBytes % 16 == 0);
 
 __device__ __forceinline__ float negative_infinity() { return __int_as_float(0xff800000); }
@@ -79,14 +87,17 @@ __host__ __device__ constexpr int screen_columns() {
 }
 
 // Dynamic shared memory of the screen kernel: the item ring, the int8 columns, each (column, group)'s
-// FP32 scale and twice its code sum, and the four warps' partial sums (warp 0's slot then holds the
+// FP32 scale and twice its code sum, and the warps' partial sums (warp 0's slot then holds the
 // item's scores).
-template <int Tiles>
+template <int Tiles, bool NarrowRing>
 constexpr int screen_shared_bytes() {
     constexpr int C = screen_columns<Tiles>();
-    return kStages * kStageBytes + C * kColumnPitch + C * kGroups * 8 + kScreenWarps * kItemRows * C * 4;
+    return kRingStages<Tiles, NarrowRing> * kStageBytes + C * kColumnPitch + C * kGroups * 8 +
+           kScreenWarps * kItemRows * C * 4;
 }
-static_assert(screen_shared_bytes<2>() <= 101376, "the screen kernel's ring and columns fit one CTA");
+static_assert(screen_shared_bytes<1, true>() * 2 <= 102400, "two narrow-ring screen CTAs fit one SM's budget");
+static_assert(screen_shared_bytes<1, false>() <= 101376, "the deep-ring screen CTA fits one SM's opt-in");
+static_assert(screen_shared_bytes<2, false>() <= 101376, "the screen kernel's ring and columns fit one CTA");
 
 struct ScreenParams {
     const bf16* x;              // [K, T]
@@ -112,8 +123,8 @@ __device__ __forceinline__ bool ranks_above(float v, int r, float w, int s) {
 template <int Tiles>
 __device__ void quantize_columns(const ScreenParams& p, std::uint8_t* xq, float2* xs) {
     constexpr int C = screen_columns<Tiles>();
-    // Eight threads per (column, group), eight values each; 128 threads cover 16 groups per pass and
-    // every pass is uniform, so the eight-lane reductions never diverge.
+    // Eight threads per (column, group), eight values each; every pass is uniform, so the
+    // eight-lane reductions never diverge.
     for (int item = static_cast<int>(threadIdx.x); item < C * kGroups * 8; item += kScreenThreads) {
         const int column = item / (kGroups * 8), rest = item % (kGroups * 8);
         const int group = rest / 8, octet = rest % 8;
@@ -149,14 +160,18 @@ __device__ void quantize_columns(const ScreenParams& p, std::uint8_t* xq, float2
     }
 }
 
-// One persistent CTA per SM over 16-row items i = blockIdx.x + k * gridDim.x. A column's screen
+// Persistent CTAs over 16-row items i = blockIdx.x + k * gridDim.x. A column's screen
 // scores, lists and partials depend on that column alone (its own int8 copy, a fixed grid).
-template <int Tiles, bool Logits, bool Softmax>
+template <int Tiles, bool NarrowRing, bool Logits, bool Softmax>
 __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams p) {
     extern __shared__ __align__(16) std::uint8_t shared[];
-    constexpr int C        = screen_columns<Tiles>();
+    constexpr int C         = screen_columns<Tiles>();
+    constexpr int kRing     = kRingStages<Tiles, NarrowRing>;
+    constexpr int kWarps    = kScreenWarps;
+    constexpr int kThreads  = kScreenThreads;
+    constexpr int kGroupsPerWarp = kGroups / kWarps;
     std::uint8_t* stages   = shared;
-    std::uint8_t* xq       = shared + kStages * kStageBytes;
+    std::uint8_t* xq       = shared + kRing * kStageBytes;
     float2* xs             = reinterpret_cast<float2*>(xq + C * kColumnPitch);
     float* partial         = reinterpret_cast<float*>(xs + C * kGroups);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
@@ -165,25 +180,25 @@ __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams 
     const int first = static_cast<int>(blockIdx.x), stride = static_cast<int>(gridDim.x);
     const int mine  = first < items ? (items - first + stride - 1) / stride : 0;
 
-    // Item k of this CTA into stage k % kStages: 16 contiguous code rows (into padded rows) and their
+    // Item k of this CTA into stage k % kRing: 16 contiguous code rows (into padded rows) and their
     // contiguous scales.
     const auto issue = [&](int k) {
         const std::size_t item = static_cast<std::size_t>(first) + static_cast<std::size_t>(k) * stride;
-        std::uint8_t* stage    = stages + (k % kStages) * kStageBytes;
+        std::uint8_t* stage    = stages + (k % kRing) * kStageBytes;
         const std::uint8_t* code_source  = p.codes + item * (kItemRows * kCodeRowBytes);
         const std::uint8_t* scale_source = p.scales + item * (kItemRows * kScaleRowBytes);
-        for (int c = tid; c < kItemRows * kCodeRowBytes / 16; c += kScreenThreads) {
+        for (int c = tid; c < kItemRows * kCodeRowBytes / 16; c += kThreads) {
             const int row = c / (kCodeRowBytes / 16), part = c % (kCodeRowBytes / 16);
             cp_async<16, Cache::cg>(stage + row * kCodePitch + part * 16, code_source + c * 16);
         }
-        for (int c = tid; c < kItemRows * kScaleRowBytes / 16; c += kScreenThreads) {
+        for (int c = tid; c < kItemRows * kScaleRowBytes / 16; c += kThreads) {
             cp_async<16, Cache::cg>(stage + kStageCodeBytes + c * 16, scale_source + c * 16);
         }
     };
 
     // The codes and scales are immutable: the first items stream in before the wait.
 #pragma unroll
-    for (int k = 0; k < kStages - 1; ++k) {
+    for (int k = 0; k < kRing - 1; ++k) {
         if (k < mine) { issue(k); }
         cp_commit();
     }
@@ -201,18 +216,18 @@ __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams 
     float column_max = negative_infinity(), column_sum = 0.0f;
 
     for (int k = 0; k < mine; ++k) {
-        cp_wait<kStages - 2>();
+        cp_wait<kRing - 2>();
         __syncthreads(); // item k landed; every thread is done with item k - 1's stage and scores
-        if (k + kStages - 1 < mine) { issue(k + kStages - 1); }
+        if (k + kRing - 1 < mine) { issue(k + kRing - 1); }
         cp_commit();
-        const std::uint8_t* stage = stages + (k % kStages) * kStageBytes;
+        const std::uint8_t* stage = stages + (k % kRing) * kStageBytes;
         const auto* scales        = reinterpret_cast<const __half*>(stage + kStageCodeBytes);
         float acc[Tiles][4];
 #pragma unroll
         for (int nt = 0; nt < Tiles; ++nt) { acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f; }
 #pragma unroll 2
-        for (int j = 0; j < kWarpGroups; ++j) {
-            const int group = warp * kWarpGroups + j;
+        for (int j = 0; j < kGroupsPerWarp; ++j) {
+            const int group = warp * kGroupsPerWarp + j;
             // Word t of the group in rows g and g + 8, each 2-bit code moved to its level c + 2 in [0, 3].
             const std::uint32_t w0 =
                 *reinterpret_cast<const std::uint32_t*>(stage + g * kCodePitch + group * 16 + t * 4) ^ 0xAAAAAAAAu;
@@ -249,9 +264,11 @@ __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams 
         }
         __syncthreads();
         const int row0 = (first + k * stride) * kItemRows;
-        for (int e = tid; e < kItemRows * C; e += kScreenThreads) {
-            const float v = ((partial[e] + partial[kItemRows * C + e]) + partial[2 * kItemRows * C + e]) +
-                            partial[3 * kItemRows * C + e];
+        for (int e = tid; e < kItemRows * C; e += kThreads) {
+            // The K split's fixed summation order: warp 0's slot first, ascending.
+            float v = partial[e];
+#pragma unroll
+            for (int w = 1; w < kWarps; ++w) { v += partial[w * kItemRows * C + e]; }
             partial[e] = v;
             if constexpr (Logits) {
                 const int column = e % C;
@@ -758,7 +775,30 @@ void validate_screen(const Weight& screen) {
             "the screen must be a row-split q2_g64_fp16 [R, 2560] with R a multiple of 16");
 }
 
-// One CTA per SM, at most kMaxGrid: fixed per device, so a column's lists do not depend on the call.
+// The 1..8-column narrow ring (two co-resident CTAs) is taken on sm_121-class unified-memory parts,
+// where it measured faster (2026-10-29, GB10); every other device keeps the deep-ring CTA it was
+// tuned with. Fixed per device, so a column's lists do not depend on the call.
+bool narrow_ring_device() {
+    static std::array<std::atomic<int>, 64> choices{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const int slot = device >= 0 && device < 64 ? device : 0;
+    int choice     = choices[slot].load(std::memory_order_acquire);
+    if (choice == 0) {
+        int major = 0, minor = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+        choice = (major == 12 && minor == 1) ? 2 : 1;
+        choices[slot].store(choice, std::memory_order_release);
+    }
+    return choice == 2;
+}
+
+// The screen grid for one (Tiles, NarrowRing) shape: the co-resident CTAs per SM the occupancy
+// admits times the SM count, at most kMaxGrid, then down to the item count. The occupancy is judged
+// on a representative instantiation (the forms share the shared memory and register footprint), so
+// the launch grid the round-robin candidate lists depend on is form-independent.
+template <int Tiles, bool NarrowRing>
 int screen_grid(int items) {
     static std::array<std::atomic<int>, 64> grids{};
     int device = 0;
@@ -766,18 +806,20 @@ int screen_grid(int items) {
     const int slot = device >= 0 && device < 64 ? device : 0;
     int grid       = grids[slot].load(std::memory_order_acquire);
     if (grid == 0) {
-        int sms = 0;
+        int sms = 0, per_sm = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-        grid = std::clamp(sms, 1, kMaxGrid);
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, screen_kernel<Tiles, NarrowRing, false, true>,
+                                                                kScreenThreads, screen_shared_bytes<Tiles, NarrowRing>()));
+        grid = std::clamp(sms * std::max(per_sm, 1), 1, kMaxGrid);
         grids[slot].store(grid, std::memory_order_release);
     }
     return std::min(grid, items);
 }
 
-template <int Tiles, bool Logits, bool Softmax>
+template <int Tiles, bool NarrowRing, bool Logits, bool Softmax>
 void launch_screen(const ScreenParams& p, int grid, cudaStream_t stream) {
-    constexpr auto kernel = screen_kernel<Tiles, Logits, Softmax>;
-    constexpr int bytes   = screen_shared_bytes<Tiles>();
+    constexpr auto kernel = screen_kernel<Tiles, NarrowRing, Logits, Softmax>;
+    constexpr int bytes   = screen_shared_bytes<Tiles, NarrowRing>();
     static const cudaError_t configured =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     CUDA_CHECK(configured);
@@ -786,12 +828,21 @@ void launch_screen(const ScreenParams& p, int grid, cudaStream_t stream) {
 }
 
 template <bool Logits, bool Softmax>
-void run_screen(const ScreenParams& p, int grid, cudaStream_t stream) {
+int run_screen(const ScreenParams& p, cudaStream_t stream) {
+    const int items = p.rows / kItemRows;
     if (p.columns <= 8) {
-        launch_screen<1, Logits, Softmax>(p, grid, stream);
-    } else {
-        launch_screen<2, Logits, Softmax>(p, grid, stream);
+        if (narrow_ring_device()) {
+            const int grid = screen_grid<1, true>(items);
+            launch_screen<1, true, Logits, Softmax>(p, grid, stream);
+            return grid;
+        }
+        const int grid = screen_grid<1, false>(items);
+        launch_screen<1, false, Logits, Softmax>(p, grid, stream);
+        return grid;
     }
+    const int grid = screen_grid<2, false>(items);
+    launch_screen<2, false, Logits, Softmax>(p, grid, stream);
+    return grid;
 }
 
 // The workspace recipe, shared by the query and the calls.
@@ -834,6 +885,15 @@ std::size_t screened_head_workspace_bytes(std::int32_t head_rows, std::int32_t m
     return layout.peak_bytes();
 }
 
+int screened_head_screen_grid(std::int32_t head_rows, std::int32_t columns) {
+    if (head_rows <= 0 || head_rows % kItemRows != 0 || columns < 1 || columns > kScreenedHeadMaxColumns) {
+        throw std::invalid_argument("screened_head screen grid: invalid rows or column count");
+    }
+    const int items = head_rows / kItemRows;
+    if (columns > 8) { return screen_grid<2, false>(items); }
+    return narrow_ring_device() ? screen_grid<1, true>(items) : screen_grid<1, false>(items);
+}
+
 void screened_head_top(const Tensor& x, const Weight& head, const Weight& screen, std::int32_t valid_rows,
                        const ScreenedHeadPolicy& policy, Tensor& rows, Tensor& logprobs, const Tensor& row_ids,
                        Tensor& tokens, WorkspaceArena& workspace, cudaStream_t stream) {
@@ -860,8 +920,7 @@ void screened_head_top(const Tensor& x, const Weight& head, const Weight& screen
     }
     auto scope          = workspace.scope();
     const Scratch scratch = allocate_scratch(workspace, T, policy.rescored);
-    const int grid      = screen_grid(R / kItemRows);
-    run_screen<false, true>(screen_params(x, screen, valid_rows, scratch), grid, stream);
+    const int grid      = run_screen<false, true>(screen_params(x, screen, valid_rows, scratch), stream);
     const TopParams top{.x            = static_cast<const bf16*>(x.data),
                         .codes        = static_cast<const std::uint8_t*>(head.qdata),
                         .scales       = static_cast<const __half*>(head.scales),
@@ -904,11 +963,10 @@ void screened_head_logits(const Tensor& x, const Tensor& bf16_head, const Weight
             "logits must be contiguous FP32 [R, T]");
     auto scope            = workspace.scope();
     const Scratch scratch = allocate_scratch(workspace, T, policy.rescored);
-    const int grid        = screen_grid(R / kItemRows);
     ScreenParams params   = screen_params(x, screen, valid_rows, scratch);
     params.logits         = static_cast<float*>(logits.data);
     params.partials       = nullptr;
-    run_screen<true, false>(params, grid, stream);
+    const int grid        = run_screen<true, false>(params, stream);
     const ListParams list{.lists   = static_cast<const float2*>(scratch.lists.data),
                           .grid    = grid,
                           .margin  = policy.margin,

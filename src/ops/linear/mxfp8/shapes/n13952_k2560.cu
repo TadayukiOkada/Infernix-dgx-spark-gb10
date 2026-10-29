@@ -1,9 +1,15 @@
 // Qwen3.8-Flash-Next QSA query, gate, key, value and indexer projections, one MXFP8 parent with BF16
 // activations (W8A16, NVIDIA FP4-Local). Every width runs the Tensor Core route, whose schedules
 // accumulate a column in one order, so a column has the same bits at every T and with either producer
-// (mxfp8_a16_tma_mma.cuh). 13,952 rows admit row tiles up to 128. The selection is
-// bench/ops/mxfp8_flash_next_sweep.cu's (RTX 5090, 2026-10-20: the fastest schedule per width, merged
-// within 2 %): cp.async to 192 columns, TMA from there.
+// (mxfp8_a16_tma_mma.cuh). 13,952 rows admit row tiles up to 128.
+// The selection is bench/ops/mxfp8_flash_next_sweep.cu's (GB10, 2026-10-29, 21 repetitions per point,
+// tolerance 2 %). All 41 schedules were bit-identical to the reference at T = 1 and T = 300 (with the
+// FP64 screen), so the retune changes no output bit. On GB10 (48 SMs, 24 MiB L2, a 48 MiB cold-L2 flush)
+// it is 1.008x in geomean over the 28 measured widths, with no width's median or p95 worse than the RTX
+// 5090 selection it replaces: T = 96 178.91 -> 171.94 us, T = 192 204.74 -> 194.72 us, T = 8192
+// 21,147 -> 20,437 us. The 36.19 MB parent puts every width up to 64 columns within 1-2 % of the
+// 152.46 us weight-read floor, so those bands are kept as the 5090 measured them; taking the sweep's
+// argmin there bought 0.9 % of geomean and regressed p95 by up to 1.37x.
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/mxfp8/mxfp8_launch.cuh"
 #include "ops/linear/mxfp8/mxfp8_shapes.h"
@@ -26,15 +32,15 @@ void select_a16(const Mxfp8Operands& p, Output output, cudaStream_t stream) {
     if (tokens <= 6) return mxfp8_tma<Geometry, Mxfp8P4<Mxfp8TmaT16R128>>(p, output, stream);
     if (tokens <= 16) return mxfp8_tma<Geometry, Mxfp8P2<Mxfp8TmaT16R128>>(p, output, stream);
     if (tokens <= 64) return mxfp8_tma<Geometry, Fp8A16RingT32R64S3>(p, output, stream);
-    if (tokens <= 128) return mxfp8_tma<Geometry, Mxfp8P2<Mxfp8TmaT64R64>>(p, output, stream);
-    if (tokens <= 192) return mxfp8_tma<Geometry, Mxfp8P4<Fp8A16RingT64R128>>(p, output, stream);
-    if (tokens <= 256) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(p, output, stream);
-    if (tokens <= 768) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
-    if (tokens <= 1024) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(p, output, stream);
-    mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
+    if (tokens <= 128) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(p, output, stream);
+    if (tokens <= 192) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(p, output, stream);
+    if (tokens <= 4096) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
+    mxfp8_tma<Geometry, Mxfp8P4<Mxfp8TmaT16R128>>(p, output, stream);
 }
 
-// f16-accumulate-prefill: the exact route's TMA tiles at the same widths (not yet swept for this route).
+// f16-accumulate-prefill: the TMA tiles of the exact route's RTX 5090 selection, kept as they were. This
+// route is not swept by mxfp8_flash_next_sweep.cu, so its bands are unverified on GB10; they no longer
+// match the exact route's widths.
 template <class Output>
 void select_f16(const Tensor& x, const Weight& weight, Output output, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {

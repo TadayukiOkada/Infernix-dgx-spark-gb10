@@ -17,6 +17,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/sincos_reduced.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
@@ -100,11 +101,8 @@ struct PrepareArgs {
 // both scaled by the attention scale (ops/kernel/rope.cuh PreparedRopeCoefficients::sincos_axis and
 // qsa.cu's rope_angle, the same coefficients for the attention and the index rotation).
 __device__ __forceinline__ void yarn_sincos(const PrepareArgs& a, int pair, int position, float& c, float& s) {
-    constexpr double kInvTwoPi = 1.59154943091895336e-01;
-    constexpr double kTwoPi    = 6.28318530717958648e+00;
-    const double angle  = static_cast<double>(position) * a.inverse[pair];
-    const float reduced = static_cast<float>(angle - nearbyint(angle * kInvTwoPi) * kTwoPi);
-    sincosf(reduced, &s, &c);
+    const double angle = static_cast<double>(position) * a.inverse[pair];
+    sincos_turns(angle, &s, &c);
     s *= a.attention_scale;
     c *= a.attention_scale;
 }
@@ -117,7 +115,7 @@ __device__ __forceinline__ void attention_sincos(const PrepareArgs& a, int pair,
         return;
     }
     const float frequency = powf(a.theta, -2.0F * static_cast<float>(pair) / static_cast<float>(kRotary));
-    sincosf(static_cast<float>(position) * frequency, &s, &c);
+    sincos_turns(static_cast<double>(position) * static_cast<double>(frequency), &s, &c);
 }
 
 // The index rotation's coefficients: qsa_index_query's and qsa_pool_keys's (qsa.cu rope_angle).
@@ -127,7 +125,7 @@ __device__ __forceinline__ void index_sincos(const PrepareArgs& a, int pair, int
         return;
     }
     const float inverse = 1.0F / powf(a.theta, static_cast<float>(2 * pair) / static_cast<float>(kRotary));
-    sincosf(static_cast<float>(position) * inverse, &s, &c);
+    sincos_turns(static_cast<double>(position) * static_cast<double>(inverse), &s, &c);
 }
 
 // Axis lane % 3 (the axis of pair `lane`) of column `column`'s RoPE position.

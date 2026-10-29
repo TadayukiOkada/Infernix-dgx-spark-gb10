@@ -33,6 +33,14 @@ MODEL_PATH="/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flas
 NGRAM_PATH="/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4.ngram"
 DIST_DIR="${REPO_ROOT}/dist/milestones"
 DRAFT_PATH="/opt/etc/models/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
+# DFlash2 vs MTP on GB10 (2026-10-29, pp2048+tg128, fp8 KV, interleaved medians, decode out t/s):
+#   c = 1: DFlash2 109.4 (dense8) / 114.8 (F4-Local) vs MTP 81.8 / 91.7 - DFlash2 +25..34 %.
+#   c = 2: DFlash2 67.9 on DFlash2Pairs-qualified artifacts (Q8/GGUF/BF16/FP8/MXFP8 dense; the
+#          kDFlashPairMaxDrafts default is 8 on GB10) vs MTP 53.8; on the NVFP4-dense F4-Local
+#          default artifact below the pair fast path is NOT qualified - DFlash2 there decodes
+#          plain (35.6), so MTP below is the right config for this MODEL_PATH at c >= 2.
+#   c = 4: MTP 38.8 beats DFlash2's 2-row pair default (20.6) and its INFERNIX_TMP_DFLASH2_ROWS=4
+#          probe (37.4): keep this server (MAX_CONCURRENCY=4) on MTP; prefer DFlash2 for c <= 2.
 # Server parameters
 HOST="0.0.0.0"
 PORT="8000"

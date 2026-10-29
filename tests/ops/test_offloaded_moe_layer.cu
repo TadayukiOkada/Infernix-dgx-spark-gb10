@@ -17,6 +17,7 @@
 #include "ops/op_family.h"
 #include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
+#include "ops/host_parallel.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/a4r_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -56,8 +57,11 @@ int g_failures = 0;
 // The idle-service latency checks (Config::idle) bound a call's time to a few milliseconds, which holds
 // only with the GPU to themselves, so CTest runs them as an entry of their own (--idle-only, run alone)
 // and every other check beside other tests (--no-idle). Without either flag everything runs.
+// --a16-only restricts the run to the W4A16 and two-term layers, the only cases that read the
+// CPU team's INFERNIX_TMP_CPU_SHARED_X; it combines with either idle flag.
 enum class IdleChecks { kAll, kSkip, kOnly };
 IdleChecks g_idle_checks = IdleChecks::kAll;
+bool g_a16_only          = false;
 
 // Live hosts get production's bound (kHeartbeatTimeoutNs, 10 s): under a loaded machine a 1 s bound
 // mistook OS scheduling stalls for dead hosts. The silent-host cases wait their whole bound, so they
@@ -200,6 +204,9 @@ private:
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                 moe::ExpertActivation activation = moe::ExpertActivation::kA4,
                 moe::NarrowA16 narrow = moe::NarrowA16::kExact, moe::WideA16 wide = moe::WideA16::kExact) {
+    // Under --idle-only, the 60 ms idle-service latency bound is checked on the one-column decode
+    // geometry (T = 1) and the multi-column shared-x geometry (T = 5) of each activation mode.
+    if (g_idle_checks == IdleChecks::kOnly && columns != 1 && columns != 5) { return; }
     const bool a16 = activation == moe::ExpertActivation::kA16;
     if (a16) {
         std::printf("--- W4A16 experts%s%s\n", narrow == moe::NarrowA16::kA4Residual ? ", two-term narrow route" : "",
@@ -294,16 +301,19 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::vector<int> id_columns(static_cast<std::size_t>(experts), 0);
     for (const std::int32_t id : ids) { ++id_columns[static_cast<std::size_t>(id)]; }
     std::vector<std::uint16_t> expected(static_cast<std::size_t>(moe::kHidden) * top_k * columns);
-    for (int t = 0; t < columns; ++t) {
-        for (int s = 0; s < top_k; ++s) {
-            const int id = ids[static_cast<std::size_t>(t) * top_k + s];
-            const bool two_term = a16 && narrow == moe::NarrowA16::kA4Residual &&
-                                  id_columns[static_cast<std::size_t>(id)] <= moe::kMaxColumns;
-            const auto y = cpu_column(bank[id], &x[static_cast<std::size_t>(t) * moe::kHidden], activation, two_term);
-            std::memcpy(&expected[(static_cast<std::size_t>(t) * top_k + s) * moe::kHidden], y.data(),
-                        moe::kHidden * sizeof(std::uint16_t));
-        }
-    }
+    const std::int64_t total_evals = static_cast<std::int64_t>(columns) * top_k;
+    infernix::test::parallel_ranges(
+        total_evals, infernix::test::threads_for_rows(total_evals, 16), [&](std::int64_t begin, std::int64_t end) {
+            for (std::int64_t idx = begin; idx < end; ++idx) {
+                const int t   = static_cast<int>(idx / top_k);
+                const int id  = ids[static_cast<std::size_t>(idx)];
+                const bool two_term = a16 && narrow == moe::NarrowA16::kA4Residual &&
+                                      id_columns[static_cast<std::size_t>(id)] <= moe::kMaxColumns;
+                const auto y = cpu_column(bank[id], &x[static_cast<std::size_t>(t) * moe::kHidden], activation, two_term);
+                std::memcpy(&expected[static_cast<std::size_t>(idx) * moe::kHidden], y.data(),
+                            moe::kHidden * sizeof(std::uint16_t));
+            }
+        });
 
     const int max_jobs = std::min(experts, top_k * columns);
     std::uint8_t* d_staging = nullptr;
@@ -1533,8 +1543,9 @@ void test_route_pooled(int experts, int columns, int top_k, int slots, std::uint
     cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
     cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
     values = random_logits();
-    cuda_check(cudaMemcpy(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice), "copy");
-    cuda_check(cudaMemset(d_demand, 0, sizeof(std::int32_t) * (experts + 1)), "memset");
+    cuda_check(cudaMemcpyAsync(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice, stream),
+               "copy");
+    cuda_check(cudaMemsetAsync(d_demand, 0, sizeof(std::int32_t) * (experts + 1), stream), "memset");
     cuda_check(cudaGraphLaunch(exec, stream), "launch");
     cuda_check(cudaStreamSynchronize(stream), "replay");
     verify(values, "graph replay");
@@ -1583,16 +1594,24 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--no-idle") {
-        g_idle_checks = IdleChecks::kSkip;
-    } else if (argc == 2 && std::string_view(argv[1]) == "--idle-only") {
-        g_idle_checks = IdleChecks::kOnly;
-    } else if (argc != 1) {
-        std::fprintf(stderr, "usage: infernix_offloaded_moe_layer_test [--no-idle | --idle-only]\n");
-        return 2;
+    bool idle_given = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--no-idle" && !idle_given) {
+            g_idle_checks = IdleChecks::kSkip;
+            idle_given    = true;
+        } else if (arg == "--idle-only" && !idle_given) {
+            g_idle_checks = IdleChecks::kOnly;
+            idle_given    = true;
+        } else if (arg == "--a16-only") {
+            g_a16_only = true;
+        } else {
+            std::fprintf(stderr, "usage: infernix_offloaded_moe_layer_test [--no-idle | --idle-only] [--a16-only]\n");
+            return 2;
+        }
     }
     try {
-        if (g_idle_checks != IdleChecks::kOnly) {
+        if (g_idle_checks != IdleChecks::kOnly && !g_a16_only) {
             for (const int entries : {1, 10, 1024, 1025, 40960}) { test_dispatch(512, entries, 100U + entries); }
             test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
             test_dispatch(3, 1000, 37);    // few experts, long runs per expert
@@ -1613,16 +1632,18 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_service_column_bound();
             test_service_failure_reported();
         }
-        test_layer(12, 1, 10, 7);  // decode: one column, ten experts
-        test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
-        test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job
-        test_layer(9, 4, 3, 17);   // MTP verification width
-        test_layer(9, 12, 3, 67);  // a call past the fork route, several columns per expert
-        test_layer(96, 10, 10, 19); // more misses than the largest cap; publishes a subset of ten columns
-        test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
-        test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
-        test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
-        if (g_idle_checks != IdleChecks::kOnly) {
+        if (!g_a16_only) {
+            test_layer(12, 1, 10, 7);  // decode: one column, ten experts
+            test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
+            test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job
+            test_layer(9, 4, 3, 17);   // MTP verification width
+            test_layer(9, 12, 3, 67);  // a call past the fork route, several columns per expert
+            test_layer(96, 10, 10, 19); // more misses than the largest cap; publishes a subset of ten columns
+            test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
+            test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
+            test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
+        }
+        if (g_idle_checks != IdleChecks::kOnly && !g_a16_only) {
             test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
             test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
             test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped

@@ -86,7 +86,10 @@ struct VqPromptShape {
     static constexpr int CodesOffset  = StagesOffset + Tiles * StageBytes;
     static constexpr int CodebookOffset = CodesOffset + 2 * CodeBytes;
     static constexpr int SignOffset   = CodebookOffset + kKVCacheVq2Patterns * 8;
-    static constexpr int SmemBytes    = SignOffset + 128 * 8;
+    // Per-warp copy of all 16 query-row scales that warp encodes: reading them from shared at
+    // each group step frees 16 registers per lane, which the full-D accumulators cannot spare.
+    static constexpr int QScaleOffset = SignOffset + 128 * 8;
+    static constexpr int SmemBytes    = QScaleOffset + Warps * 16 * kVqPromptGroups * 4;
     static_assert(StageBytes % 16 == 0 && CodeBytes % 16 == 0);
     static_assert(SmemBytes <= 99 * 1024);
 };
@@ -180,6 +183,7 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     std::int8_t* codebook = reinterpret_cast<std::int8_t*>(smem_raw + Shape::CodebookOffset);
     uint2* sign_masks     = reinterpret_cast<uint2*>(smem_raw + Shape::SignOffset);
+    float* q_scale_s      = reinterpret_cast<float*>(smem_raw + Shape::QScaleOffset);
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -234,7 +238,9 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
     vq_stage_codebook(codebook, tid, Threads);
     kv_cache_vq2_stage_sign_masks(sign_masks, tid, Threads);
 
-    float q_scale_r[2][Groups];
+    // Each warp rotates and encodes its own 16 rows and publishes every row scale to its
+    // shared-memory slice; QK reads the two accumulator rows each lane owns per group step.
+    float* q_scale_w = q_scale_s + warp * (16 * Groups);
 #pragma unroll
     for (int r = 0; r < 16; ++r) {
         const int row    = warp * 16 + r;
@@ -260,7 +266,7 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
             causal_prompt_store_byte_swizzled(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
             causal_prompt_store_byte_swizzled(q_i8, row, d0 + 32,
                                               kv_cache_int8_quant_code(x1, inv));
-            if (gid == (r & 7)) { q_scale_r[r >> 3][grp] = qs; }
+            if (gid == (r & 7)) { q_scale_w[r * Groups + grp] = qs; }
         }
     }
 
@@ -545,34 +551,30 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
         for (int nt = 0; nt < QKNt; ++nt) {
             score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
         }
-#pragma unroll
+#pragma unroll 1
         for (int grp = 0; grp < Groups; ++grp) {
-            unsigned af[GroupKc][4];
-#pragma unroll
-            for (int kk = 0; kk < GroupKc; ++kk) {
-                const int acol = (grp * GroupKc + kk) * 16 + a_coloff;
-                ldmatrix_x4(af[kk][0], af[kk][1], af[kk][2], af[kk][3],
-                            smem_addr(&q_b16[(row_base + a_rowoff) * DB16 +
-                                             causal_prompt_swz(row_base + a_rowoff, acol)]));
-            }
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
 #pragma unroll
                 for (int kk = 0; kk < GroupKc; ++kk) {
+                    const int acol = (grp * GroupKc + kk) * 16 + a_coloff;
+                    unsigned af[4];
+                    ldmatrix_x4(af[0], af[1], af[2], af[3],
+                                smem_addr(&q_b16[(row_base + a_rowoff) * DB16 +
+                                                 causal_prompt_swz(row_base + a_rowoff, acol)]));
                     const int brow = nt * 8 + a_rin;
                     const int bcol = (grp * GroupKc + kk) * 16 + b_koff;
                     unsigned bf[2];
                     ldmatrix_x2(bf[0], bf[1],
                                 smem_addr(&k_b16[brow * DB16 + causal_prompt_swz(brow, bcol)]));
-                    mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
-                           bf[1]);
+                    mma_s8(c0, c1, c2, c3, af[0], af[1], af[2], af[3], bf[0], bf[1]);
                 }
                 const int keya  = nt * 8 + 2 * lid;
                 const float ks0 = __half2float(ks_s[keya * Groups + grp]);
                 const float ks1 = __half2float(ks_s[(keya + 1) * Groups + grp]);
-                const float qs0 = q_scale_r[0][grp];
-                const float qs1 = q_scale_r[1][grp];
+                const float qs0 = q_scale_w[gid * Groups + grp];
+                const float qs1 = q_scale_w[(gid + 8) * Groups + grp];
                 score[nt][0]    = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
                 score[nt][1]    = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
                 score[nt][2]    = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
@@ -782,8 +784,10 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
             reinterpret_cast<const std::int8_t*>(base) + Shape::TileBytes;
         const __half* vs_s =
             reinterpret_cast<const __half*>(v_s + Shape::TileBytes) + Bc * Groups;
-        const __half2 mul   = __float2half2_rn(ldexpf(1.0f, -tile_shift));
-        const float unscale = ldexpf(1.0f, tile_shift);
+        const __half2 mul    = __float2half2_rn(ldexpf(1.0f, -tile_shift));
+        const float unscale  = ldexpf(1.0f, tile_shift);
+        const float a_scale0 = tile_shift != 0 ? ldexpf(tile_alpha0, -tile_shift) : tile_alpha0;
+        const float a_scale1 = tile_shift != 0 ? ldexpf(tile_alpha1, -tile_shift) : tile_alpha1;
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
             unsigned vsc[PVKs][2];
@@ -804,11 +808,16 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
 #pragma unroll
             for (int pass = 0; pass < GroupDBlocks / PassDBlocks; ++pass) {
                 const int db0 = grp * GroupDBlocks + pass * PassDBlocks;
-                unsigned h[PassDBlocks][2][2];
 #pragma unroll
                 for (int b = 0; b < PassDBlocks; ++b) {
 #pragma unroll
-                    for (int p = 0; p < 2; ++p) { h[b][p][0] = h[b][p][1] = 0u; }
+                    for (int p = 0; p < 2; ++p) {
+                        float (&a)[4] = acc[db0 + b][p];
+                        a[0] *= a_scale0;
+                        a[1] *= a_scale0;
+                        a[2] *= a_scale1;
+                        a[3] *= a_scale1;
+                    }
                 }
 #pragma unroll
                 for (int j = 0; j < PVKs; ++j) {
@@ -827,32 +836,26 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
                                                                 odd_lo);
                             causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc[j][1], even_hi,
                                                                 odd_hi);
-                            unsigned (&he)[2] = h[2 * q2 + b][0];
-                            unsigned (&ho)[2] = h[2 * q2 + b][1];
-                            causal_prompt_i8_fast_mma_f16_acc(he[0], he[1], pa[j][0], pa[j][1],
-                                                              pa[j][2], pa[j][3], even_lo, even_hi);
-                            causal_prompt_i8_fast_mma_f16_acc(ho[0], ho[1], pa[j][0], pa[j][1],
-                                                              pa[j][2], pa[j][3], odd_lo, odd_hi);
+                            float (&ae)[4] = acc[db + b][0];
+                            float (&ao)[4] = acc[db + b][1];
+                            mma_f16(ae[0], ae[1], ae[2], ae[3], pa[j][0], pa[j][1], pa[j][2],
+                                    pa[j][3], even_lo, even_hi);
+                            mma_f16(ao[0], ao[1], ao[2], ao[3], pa[j][0], pa[j][1], pa[j][2],
+                                    pa[j][3], odd_lo, odd_hi);
                         }
                     }
                 }
+                if (tile_shift != 0) {
 #pragma unroll
-                for (int b = 0; b < PassDBlocks; ++b) {
+                    for (int b = 0; b < PassDBlocks; ++b) {
 #pragma unroll
-                    for (int p = 0; p < 2; ++p) {
-                        float (&a)[4] = acc[db0 + b][p];
-                        float2 r0     = __half22float2(load_vec<__half2>(&h[b][p][0]));
-                        float2 r1     = __half22float2(load_vec<__half2>(&h[b][p][1]));
-                        if (tile_shift != 0) {
-                            r0.x *= unscale;
-                            r0.y *= unscale;
-                            r1.x *= unscale;
-                            r1.y *= unscale;
+                        for (int p = 0; p < 2; ++p) {
+                            float (&a)[4] = acc[db0 + b][p];
+                            a[0] *= unscale;
+                            a[1] *= unscale;
+                            a[2] *= unscale;
+                            a[3] *= unscale;
                         }
-                        a[0] = __fmaf_rn(a[0], tile_alpha0, r0.x);
-                        a[1] = __fmaf_rn(a[1], tile_alpha0, r0.y);
-                        a[2] = __fmaf_rn(a[2], tile_alpha1, r1.x);
-                        a[3] = __fmaf_rn(a[3], tile_alpha1, r1.y);
                     }
                 }
             }

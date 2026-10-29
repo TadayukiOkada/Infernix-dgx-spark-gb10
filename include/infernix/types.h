@@ -236,7 +236,7 @@ enum class FastPath : std::uint8_t {
     // Prefill steps take a wider chunk while no request is waiting to decode (the chunk boundaries,
     // and with them the prefill arithmetic, depend on load).
     IdleWidePrefill,
-    // Qwen3.8-Flash-Next GGUF imports: dense projections of prefill calls of 32 or more columns run on
+    // Qwen3.8-Flash-Next GGUF imports: dense projections of prefill calls of 128 or more columns run on
     // BF16 tensor cores (each code exact in BF16, x as stored, FP32 sums of each sub-block scaled by
     // d * sub; ops::LinearRoutes::GgmlBf16Wide) instead of the exact A16 integer tiles, and the GGUF
     // expert banks' MoE calls of 4,096 or more columns the same arithmetic, each K stage of an expert's
@@ -819,7 +819,7 @@ struct EngineOptions {
     // §19.3.31). Decode and verification calls: int8 codes with an FP32 scale per 32 values (llama.cpp's Q8_1
     // form) in a GGUF import's dense projections (calls of 1-31 columns) and in routed experts (GGUF and NVFP4
     // W4A16 banks, calls of at most 128 columns) with their CPU-served misses (the CPU returns the GPU's bits).
-    // Prefill calls: on the same codec, a GGUF import's dense projections (calls of 32 or more columns) and the
+    // Prefill calls: on the same codec, a GGUF import's dense projections (calls of 128 or more columns) and the
     // same routed experts (calls of more than 128 columns, in place of expert-a4-residual's A4 terms where that
     // runs); a groupwise Q4 MLP gate/up's int8 activations per token (q4-w4a8's route, calls of 256 or more
     // columns); MXFP8 dense projections' two E4M3 terms per 32 values (fp8-a8-pair-block32's route, in place of

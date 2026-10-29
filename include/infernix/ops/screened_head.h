@@ -17,12 +17,13 @@ namespace infernix::ops {
  * `rescored` of them, the highest screen scores first (equal scores: the lower row first), and at
  * least `ranks` (the Op's required rows) even when fewer lie within the margin.
  *
- * The candidates are the screen's per-CTA lists: the screen's g CTAs (one per SM, at most 256) take
- * the head's 16-row items round-robin (item i to CTA i mod g) and each keeps its best 8 rows per
- * column, so a row is a candidate only when fewer than 8 rows of its CTA score above it. A CTA's rows
- * are 16-row runs g * 16 rows apart: more than 8 rows within the margin in one CTA (a run of adjacent
- * near-equal tokens, such as the digits) drops the CTA's lower ones. The candidate set, and with it
- * every output, depends on the device's SM count, never on T or other columns.
+ * The candidates are the screen's per-CTA lists: the screen's g CTAs (screened_head_screen_grid)
+ * take the head's 16-row items round-robin (item i to CTA i mod g) and each keeps its best 8 rows
+ * per column, so a row is a candidate only when fewer than 8 rows of its CTA score above it. A CTA's
+ * rows are 16-row runs g * 16 rows apart: more than 8 rows within the margin in one CTA (a run of
+ * adjacent near-equal tokens, such as the digits) drops the CTA's lower ones. The candidate set, and
+ * with it every output, depends on the device's SM count and shared memory per SM, never on T or
+ * other columns.
  */
 struct ScreenedHeadPolicy {
     float margin           = 5.0F;
@@ -33,6 +34,16 @@ struct ScreenedHeadPolicy {
 inline constexpr std::int32_t kScreenedHeadMaxColumns = 16;
 // The ranks screened_head_top returns per column (1..4).
 inline constexpr std::int32_t kScreenedHeadMaxRanks = 4;
+
+/**
+ * The screen kernel's persistent grid for a call of `columns` columns over a `head_rows`-row
+ * screen: the co-resident CTAs per SM the screen kernel's item ring admits (sm_121-class parts run
+ * the 1..8-column narrow two-item ring at two CTAs per SM; every other device runs the four-item
+ * ring at one), times the SM count, clamped to [1, 256] and then to the head's 16-row item count.
+ * The round-robin item-to-CTA assignment the candidate lists come from depends on this value, so so
+ * does every output; it is fixed per device and column width. Invalid rows or columns throw.
+ */
+[[nodiscard]] int screened_head_screen_grid(std::int32_t head_rows, std::int32_t columns);
 
 /**
  * Caller-owned transient capacity of screened_head_top and screened_head_logits for every column

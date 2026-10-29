@@ -448,10 +448,17 @@ constexpr std::array kQualified{
     // measured, each against the default route (ABBA, RTX 5090, 2026-10-25):
     // NVIDIA FP4-Local, INT8 KV: screened-lm-head, plain decode (pp1024+tg256) +7.5 % (4 of 4 blocks, worst
     // +7.2 %), MTP 3 with --lm-head-draft +3.7 % (4 of 4, worst +3.3 %); it runs where the artifact carries the
-    // LM head's screen (select_fast_paths). f16-accumulate-prefill, pp32768 +5.3 % with the route's row raster
-    // and B fragments (3 of 3), pp4096 neutral.
+    // LM head's screen (select_fast_paths).
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::F16AccumulatePrefill, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    // f16-accumulate-prefill is off by default on GB10. It was qualified here on the 5090's 1:2
+    // FP32-vs-FP16 HMMA rate (pp32768 +5.3 %, pp4096 neutral); sm_121a runs FP32-accumulating HMMA at 1:1
+    // parity, so that advantage is absent, and timing the three MXFP8 routes through ops::linear on GB10
+    // (21 repetitions, 48 MiB cold-L2 flush, 2026-10-29; docs/gb10/20261029-changelog.md) found the route
+    // 5.3-36.2 % slower than the retuned exact route at its admitted widths on [16384,2560], [2560,6144],
+    // [1280,2560] and [2560,640], and faster only on [13952,2560] from 4096 columns (-12.1 %, -40.7 % at
+    // 8192). The single kMxfp8F16MinTokens = 256 admission cannot express that split, so no configuration
+    // registers it; re-enabling it takes per-problem admissions (the field is per problem) and the model
+    // gate, not a default here. The route and its op-level qualification stay registered.
     // Dense8 and Recipe A: FP16 GDN prefill and fused QSA prepare across Flash-Next artifacts.
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, KvCacheStorage::Int8Group64}},
@@ -783,11 +790,15 @@ A8Routes a8_activation_routes(const FastPathConfiguration& configuration, QType 
     // Decode: Ornith-122B's W4A8 expert kernels 630 against 906 ms, FP4-Local's CPU team 80,926 against 29,371
     // columns/s (W4A4 banks keep their 4-bit route).
     out.nvfp4_experts = nvfp4 && !configuration.a4_experts && !expert_a4_narrow;
-    // Prefill: a GGUF import's dense projections on the 8-bit tiles; not yet measured end to end.
+    // Prefill: a GGUF import's dense projections on the 8-bit tiles; E2E pp4096 1,270.2 against 1,847.9 tok/s and
+    // op level 0.13–0.85× the replaced route's time at 128 columns or more on every tested format (2026-10-29); the
+    // 1,280-row gate/up projection at calls of 128 columns is the exception (1.13× exact, still ahead of the BF16
+    // tiles' 1.58×).
     out.ggml_dense_prefill = ggml_projections != 0;
     // Prefill: FP4-Local's MXFP8 dense on the block-scaled pair; not yet measured end to end.
     out.mxfp8_dense = configuration.dense == DenseKernels::Mxfp8;
-    // Prefill: the experts' wide calls on the 8-bit tiles (beside their narrow route); not yet measured end to end.
+    // Prefill: the experts' wide calls on the 8-bit tiles (beside their narrow route); GGUF expert banks take
+    // 0.90–0.59× the BF16 route's time at 64 to 4,096 rows, inside E2E tg128 44.7 against 49.4 tok/s (2026-10-29).
     out.experts_prefill = out.ggml_experts || out.nvfp4_experts;
     return out;
 }
@@ -834,7 +845,7 @@ std::string A8Routes::describe() const {
         add(decode, "the routed experts (calls of up to 128 columns) with their CPU-served misses");
     }
     if (ggml_dense_prefill) {
-        add(prefill, std::to_string(ggml_projections) + " GGUF dense projections (calls of 32 or more columns)");
+        add(prefill, std::to_string(ggml_projections) + " GGUF dense projections (calls of 128 or more columns)");
     }
     if (mxfp8_dense) { add(prefill, "the MXFP8 dense projections (two E4M3 terms per 32 values, fp8-a8-pair-block32)"); }
     if (experts_prefill) { add(prefill, "the routed experts (calls of more than 128 columns)"); }

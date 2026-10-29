@@ -2,7 +2,7 @@
 
 // The wide (prefill-width) tensor-core tiles of the 8-bit activation route over GGUF weights
 // (`--a8-activations`: LOSSY, opt-in; docs/maintainer/qwen3_8-flash-next-design.md §19.3.31): ops::ggml_linear's
-// calls of 32 or more columns under LinearRoutes::GgmlA8Wide (compute_plane, over decoded weight planes of
+// calls of 128 or more columns under LinearRoutes::GgmlA8Wide (compute_plane, over decoded weight planes of
 // PlaneStage images) and the GGUF expert banks' wide jobs under WideA16::kA8 (compute_decode, which decodes each
 // K stage of the raw rows in shared memory). The activations are ops/ggml/ggml_a8.h's codec, the narrow routes'
 // codes and slice scales: every column quantized per 32-element slice s to int8 codes q with an FP32 scale d_s.
@@ -408,6 +408,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
         const int elems         = 32 * min(tile::kUnitSlices, slices - u * tile::kUnitSlices);
         const int bytes         = elems / kBlockElems * kBlockBytes;
         const std::size_t begin = static_cast<std::size_t>(u) * kUnitBytes<F>;
+#pragma unroll 1
         for (int i = tid; i < kDecodeRows * kRawChunks<F>; i += kThreads) {
             const int r = i / kRawChunks<F>, chunk = i % kRawChunks<F>;
             const std::uint8_t* src = row_of(r) + begin;
@@ -440,7 +441,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
         ops::cp_commit();
         // The decode: task (j, m) = warp, warp + 8 (as j kDecodeGroups + m); lane (g, t) decodes chunk t of
         // rows 16 m + g and 16 m + g + 8 of slice j: its whole A fragment.
-#pragma unroll
+#pragma unroll 1
         for (int k = 0; k < 2; ++k) {
             const int task = warp + kWarps * k;
             const int j = task / kDecodeGroups, m = task % kDecodeGroups;
@@ -463,7 +464,7 @@ __device__ __forceinline__ void compute_decode(DecodeShared<F>& sm, RowOf row_of
         float4 xd[NT];
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) { xd[nt] = *reinterpret_cast<const float4*>(&sm.xs[buf][wc * 8 * NT + 8 * nt + 2 * t]); }
-#pragma unroll
+#pragma unroll 1
         for (int j = 0; j < kStageSlices; ++j) {
             int2 b[NT];
 #pragma unroll

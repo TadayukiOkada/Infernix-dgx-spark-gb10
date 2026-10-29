@@ -56,7 +56,7 @@ enum class LinearRoutes : std::uint16_t {
     /// batched-decode: NVFP4 linear_add [5120,17408] A16 tiles of 8 K-warps at 5-16 columns (the
     /// exact route keeps the release's 4 K-warp tiles; the K-warp count sets the reduction order).
     WideDownTile = 8,
-    /// ggml-bf16-prefill: GGUF projections of 32 or more columns on BF16 tensor cores with FP32 sums
+    /// ggml-bf16-prefill: GGUF projections of 128 or more columns on BF16 tensor cores with FP32 sums
     /// (ops::ggml_linear) instead of the exact A16 integer tiles.
     GgmlBf16Wide = 16,
     /// fp8-a8-pair-block32: fp8-a8-pair's two E4M3 activation terms with a power-of-two scale per
@@ -80,7 +80,7 @@ enum class LinearRoutes : std::uint16_t {
     /// route of decode widths: the other formats' measured slower than their 16-bit decode routes and
     /// were removed (docs/maintainer/qwen3_8-flash-next-design.md §19.3.31).
     GgmlA8 = 256,
-    /// a8-activations at prefill widths: GGUF projections (ops::ggml_linear) of 32 or more columns take the
+    /// a8-activations at prefill widths: GGUF projections (ops::ggml_linear) of 128 or more columns take the
     /// same 8-bit activations (the GgmlA8 codec's codes and slice scales) on int8 tensor cores over decoded
     /// weight planes: exact int32 slice dots, fl32(dot * d * sub) and an FP32 sum in K order per output, so a
     /// column's bits do not depend on the call's width or other columns. LOSSY and opt-in, never on the

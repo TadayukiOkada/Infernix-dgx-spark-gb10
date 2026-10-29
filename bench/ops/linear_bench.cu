@@ -238,6 +238,8 @@ const char* qtype_name(QType qtype) {
         return "NVFP4";
     case QType::FP8_E4M3FN_ROW_BF16:
         return "FP8";
+    case QType::FP8_E4M3FN_ROW_F32:
+        return "FP8F32";
     default:
         break;
     }
@@ -261,6 +263,7 @@ QType parse_qtype(std::string_view text) {
     if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
+    if (value == "fp8f32" || value == "fp8_e4m3fn_row_f32") { return QType::FP8_E4M3FN_ROW_F32; }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -328,8 +331,8 @@ Sweep parse_sweep(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|FP8F32 --n N --k K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8|FP8F32 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
@@ -544,6 +547,11 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
+    if (qtype == QType::FP8_E4M3FN_ROW_F32) {
+        bench::PackedQuantizedWeight packed = bench::make_fp8_weight(n, k, 0x51U, 0.05F, true);
+        const std::uint64_t model_bytes     = packed.model_weight_bytes();
+        return {std::move(packed.storage), packed.weight, model_bytes};
+    }
     const std::uint64_t padded_k_u64 = align_up(static_cast<std::uint64_t>(k), 128);
     if (padded_k_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("padded K does not fit int32");
@@ -600,6 +608,13 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         (((point.n == 14336 || point.n == 16384) && point.k == 5120) ||
          (point.n == 5120 && (point.k == 6144 || point.k == 17408))) &&
         point.t > 1 && (point.policy == LinearPolicy::A16Only || point.t <= 16)) {
+        profile = "BF16_F32ACC";
+        return kBf16Fp32AccumulateTFLOPs;
+    }
+    // Qwen3.5-122B-A10B's A16-only row_f32 shapes: vocabulary head and shared-expert down.
+    if (point.qtype == QType::FP8_E4M3FN_ROW_F32 &&
+        ((point.n == 248320 && point.k == 3072) || (point.n == 3072 && point.k == 1024)) &&
+        point.t > 1) {
         profile = "BF16_F32ACC";
         return kBf16Fp32AccumulateTFLOPs;
     }

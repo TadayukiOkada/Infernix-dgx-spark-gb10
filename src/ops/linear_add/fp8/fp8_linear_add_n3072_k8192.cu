@@ -12,6 +12,8 @@
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
+#include <stdexcept>
+
 namespace infernix::ops::detail {
 namespace {
 
@@ -29,6 +31,7 @@ struct ResidualPairEpilogue : LinearResidualAddEpilogue {
 };
 
 using Tma32x64 = Fp8A8TmaMmaSchedule<32, 64, 128, 1, 2, 3, 2>;
+using Tma192x128G8 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1, Fp8MmaRaster::Grouped, 8>;
 using Small    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>, 170, 4, 8>;
 using Mid      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1>, 170, 4, 8>;
 using Wide     = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>, 170, 4, 8>;
@@ -109,11 +112,125 @@ void fp8_linear_add_n3072_a8_launch(const Tensor& x, const Weight& weight, Tenso
                                                                  scratch.partials);
     };
     const int tokens = x.ne[1];
+    // GB10 retune (2026-10-29, 48 SMs, 24 MiB L2): argmin over the 10 candidate schedules, bands
+    // arbitrated with interleaved ckt ab (6 rounds); cold-L2 medians cited below.
     if (tokens <= 64) return launch.template operator()<Tma32x64>();
     if (tokens <= 128) return launch.template operator()<Small>();
     if (tokens <= 256) return launch.template operator()<Mid>();
-    if (tokens <= 384 || (tokens > 512 && tokens <= 768)) return launch.template operator()<Wide>();
-    launch.template operator()<Bulk>();
+    if (tokens <= 384 || (tokens > 512 && tokens <= 704)) return launch.template operator()<Wide>();
+    // 385..512: Mid beats the former Bulk band and Wide outright (ab: Mid -12.3% vs Wide at 448;
+    // sweep: 185 us vs 192 us Bulk at 448, 196 us vs 202 us at 512).
+    // 705..896: Mid (8 exact 128-column tiles by 896) beats Bulk by 8.3% at 769 and 7.7% at 896
+    // (ab), and it replaces the old 768 -> 769 Wide-to-Bulk +27%-per-token admission cliff with a
+    // padding-continuous 704 boundary (both sides run 768-column tiles). Wide keeps 641 (ab +2.0%).
+    if (tokens <= 896) return launch.template operator()<Mid>();
+    // 897..2560: Bulk's 128x256 split-K tiles stay argmin at 1024/1536/2048/2560.
+    if (tokens <= 2560) return launch.template operator()<Bulk>();
+    // 2561+: the Grouped-8 192x128 full tile replaces split-K Bulk: sweep -22.3% vs Bulk at 4096
+    // (1623 us vs 2088 us) and argmin at 3072/6144. The G8 raster keeps the K=8192 activation slab
+    // L2-resident across the 24 row tiles, which the 170-wave split-K ordering cannot.
+    launch.template operator()<Tma192x128G8>();
+}
+
+namespace {
+
+using Tma128x128G8   = Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1, Fp8MmaRaster::Grouped, 8>;
+using SmallWave48    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>, 48, 4,
+                                              8>;
+using BulkG8         = Fp8A8TmaSplitKSchedule<Tma128x128G8, 170, 4, 8>;
+using BulkG8Wave48   = Fp8A8TmaSplitKSchedule<Tma128x128G8, 48, 4, 8>;
+
+void launch_n3072_a8_schedule(Fp8LinearAddN3072ScheduleId schedule, const Tensor& x,
+                              const Weight& weight, Tensor& residual, Fp8A8Workspace scratch,
+                              cudaStream_t stream) {
+    launch_fp8_a8_quantize(x, weight, scratch, stream);
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    const LinearBf16Output output{data, kRows};
+    const ResidualPairEpilogue epilogue{{{data, kRows}}};
+    const auto operands = fp8_a8_operands<float>(weight, scratch, x.ne[1]);
+    const auto launch   = [&]<class Schedule>() {
+        launch_fp8_a8_tma_mma<Fp8ScheduleInstance<Schedule, kK>>(operands, output, epilogue, stream,
+                                                                 scratch.partials);
+    };
+    switch (schedule) {
+    case Fp8LinearAddN3072ScheduleId::A8Tma32x64:
+        return launch.template operator()<Tma32x64>();
+    case Fp8LinearAddN3072ScheduleId::A8Small:
+        return launch.template operator()<Small>();
+    case Fp8LinearAddN3072ScheduleId::A8SmallWave48:
+        return launch.template operator()<SmallWave48>();
+    case Fp8LinearAddN3072ScheduleId::A8Mid:
+        return launch.template operator()<Mid>();
+    case Fp8LinearAddN3072ScheduleId::A8Wide:
+        return launch.template operator()<Wide>();
+    case Fp8LinearAddN3072ScheduleId::A8Tma128x128G8:
+        return launch.template operator()<Tma128x128G8>();
+    case Fp8LinearAddN3072ScheduleId::A8Tma192x128G8:
+        return launch.template operator()<Tma192x128G8>();
+    case Fp8LinearAddN3072ScheduleId::A8Bulk:
+        return launch.template operator()<Bulk>();
+    case Fp8LinearAddN3072ScheduleId::A8BulkG8:
+        return launch.template operator()<BulkG8>();
+    case Fp8LinearAddN3072ScheduleId::A8BulkG8Wave48:
+        return launch.template operator()<BulkG8Wave48>();
+    }
+    throw std::logic_error("fp8 A8 linear_add n3072: unknown schedule");
+}
+
+} // namespace
+
+std::size_t fp8_linear_add_n3072_candidate_partial_capacity_bytes() {
+    // Largest partial plane any forced candidate may need: Bulk's 170-wave 128x256 split-K tiles.
+    return Bulk::kPartialBytes;
+}
+
+const char* fp8_linear_add_n3072_schedule_name(Fp8LinearAddN3072ScheduleId schedule) noexcept {
+    switch (schedule) {
+    case Fp8LinearAddN3072ScheduleId::A8Tma32x64:
+        return "linear_add.fp8.n3072.a8.tma32x64";
+    case Fp8LinearAddN3072ScheduleId::A8Small:
+        return "linear_add.fp8.n3072.a8.small";
+    case Fp8LinearAddN3072ScheduleId::A8SmallWave48:
+        return "linear_add.fp8.n3072.a8.small.w48";
+    case Fp8LinearAddN3072ScheduleId::A8Mid:
+        return "linear_add.fp8.n3072.a8.mid";
+    case Fp8LinearAddN3072ScheduleId::A8Wide:
+        return "linear_add.fp8.n3072.a8.wide";
+    case Fp8LinearAddN3072ScheduleId::A8Tma128x128G8:
+        return "linear_add.fp8.n3072.a8.tma128x128.g8";
+    case Fp8LinearAddN3072ScheduleId::A8Tma192x128G8:
+        return "linear_add.fp8.n3072.a8.tma192x128.g8";
+    case Fp8LinearAddN3072ScheduleId::A8Bulk:
+        return "linear_add.fp8.n3072.a8.bulk";
+    case Fp8LinearAddN3072ScheduleId::A8BulkG8:
+        return "linear_add.fp8.n3072.a8.bulk.g8";
+    case Fp8LinearAddN3072ScheduleId::A8BulkG8Wave48:
+        return "linear_add.fp8.n3072.a8.bulk.g8.w48";
+    }
+    return "linear_add.fp8.n3072.a8.unknown";
+}
+
+bool fp8_linear_add_n3072_candidate_is_legal(Fp8LinearAddN3072ScheduleId schedule,
+                                             std::int32_t output_rows, std::int32_t input_rows,
+                                             std::int32_t cols) noexcept {
+    if (output_rows != 3072 || input_rows != 8192 || cols < 1) { return false; }
+    // Every A8 schedule slices tokens internally and every row tile (32, 64, 128, 192, 256) divides
+    // the 3072 rows, so each is legal at any token count; the sweep measures each one everywhere.
+    (void)schedule;
+    return true;
+}
+
+void fp8_linear_add_n3072_execute_candidate(Fp8LinearAddN3072ScheduleId schedule, const Tensor& x,
+                                            const Weight& weight, Tensor& residual,
+                                            WorkspaceArena& workspace, cudaStream_t stream) {
+    if (!fp8_linear_add_n3072_candidate_is_legal(schedule, weight.n, weight.k, x.ne[1])) {
+        throw std::invalid_argument(
+            "fp8 A8 linear_add n3072: candidate schedule is not legal for problem");
+    }
+    auto scope = workspace.scope();
+    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
+        workspace, x.ne[1], weight.k, fp8_linear_add_n3072_candidate_partial_capacity_bytes());
+    launch_n3072_a8_schedule(schedule, x, weight, residual, scratch, stream);
 }
 
 } // namespace infernix::ops::detail

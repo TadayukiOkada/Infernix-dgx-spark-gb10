@@ -84,5 +84,15 @@ void launch_q8_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weight,
 [[nodiscard]] Q8Launch select_q8_n320_k10240(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n10240_k320(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k640(std::int32_t tokens);
+// A16ColumnInvariant for the Flash-Next shapes: one fixed sliced-K family per shape for every T
+// (N = 324 has no 16-row-multiple rows, so it keeps the SIMT pair and has no entry here).
+[[nodiscard]] Q8Launch select_q8_n10240_k320_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n320_k10240_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k640_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n1280_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n12800_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n13952_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n16384_k2560_invariant(std::int32_t tokens);
 
 } // namespace infernix::ops::detail

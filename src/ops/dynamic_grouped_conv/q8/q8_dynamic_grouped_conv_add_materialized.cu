@@ -40,9 +40,10 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
         InputRows == 4096 && ((TileColumns > 24 && TileColumns <= 40) || TileColumns > 48)
             ? Cache::cg
             : Cache::ca;
-    using Geometry    = Q8LinearGeometry<Rows, InputRows>;
-    using Schedule    = Q8A16SlicedKMmaSchedule<TileColumns, Warps, 1, Warps == 8 ? 2 : 3,
-                                                Q8ScaleAccess::Shared, Activation>;
+    constexpr int MinBlocks = (Warps == 8 || TileColumns > 56) ? 2 : 3;
+    using Geometry          = Q8LinearGeometry<Rows, InputRows>;
+    using Schedule          = Q8A16SlicedKMmaSchedule<TileColumns, Warps, 1, MinBlocks,
+                                                      Q8ScaleAccess::Shared, Activation>;
     LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Rows};
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, TileColumns, false>,

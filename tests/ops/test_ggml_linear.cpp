@@ -459,7 +459,8 @@ void run_mixed(QType q0, QType q1, int rows, int k, int columns, std::mt19937& r
 // and only FP32 sums round, so it is checked against a binary64 reference over the exactly decoded
 // weights and the BF16 inputs themselves (no A16 encoding): |y - ref| <= (K / 32 + 48) * 2^-24 *
 // sum |w x| per output (an FP32 accumulator over K / 32 slices plus one MMA sum each), plus half a
-// BF16 ulp of ref for BF16 outputs. Calls narrower than 32 columns must keep the exact route's bits.
+// BF16 ulp of ref for BF16 outputs. Calls narrower than the route's 128-column admission must keep the exact
+// route's bits.
 // An information line gives both routes' largest and mean error against the reference, in units of
 // sum |w x|, and the share of BF16 outputs equal to the exact route's.
 void run_bf16(QType q, int rows, int k, int columns, bool permute, bool tiled, bool f32, Scales scales, std::mt19937& rng) {
@@ -556,8 +557,8 @@ void run_bf16(QType q, int rows, int k, int columns, bool permute, bool tiled, b
     };
     const auto [fast, fast_bits]   = run(ops::LinearRoutes::GgmlBf16Wide);
     const auto [exact, exact_bits] = run(ops::LinearRoutes::Exact);
-    if (columns < 32) {
-        check(fast_bits == exact_bits, label + ": a narrow call must keep the exact route's bits");
+    if (columns < 128) {
+        check(fast_bits == exact_bits, label + ": a call below the route's admission must keep the exact route's bits");
         return;
     }
     // Up to three FP32 roundings per slice (two halves' scaled sums, the min term) and the MMAs'
@@ -740,7 +741,7 @@ private:
 };
 
 // --bench N [tiled] [bf16]: every bench call at N columns, rows or tiled, on the exact route and, with
-// bf16, also on the ggml-bf16-prefill route (LinearRoutes::GgmlBf16Wide; 32 or more columns).
+// bf16, also on the ggml-bf16-prefill route (LinearRoutes::GgmlBf16Wide; 128 or more columns).
 void bench(int columns, bool tiled, bool bf16) {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -1176,7 +1177,7 @@ INFERNIX_OP_TEST(ggml_linear) {
         }
         // The ggml-bf16-prefill route within its FP32-sum bound: every format, partial row tiles (two
         // segments of 100 or 65 rows; 45 tiled rows) and column tiles, the input permutation, FP32
-        // outputs, every scale span; a call narrower than 32 columns keeps the exact route's bits.
+        // outputs, every scale span; a call narrower than the route's 128-column admission keeps the exact route's bits.
         for (const QType q : formats) {
             const int k = ggml_block_elems(q) == 256 ? 2560 : 640;
             run_bf16(q, 200, k, 40, false, false, false, Scales::Narrow, rng);

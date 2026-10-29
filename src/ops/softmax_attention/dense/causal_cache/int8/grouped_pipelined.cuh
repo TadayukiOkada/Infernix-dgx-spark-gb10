@@ -69,12 +69,14 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
     extern __shared__ __align__(16) std::int8_t arena[];
     __shared__ __align__(16) __half p_s[Br * Bc];
     __shared__ float alpha_s[Br];
+    // Query scales live outside the arena stages (stage one becomes KV staging from the first
+    // tile on), so producer QK reads them at each group step instead of caching 16 registers.
+    __shared__ float q_scale_s[Br * Groups];
     std::int8_t* q_i8    = q_s;
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     // Stage one is free until the first tile is issued into it: it holds the append's H64
-    // exchange and the query scales during the prologue.
+    // exchange during the prologue.
     float* stage1_scratch = reinterpret_cast<float*>(arena + StageBytes);
-    float* q_scale_tmp    = stage1_scratch;
     const auto stage_k    = [&](int s) { return arena + s * StageBytes; };
     const auto stage_v    = [&](int s) { return arena + s * StageBytes + Bc * D; };
     const auto stage_ks   = [&](int s) {
@@ -263,7 +265,7 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
     if (owns_append && key_blocks > 0) issue_kv_tile(0, first_tile);
 
     for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
-    for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
+    for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_s[i] = 0.0f; }
     __syncthreads();
 
     for (int row = warp; row < RowCount; row += Wc) {
@@ -292,7 +294,7 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
             causal_store_query_code(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
             causal_store_query_code(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
-            if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
+            if (lane == 0) { q_scale_s[row * Groups + grp] = qs; }
         }
     }
     __syncthreads();
@@ -307,22 +309,8 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    float q_scale_r0[Groups];
-    float q_scale_r1[Groups];
-    if (warp < RowTiles) {
-        const int producer_row0 = warp * 16 + gid;
-#pragma unroll
-        for (int g = 0; g < Groups; ++g) {
-            float qs0     = (lid == 0 && producer_row0 < tile_tokens * Geometry::GroupSize)
-                                ? q_scale_tmp[producer_row0 * Groups + g]
-                                : 0.0f;
-            float qs1     = (lid == 0 && producer_row0 + 8 < RowCount)
-                                ? q_scale_tmp[(producer_row0 + 8) * Groups + g]
-                                : 0.0f;
-            q_scale_r0[g] = __shfl_sync(FullMask, qs0, gid * 4);
-            q_scale_r1[g] = __shfl_sync(FullMask, qs1, gid * 4);
-        }
-    }
+    // Producer QK reads the row scales from q_scale_s at each group step: caching the two
+    // rows per lane cost 16 registers per producer lane for the whole kernel.
     __syncthreads();
 
     // acc[row tile][d-block][even/odd n8 tile]: this warp owns dimensions 32 * warp .. + 31.
@@ -365,8 +353,15 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
                 score[nt][3] = 0.0f;
             }
 
-#pragma unroll
+#pragma unroll 1
             for (int g = 0; g < Groups; ++g) {
+                const int qscale_row = producer_row_base + gid;
+                const float qs0      = qscale_row < tile_tokens * Geometry::GroupSize
+                                           ? q_scale_s[qscale_row * Groups + g]
+                                           : 0.0f;
+                const float qs1      = qscale_row + 8 < RowCount
+                                           ? q_scale_s[(qscale_row + 8) * Groups + g]
+                                           : 0.0f;
                 unsigned af[GroupKc][4];
 #pragma unroll
                 for (int kk = 0; kk < GroupKc; ++kk) {
@@ -402,10 +397,10 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
                     }
                     ka  = __shfl_sync(FullMask, ka, lid);
                     kb2 = __shfl_sync(FullMask, kb2, lid);
-                    score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
-                    score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
-                    score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
-                    score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
+                    score[nt][0] += qs0 * ka * static_cast<float>(c0);
+                    score[nt][1] += qs0 * kb2 * static_cast<float>(c1);
+                    score[nt][2] += qs1 * ka * static_cast<float>(c2);
+                    score[nt][3] += qs1 * kb2 * static_cast<float>(c3);
                 }
             }
 

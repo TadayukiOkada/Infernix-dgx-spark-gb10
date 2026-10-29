@@ -360,9 +360,11 @@ int main() {
             for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                                   KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                   KvCacheStorage::Q4KeyVq2Value}) {
-                const bool measured = dense == DenseKernels::Mxfp8 && !a4 && kv == KvCacheStorage::Int8Group64;
-                failures += check(q::fast_path_qualified(FastPath::F16AccumulatePrefill, {dense, a4, kv}) == measured,
-                                  "f16-accumulate-prefill is qualified on FP4-Local with INT8 KV only");
+                // No configuration registers it on GB10: measured against the retuned exact route it is
+                // 5.3-36.2 % slower at its 256-column admission on four of the five MXFP8 problems, and
+                // faster only on [13952,2560] from 4096 columns (docs/gb10/20261029-changelog.md).
+                failures += check(!q::fast_path_qualified(FastPath::F16AccumulatePrefill, {dense, a4, kv}),
+                                  "f16-accumulate-prefill registers no configuration on GB10");
             }
         }
     }

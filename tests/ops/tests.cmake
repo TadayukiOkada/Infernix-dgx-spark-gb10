@@ -494,14 +494,12 @@ infernix_add_family_op_test(infernix_offloaded_moe_layer_test FAMILY offloaded_m
   LIBRARIES infernix_ops
   ARGS --no-idle)
 
+
 # The fused route's CPU plan at Qwen3.5-122B-A10B's and
 # Qwen3.8-Flash-Next's routing against a host oracle of the plan, byte for byte.
 infernix_add_family_op_test(infernix_offloaded_moe_plan_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_plan.cu"
   LIBRARIES infernix_ops)
-# The layer test asserts on idle-service wall-clock tolerances, which other tests' concurrent GPU
-# and CPU work breaks; it passes when it runs alone.
-set_tests_properties(infernix_offloaded_moe_layer_test PROPERTIES RUN_SERIAL TRUE)
 
 # The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
 infernix_add_family_op_test(infernix_offloaded_moe_wide_test FAMILY offloaded_moe

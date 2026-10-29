@@ -8,6 +8,7 @@
 #include "ops/launcher/rope.h"
 
 #include "ops/common/dflash_rope.cuh"
+#include "ops/common/sincos_reduced.cuh"
 #include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
@@ -64,10 +65,12 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
         int axis = 0;
         float frequency;
         fixed_axis_frequency<Mode>(pair, &axis, &frequency);
-        const float angle =
-            static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-            frequency;
-        sincosf(angle, sine, cosine);
+        // The exact product in FP64 reduced to one turn: keeps the coefficient off `sincosf`'s
+        // FP32 Cody-Waite reduction, whose Payne-Hanek slowpath allocates a 32 B stack frame.
+        const double angle =
+            static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
+            static_cast<double>(frequency);
+        sincos_turns(angle, sine, cosine);
     }
 }
 
@@ -101,14 +104,9 @@ struct PreparedRopeCoefficients {
     PreparedRope prepared;
     __device__ __forceinline__ void sincos_axis(const std::int32_t* positions, int tokens,
         int token, int pair, int axis, float* sine, float* cosine) const {
-        // Same multiply-by-reciprocal reduction as dflash_rope_sincos: no double divide.
-        constexpr double kInvTwoPi = 1.59154943091895336e-01;
-        constexpr double kTwoPi    = 6.28318530717958648e+00;
         const double angle = static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
                              prepared.inverse[pair];
-        const double turns   = angle * kInvTwoPi;
-        const float reduced  = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
-        sincosf(reduced, sine, cosine);
+        sincos_turns(angle, sine, cosine);
         *sine   *= prepared.attention_scale;
         *cosine *= prepared.attention_scale;
     }
@@ -243,10 +241,10 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
             float exponent = 0.0F;
             generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
             const float frequency = powf(theta, exponent);
-            const float angle =
-                static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-                frequency;
-            sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+            const double angle =
+                static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
+                static_cast<double>(frequency);
+            sincos_turns(angle, &sin_cache[pair], &cos_cache[pair]);
         }
     }
     __syncthreads();
