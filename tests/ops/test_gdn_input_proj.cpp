@@ -288,7 +288,7 @@ int run_flash_next_parent_case(DevicePackedWeight& parent, const char* format, s
     // roundoff in relative L2, two in the gross bound (or the A4 tolerance for Nvfp4A4Pair).
     constexpr ReductionCriterion kLinearA16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
     const ReductionCriterion& criterion =
-        (routes == ops::LinearRoutes::Nvfp4A4Pair && tokens >= 128) ? kGdnInputProjA4Tolerance
+        (routes == ops::LinearRoutes::Nvfp4A4Pair && tokens >= 65) ? kGdnInputProjA4Tolerance
                                                                     : kLinearA16;
     failures += verify_output_range("gdn qkv" + suffix, qkv, kQkvRows, 0, kQkvRows, parent.host, 0,
                                     activation, kHidden, tokens, criterion);
@@ -345,7 +345,7 @@ int run_mxfp8_flash_next() {
     for (const std::int32_t tokens : {1, 2, 3, 8, 16, 17, 24, 32, 33, 64, 65, 256, 257}) {
         failures += run_flash_next_parent_case(nvfp4_parent, "NVFP4", tokens, ops::LinearRoutes::Exact);
     }
-    for (const std::int32_t tokens : {127, 128, 129, 256}) {
+    for (const std::int32_t tokens : {65, 96, 127, 128, 129, 256}) {
         failures += run_flash_next_parent_case(nvfp4_parent, "NVFP4", tokens, ops::LinearRoutes::Nvfp4A4Pair);
     }
     return failures;

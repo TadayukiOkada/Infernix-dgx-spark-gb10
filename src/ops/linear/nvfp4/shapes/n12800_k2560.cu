@@ -49,5 +49,5 @@ bool uses_a4(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N12800K2560{
-    12800, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 128};
+    12800, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail

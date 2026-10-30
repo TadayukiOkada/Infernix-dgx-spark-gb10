@@ -82,8 +82,12 @@ void validate_prefill(const ContextPrefillCost& prefill, std::string_view contex
     if (prefill.chunk_ns == 0 && prefill.token_ns_q32 == 0 && prefill.attention_pair_ns_q32 == 0) {
         throw std::invalid_argument(std::string(context) + " has no text cost");
     }
-    if (prefill.vision_item_ns == 0 && prefill.vision_patch_ns_q32 == 0) {
-        throw std::invalid_argument(std::string(context) + " has no Vision cost");
+    // A Text-only configuration prices no Vision work: the calibration leaves those coefficients at
+    // their exact zeros, because a feature that is zero at every measurement carries no information
+    // to fit. Both-zero is that configuration; exactly-one-zero is a Vision calibration that
+    // measured one of its two terms and not the other.
+    if ((prefill.vision_item_ns == 0) != (prefill.vision_patch_ns_q32 == 0)) {
+        throw std::invalid_argument(std::string(context) + " has a partial Vision cost");
     }
 }
 
@@ -435,6 +439,37 @@ resolve_context_machine_cost(const ContextCostIdentity& identity,
                 .preset_path       = external_preset_path,
             },
     };
+}
+
+void layer_hybrid_cost(prefix_cache::CacheCostModel& cost,
+                       const ContextMachineCostModel& model) noexcept {
+    constexpr double kSecondsPerNs = 1.0e-9;
+    constexpr double kQ32          = 4294967296.0;
+    if (model.prefill.chunk_ns != 0) {
+        cost.chunk_seconds = static_cast<double>(model.prefill.chunk_ns) * kSecondsPerNs;
+    }
+    if (model.prefill.token_ns_q32 != 0) {
+        cost.token_seconds = static_cast<double>(model.prefill.token_ns_q32) / kQ32 * kSecondsPerNs;
+    }
+    if (model.prefill.attention_pair_ns_q32 != 0) {
+        cost.attention_pair_seconds =
+            static_cast<double>(model.prefill.attention_pair_ns_q32) / kQ32 * kSecondsPerNs;
+    }
+    const ContextTransferCost& h2d =
+        model.transfer[static_cast<std::size_t>(ContextTransferDirection::HostToDevice)];
+    if (h2d.ns_per_byte_q32 != 0) {
+        cost.h2d_bytes_per_second =
+            1.0 / (static_cast<double>(h2d.ns_per_byte_q32) / kQ32 * kSecondsPerNs);
+    }
+    if (h2d.batch_ns != 0) {
+        cost.transfer_batch_seconds = static_cast<double>(h2d.batch_ns) * kSecondsPerNs;
+    }
+}
+
+prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& model) noexcept {
+    prefix_cache::CacheCostModel cost;
+    layer_hybrid_cost(cost, model);
+    return cost;
 }
 
 void upsert_context_transfer_cost_atomic(const std::filesystem::path& path,

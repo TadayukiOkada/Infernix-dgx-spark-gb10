@@ -37,6 +37,8 @@ constexpr std::array kGeometries{
     Geometry{16384, 2560, 313U}, Geometry{2560, 6144, 317U},  Geometry{1280, 2560, 337U},
     Geometry{2560, 640, 347U},   Geometry{12800, 2560, 349U}, Geometry{13952, 2560, 353U},
     Geometry{2560, 2560, 359U},
+    // DFlash2's feature_projection.
+    Geometry{2560, 12800, 383U},
     // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
     Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
@@ -81,6 +83,7 @@ int q8_a16_conformance() {
         if ((shape.k == 2560 &&
              (shape.n == 1280 || shape.n == 2560 || shape.n == 12800 || shape.n == 13952 ||
               shape.n == 16384)) ||
+            (shape.n == 2560 && shape.k == 12800) ||
             (shape.n == 10240 && shape.k == 320) || (shape.n == 320 && shape.k == 10240) ||
             (shape.n == 2560 && shape.k == 640)) {
             // The Flash-Next shapes' fixed sliced-K column-invariant families, including the
@@ -104,8 +107,9 @@ int q8_a16_conformance() {
         calls.push_back({17, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8});
         calls.push_back({64, CallForm::Policy, infernix::ops::LinearPolicy::AllowA4});
         // The q8-sliced-k fast routes (LinearRoutes::Q8SlicedK) meet the same criterion on every route and
-        // at each seam of the two fast tables; other shapes run their exact route under Fast.
-        const bool fast_shape = (shape.n == 16384 && shape.k == 2560) || (shape.n == 2560 && shape.k == 6144);
+        // at each seam of the fast tables; other shapes run their exact route under Fast.
+        const bool fast_shape = (shape.n == 16384 && shape.k == 2560) || (shape.n == 2560 && shape.k == 6144) ||
+                                (shape.n == 1280 && shape.k == 2560) || (shape.n == 2560 && shape.k == 12800);
         for (int t : fast_shape ? std::vector<int>{1,  2,  3,  5,  7,  8,  9,  15, 16, 17, 23,  24,  25,  31,
                                                    32, 33, 39, 40, 41, 47, 48, 49, 50, 51, 62,  63,  64,  65,
                                                    95, 96, 97, 127, 128, 129, 256, 511, 512, 513, 4096}
@@ -210,7 +214,7 @@ int q8_a16_column_invariance() {
           std::pair{Geometry{2560, 6144, 431U}, 8},   std::pair{Geometry{1280, 2560, 433U}, 48},
           std::pair{Geometry{2560, 640, 439U}, 16},   std::pair{Geometry{12800, 2560, 443U}, 8},
           std::pair{Geometry{13952, 2560, 449U}, 8},  std::pair{Geometry{2560, 2560, 457U}, 8},
-          std::pair{Geometry{2560, 4096, 409U}, 8}}) {
+          std::pair{Geometry{2560, 12800, 461U}, 8},  std::pair{Geometry{2560, 4096, 409U}, 8}}) {
         failures += column_invariance_once(shape, kColumns, std::nullopt);
     }
     return failures;
@@ -226,7 +230,7 @@ int q8_a16_column_invariance_invariant() {
           std::pair{Geometry{10240, 320, 419U}, 8},   std::pair{Geometry{16384, 2560, 421U}, 8},
           std::pair{Geometry{1280, 2560, 433U}, 48},  std::pair{Geometry{2560, 640, 439U}, 16},
           std::pair{Geometry{12800, 2560, 443U}, 8},  std::pair{Geometry{13952, 2560, 449U}, 8},
-          std::pair{Geometry{2560, 2560, 457U}, 8}}) {
+          std::pair{Geometry{2560, 2560, 457U}, 8},   std::pair{Geometry{2560, 12800, 461U}, 8}}) {
         failures += column_invariance_once(shape, kColumns, infernix::ops::LinearPolicy::A16ColumnInvariant);
     }
     return failures;

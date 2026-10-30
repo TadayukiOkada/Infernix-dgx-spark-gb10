@@ -212,7 +212,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         return 0;
     case QType::NVFP4:
         if (parent_rows == 13952 && input_rows == 2560 && !column_invariant(policy)) {
-            return max_tokens >= 128
+            return max_tokens >= 65
                        ? detail::nvfp4_a4_workspace_capacity_bytes(
                              max_tokens, 2560, detail::kNvfp4A4ResidualTerms, true)
                        : 0;

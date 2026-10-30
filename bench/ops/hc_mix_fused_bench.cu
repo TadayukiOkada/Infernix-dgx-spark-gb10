@@ -115,7 +115,7 @@ HcWeights make_weights(Codec codec, std::uint64_t seed) {
         w.up_storage = std::move(uq.storage);
         w.up         = uq.weight;
         if (!ops::detail::hc_mix_fused_supported(w.down, w.up, kHidden, kStreams, kRank,
-                                                 ops::detail::kHcMixFusedMaxColumns)) {
+                                                 ops::detail::kHcMixFusedMaxColumnsQ8)) {
             throw std::runtime_error("constructed Q8 weights rejected by hc_mix_fused_supported");
         }
         w.weight_bytes = dq.model_weight_bytes() + uq.model_weight_bytes();
@@ -171,6 +171,9 @@ int main(int argc, char** argv) {
 
         const HcWeights weights = make_weights(opt.codec, 0x51U);
         const char* codec_name  = opt.codec == Codec::Q8 ? "q8_g32_fp16" : "bf16";
+        // The fused band is per-codec (the columns where it beats the composed route on this GPU).
+        const int fused_max = opt.codec == Codec::Q8 ? ops::detail::kHcMixFusedMaxColumnsQ8
+                                                     : ops::detail::kHcMixFusedMaxColumnsBf16;
 
         // Fused workspace: partials buffer sized for max T in the grid.
         const int max_T = *std::max_element(opt.tokens.begin(), opt.tokens.end());
@@ -213,13 +216,13 @@ int main(int argc, char** argv) {
         std::vector<Row> results;
 
         for (int T : opt.tokens) {
-            if (T > ops::detail::kHcMixFusedMaxColumns && opt.check) {
-                // fused only supports T<=16; skip fused timing beyond that
+            if (T > fused_max && opt.check) {
+                // fused only serves its codec's band; skip the fused arm beyond that
                 continue;
             }
 
             // --- Fused route timing ---
-            if (T <= ops::detail::kHcMixFusedMaxColumns) {
+            if (T <= fused_max) {
                 auto launch_fused = [&](cudaStream_t s) {
                     run_fused(weights, residual_buf, x_buf, inject_buf, partials.p, T, s);
                 };
@@ -277,7 +280,7 @@ int main(int argc, char** argv) {
             }
 
             // --- Correctness check: fused vs composed ---
-            if (opt.check && T <= ops::detail::kHcMixFusedMaxColumns) {
+            if (opt.check && T <= fused_max) {
                 CUDA_CHECK(cudaMemsetAsync(x_buf.p, 0, x_buf.bytes, stream));
                 CUDA_CHECK(cudaMemsetAsync(inject_buf.p, 0, inject_buf.bytes, stream));
                 run_fused(weights, residual_buf, x_buf, inject_buf, partials.p, T, stream);

@@ -18,7 +18,11 @@ namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next output projections [2560, 6144]: the GDN out_proj and the QSA o_proj share this
 // shape (query_width = 24 heads x 256 = 6144). Schedules mirror the proven [5120, 6144] family with
-// the row count changed. A4 is not enabled for these dense shapes.
+// the row count changed; the A4 single-term route stays disabled for this dense shape.
+// T = 17..24 is the DFlash2 pair-verification width (c = 2 verifies 2 x 9 rows) and K = 6144 needs
+// the full 8-warp K reduction there: the earlier WarpsK = 4 tile measured +58% over T = 16 (GB10,
+// 2026-10-30). T >= 65 admits the Nvfp4A4Pair pair route, measured 18..23% faster than A16 through
+// T = 120.
 using Geometry = Nvfp4Geometry<2560, 6144>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -30,7 +34,8 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
-    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 2, 2>>;
+    if (tokens <= 20) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 8, 1, 1>>;
+    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 8, 2, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 32, 128, 16, 16, 2, 2>>;
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 32, 16, 2, 2>>;
     if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 128, 32, 16, 2, 1>>;
@@ -49,5 +54,5 @@ bool uses_a4(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N2560K6144{
-    2560, 6144, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 128};
+    2560, 6144, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail

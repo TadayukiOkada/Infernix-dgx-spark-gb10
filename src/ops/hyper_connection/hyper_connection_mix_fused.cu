@@ -27,7 +27,6 @@
 #include "ops/hyper_connection/hyper_connection_inject.cuh"
 
 #include "core/pdl.cuh"
-#include "core/temporary_switches.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
@@ -713,16 +712,16 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
 }
 
 // K1a with v4's staging (see above): one row of W_down per warp, 8 warps per CTA. Shared Rn:
-// [pass column][plane][kHidden / 2]. ColumnGrid (TEMPORARY, INFERNIX_TMP_HC_DOWN_COLUMNS, candidates
-// §2.3 ST-03): a grid of one CTA per (row group, stream, column), blockIdx.z the column; each column's
-// arithmetic is the same fixed order, so its partials and inv keep their bits.
-template <class Codec, class Norm, bool Pending, bool ColumnGrid = false>
+// [pass column][plane][kHidden / 2]. A per-column CTA grid (one CTA per row group, stream and
+// column, GB10 candidate 2026-10-30) measured 3..8 % slower at the widths this branch now serves
+// (T = 2..3) and neutral at 4..8, so the pass loop stays.
+template <class Codec, class Norm, bool Pending>
 __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
     const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
     const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
     constexpr int RowsPerWarp = 1;
-    constexpr int kColumns    = ColumnGrid ? 1 : kPassColumns; // columns per pass
+    constexpr int kColumns    = kPassColumns; // columns per pass
     extern __shared__ __align__(16) float rn[]; // [kColumns][2][kHidden / 2]
     __shared__ float scratch[kDownThreads / 32][kColumns];
     __shared__ float inv[kColumns];
@@ -754,7 +753,7 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
     pdl::wait_for_dependencies();
 
 #pragma unroll 1
-    for (int c0 = ColumnGrid ? static_cast<int>(blockIdx.z) : 0; c0 < columns; c0 += ColumnGrid ? columns : kPassColumns) {
+    for (int c0 = 0; c0 < columns; c0 += kPassColumns) {
         const int pass = min(kColumns, columns - c0);
         // 2. K1a's loads (and pending inject) and per-thread sums of squares (its elements in index
         // order), its warp butterflies and its warps' sums in warp order.
@@ -895,9 +894,19 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_v4_kernel(
 }
 
 // K1b with v4's row map and transposed butterfly (see above).
+// The v4 up collapse keeps __launch_bounds__ minBlocks = 1: its natural footprint is ~168 registers,
+// so the SM already caps at one block per SM and forcing the 2-block 128-register ceiling spilled
+// 128 bytes of stack into every instantiation when measured on GB10 (2026-10-30) with no bandwidth
+// to gain. The call's own dynamic SMEM (below) shrinks the shared footprint without touching
+// registers.
 constexpr int kUpV4Warps   = 8;
 constexpr int kUpV4Threads = kUpV4Warps * 32;
 constexpr int kUpV4Rows    = 8; // a warp's rows: features warp and warp + 8, 4 streams each
+// Worst-case dynamic SMEM for one v4 up collapse call: m [T][rank], u [T][S][features], inv [S][T].
+constexpr int kUpV4MaxSmem = static_cast<int>(
+    (static_cast<std::size_t>(kHcMixFusedMaxColumns) * (kMaxRank + kStreams * kUpFeatures) +
+     static_cast<std::size_t>(kStreams) * kHcMixFusedMaxColumns) *
+    sizeof(float));
 
 template <class Codec, class Norm, bool Pending>
 __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
@@ -907,9 +916,14 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
     const float* __restrict__ pending_inject) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);
     static_assert(kUpFeatures * kHcMixFusedMaxColumns <= kUpV4Threads);
-    __shared__ __align__(16) float m[kHcMixFusedMaxColumns * kMaxRank];    // [T][2][rank / 2]
-    __shared__ float u[kHcMixFusedMaxColumns * kStreams * kUpFeatures];   // [T][S][feature]
-    __shared__ float inv[kStreams * kHcMixFusedMaxColumns];               // [S][T]
+    // The three arrays move through dynamic shared memory sized to this call (as in
+    // hc_up_collapse_kernel), so a narrow call stages its own bytes instead of the old worst-case
+    // static kHcMixFusedMaxColumns x kMaxRank reservation. The layouts and every index are the ones
+    // the static arrays had; rank % 8 == 0 keeps each m row 16-byte aligned for the float4 reads.
+    extern __shared__ __align__(16) float dyn_smem[];
+    float* m   = dyn_smem;                                                        // [T][2][rank / 2]
+    float* u   = m + static_cast<std::size_t>(columns) * rank;                    // [T][S][feature]
+    float* inv = u + static_cast<std::size_t>(columns) * kStreams * kUpFeatures;  // [S][T]
     const int tid  = static_cast<int>(threadIdx.x);
     const int lane = tid & 31, warp = tid >> 5;
     const int d0   = static_cast<int>(blockIdx.x) * kUpFeatures;
@@ -1068,21 +1082,6 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
         return true;
     }();
     (void)configured;
-    // TEMPORARY (INFERNIX_TMP_HC_DOWN_COLUMNS, candidates §2.3 ST-03): calls of up to a pass's columns
-    // spread their columns over the grid (one CTA per row group, stream and column) instead of one
-    // CTA per row group and stream, about one per SM, looping over them.
-    static const bool column_grid = temporary_switches::flag("INFERNIX_TMP_HC_DOWN_COLUMNS");
-    const int columns             = residual.ne[1];
-    if (column_grid && columns <= kPassColumns) {
-        check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams, columns),
-                                           dim3(kDownThreads), kHidden * sizeof(float), stream},
-                                          hc_down_partials_v4_kernel<Codec, Norm, Fold, true>,
-                                          static_cast<const bf16*>(residual.data),
-                                          static_cast<const Norm*>(norm_weight.data), down, down_rows, columns, eps,
-                                          partial, inv, pending.y, pending.inject),
-                     "down partials v4 (column grid)");
-        return;
-    }
     check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
                                        rn_bytes, stream},
                                       hc_down_partials_v4_kernel<Codec, Norm, Fold>,
@@ -1113,10 +1112,19 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                                                       cudaFuncAttributeMaxDynamicSharedMemorySize, kUp1Smem);
         const cudaError_t e2 = cudaFuncSetAttribute(hc_up_collapse_kernel<Codec, Norm, Fold>,
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kUpMaxSmem);
-        if (e1 != cudaSuccess || e1_wide != cudaSuccess || e2_1 != cudaSuccess || e2 != cudaSuccess) {
+        const cudaError_t e3 = cudaFuncSetAttribute(hc_up_collapse_v4_kernel<Codec, Norm, Fold>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kUpV4MaxSmem);
+        if (e1 != cudaSuccess || e1_wide != cudaSuccess || e2_1 != cudaSuccess || e2 != cudaSuccess ||
+            e3 != cudaSuccess) {
             throw std::runtime_error(
                 std::string("hyper_connection_mix: shared memory: ") +
-                cudaGetErrorString(e1 != cudaSuccess ? e1 : (e1_wide != cudaSuccess ? e1_wide : (e2_1 != cudaSuccess ? e2_1 : e2))));
+                cudaGetErrorString(e1 != cudaSuccess
+                                       ? e1
+                                       : (e1_wide != cudaSuccess
+                                              ? e1_wide
+                                              : (e2_1 != cudaSuccess
+                                                     ? e2_1
+                                                     : (e2 != cudaSuccess ? e2 : e3)))));
         }
         return true;
     }();
@@ -1157,8 +1165,15 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                      "down partials");
     }
     if (v4) {
-        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpV4Threads), 0, stream},
-                                          hc_up_collapse_v4_kernel<Codec, Norm, Fold>, static_cast<const float*>(partial),
+        // The v4 collapse's arrays are sized to this call: m [T][rank], u [T][S][features], inv [S][T].
+        const std::size_t up_v4_smem =
+            (static_cast<std::size_t>(columns) * (static_cast<std::size_t>(rank) + kStreams * kUpFeatures) +
+             static_cast<std::size_t>(kStreams) * static_cast<std::size_t>(columns)) *
+            sizeof(float);
+        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpV4Threads),
+                                           up_v4_smem, stream},
+                                          hc_up_collapse_v4_kernel<Codec, Norm, Fold>,
+                                          static_cast<const float*>(partial),
                                           static_cast<const float*>(inv), residual_data,
                                           static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
                                           inject != nullptr ? static_cast<float*>(inject->data) : nullptr,
@@ -1234,8 +1249,10 @@ void mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& 
 
 bool hc_mix_fused_supported(const Weight& down, const Weight& up, std::int32_t hidden, std::int32_t streams,
                             std::int32_t rank, std::int32_t columns) noexcept {
-    const bool codec = (q8_rowsplit(down) && q8_rowsplit(up)) || (bf16_contiguous(down) && bf16_contiguous(up));
-    return codec && columns >= 1 && columns <= kHcMixFusedMaxColumns && hidden == kHidden && streams == kStreams &&
+    const bool q8   = q8_rowsplit(down) && q8_rowsplit(up);
+    const bool bf16 = bf16_contiguous(down) && bf16_contiguous(up);
+    const std::int32_t max_columns = q8 ? kHcMixFusedMaxColumnsQ8 : kHcMixFusedMaxColumnsBf16;
+    return (q8 || bf16) && columns >= 1 && columns <= max_columns && hidden == kHidden && streams == kStreams &&
            rank > 0 && rank % 8 == 0 && rank <= kMaxRank && down.k == kStreams * kHidden &&
            (down.n == rank || down.n == rank + kStreams) && up.n == kStreams * kHidden && up.k == rank;
 }

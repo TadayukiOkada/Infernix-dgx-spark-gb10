@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -269,12 +270,147 @@ void test_resolution_and_atomic_upserts() {
     std::filesystem::remove_all(directory);
 }
 
+void test_hybrid_cost_layering() {
+    // What the Qwen4Exp loader does: it prices its architecture first, then layers the resolved
+    // table over it. Every term the table leaves unmeasured keeps the loader's estimate, and every
+    // field the machine contract does not carry (the chunk width, the route saturation) survives a
+    // measured replacement of the terms it does carry.
+    infernix::runtime::prefix_cache::CacheCostModel architecture{
+        .chunk_seconds          = 0.56,
+        .chunk_tokens           = 1024,
+        .token_seconds          = 9.0e-5,
+        .attention_pair_seconds = 4.0e-9,
+        .h2d_bytes_per_second   = 19.4e9,
+        .transfer_batch_seconds = 20.0e-6,
+        .call_route_fraction    = 10.0 / 512.0,
+    };
+    infernix::runtime::ContextMachineCostModel model{
+        .transfer = transfer(10),
+        .prefill  = {},
+    };
+    infernix::runtime::layer_hybrid_cost(architecture, model);
+    expect(architecture.chunk_seconds == 0.56 && architecture.token_seconds == 9.0e-5 &&
+               architecture.attention_pair_seconds == 4.0e-9,
+           "an unbound prefill half overwrote the architecture's own recomputation estimate");
+    expect(std::abs(architecture.h2d_bytes_per_second - 2.0e9) <= 2.0e9 * 1e-12 &&
+               std::abs(architecture.transfer_batch_seconds - 10.0e-9) <= 10.0e-9 * 1e-12,
+           "a measured transfer half did not price the restore");
+    expect(architecture.chunk_tokens == 1024 && architecture.call_route_fraction == 10.0 / 512.0,
+           "layering a measured table lost a field the machine contract does not carry");
+
+    model.prefill = prefill(1'000'000'000);
+    infernix::runtime::layer_hybrid_cost(architecture, model);
+    expect(architecture.chunk_seconds == 1.0 &&
+               architecture.token_seconds == 0.5e-9 &&
+               architecture.attention_pair_seconds == 0.25e-9,
+           "a measured prefill half did not replace the architecture's estimate in seconds");
+
+    const auto default_form = infernix::runtime::hybrid_cache_cost(model);
+    infernix::runtime::prefix_cache::CacheCostModel fresh;
+    infernix::runtime::layer_hybrid_cost(fresh, model);
+    expect(fresh.chunk_seconds == default_form.chunk_seconds &&
+               fresh.token_seconds == default_form.token_seconds &&
+               fresh.attention_pair_seconds == default_form.attention_pair_seconds &&
+               fresh.h2d_bytes_per_second == default_form.h2d_bytes_per_second &&
+               fresh.transfer_batch_seconds == default_form.transfer_batch_seconds &&
+               fresh.chunk_tokens == default_form.chunk_tokens &&
+               fresh.call_route_fraction == default_form.call_route_fraction,
+           "the default-form conversion differs from the layered one");
+}
+
+void test_qwen4_exp_signature_binding() {
+    // A measured Qwen4Exp entry binds exactly the configuration its digest describes: the same
+    // machine with another key keeps the generic estimate (and the architecture loader's own
+    // constants, which the layering test above covers), while the machine's transfer still binds.
+    const infernix::runtime::ContextCostIdentity measured{
+        .hardware_class    = "nvidia-gb10-sm121",
+        .prefill_signature = "qwen4_exp-measured-configuration-and-formats",
+    };
+    const infernix::runtime::ContextCostIdentity other{
+        .hardware_class    = measured.hardware_class,
+        .prefill_signature = "qwen4_exp-another-configuration",
+    };
+    // The two configurations share the machine's compiled transfer entry and differ only in the
+    // prefill half, which is what an external table for one of them must not disturb.
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() /
+        ("infernix-context-cost-signature-" + std::to_string(test_process_id()));
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path path = directory / "presets.json";
+    try {
+        infernix::runtime::upsert_context_prefill_cost_atomic(path, measured, prefill(4242),
+                                                              R"({"suite":"prefill"})");
+        const auto hit = infernix::runtime::resolve_context_machine_cost(measured, path);
+        expect(hit.summary.prefill_source == infernix::ContextCostPresetSource::External &&
+                   hit.model.prefill.chunk_ns == 4242 &&
+                   hit.summary.transfer_source ==
+                       infernix::ContextCostPresetSource::CompiledDefault &&
+                   hit.summary.prefill_signature == measured.prefill_signature,
+               "a Qwen4Exp table entry did not bind its own signature on GB10");
+        const auto miss = infernix::runtime::resolve_context_machine_cost(other, path);
+        expect(miss.summary.prefill_source == infernix::ContextCostPresetSource::GenericDefault &&
+                   miss.summary.transfer_source ==
+                       infernix::ContextCostPresetSource::CompiledDefault &&
+                   miss.model.prefill != hit.model.prefill,
+               "a Qwen4Exp table entry leaked onto another configuration");
+
+        // The entry round-trips through the document: re-writing it replaces it in place and keeps
+        // the machine's transfer and any sibling entry.
+        infernix::runtime::upsert_context_prefill_cost_atomic(path, other, prefill(99),
+                                                              R"({"suite":"prefill"})");
+        infernix::runtime::upsert_context_prefill_cost_atomic(path, measured, prefill(7777),
+                                                              R"({"suite":"prefill","run":2})");
+        const auto parsed = infernix::runtime::parse_context_cost_presets(read_file(path), "file");
+        expect(parsed.size() == 1 && parsed[0].hardware_class == "nvidia-gb10-sm121" &&
+                   parsed[0].prefill.size() == 2,
+               "signature-keyed upserts did not round-trip as separate entries");
+        const auto rewritten = infernix::runtime::resolve_context_machine_cost(measured, path);
+        expect(rewritten.model.prefill.chunk_ns == 7777,
+               "a repeated upsert did not replace its own signature's entry");
+
+        // A Text-only Flash-Next calibration measures no Vision work, so those two coefficients
+        // stay exact zeros; the document still round-trips and resolves the entry.
+        const infernix::runtime::ContextPrefillCost text_only{
+            .chunk_ns              = 138'097'163,
+            .token_ns_q32          = 1'579'929'730'021'409,
+            .attention_pair_ns_q32 = 27'930'392'335,
+            .vision_item_ns        = 0,
+            .vision_patch_ns_q32   = 0,
+        };
+        infernix::runtime::upsert_context_prefill_cost_atomic(path, measured, text_only,
+                                                              R"({"suite":"prefill"})");
+        const auto reread = infernix::runtime::resolve_context_machine_cost(measured, path);
+        expect(reread.model.prefill == text_only &&
+                   reread.summary.prefill_source == infernix::ContextCostPresetSource::External,
+               "a Text-only entry's zero Vision coefficients did not round-trip");
+
+        // Half a Vision calibration is still refused: the entry would price one of the tower's two
+        // terms and claim the other costs nothing.
+        auto half_vision = text_only;
+        half_vision.vision_item_ns = 1;
+        const std::string partial_vision_document =
+            document(Json::array({machine("nvidia-gb10-sm121", nullptr,
+                                          Json::array({prefill_entry("any", half_vision)}))}))
+                .dump();
+        expect_throw([&] {
+            (void)infernix::runtime::parse_context_cost_presets(partial_vision_document,
+                                                                "partial-vision");
+        }, "a half-measured Vision cost was accepted");
+    } catch (...) {
+        std::filesystem::remove_all(directory);
+        throw;
+    }
+    std::filesystem::remove_all(directory);
+}
+
 } // namespace
 
 int main() {
     test_hardware_class();
     test_schema_validation();
     test_resolution_and_atomic_upserts();
+    test_hybrid_cost_layering();
+    test_qwen4_exp_signature_binding();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

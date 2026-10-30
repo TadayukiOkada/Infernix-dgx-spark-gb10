@@ -9,6 +9,8 @@ target_sources(infernix_model_loading PRIVATE
 
 target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
+  # The prefill-cost applicability key needs the shared frontend's digest (in this library).
+  "${CMAKE_CURRENT_LIST_DIR}/measurement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/activation_scan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward_lossless.cpp"

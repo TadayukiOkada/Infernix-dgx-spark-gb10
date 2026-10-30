@@ -320,9 +320,10 @@ int main() {
                           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                           KvCacheStorage::Q4KeyVq2Value}) {
         for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Ggml,
-                                         DenseKernels::Mxfp8}) {
-            // Every Flash-Next artifact's configuration (the owner's decision, 2026-10-24): Q8 with 4-bit
-            // experts (Dense8), GGUF and FP8 with 16-bit (IQ3_S, recipe C), BF16 and MXFP8 with both.
+                                         DenseKernels::Mxfp8, DenseKernels::Nvfp4}) {
+            // Every Flash-Next artifact's configuration (the owner's decision, 2026-10-24; W4Dense's
+            // NVFP4 dense kind joins it on 2026-10-30): Q8 with 4-bit experts (Dense8), GGUF and FP8
+            // with 16-bit (IQ3_S, recipe C), BF16, MXFP8 and NVFP4 with both.
             for (const bool a4 : {false, true}) {
                 if (dense == DenseKernels::Fp8Row && a4) { continue; }
                 if (dense == DenseKernels::Q8 && !a4) { continue; }
@@ -335,6 +336,44 @@ int main() {
     selection.paths = {FastPath::DFlash2Pairs};
     failures += check(!selection.request_invariant(), "dflash2-pairs couples the rows of a two-row round");
     failures += check(infernix::parse_fast_path("dflash2-pairs") == FastPath::DFlash2Pairs, "dflash2-pairs parses");
+
+    // W4Dense (NVFP4 dense, both expert activation precisions, every KV format): q8-sliced-k routes
+    // the artifact's Q8 weights (its NVFP4 problems ignore the flag) and dflash2-pairs joins the
+    // owner's every-configuration registration; both are registered. gdn-conv-fused's [16384,2560]
+    // NVFP4 route is implemented (it applies, so --fast-path can run it) but measured slower than
+    // the composed decode route on GB10 (120.2 us against 96.2 + 2.8 per GDN layer call), so it
+    // registers nowhere. The fused convolution is per column and keeps a request invariant;
+    // q8-sliced-k and dflash2-pairs couple a request to its round, which the reproducible route
+    // therefore excludes.
+    for (const bool a4 : {false, true}) {
+        for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+                              KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+                              KvCacheStorage::Q4KeyVq2Value}) {
+            const FastPathConfiguration w4dense{DenseKernels::Nvfp4, a4, kv};
+            failures += check(q::fast_path_applies(FastPath::GdnConvFused, w4dense, options) &&
+                                  !q::fast_path_qualified(FastPath::GdnConvFused, w4dense),
+                              "gdn-conv-fused's NVFP4 route is an unqualified candidate (measured slower)");
+            failures += check(q::fast_path_applies(FastPath::Q8SlicedK, w4dense, options) &&
+                                  q::fast_path_qualified(FastPath::Q8SlicedK, w4dense),
+                              "q8-sliced-k applies and is registered on W4Dense (its Q8 weights)");
+        }
+    }
+    {
+        const FastPathConfiguration w4dense_fp8{DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256};
+        failures += check(q::fast_path_applies(FastPath::DFlash2Pairs, w4dense_fp8, dflash2) &&
+                              q::fast_path_qualified(FastPath::DFlash2Pairs, w4dense_fp8),
+                          "dflash2-pairs applies and is registered on W4Dense with the DFlash2 drafter");
+        q::FastPathSelection w4{.configuration = w4dense_fp8, .paths = {FastPath::GdnConvFused}};
+        failures += check(w4.forward().gdn_conv_fused &&
+                              w4.forward().dense_routes == infernix::ops::LinearRoutes::Exact &&
+                              w4.request_invariant(),
+                          "the fused convolution alone (as a candidate) sets its own flag and stays reproducible");
+        w4.paths = {FastPath::GdnConvFused, FastPath::Q8SlicedK, FastPath::DFlash2Pairs};
+        failures += check(w4.forward().gdn_conv_fused &&
+                              w4.forward().dense_routes == infernix::ops::LinearRoutes::Q8SlicedK &&
+                              !w4.request_invariant(),
+                          "q8-sliced-k sets the dense route flag and leaves the reproducible route");
+    }
     // f16-accumulate-prefill acts on the 8-bit-code dense projections (recipe C's row FP8, FP4-Local's
     // MXFP8, Dense8's Q8) only, sets its route flag, couples a prompt to its call boundaries, and is
     // qualified only where it measured faster (FP4-Local, INT8 KV; the owner's decision, 2026-10-25).

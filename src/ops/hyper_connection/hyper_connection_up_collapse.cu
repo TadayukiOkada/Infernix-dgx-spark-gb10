@@ -114,8 +114,11 @@ void launch(const Tensor& m, const Weight& up, const Tensor& normalized, Tensor&
 
 bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams,
                               std::int32_t columns) noexcept {
-    // Beyond the fused decode route (kHcMixFusedMaxColumns = 16), fuse up + collapse so u stays in
-    // shared memory instead of round-tripping [streams * hidden, T] through global memory.
+    // From 17 columns, fuse up + collapse so u stays in shared memory instead of round-tripping
+    // [streams * hidden, T] through global memory. The boundary is measured, not the fused route's:
+    // at 4..16 columns (the composed mix since the 2026-10-30 GB10 retune) the separate linear and
+    // collapse beat this route's 64-row tile by 2..4 % at 5 and 9..16, and it only wins at 6..8,
+    // so the fusion keeps starting at 17 (infernix_hyper_connection_bench, GB10, interleaved).
     if (streams != kStreams || hidden <= 0 || hidden % 16 != 0 || columns <= 16 || up.qdata == nullptr ||
         up.n != streams * hidden) {
         return false;

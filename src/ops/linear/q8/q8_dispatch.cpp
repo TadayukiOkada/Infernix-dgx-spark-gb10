@@ -47,8 +47,11 @@ constexpr std::array kShapes{
     ShapeEntry{1024, 2560, select_q8_n13952_k2560},
     ShapeEntry{128, 2560, select_q8_n13952_k2560},
     ShapeEntry{2560, 2560, select_q8_n2560_k2560, nullptr, select_q8_n2560_k2560_invariant},
-    ShapeEntry{1280, 2560, select_q8_n1280_k2560, nullptr, select_q8_n1280_k2560_invariant},
+    ShapeEntry{1280, 2560, select_q8_n1280_k2560, select_q8_n1280_k2560_fast, select_q8_n1280_k2560_invariant},
     ShapeEntry{2560, 6144, select_q8_n2560_k6144, select_q8_n2560_k6144_fast},
+    // DFlash2's feature_projection (the drafter companion's [2560, 12800] context projection).
+    ShapeEntry{2560, 12800, select_q8_n2560_k12800, select_q8_n2560_k12800_fast,
+               select_q8_n2560_k12800_invariant},
     ShapeEntry{324, 10240, select_q8_n324_k10240},
     ShapeEntry{320, 10240, select_q8_n320_k10240, nullptr, select_q8_n320_k10240_invariant},
     ShapeEntry{10240, 320, select_q8_n10240_k320, nullptr, select_q8_n10240_k320_invariant},

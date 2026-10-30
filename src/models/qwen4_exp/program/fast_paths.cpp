@@ -542,6 +542,44 @@ constexpr std::array kQualified{
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    // W4Dense (NVFP4 dense), both expert activation precisions and every KV format (task T1,
+    // 2026-10-30): dflash2-pairs joins the owner's every-configuration registration of 2026-10-24
+    // (T7 found this dense kind missing, so DFlash2 decoded plain at concurrency 2 on the artifact;
+    // measured on it here: c = 2 pair rounds 6/723 -> 136/4, decode 35.4 -> 71.8 tok/s, 2.0x plain).
+    // q8-sliced-k takes the flag on the artifact's 303 Q8 weights (shared expert, hyper-connections,
+    // MTP drafters, LM head; the NVFP4 problems ignore it, its T=1 problems tie the exact route at
+    // the Op level). Neither reads the KV format. gdn-conv-fused's NVFP4 route is implemented but
+    // registers nothing here: measured slower than the composed decode route on this artifact
+    // (120.2 us against 96.2 + 2.8 per GDN layer call, -3.3 % plain decode; fast_path_applies).
+    // The two paths' model-quality joint gate on this artifact is the recorded follow-up.
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -655,8 +693,15 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // W4Dense's NVFP4 dense projections run 16-bit activations (A16Only) at narrow widths and the
     // two-term row-scaled A4 TMA route at prefill widths (T >= 128).
     case FastPath::Nvfp4A4Pair: return configuration.dense == DenseKernels::Nvfp4;
+    // W4Dense's NVFP4 projections carry their own fused decode convolution ([16384,2560]) - an
+    // implemented candidate: measured on GB10 (2026-10-30, T1) its epilogue form runs 120.2 us of
+    // the shared A16 GEMV schedule against the composed route's 96.2 + 2.8 (its own convolution
+    // kernel), -3.3 % plain decode, so it registers nowhere (its Q8 route is the faster fusion).
+    // W4Dense's Q8 weights (the shared expert, hyper-connections, MTP drafters, LM head) take the
+    // sliced-K decode routes the flag serves; the dispatch ignores the flag on NVFP4 problems.
     case FastPath::Q8SlicedK:
-    case FastPath::GdnConvFused: return configuration.dense == DenseKernels::Q8;
+    case FastPath::GdnConvFused:
+        return configuration.dense == DenseKernels::Q8 || configuration.dense == DenseKernels::Nvfp4;
     // The wide route of NVFP4 W4A16 experts: recipe C's weight-only export (FP8-row dense) and NVIDIA
     // FP4-Local's banks at their default 16-bit activations (MXFP8 dense). GGUF and block-FP8 experts
     // also take 16-bit activations but have no such kernel.

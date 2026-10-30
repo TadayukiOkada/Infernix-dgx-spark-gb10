@@ -121,39 +121,6 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     }
 }
 
-namespace {
-
-// The hybrid index ranks admission sources and values snapshots with the same calibrated
-// prefill and Host-to-Device coefficients as the original cache's ResourceManager.
-// Uncalibrated (zero) terms keep the index's generic defaults.
-prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& model) {
-    constexpr double kSecondsPerNs = 1.0e-9;
-    constexpr double kQ32          = 4294967296.0;
-    prefix_cache::CacheCostModel cost;
-    if (model.prefill.chunk_ns != 0) {
-        cost.chunk_seconds = static_cast<double>(model.prefill.chunk_ns) * kSecondsPerNs;
-    }
-    if (model.prefill.token_ns_q32 != 0) {
-        cost.token_seconds = static_cast<double>(model.prefill.token_ns_q32) / kQ32 * kSecondsPerNs;
-    }
-    if (model.prefill.attention_pair_ns_q32 != 0) {
-        cost.attention_pair_seconds =
-            static_cast<double>(model.prefill.attention_pair_ns_q32) / kQ32 * kSecondsPerNs;
-    }
-    const ContextTransferCost& h2d =
-        model.transfer[static_cast<std::size_t>(ContextTransferDirection::HostToDevice)];
-    if (h2d.ns_per_byte_q32 != 0) {
-        cost.h2d_bytes_per_second =
-            1.0 / (static_cast<double>(h2d.ns_per_byte_q32) / kQ32 * kSecondsPerNs);
-    }
-    if (h2d.batch_ns != 0) {
-        cost.transfer_batch_seconds = static_cast<double>(h2d.batch_ns) * kSecondsPerNs;
-    }
-    return cost;
-}
-
-} // namespace
-
 // The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling, the
 // prefill chunk and the product binary's build identity. Any difference makes the saved state meaningless, so the file is
 // ignored.

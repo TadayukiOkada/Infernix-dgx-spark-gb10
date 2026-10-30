@@ -8,6 +8,7 @@
 #include "core/vram_budget.h"
 #include "models/load_options.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/measurement.h"
 #include "runtime/expert_offload/memory_plan.h"
 #include "models/qwen4_exp/program/fast_paths.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
@@ -569,6 +570,29 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
     frontend.complete();
 
+    // The applicability key of this exact configuration (the architecture dimensions and the bound
+    // Text/Vision weight inventory). Serving reports it, an external --context-cost-table and the
+    // entries compiled for this machine key on it, and the calibration bench records a measured
+    // table under it. Resolution is unconditional: the LoadSummary reports the sources whether or
+    // not the prefix cache runs.
+    const std::string prefill_signature = models::qwen4_exp::prefill_signature(*instance->model);
+    auto context_cost =
+        resolve_context_machine_cost({.hardware_class    = context_cost_hardware_class(
+                                          device.props.name, device.props.major, device.props.minor),
+                                      .prefill_signature = prefill_signature},
+                                     options.context_cost.preset_path);
+    if (cache.enabled) {
+        // A table that binds this configuration prices recomputation with its measured
+        // coefficients. The generic estimate is one measured artifact's average, so a
+        // configuration no table binds keeps the estimates set above; the Program still replaces
+        // the restore rate with the link rate it measures at startup.
+        auto priced = context_cost.model;
+        if (context_cost.summary.prefill_source == ContextCostPresetSource::GenericDefault) {
+            priced.prefill = {};
+        }
+        layer_hybrid_cost(program_options.prefix_cost, priced);
+    }
+
     // The fast paths qualified for this configuration (docs/maintainer/model-quality.md section 6.7).
     const models::qwen4_exp::FastPathSelection fast = models::qwen4_exp::select_fast_paths(instance->parameters, options);
     program_options.fast_paths        = fast.forward();
@@ -698,6 +722,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary summary;
     summary.architecture         = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
     summary.model_name           = instance->model->info().name;
+    summary.prefill_signature    = prefill_signature;
     summary.load_seconds         = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;
@@ -706,6 +731,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"bf16", "fp32", "nvfp4_mul"};
+    summary.context_cost         = std::move(context_cost.summary);
     summary.prefix_cache         = std::move(restore);
     summary.fast_path_configuration = models::qwen4_exp::describe(fast.configuration);
     for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }

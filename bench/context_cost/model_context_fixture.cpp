@@ -520,8 +520,11 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
     };
 
     const std::vector<std::uint32_t> lengths(root_lengths.begin(), root_lengths.end());
-    (void)run_root(lengths.front());
-    if (lengths.back() != lengths.front()) { (void)run_root(lengths.back()); }
+    // Every grid length runs once before any sample is taken. A length's first run pays the page
+    // setup of its own context (measured on GB10 at 4096+64: 103.6 ms cold against 67.2 ms warm),
+    // and a suffix priced as the difference of two roots would fold that setup into the
+    // coefficients it cannot express. The transfer suite warms its points the same way.
+    for (const std::uint32_t length : lengths) { (void)run_root(length); }
     std::map<std::uint32_t, std::vector<double>> root_samples;
     for (const std::uint32_t length : lengths) {
         root_samples.emplace(length, std::vector<double>{});
@@ -588,7 +591,7 @@ PrefillSuiteResult measure_prefill(const ArtifactProfile& artifact,
             }
             return std::pair{patches, generated.timings.vision_seconds * 1'000'000'000.0};
         };
-        (void)run_vision(vision_cases.back().dimension);
+        for (const VisionCase& test : vision_cases) { (void)run_vision(test.dimension); }
         std::array<std::vector<double>, vision_cases.size()> vision_samples;
         std::array<std::uint64_t, vision_cases.size()> patches{};
         for (int repetition = 0; repetition < options.prefill_repetitions; ++repetition) {

@@ -1,42 +1,39 @@
+// GB10 (sm_121a) tuned dispatch, 2026-10-30: bench/ops/q8_route_sweep.cu over T = 1..64 (sweep
+// record /tmp q8sweep_1280x2560, shipped 2026-10-30). The SIMT pair left T = 3..48 on 160 CTAs
+// iterating K = 2560 serially (the shape serves 49x per forward pass): the sliced-K MMA family
+// tiles hold ~16 us through T = 16 and ~21..33 us through T = 48, 28..68% faster at every width.
+// The exact table delegates T = 1..48 to the shape's fixed sliced-K family: the sweep's per-width
+// bit_exact gates cannot certify a cross-schedule column contract (each candidate was only
+// checked at its own width against the pre-change route, and the SIMT, 4-K-warp and grouped
+// families reduce a column differently), and the [1280,2560] 48-column invariance contract needs
+// one bit family across the whole range. The T-dependent 4-K-warp winners the family cannot
+// serve bit-invariantly stay on the fast route.
+
+#include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_shapes.h"
-#include "ops/linear/q8/q8_sliced_k_launch.cuh"
-#include "ops/linear/q8/q8_stream_launch.cuh"
 
 namespace infernix::ops::detail {
-namespace {
-// Qwen3.8-Flash-Next shared expert gate/up: the register-streamed route up to 48 columns but 4 (SIMT there),
-// the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per pass.
-template <int MaxCols, int ColsPerPass>
-using Stream = Q8A16StreamSchedule<2560, 2, 1, 4, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
-// route-sweep 2026-10-24 (bench/ops/q8_route_sweep.cu, bit_exact=1 && t_invariant=1 vs production):
-// the sliced-K winners replicate the swept template args exactly, including StaticK=0, TokenCapacity
-// and RowTiles, so the shipped instantiations are precisely the ones the sweep verified and timed.
-using SlicedK_T8W8S1M1RT1 = Q8A16SlicedKMmaSchedule<8, 8, 1, 1, Q8ScaleAccess::Shared, Cache::ca,
-                                                    Cache::cg, Q8ActivationStage::ActiveOnly, 0, 8,
-                                                    false, 1>;
-using SlicedK_T8W8S2M1RT2 = Q8A16SlicedKMmaSchedule<8, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca,
-                                                    Cache::cg, Q8ActivationStage::ActiveOnly, 0, 8,
-                                                    false, 2>;
-using SlicedK_T16W8S1M1RT1 = Q8A16SlicedKMmaSchedule<16, 8, 1, 1, Q8ScaleAccess::Shared, Cache::ca,
-                                                     Cache::cg, Q8ActivationStage::ActiveOnly, 0, 16,
-                                                     false, 1>;
 
-template <class Schedule>
-void sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    launch_q8_a16_sliced_k_mma<Schedule>(
-        q8_linear_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
-        LinearIdentityEpilogue{}, stream);
-}
-} // namespace
-
+// The exact table: the fixed 8-K-warp family (capacity 8/16/32 rungs) through T = 48 — the width
+// the column-invariance contract covers — then the pre-existing MMA tail.
 Q8Launch select_q8_n1280_k2560(std::int32_t tokens) {
-    if (tokens <= 2) return launch_q8_a16_stream_linear<Stream<4, 4>>;
-    if (tokens <= 4) return launch_q8_a16_simt_r8_t4;
-    if (tokens <= 48) return launch_q8_a16_simt_r8_t8;
+    if (tokens <= 48) return select_q8_n1280_k2560_invariant(tokens);
     if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
     return launch_q8_a16_mma_r64_t128;
+}
+
+// The q8-sliced-k fast path (LinearRoutes::Q8SlicedK): the T-dependent sliced winners. Beyond
+// T = 16 the 4-K-warp tiles beat the family (19.2..19.4 us flat over T = 17..32, 25..28 us over
+// T = 33..64, where the swept sliced candidates pay 27..32); beyond T = 64 it falls back to the
+// exact MMA tail.
+Q8Launch select_q8_n1280_k2560_fast(std::int32_t tokens) {
+    if (tokens <= 1) return select_q8_n1280_k2560_invariant(1);
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r32_t16_w4_s2;
+    if (tokens <= 44) return launch_q8_a16_sliced_r16_t16_w4_s2;
+    if (tokens <= 64) return launch_q8_a16_sliced_r32_t16_w4_s2;
+    return select_q8_n1280_k2560(tokens);
 }
 
 } // namespace infernix::ops::detail

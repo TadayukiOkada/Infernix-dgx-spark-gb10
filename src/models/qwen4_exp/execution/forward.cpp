@@ -615,10 +615,12 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), batch.batch); }
     scan_input(x, scan_layer_, ActivationScan::Site::GdnInput);
-    // gdn-conv-fused: a decode call's Q8 projection runs the causal convolution in its epilogue, from
-    // the FP32 projection rather than its BF16 rounding. Verification and prefill stay composed.
+    // gdn-conv-fused: a decode call's Q8 or NVFP4 projection runs the causal convolution in its epilogue,
+    // from the FP32 projection rather than its BF16 rounding. Verification and prefill stay composed.
     const bool decode     = batch.verify == nullptr && batch.width <= 1;
-    const bool fused_conv = fast_.gdn_conv_fused && decode && p.projection.weight.qtype == QType::Q8_G32_FP16;
+    const bool fused_conv =
+        fast_.gdn_conv_fused && decode &&
+        (p.projection.weight.qtype == QType::Q8_G32_FP16 || p.projection.weight.qtype == QType::NVFP4);
     Tensor qkv;
     if (!fused_conv) { qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T}); }
     Tensor z  = work_.alloc(DType::BF16, {VW, T});

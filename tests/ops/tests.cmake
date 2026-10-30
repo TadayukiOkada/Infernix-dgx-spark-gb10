@@ -402,11 +402,13 @@ add_test(NAME infernix_gdn_replay_fold_wide_batched_test
 set_tests_properties(infernix_gdn_replay_fold_wide_batched_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 
-# hyper_connection_mix against the FP64 closed formula: fused Q8 route (T <= 16) and composed route.
+# hyper_connection_mix against the FP64 closed formula: fused route (Q8 weights up to 3 columns,
+# BF16 up to 4) and composed route.
 infernix_add_family_op_test(infernix_hyper_connection_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
   LIBRARIES infernix_linear_test_support)
 set_tests_properties(infernix_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # hyper_connection_stream_mean (DFlash2's target features) against the FP64 stream mean.
 infernix_add_family_op_test(infernix_hyper_connection_stream_mean_test FAMILY elementwise
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection_stream_mean.cpp"

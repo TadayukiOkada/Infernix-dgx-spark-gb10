@@ -1,3 +1,9 @@
+// GB10 (sm_121a) tuned dispatch, 2026-10-30: bench/ops/nvfp4_route_sweep.cu (A16) over
+// T = 1..512 against the pre-change table, which carried the RTX 5090 fit. The 32-row (RowTiles 2)
+// sliced-K tiles win the decode and verification band (-8..-10% at T = 3 and T = 17..32), the
+// 32-row K128 tile takes T = 49..64 (-7%) and T = 97..128 (-8.6%), and the 128-row K64 tile
+// replaces the RTX 5090 t256 tail over the whole prefill range (T = 192..384: -17..-37%).
+// The A4 route is unchanged (it dominates every width it admits on this shape).
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -7,30 +13,29 @@ namespace {
 using Geometry = Nvfp4Geometry<34816, 5120>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
-using C2      = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using T64R64  = Nvfp4A4MmaSchedule<64, 64, 256, 2, 4, 2, 1>;
 using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
-    if (tokens <= 2) return nvfp4_linear_a16_simt<Geometry, 2, C2, true>;
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
-    if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2>>;
-    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 8, 1>>;
-    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1>>;
-    if (tokens <= 64)
+    if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
+    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 1, 2>>;
+    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
+    if (tokens <= 48)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
+    if (tokens <= 64)
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;
     if (tokens <= 96)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;
     if (tokens <= 128)
-        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 256, 64, 32, 32, 2, 1>>;
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
+    if (tokens <= 384)
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>>;
+    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
 }
 
 void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {

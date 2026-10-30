@@ -3,6 +3,7 @@
 #include "core/transfer_work.h"
 #include "infernix/types.h"
 #include "runtime/contract/resources.h"
+#include "runtime/prefix_cache/cost.h"
 
 #include <array>
 #include <cstdint>
@@ -83,6 +84,20 @@ parse_context_cost_presets(std::string_view json, std::string_view source_name);
 [[nodiscard]] ResolvedContextMachineCost
 resolve_context_machine_cost(const ContextCostIdentity& identity,
                              const std::filesystem::path& external_preset_path = {});
+
+// Layers the machine coefficients over an index cost model the caller already configured:
+// nanoseconds become seconds, Q32 nanoseconds their double rate, and the Host-to-Device direction
+// its byte rate. An unmeasured (zero) term and every field this contract does not carry (the chunk
+// width, an offloaded model's route saturation) keeps the base's value, so a caller that priced
+// its own architecture before it resolved a table retains that estimate for the half the table
+// does not bind.
+void layer_hybrid_cost(prefix_cache::CacheCostModel& cost,
+                       const ContextMachineCostModel& model) noexcept;
+
+// The same over the index's own generic defaults: what an architecture that prices nothing itself
+// (the Qwen3.5 Program) gives its hybrid index.
+[[nodiscard]] prefix_cache::CacheCostModel
+hybrid_cache_cost(const ContextMachineCostModel& model) noexcept;
 
 // Calibration updates one independently measurable component and preserves every other component.
 void upsert_context_transfer_cost_atomic(const std::filesystem::path& path,

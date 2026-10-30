@@ -112,7 +112,7 @@ bool uses_a4(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N16384K2560{
-    16384, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 128};
+    16384, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 65};
 
 void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                      cudaStream_t stream, LinearPolicy policy, LinearRoutes routes,
@@ -120,7 +120,7 @@ void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tens
     const LinearBf16SegmentedOutput<10240, 6144> output{
         {static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)}};
     if ((allows_a4_residual(policy) || has_route(routes, LinearRoutes::Nvfp4A4Pair)) &&
-        x.ne[1] >= 128 && workspace != nullptr) {
+        x.ne[1] >= 65 && workspace != nullptr) {
         auto scope = workspace->scope();
         const auto scratch =
             allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k, kNvfp4A4ResidualTerms, true);

@@ -79,6 +79,9 @@ struct G13952x2560 {
 struct G16384x2560 {
     static constexpr std::int32_t kInputRows = 2560, kOutputRows = 16384;
 };
+struct G2560x12800 {
+    static constexpr std::int32_t kInputRows = 12800, kOutputRows = 2560;
+};
 
 } // namespace
 
@@ -121,6 +124,13 @@ Q8Launch select_q8_n13952_k2560_invariant(std::int32_t tokens) {
 }
 Q8Launch select_q8_n16384_k2560_invariant(std::int32_t tokens) {
     return static_ladder<G16384x2560, Rung<8, 8, 2, 1>, Rung<16, 8, 2, 1>, Rung<32, 8, 2, 1>>(tokens);
+}
+
+// DFlash2's feature_projection (added 2026-10-30 with the shape's dispatch entry): the [2560, 6144]
+// 2-stage pattern over the 12800-K reduction; the sweep's width-1..8 sliced winners run at
+// 160..168 us here, 15..20% under the SIMT pair's 187..215.
+Q8Launch select_q8_n2560_k12800_invariant(std::int32_t tokens) {
+    return static_ladder<G2560x12800, Rung<8, 8, 2, 1>, Rung<16, 8, 2, 1>, Rung<32, 8, 2, 1>>(tokens);
 }
 
 } // namespace infernix::ops::detail

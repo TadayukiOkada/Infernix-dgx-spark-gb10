@@ -63,10 +63,16 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n2560_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n1280_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k6144(std::int32_t tokens);
+// DFlash2's feature_projection (the drafter's [2560, 12800] context projection).
+[[nodiscard]] Q8Launch select_q8_n2560_k12800(std::int32_t tokens);
 // The q8-sliced-k fast path (LinearRoutes::Q8SlicedK): NInfer's GEMV, sliced-K and grouped sliced-K
 // routes for the same two problems, whose accumulation order differs from the exact routes'.
 [[nodiscard]] Q8Launch select_q8_n16384_k2560_fast(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k6144_fast(std::int32_t tokens);
+// The T-dependent sliced-K winners of the GB10 retune for the shared-expert gate and DFlash2's
+// feature_projection; a column's bits depend on the call's width, so they are fast-path routes only.
+[[nodiscard]] Q8Launch select_q8_n1280_k2560_fast(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k12800_fast(std::int32_t tokens);
 // The [16384,2560] GDN projection on the same routes, rows [0,10240) written to qkv [10240,T] and
 // rows [10240,16384) to z [6144,T] (gdn_input_proj).
 void launch_q8_n16384_k2560_split(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -94,5 +100,6 @@ void launch_q8_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weight,
 [[nodiscard]] Q8Launch select_q8_n12800_k2560_invariant(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n13952_k2560_invariant(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n16384_k2560_invariant(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k12800_invariant(std::int32_t tokens);
 
 } // namespace infernix::ops::detail
