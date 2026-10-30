@@ -372,3 +372,41 @@ When operating with `.github/agents/`, follow the Parent–Child hierarchy:
   Continue from the existing changes. Do not redo completed work.
   Finish the task, run the relevant tests, and report the result.
   ```
+
+## Waiting for background tasks
+
+Never use `sleep` (fixed delays, `sleep N` polling loops, or `sleep` inside retry loops) to wait for a
+build, benchmark, test, or other background process. A fixed delay either wastes time or returns
+before the work finished. Wait on the process itself and return the moment it exits.
+
+Prefer waiting on the exact PID with `kill -0`: several processes can share a name (parallel
+`ninja`, `python3`, `bash`, other agents' runs), so name-based matching can wait on the wrong one
+or never terminate.
+
+```bash
+# Preferred: start the task, capture its PID, wait for exactly that process
+./bench/run_kv_matrix_bench.sh /tmp/out > /tmp/out.log 2>&1 &
+PID=$!
+while kill -0 "$PID" 2>/dev/null; do :; done
+
+# Already-running process: obtain its PID once, then wait on the PID
+PID=$(pgrep -n -f '[r]un_kv_matrix_bench')    # -n newest, -o oldest; verify it is the right one
+while kill -0 "$PID" 2>/dev/null; do :; done
+
+# Fallback only when the PID is unobtainable and the name is unique:
+while pgrep -x ninja >/dev/null; do :; done
+```
+
+Rules:
+
+- Use `while kill -0 "$PID" 2>/dev/null; do :; done` by default. `kill -0` only checks that the
+  process exists; it sends no signal.
+- After the loop ends, check the result (exit code via `wait "$PID"` when it is a child of the
+  same shell, log tail, expected output file); process disappearance alone does not prove success.
+- When resolving a PID with `pgrep -f`, use a pattern that cannot match the waiting shell itself
+  (e.g. the `[r]un_kv_matrix_bench` bracket trick) and confirm a single intended match
+  (`pgrep -af`) before waiting.
+- Use name-based `while pgrep -x ...` only as a fallback, and only when no other process of that
+  name can exist.
+- Prefer the tool's native completion notification for background commands; use a wait loop only
+  when a synchronous wait on an already-running process is required.
