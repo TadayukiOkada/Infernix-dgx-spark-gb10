@@ -34,6 +34,10 @@ void q8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 void q8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                        Tensor& v, cudaStream_t stream);
+void q8_attn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_attn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                                        Tensor& v, cudaStream_t stream);
 void q8_companion_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                                 Tensor& k, Tensor& v, cudaStream_t stream);
 void q8_companion_attn_input_mma_r64_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
@@ -52,6 +56,8 @@ void q8_dflash2_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& wei
                                               Tensor& k, Tensor& v, cudaStream_t stream);
 void q8_dflash2_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                                Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_dflash2_attn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                                Tensor& k, Tensor& v, cudaStream_t stream);
 
 void q8_dflash2_attn_input_mma_r16_c64_k128_launch(const Tensor&, const Weight&, Tensor&, Tensor&,
                                                    Tensor&, cudaStream_t);
@@ -71,6 +77,9 @@ void q8_attn_input_n17408_mma_r32_c128_launch(const Tensor& x, const Weight& wei
                                               Tensor& k, Tensor& v, cudaStream_t stream);
 void q8_attn_input_n17408_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                               Tensor& k, Tensor& v, cudaStream_t stream);
+void q8_attn_input_n17408_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                               Tensor& gate, Tensor& k, Tensor& v,
+                                               cudaStream_t stream);
 void q8_attn_input_n17408_column_invariant_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                                   Tensor& k, Tensor& v, cudaStream_t stream);
 

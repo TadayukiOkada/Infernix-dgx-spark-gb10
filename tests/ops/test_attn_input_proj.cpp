@@ -589,7 +589,7 @@ int run_q8_target() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 9216, kHidden, 211U));
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129}) {
+    for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129, 512, 4096}) {
         failures += run_q8_target_case(parent, tokens);
     }
     // The column-invariant route: one column, the exact instances' range and its 48-column slices.
@@ -674,8 +674,9 @@ int run_q8_companion() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, kHidden, 307U));
     int failures = 0;
-    // One public numerical case from every registered companion A16 T region.
-    for (const std::int32_t tokens : {1, 2, 97, 193, 289, 321, 385, 449}) {
+    // One public numerical case from every registered companion A16 T region. 385 starts the
+    // 128x128 prefill band and 4096 is the production prefill width inside it.
+    for (const std::int32_t tokens : {1, 2, 97, 193, 289, 321, 385, 449, 512, 4096}) {
         failures += run_q8_qkv_case(parent, kHidden, "companion", tokens);
     }
     return failures;
@@ -690,7 +691,7 @@ int run_q8_dflash2() {
         const std::string label = "DFlash2 H=" + std::to_string(hidden);
         for (int tokens = 1; tokens <= 128; ++tokens)
             failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens);
-        for (int tokens : {129, 192, 193, 1024})
+        for (int tokens : {129, 192, 193, 1024, 4096})
             failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens);
         for (int tokens : {1, 8, 16, 48, 49, 53, 54, 63, 64, 65, 96, 97, 112, 127, 128, 129})
             failures += run_q8_qkv_case(parent, hidden, label.c_str(), tokens, true, 31);

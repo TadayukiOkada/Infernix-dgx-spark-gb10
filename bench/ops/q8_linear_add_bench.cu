@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
                 });
             if (options.production_only) { continue; }
 
-            if (t == 1 && options.hidden == 6144) {
+            if (t == 1) {
                 run("decode_r4", [&](cudaStream_t candidate_stream) {
                     ops::detail::q8_linear_add_decode_r4_launch(x, packed.weight, out,
                                                                 candidate_stream);

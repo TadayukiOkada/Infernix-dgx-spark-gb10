@@ -22,10 +22,20 @@ struct Q8PairRouteSpec {
     Q8PairScheduleId schedule;
 };
 
-constexpr std::array<Q8PairRouteSpec, 3> kK5120Routes{{
+// The k = 5120 companion pair ([1024, 5120] x 2, the Qwen3.6-35B-A3B gate/up companion). The HEAD
+// table is the RTX 5090 fit; GB10 (48 SM) re-measured 2026-10-31, cold cache, warmup 3 / repeat 10.
+// Below 512 columns the 32-row tiles own the range — a 1024-row weight is only 8 tiles of 128 rows,
+// and at these widths the 128x128 tile leaves most of its column tile empty (2x slower at T = 128).
+// From 1536 columns the 128x128 tile wins outright: 446 us against 543 at T = 1536, 676 against 754
+// at 2048, 858 against 1058 at 3072 and 1225 against 1464 at 4096 (16% ahead). The 512..1024 band is
+// a coin flip between the tiles (r128 leads by 3-6% at 512/640/704/960 and trails by the same at
+// 576/832/896/1024, i.e. wave quantisation on 48 SMs rather than a schedule property), so it keeps
+// the incumbent 32x128 tile instead of freezing an unstable argmin.
+constexpr std::array<Q8PairRouteSpec, 4> kK5120Routes{{
     {1, 20, Q8PairScheduleId::TwoSimtR8C4},
     {21, 256, Q8PairScheduleId::DualMmaR32C64},
-    {257, kAnyCols, Q8PairScheduleId::DualMmaR32C128},
+    {257, 1535, Q8PairScheduleId::DualMmaR32C128},
+    {1536, kAnyCols, Q8PairScheduleId::DualMmaR128C128},
 }};
 
 constexpr std::array<Q8PairRouteSpec, 24> kK2048Routes{{
@@ -167,6 +177,7 @@ std::int32_t schedule_rows(Q8PairScheduleId schedule) {
         return 96;
     case Q8PairScheduleId::ConcatMmaR128C64:
     case Q8PairScheduleId::ConcatMmaR128C80:
+    case Q8PairScheduleId::DualMmaR128C128:
         return 128;
     default:
         throw std::logic_error("q8 pair: exact schedule has no row tile");
@@ -214,6 +225,7 @@ std::int32_t schedule_cols(Q8PairScheduleId schedule) {
         return 112;
     case Q8PairScheduleId::DualSplitKMediumC128:
     case Q8PairScheduleId::DualMmaR32C128:
+    case Q8PairScheduleId::DualMmaR128C128:
     case Q8PairScheduleId::ConcatMmaR32C128:
     case Q8PairScheduleId::ConcatMmaR48C128:
     case Q8PairScheduleId::ConcatMmaR64C128:
@@ -337,6 +349,8 @@ const char* q8_pair_schedule_name(Q8PairScheduleId schedule) {
         return "q8_pair.dual_mma.r32.c64";
     case Q8PairScheduleId::DualMmaR32C128:
         return "q8_pair.dual_mma.r32.c128";
+    case Q8PairScheduleId::DualMmaR128C128:
+        return "q8_pair.dual_mma.r128.c128";
     case Q8PairScheduleId::ConcatMmaR32C64:
         return "q8_pair.concat_mma.r32.c64";
     case Q8PairScheduleId::ConcatMmaR32C80:
@@ -447,6 +461,10 @@ void launch_tiled(Q8PairScheduleId schedule, bool full, const Tensor& x, const W
         case Q8PairScheduleId::DualMmaR32C128:
             q8_pair_gemm_mma_r32_c128_launch(full, x_slice, first_weight, second_weight,
                                              first_slice, second_slice, stream);
+            return;
+        case Q8PairScheduleId::DualMmaR128C128:
+            q8_pair_gemm_mma_r128_c128_launch(x_slice, first_weight, second_weight, first_slice,
+                                              second_slice, stream);
             return;
         default:
             if (is_concat_schedule(schedule)) {

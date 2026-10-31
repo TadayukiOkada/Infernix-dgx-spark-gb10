@@ -15,13 +15,29 @@ namespace {
 constexpr int kRowsPerBlock = 8;
 constexpr int kStages       = 2;
 
-template <int RowsPerCta>
+template <int RowsPerCta, int K>
 void launch_decode(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
-    using Schedule = Q8A16GemvSchedule<RowsPerCta, 1, 2, 6144, 24>;
+    using Schedule = Q8A16GemvSchedule<RowsPerCta, 1, 2, K, 24>;
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(residual_out.data),
                                   residual_out.ne[0]};
     launch_q8_a16_gemv<Schedule>(q8_linear_operands(x, w), output,
                                  LinearResidualAddEpilogue{{output.data, output.rows, 0}}, stream);
+}
+
+// The GEMV schedule bakes K, so each admitted width gets its own instantiation.
+template <int RowsPerCta>
+void launch_decode_by_k(const Tensor& x, const Weight& w, Tensor& residual_out,
+                        cudaStream_t stream) {
+    switch (w.k) {
+    case 4096:
+        launch_decode<RowsPerCta, 4096>(x, w, residual_out, stream);
+        return;
+    case 6144:
+        launch_decode<RowsPerCta, 6144>(x, w, residual_out, stream);
+        return;
+    default:
+        throw std::invalid_argument("q8 linear_add: the decode route registers no GEMV for this K");
+    }
 }
 
 template <int ColsPerTile>
@@ -37,17 +53,17 @@ void launch_variant(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
 
 void q8_linear_add_decode_r4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                     cudaStream_t stream) {
-    launch_decode<4>(x, w, residual_out, stream);
+    launch_decode_by_k<4>(x, w, residual_out, stream);
 }
 
 void q8_linear_add_decode_r8_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                     cudaStream_t stream) {
-    launch_decode<8>(x, w, residual_out, stream);
+    launch_decode_by_k<8>(x, w, residual_out, stream);
 }
 
 void q8_linear_add_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      cudaStream_t stream) {
-    launch_decode<16>(x, w, residual_out, stream);
+    launch_decode_by_k<16>(x, w, residual_out, stream);
 }
 
 void q8_linear_add_simt_r8_c4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,

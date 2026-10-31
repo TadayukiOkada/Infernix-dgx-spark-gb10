@@ -68,8 +68,10 @@ int cancellation_conformance() {
 int q8_a16_conformance() {
     int failures = 0;
 
-    constexpr std::array<std::int32_t, 4> kK4096RouteStarts{2, 49, 129, 641};
-    constexpr std::array<std::int32_t, 5> kK4096RouteInteriors{1, 24, 96, 256, 1024};
+    // 992 and 2560 are the 2026-10-31 T8 crossovers (R64C128 -> R128C80 -> R64C128 -> R128C64);
+    // 2048/4096 are the prefill interiors that now run the 128-row/64-column tile.
+    constexpr std::array<std::int32_t, 6> kK4096RouteStarts{2, 49, 129, 641, 992, 2560};
+    constexpr std::array<std::int32_t, 7> kK4096RouteInteriors{1, 24, 96, 256, 1024, 2048, 4096};
     failures += infernix::test::linear_add::run_shape(
         "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
         ShapeCase{2048, 4096, 419U, kK4096RouteStarts, kK4096RouteInteriors});
@@ -83,10 +85,11 @@ int q8_a16_conformance() {
         ShapeCase{2048, 4096, 427U, kNoStarts, kInvariantTokens, kInvariantGraphs, false, 0,
                   infernix::ops::LinearPolicy::A16ColumnInvariant});
 
-    constexpr std::array<std::int32_t, 32> kK6144RouteStarts{
+    // 1009 and 1792 are the 2026-10-31 T8 crossovers (R64C112 -> R64C128 -> R128C64).
+    constexpr std::array<std::int32_t, 33> kK6144RouteStarts{
         2,    49,   129,  192,  193,  257,  385,  400,  401,  448,  449,
-        481,  641,  673,  705,  785,  897,  961,  1024, 1025, 1121, 1281,
-        1345, 1409, 1681, 1792, 1793, 1920, 1921, 2017, 2048, 2049,
+        481,  641,  673,  705,  785,  897,  961,  1009, 1024, 1025, 1121,
+        1281, 1345, 1409, 1681, 1792, 1793, 1920, 1921, 2017, 2048, 2049,
     };
     constexpr std::array<std::int32_t, 33> kK6144RouteInteriors{
         1,    24,   96,   160,  192,  224,  320,  392,  400,  424,  448,

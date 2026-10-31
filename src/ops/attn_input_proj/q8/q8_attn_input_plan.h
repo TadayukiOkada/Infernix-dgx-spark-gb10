@@ -21,12 +21,14 @@ enum class Q8AttnInputScheduleId {
     MmaR64C128,
     MmaR128C64,
     MmaR128C80,
+    MmaR128C128,
     DFlash2SmallT,
     DFlash2MmaR16C64K128,
     DFlash2MmaR32C32K128,
     DFlash2MmaR32C64K128,
     DFlash2MmaR32C64,
     DFlash2MmaR64C128,
+    DFlash2MmaR128C128,
     // Request-invariant exact route of the four-output parents (35B-A3B, 122B-A10B): one sliced-K
     // reduction at every width.
     ColumnInvariant,

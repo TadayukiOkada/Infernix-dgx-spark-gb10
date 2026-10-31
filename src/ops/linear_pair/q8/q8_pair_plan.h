@@ -30,6 +30,7 @@ enum class Q8PairScheduleId {
     DualSplitKMediumC256,
     DualMmaR32C64,
     DualMmaR32C128,
+    DualMmaR128C128,
     ConcatMmaR32C64,
     ConcatMmaR32C80,
     ConcatMmaR32C96,

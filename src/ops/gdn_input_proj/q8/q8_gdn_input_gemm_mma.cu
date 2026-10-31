@@ -19,4 +19,13 @@ void q8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Ten
     launch_q8_a16_mma<Schedule>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
                                 stream);
 }
+
+void q8_gdn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                       cudaStream_t stream) {
+    using WideSchedule = Q8A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>;
+    static_assert((8192 % WideSchedule::kBlockRows) == 0 && (4096 % WideSchedule::kBlockRows) == 0);
+    const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
+    launch_q8_a16_mma<WideSchedule>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
+                                    stream);
+}
 } // namespace infernix::ops::detail

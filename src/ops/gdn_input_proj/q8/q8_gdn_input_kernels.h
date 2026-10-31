@@ -28,5 +28,7 @@ void q8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weigh
                                             Tensor& value, Tensor& z, cudaStream_t stream);
 void q8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                       cudaStream_t stream);
+void q8_gdn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                       cudaStream_t stream);
 
 } // namespace infernix::ops::detail

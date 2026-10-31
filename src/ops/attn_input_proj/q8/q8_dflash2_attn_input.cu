@@ -114,6 +114,12 @@ void q8_dflash2_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& we
     launch_mma<Schedule>(x, weight, q, k, v, stream);
 }
 
+void q8_dflash2_attn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                                Tensor& k, Tensor& v, cudaStream_t stream) {
+    using Schedule = Q8A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>;
+    launch_mma<Schedule>(x, weight, q, k, v, stream);
+}
+
 void q8_dflash2_attn_input_mma_r16_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
                                                    Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<16, 64, 128, 16, 16, 1, 1>;

@@ -115,6 +115,13 @@ void q8_attn_input_n17408_mma_r64_c128_launch(const Tensor& x, const Weight& wei
     CUDA_CHECK(cudaGetLastError());
 }
 
+void q8_attn_input_n17408_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                               Tensor& gate, Tensor& k, Tensor& v,
+                                               cudaStream_t stream) {
+    launch_mma<Q8A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>>(x, weight, q, gate, k, v, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Every width runs the 8 K-warp sliced-K reduction of the exact route's T=2..48 instances: T=1 its
 // one-column instance, wider calls its T=48 schedule over 48-column slices, so a column's bits do not
 // depend on the call's width.

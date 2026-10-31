@@ -236,8 +236,10 @@ int run_q8() {
     int failures = 0;
     // Straddle the decode/split-K edge (1/2), every split-K internal sub-edge (32/33, 48/49,
     // 64/65 exact-launcher vs medium-launcher), the retuned split-K -> R64C128 crossover (64/65),
-    // and the upper split-K bound (96/97).
-    for (const std::int32_t tokens : {1, 2, 32, 33, 48, 49, 64, 65, 96, 97}) {
+    // the upper split-K bound (96/97), the R64C128 -> R128C128 crossover (128/129), and a wide
+    // prefill width where the 128x128 tile owns the route.
+    for (const std::int32_t tokens :
+         {1, 2, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 512, 2049}) {
         failures += run_q8_case(parent, tokens);
     }
     // The column-invariant route: one column, the exact instances' range and its 32-column slices.

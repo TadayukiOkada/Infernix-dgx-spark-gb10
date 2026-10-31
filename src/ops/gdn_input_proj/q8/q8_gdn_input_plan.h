@@ -14,6 +14,7 @@ enum class Q8GdnInputScheduleId {
     DecodeR8Direct,
     SplitKMmaDirect,
     MmaR64C128,
+    MmaR128C128,
     // Request-invariant exact route: one sliced-K reduction at every width.
     ColumnInvariant,
 };

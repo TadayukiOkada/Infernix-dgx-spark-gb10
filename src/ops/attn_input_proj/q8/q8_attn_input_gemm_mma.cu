@@ -122,4 +122,27 @@ void q8_companion_attn_input_mma_r128_c80_launch(const Tensor& x, const Weight& 
     launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
 }
 
+// The 128x128 prefill tile. The raster keeps the shared 8-row CTA group: a 32-row group measured
+// 2-6% slower on every routed width of this Op's four-output lane (129 145.3 against 137.1 us,
+// 1024 497.5 against 472.9) and only 2% ahead at 4096, so the shared default stays.
+void q8_attn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    using Schedule = Q8A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>;
+    static_assert((4096 % Schedule::kBlockRows) == 0 && (512 % Schedule::kBlockRows) == 0);
+    const TargetOutput output{
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+    launch_route<Schedule, kTargetRows>(x, weight, output, stream);
+}
+
+void q8_attn_input_mma_r128_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                                        Tensor& v, cudaStream_t stream) {
+    using Schedule = Q8A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>;
+    static_assert((4096 % Schedule::kBlockRows) == 0 && (1024 % Schedule::kBlockRows) == 0);
+    const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
+                                 static_cast<__nv_bfloat16*>(k.data),
+                                 static_cast<__nv_bfloat16*>(v.data)};
+    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+}
+
 } // namespace infernix::ops::detail

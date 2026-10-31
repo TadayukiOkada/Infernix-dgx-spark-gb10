@@ -23,11 +23,19 @@ struct RouteSpec {
 // admitted tile across the token-width range (bench/ops/q8_linear_add_bench, rows=2048, K=4096, warmup
 // 8 / repeat 40). The previous 5-band table was fitted on the RTX 5090 (170 SMs); its MediumSplitK band
 // (cols 49-128) and single MmaR32C128 band (cols 129-640) under-fill 48 SMs and lose 14-47% in the
-// prefill band. Decode (col 1) and the exact-T split-K band (cols 2-48) were already optimal on GB10
-// (0% gap) and are unchanged. All MMA tiles accumulate each output over K in the same order, so
-// swapping them is bit-identical; only speed differs.
-constexpr std::array<RouteSpec, 19> kK4096Routes{{
-    {1, 1, Q8LinearAddScheduleId::SimtR8C4},
+// prefill band. The exact-T split-K band (cols 2-48) was already optimal on GB10 (0% gap) and is
+// unchanged. All MMA tiles accumulate each output over K in the same order, so swapping them is
+// bit-identical; only speed differs.
+//
+// 2026-10-31 T8 re-fit at the two ends of the range. At col 1 the r16 GEMV reads the weight once at
+// 212.7 GB/s against the r8x4-column SIMT's 198.2 (the SIMT's four-column reuse buys nothing when a
+// single token leaves nothing to reuse), so decode now takes the same GEMV family K = 6144 uses. From
+// col 2560 the 128-row/64-column tile beats the 64x128 incumbent by 7% (1001 us against 1075 at
+// T = 4096, 68.6 against 64.4 TFLOP/s): with 16 row tiles the wider row tile halves the activation
+// re-stream while 64 columns keep 1024 CTAs, which is what fills 48 SMs at two CTAs each. The
+// 128x128 tile the task proposed is 27% slower here (54.0 TFLOP/s) — see the GB10 changelog.
+constexpr std::array<RouteSpec, 20> kK4096Routes{{
+    {1, 1, Q8LinearAddScheduleId::DecodeR16},
     {2, 48, Q8LinearAddScheduleId::SplitKMmaExactT},
     {49, 71, Q8LinearAddScheduleId::MmaR32C128},
     {72, 195, Q8LinearAddScheduleId::MmaR32C64},
@@ -45,7 +53,8 @@ constexpr std::array<RouteSpec, 19> kK4096Routes{{
     {864, 895, Q8LinearAddScheduleId::MmaR64C96},
     {896, 927, Q8LinearAddScheduleId::MmaR64C128},
     {928, 991, Q8LinearAddScheduleId::MmaR128C80},
-    {992, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
+    {992, 2559, Q8LinearAddScheduleId::MmaR64C128},
+    {2560, kAnyCols, Q8LinearAddScheduleId::MmaR128C64},
 }};
 
 // GB10 (sm_121a, 48 SMs) route table, re-fitted from a complete cold-cache candidate sweep of every
@@ -55,7 +64,11 @@ constexpr std::array<RouteSpec, 19> kK4096Routes{{
 // exact-T split-K band (cols 2-48) were already optimal on GB10 (0% gap) and are unchanged. Wider
 // MMA tiles (r48/r64/r128) win the prefill band on 48 SMs. All MMA tiles accumulate each output over
 // K in the same order, so swapping them is bit-identical; only speed differs.
-constexpr std::array<RouteSpec, 18> kK6144Routes{{
+//
+// 2026-10-31 T8: from col 1792 the 128-row/64-column tile beats the 64x128 incumbent by 7-10%
+// (1509 us against 1620 at T = 4096, 68.3 against 63.6 TFLOP/s); it still loses below 1536, where the
+// 64-row tile's 32 row tiles are what keeps enough CTAs in flight.
+constexpr std::array<RouteSpec, 19> kK6144Routes{{
     {1, 1, Q8LinearAddScheduleId::DecodeR16},
     {2, 48, Q8LinearAddScheduleId::SplitKMmaExactT},
     {49, 79, Q8LinearAddScheduleId::MmaR32C128},
@@ -73,7 +86,8 @@ constexpr std::array<RouteSpec, 18> kK6144Routes{{
     {768, 959, Q8LinearAddScheduleId::MmaR64C128},
     {960, 975, Q8LinearAddScheduleId::MmaR128C80},
     {976, 1008, Q8LinearAddScheduleId::MmaR64C112},
-    {1009, kAnyCols, Q8LinearAddScheduleId::MmaR64C128},
+    {1009, 1791, Q8LinearAddScheduleId::MmaR64C128},
+    {1792, kAnyCols, Q8LinearAddScheduleId::MmaR128C64},
 }};
 
 constexpr std::array<RouteSpec, 2> kN5120Routes{{

@@ -432,10 +432,11 @@ void run_q8_candidates(const Options& options, bench::L2FlushBuffer& flush, cuda
     DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
 
-    constexpr std::array<ops::detail::Q8GdnInputScheduleId, 3> kSchedules{{
+    constexpr std::array<ops::detail::Q8GdnInputScheduleId, 4> kSchedules{{
         ops::detail::Q8GdnInputScheduleId::DecodeR8Direct,
         ops::detail::Q8GdnInputScheduleId::SplitKMmaDirect,
         ops::detail::Q8GdnInputScheduleId::MmaR64C128,
+        ops::detail::Q8GdnInputScheduleId::MmaR128C128,
     }};
 
     for (const std::int32_t tokens : options.tokens) {
@@ -443,6 +444,10 @@ void run_q8_candidates(const Options& options, bench::L2FlushBuffer& flush, cuda
                                                      tokens};
         for (const auto schedule : kSchedules) {
             if (!ops::detail::q8_gdn_input_candidate_is_legal(schedule, problem)) { continue; }
+            if (!options.cand_filter.empty() &&
+                options.cand_filter != ops::detail::q8_gdn_input_schedule_name(schedule)) {
+                continue;
+            }
             const auto launch = [&](cudaStream_t launch_stream) {
                 Tensor x(input.p, DType::BF16, {kHidden, tokens});
                 Tensor tqkv(qkv.p, DType::BF16, {kQkvRows, tokens});

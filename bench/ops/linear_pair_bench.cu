@@ -286,6 +286,10 @@ int main(int argc, char** argv) {
                     K::q8_pair_gemm_mma_r32_c128_launch(c128_full, x, first_weight, second_weight,
                                                         first, second, cs);
                 });
+                run("dual_mma_r128_c128", [&](cudaStream_t cs) {
+                    K::q8_pair_gemm_mma_r128_c128_launch(x, first_weight, second_weight, first,
+                                                         second, cs);
+                });
             }
         }
         write_csv(options, results);

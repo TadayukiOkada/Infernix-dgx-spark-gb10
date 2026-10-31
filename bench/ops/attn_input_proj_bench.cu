@@ -62,6 +62,9 @@ struct Options {
     bool graph       = false;
     bool candidates  = false;
     std::string cand_filter;  // --candidates: keep only schedules with this exact name
+    // The DFlash2 drafter width to sweep: 5120 (Qwen3.8-27B), 2560 (Qwen3.8-Flash-Next) or
+    // 3072 (Qwen3.5-122B-A10B). All three share one route table, so each needs its own evidence.
+    std::int32_t dflash2_hidden = 5120;
     std::string csv_out;
 };
 
@@ -93,6 +96,7 @@ struct Measurement {
                  "[--fp8-problem 27b|122b] "
                  "[--q4q5-policy a16|invariant] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
+                 "[--dflash2-hidden 5120|2560|3072] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -217,6 +221,12 @@ Options parse_options(int argc, char** argv) {
             options.candidates = true;
         } else if (argument == "--cand-filter") {
             options.cand_filter = std::string(next("--cand-filter requires a value"));
+        } else if (argument == "--dflash2-hidden") {
+            options.dflash2_hidden =
+                parse_i32(next("--dflash2-hidden requires a value"), 2560, 5120, "--dflash2-hidden");
+            if (options.dflash2_hidden != 5120 && options.dflash2_hidden != 2560 &&
+                options.dflash2_hidden != 3072)
+                usage("--dflash2-hidden expects 5120, 2560, or 3072");
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--csv-out") {
@@ -700,13 +710,14 @@ void run_q8_target_candidates(const Options& options, bench::L2FlushBuffer& flus
     DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
     DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
 
-    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 6> kSchedules{{
+    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 7> kSchedules{{
         ops::detail::Q8AttnInputScheduleId::DecodeR8Direct,
         ops::detail::Q8AttnInputScheduleId::SplitKMmaDirect,
         ops::detail::Q8AttnInputScheduleId::SimtR8C4,
         ops::detail::Q8AttnInputScheduleId::MmaR32C128,
         ops::detail::Q8AttnInputScheduleId::MmaR32C64,
         ops::detail::Q8AttnInputScheduleId::MmaR64C128,
+        ops::detail::Q8AttnInputScheduleId::MmaR128C128,
     }};
 
     for (const std::int32_t tokens : options.tokens) {
@@ -714,6 +725,10 @@ void run_q8_target_candidates(const Options& options, bench::L2FlushBuffer& flus
                                                       kHidden, tokens};
         for (const auto schedule : kSchedules) {
             if (!ops::detail::q8_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            if (!options.cand_filter.empty() &&
+                options.cand_filter != ops::detail::q8_attn_input_schedule_name(schedule)) {
+                continue;
+            }
             const auto launch = [&](cudaStream_t launch_stream) {
                 Tensor x(input.p, DType::BF16, {kHidden, tokens});
                 Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
@@ -749,7 +764,7 @@ void run_q8_qkv_candidates(const Options& options, const char* label, std::int32
     DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
     DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
 
-    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 10> kSchedules{{
+    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 11> kSchedules{{
         ops::detail::Q8AttnInputScheduleId::DecodeR8Direct,
         ops::detail::Q8AttnInputScheduleId::SplitKMmaDirect,
         ops::detail::Q8AttnInputScheduleId::MmaR32C64,
@@ -759,6 +774,7 @@ void run_q8_qkv_candidates(const Options& options, const char* label, std::int32
         ops::detail::Q8AttnInputScheduleId::MmaR64C128,
         ops::detail::Q8AttnInputScheduleId::MmaR128C64,
         ops::detail::Q8AttnInputScheduleId::MmaR128C80,
+        ops::detail::Q8AttnInputScheduleId::MmaR128C128,
         ops::detail::Q8AttnInputScheduleId::SimtR8C4,
     }};
 
@@ -767,6 +783,10 @@ void run_q8_qkv_candidates(const Options& options, const char* label, std::int32
                                                       hidden, tokens};
         for (const auto schedule : kSchedules) {
             if (!ops::detail::q8_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            if (!options.cand_filter.empty() &&
+                options.cand_filter != ops::detail::q8_attn_input_schedule_name(schedule)) {
+                continue;
+            }
             const auto launch = [&](cudaStream_t launch_stream) {
                 Tensor x(input.p, DType::BF16, {hidden, tokens});
                 Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
@@ -789,10 +809,14 @@ void run_q8_qkv_candidates(const Options& options, const char* label, std::int32
 
 void run_q8_dflash2_candidates(const Options& options, bench::L2FlushBuffer& flush,
                                cudaStream_t stream, std::vector<Result>& results) {
-    constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQueryRows   = 4096;
     constexpr std::int32_t kKvRows      = 1024;
     constexpr std::int32_t kParentRows  = 6144;
+    const std::int32_t kHidden          = options.dflash2_hidden;
+    const char* label                   = kHidden == 5120
+                                              ? "q8-dflash2-qkv"
+                                              : (kHidden == 2560 ? "q8-dflash2-qkv-h2560"
+                                                                  : "q8-dflash2-qkv-h3072");
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
     bench::PackedQuantizedWeight parent =
         bench::make_row_split_weight(QType::Q8_G32_FP16, kParentRows, kHidden, kHidden, 509U);
@@ -801,13 +825,14 @@ void run_q8_dflash2_candidates(const Options& options, bench::L2FlushBuffer& flu
     DeviceBuffer k(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
     DeviceBuffer v(static_cast<std::size_t>(kKvRows) * max_tokens * 2);
 
-    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 6> kSchedules{{
+    constexpr std::array<ops::detail::Q8AttnInputScheduleId, 7> kSchedules{{
         ops::detail::Q8AttnInputScheduleId::DFlash2SmallT,
         ops::detail::Q8AttnInputScheduleId::DFlash2MmaR16C64K128,
         ops::detail::Q8AttnInputScheduleId::DFlash2MmaR32C32K128,
         ops::detail::Q8AttnInputScheduleId::DFlash2MmaR32C64K128,
         ops::detail::Q8AttnInputScheduleId::DFlash2MmaR32C64,
         ops::detail::Q8AttnInputScheduleId::DFlash2MmaR64C128,
+        ops::detail::Q8AttnInputScheduleId::DFlash2MmaR128C128,
     }};
 
     for (const std::int32_t tokens : options.tokens) {
@@ -815,6 +840,10 @@ void run_q8_dflash2_candidates(const Options& options, bench::L2FlushBuffer& flu
                                                       kHidden, tokens};
         for (const auto schedule : kSchedules) {
             if (!ops::detail::q8_attn_input_candidate_is_legal(schedule, problem)) { continue; }
+            if (!options.cand_filter.empty() &&
+                options.cand_filter != ops::detail::q8_attn_input_schedule_name(schedule)) {
+                continue;
+            }
             const auto launch = [&](cudaStream_t launch_stream) {
                 Tensor x(input.p, DType::BF16, {kHidden, tokens});
                 Tensor tq(q.p, DType::BF16, {kQueryRows, tokens});
@@ -829,7 +858,7 @@ void run_q8_dflash2_candidates(const Options& options, bench::L2FlushBuffer& flu
             const std::uint64_t logical = parent.model_weight_bytes() + tensor_bytes(kHidden, tokens) +
                                           tensor_bytes(kQueryRows + 2 * kKvRows, tokens);
             const double flops = 2.0 * static_cast<double>(kParentRows) * kHidden * tokens;
-            append_result(results, "q8-dflash2-qkv",
+            append_result(results, label,
                           ops::detail::q8_attn_input_schedule_name(schedule), tokens,
                           CacheState::Cold, 0, logical, flops, measurement);
         }
@@ -1017,7 +1046,8 @@ int main(int argc, char** argv) {
             if (options.candidates) {
                 run_q8_dflash2_candidates(options, flush, stream, results);
             } else {
-                run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, stream, results);
+                run_q8_qkv(options, "q8-dflash2-qkv", options.dflash2_hidden, flush, stream,
+                           results);
             }
         }
         if (selected(options.format, Format::Bf16)) {

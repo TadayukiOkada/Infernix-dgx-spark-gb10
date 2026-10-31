@@ -1470,3 +1470,208 @@ its two siblings were deleted rather than left as an unreached fallback.
   and the Attn one at 4 as measured values with their numbers in the comment; and keep
   `nvfp4_{linear_add,gdn_input,attn_input}_small_t.cu` deleted — if an upstream change resurrects a SIMT
   `T = 2..5` band, it must be re-measured against the runtime-`K` tile of the same K-warp count first.
+
+---
+
+# GB10 changelog — 2026-10-31 (T8: upgrade the fused Q8 projections toward the GB10 bandwidth and compute ceilings)
+
+Task: `docs/tasks/20261031-performance-tasks.md` T8 (P1). Scope as specified: the four fused Q8 ops'
+schedule tables — `q8_linear_add`, `q8_attn_input_proj`, `q8_gdn_input_proj`, `q8_linear_pair` — the
+`128x128` (`MmaR128C128`) prefill tile for the four `gemm_mma` files, and the RTX-5090
+`kK5120Routes` table.
+
+## 1. Accounting
+
+- Base commit: `f7ccbaeb5` (`dev-rebased-20261028`). No commit created (task instruction — the reviewer
+  commits). `git diff --check` clean.
+- Files changed (23 tracked, all `M`; 295 insertions, 51 deletions):
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/linear_add/q8/q8_linear_add_plan.cpp` | M | `kK4096Routes` 19 → 20 bands: `T = 1` `SimtR8C4` → `DecodeR16`, tail re-closed as `{992,2559,MmaR64C128},{2560,any,MmaR128C64}`; `kK6144Routes` tail re-closed as `{1009,1791,MmaR64C128},{1792,any,MmaR128C64}`; both with the T8 measurements in the comment |
+| `src/ops/linear_add/q8/q8_linear_add_gemm_simt.cu` | M | the decode GEMV is now `K`-templated (`Q8A16GemvSchedule<RowsPerCta,1,2,K,24>`) with a `launch_decode_by_k` switch over the two admitted widths, so the `RowsPerCta = 16` GEMV exists at `K = 4096` and not only `6144`; an unknown `K` throws instead of silently picking a schedule |
+| `src/ops/attn_input_proj/q8/q8_attn_input_plan.h` | M | `MmaR128C128` and `DFlash2MmaR128C128` schedule ids |
+| `src/ops/attn_input_proj/q8/q8_attn_input_plan.cpp` | M | the two schedule names, their `execute_candidate` / `execute_plan` / n17408 / companion / DFlash2 wiring and sweep legality; `kTargetRoutes` 3 → 4 bands (`{65,128,R64C128},{129,any,R128C128}`), `kCompanionRoutes` 12 → 9 bands (the four `385..any` alternation bands collapse to `{385,any,MmaR128C128}`), `kDFlash2Routes` 3 → 4 bands (`{65,128,DFlash2R64C128},{129,any,DFlash2R128C128}`) |
+| `src/ops/attn_input_proj/q8/q8_attn_input_gemm_mma.cu` | M | `q8_attn_input_mma_r128_c128_launch` in both the four-output (`LinearBf16SegmentedOutput<4096,512,4096,512>`, 9216 rows) and three-output (`<4096,1024,1024>`, 6144 rows) overloads |
+| `src/ops/attn_input_proj/q8/q8_attn_input_n17408.cu` | M | `q8_attn_input_n17408_mma_r128_c128_launch` for the shared four-output table's `[17408,3072]` lane |
+| `src/ops/attn_input_proj/q8/q8_dflash2_attn_input.cu` | M | `q8_dflash2_attn_input_mma_r128_c128_launch` |
+| `src/ops/attn_input_proj/q8/q8_attn_input_kernels.h` | M | the four new launcher declarations |
+| `src/ops/gdn_input_proj/q8/q8_gdn_input_plan.h` / `.cpp` | M | `MmaR128C128` id + name + dispatch/candidate wiring; `kRoutes` 3 → 4 bands: `{2,96,SplitK}` unchanged (accuracy, §2), `{97,128,MmaR64C128},{129,any,MmaR128C128}` |
+| `src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_mma.cu` / `_kernels.h` | M | `q8_gdn_input_mma_r128_c128_launch` (`8192`/`4096` rows, `BlockK = 64`) |
+| `src/ops/linear_pair/q8/q8_pair_plan.h` / `.cpp` | M | `DualMmaR128C128` id, name, `schedule_rows`/`schedule_cols`, `launch_tiled` case; `kK5120Routes` replaced — the three RTX-5090 entries become four GB10 bands `{1,20,TwoSimtR8C4},{21,256,DualMmaR32C64},{257,1535,DualMmaR32C128},{1536,any,DualMmaR128C128}` |
+| `src/ops/linear_pair/q8/q8_pair_gemm_mma.cu` / `_kernels.h` | M | `q8_pair_gemm_mma_r128_c128_launch` (two `launch_q8_a16_mma` passes over the paired weights) |
+| `bench/ops/q8_linear_add_bench.cu` | M | the decode candidates now sweep `T = 1` at both `K` (was `K = 6144` only) — the reason the `K = 4096` GEMV gap was invisible |
+| `bench/ops/attn_input_proj_bench.cu` | M | `MmaR128C128` in the target and companion candidate sets, `DFlash2MmaR128C128` in the drafter set; all three Q8 candidate loops honour `--cand-filter`; new `--dflash2-hidden 5120\|2560\|3072` so the Qwen3.8-Flash-Next drafter is measurable at all (candidate and public lanes; the label carries the width) |
+| `bench/ops/gdn_input_proj_bench.cu` | M | `MmaR128C128` candidate + `--cand-filter` gate |
+| `bench/ops/linear_pair_bench.cu` | M | `dual_mma_r128_c128` candidate at `k = 5120` |
+| `tests/ops/linear_add/test_q8_a16.cpp` | M | `K = 4096` band starts `+992, +2560` and interiors `+2048, +4096`; `K = 6144` starts `+1009` |
+| `tests/ops/test_attn_input_proj.cpp` | M | target `+512, +4096`, companion `+512, +4096`, drafter `+4096` — the shipped prefill bands are now oracle-covered at the production width |
+| `tests/ops/test_gdn_input_proj.cpp` | M | widths `+32, +33, +96, +97, +128, +129, +512, +2049`, naming the `R64C128 → R128C128` crossover at 128/129 |
+
+- **Not changed, on measurement (§2):** `src/ops/linear/q8/q8_schedule.cuh` and
+  `src/ops/linear/q8/q8_a16_mma.cuh` — the `GroupRows` raster parameter the route sweep seemed to want
+  was implemented, measured, and reverted (two of the files touched during the task went back to `HEAD`,
+  together with the 13 raster-sweep candidates added to `bench/ops/q8_route_sweep.cu`, which is also
+  back at `HEAD`). `q8_linear_add_gemm_mma.cu` / `q8_linear_add_plan.h` — the task's `MmaR128C128`
+  launcher for `linear_add` was added, measured 27 % slower, and removed again. `kK2048Routes` (already
+  24 GB10 bands), `kN5120Routes`, and the column-invariant routes: untouched.
+- CUDA stack allowlist: **unchanged** — no spill was eliminated, so no `check_cuda_stack.py update` ran
+  and `git diff` on the allowlist is empty. `infernix_cuda_stack_check` passes. Every new
+  `Q8A16MmaSchedule<128, 128, …>` instance is `STACK:0 LOCAL:0` in the linked `infernix-serve`
+  (`cuobjdump --dump-resource-usage`, §4).
+- Rebuilds: seven single-invocation `ninja -C build-native -j "$(nproc)"` builds in this task
+  (463-target retune, 133-target resume, bench-flag, 200-target post-wiring, 338-target post-revert,
+  plus two no-ops), each preceded by `find src/ops … -name '*.cu' -exec touch {} +` because
+  `build-native` CUDA depfiles do not track headers. No `update` on the spill allowlist, no concurrent
+  ninja, no clean/reconfigure.
+
+## 2. Architectural rationale & task premise analysis (`20261031-performance-tasks.md` T8)
+
+**The `128x128` tile is right for the three projection Ops and wrong for `linear_add`.** The task
+prescribes `MmaR128C128` for all four ops. On the three projection Ops it wins outright (attn target
+2021.2 vs 2165.4 µs at `T = 4096`, drafter 1591.1 vs 1757.0, gdn 2674.6 vs 2902.9 — all cold,
+same-process candidates). On `linear_add` it is **27 % slower than the incumbent**: `T = 4096`,
+`K = 4096` gives 1271.7 µs / 54.04 TFLOP/s against `MmaR64C128`'s 1075.2 / 64.40 and `MmaR128C64`'s
+1001.2 / **68.63**; at `K = 6144` 1937.4 / 53.20 against 1620 / 63.6 and 1509.4 / **68.29**. The
+mechanism is the CTA count, not the tile area: `linear_add` slices tokens into `schedule_cols`-wide
+slabs and launches one kernel per slab, so at `T = 4096` the `K = 4096` problem has 16 row tiles and the
+`128x128` tile leaves 16 × 32 = 512 CTAs whose second wave under-fills 48 SMs at two CTAs each, while
+the `128x64` tile keeps 1024 CTAs with the same `BlockK = 64` K order. **What shipped for `linear_add`
+is therefore `MmaR128C64` from 2560 (`K = 4096`) / 1792 (`K = 6144`) columns**, which is 7–10 % ahead of
+the incumbent there and 68.6 / 68.3 TFLOP/s in the sweep (70.20 / 71.39 TFLOP/s in the isolated
+production run). The `MmaR128C128` launcher, enum id and bench candidate for that Op were removed rather
+than left unrouted.
+
+**The `T = 48..96` split-K crossover is bound by the numerical criterion, not by speed** (task step 3,
+gdn). Re-measured with the new tile: split-K is still the fastest candidate at 65/80/96 columns
+(151/166/190 µs against `R64C128`'s 143), and the `128x128` tile also loses at 97 (154.5 vs 145.3) and
+128 (168.8 vs 151.8), so the crossover the task expected to move is the **129** boundary, not 48..96.
+The 96 ceiling is the A16 reduction criterion: `R64C128` measures rel-L2 3.28e-3 against the 3.15e-3
+limit at 96 aggregate columns while split-K is 2.59e-3. The `128x128` tile has the same `BlockK = 64`
+and no K split as `R64C128`, so it is bit-identical to it and inherits the identical bound — a faster
+tile cannot lower it. Re-tuning that band requires a numerically-equal wider tile (an Op change), not a
+route change. The same argument keeps the attn companion's split-K band at 48 and the target's at 64,
+both of which re-measured as measured before (split-K wins at 64 target / 48 companion and loses above).
+
+**The raster-group lever the route sweep suggested is a phantom, and was reverted.** A `GroupRows`
+template parameter (row-group width of the CTA raster, `with_group_rows` alias, `static_assert` that it
+is 0 or a multiple of 8) was added to `q8_schedule.cuh`/`q8_a16_mma.cuh` and 13
+`g8/g16/g24/g32/g48` candidates to `infernix_q8_route_sweep`. Three runs at `n9216 k2048 T = 4096` put
+`g32` 3.0 % ahead of the `g8` default (1940.1 vs 1999.5 µs best-of-3, `g32` ahead in all three pairings
+and starting from a disadvantageous position in the candidate order), `n12288` neutral (2688.2 vs
+2685.5), and `g16`/`g24` consistently worst — a non-monotone raster is already a warning. The decisive
+test was a binary A/B on the **real route** (same schedule name, the pre-change binary against the
+post-change one, alternating passes): 129 145.3 vs 137.1 µs, 512 255.8 vs 247.7, 1024 497.5 vs 472.9,
+2048 966.5 vs 944.0, 4096 1894.2 vs 1932.1 — i.e. 2–6 % **slower** everywhere except `T = 4096`, where
+it is 2 % ahead. Both header files and the sweep candidates are back at `HEAD`; the fused Op keeps the
+shared 8-row group. Lesson for future campaigns: an `infernix_q8_route_sweep` delta is not evidence
+about a fused Op — that sweep drives a plain `LinearBf16Output` with its own flush size, and its deltas
+do not transfer.
+
+**Candidate-sweep order biases a newly added candidate against itself.** The first attn sweep reported
+the new tile 3–6 % behind at 129/192/256 — because it was appended last to each candidate array and ran
+last inside every width loop, where clock droop accumulates. Re-measuring each candidate in its own
+process (twice, min-of-two) reversed the sign at 129 (137.2 vs 143.2 µs) and 192 (141.1 vs 145.2) and
+confirmed the loss at 256/384. Every band boundary in this task is therefore taken from
+`--cand-filter`-isolated processes, with the multi-candidate sweep used only to find the candidates and
+the wide-`T` trend. The same effect produced the implausible gdn `T = 832` point (815.7 µs against
+548.8 at 896) and the attn companion `T = 704` point (337.7 µs against 249.7 at 768) — both isolated
+clean (704: 251.7 vs 276.3).
+
+**`kK5120Routes` was a three-entry RTX-5090 table and is now four GB10 bands.** Cold
+`infernix_linear_pair_bench --k 5120 --candidates` (µs, new tile against the incumbent): 1536 446.3 vs
+542.5, 2048 675.6 vs 753.5, 3072 857.9 vs 1058.4, 4096 1224.5 vs 1468.2 — and 2× slower at `T ≤ 256`
+(274 vs 131 at 128), with `512..1024` a genuine coin flip (it leads 512/640/704/960 by 3–6 % and trails
+576/832/896/1024). The band is at 1536 and the coin-flip band stays on the incumbent rather than
+freezing a wave-quantisation argmin; the production route at `T = 4096` measured 1177.4 µs against
+HEAD's 1468.2 (−19.8 %).
+
+**The 90 %-of-ceiling bars need a different kernel class, not a schedule.** All four ops land at
+70–83 TFLOP/s against the 97.0 TFLOP/s `BF16_F32ACC` reference (§4). `q8_a16_mma_kernel` dequantises
+int8 → bf16 into shared memory and then feeds HMMA, so the SIMT dequant path — not the staging, the
+vectorisation, or the tile — is the ceiling; T8 re-confirmed this by finding no schedule in the class
+above 82.9 TFLOP/s, which is also T1's measured ceiling for the same kernel. The bars (80–86 TFLOP/s
+for `linear_add`, 86–90 for attn/gdn) require the native int8 `IMMA` path with FP32 accumulate (247.43
+TOP/s measured on this device) or a TMA-staged dequant, i.e. a new Op implementation with its own
+oracle qualification, which is outside a dispatch retune.
+
+## 3. Subsystem breakdown
+
+- **Ops / route tables** (`linear_add`, `attn_input_proj`, `gdn_input_proj`, `linear_pair`): one new
+  prefill tile per Op plus the `linear_add` decode-GEMV promotion. All new tiles are plain
+  `Q8A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>` instances (44032 B shared, 512 threads, 2 CTAs/SM), so
+  every swap is bit-identical to the tile it replaces within a band — 1:1 FP32 Tensor Core accumulation
+  is preserved by construction and the oracle tests are the check.
+- **Ops / shared kernel header**: net zero (§2). No weight is allocated twice — the new launchers take
+  the same `Weight` view through `q8_linear_operands`, and no `HostPinned` + `Device` pair was
+  introduced.
+- **Benches**: the three Q8 candidate sets can now be driven one candidate at a time
+  (`--cand-filter`), which is what makes a band decision admissible; the drafter is measurable at
+  `H = 2560`; the `linear_add` decode candidates run at both `K`.
+- **Tests**: the shipped bands' starts and the production prefill width are oracle-covered for all four
+  ops (§1 table).
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+```
+ctest --test-dir build-native -R "infernix_linear_add_q8_a16_test|infernix_linear_pair_q8_a16_test|\
+infernix_attn_input_proj_test|infernix_gdn_input_proj_test|\
+infernix_column_invariant_projections_test|infernix_cuda_stack_check" --output-on-failure
+→ 100% tests passed, 0 tests failed out of 6   (stack check 1.47 s, attn 26.13 s, column-invariant
+  9.49 s, gdn 10.56 s, linear_add 4.32 s, linear_pair 2.27 s; no --parallel — this host fails
+  numerically under parallel GPU tests)
+```
+
+`cuobjdump --dump-resource-usage build-native/apps/infernix-serve` over every
+`Q8A16MmaSchedule<128, 128, …>` instance (target, companion, drafter, n17408, gdn, pair): `REG` 102–128,
+`SHARED` 44032 (0 for the pair variants that share the launch path), and **no instance with `STACK` or
+`LOCAL` nonzero**.
+
+Acceptance, every point in its own process (sustained-load clock droop otherwise understates the wide
+tiles — see the `T = 832` / `T = 704` artifacts above), production route only:
+
+| Route | task baseline | HEAD measured here | T8 | bar | verdict |
+|---|---|---|---|---|---|
+| `linear_add` `K = 4096` `T = 1` | 198.2 GB/s | 198.2 (`SimtR8C4`) | **213.2 GB/s** (41.888 µs, `DecodeR16`) | ≥ 210 | **met** |
+| `linear_add` `K = 6144` `T = 1` | — | 217.8 | 215.0 (62.272 µs, route unchanged) | — | unchanged |
+| `linear_add` `K = 4096` `T = 4096` | 55.02 TF | 64.28 (1069 µs) | **70.20 TF** (978.9 µs, `MmaR128C64`) | 80–86 | **not met** (+9.2 %) |
+| `linear_add` `K = 6144` `T = 4096` | 65.11 TF | 64.20 | **71.39 TF** (1443.8 µs) | 80–86 | **not met** (+11.2 %) |
+| `attn_input_proj` target `[9216,2048]` `T = 4096` | 76.5–77.5 TF | 75.50–75.81 | **81.28 TF** (1902.4 µs) | 86–90 | **not met** (+7.2 %) |
+| `attn_input_proj` companion `[6144,2048]` `T = 4096` | — | 75.70 | **80.29 TF** (1283.9 µs) | 86–90 | **not met** (+6.1 %) |
+| `attn_input_proj` drafter `[6144,2560]` `T = 4096` | — | 68.26 | **82.79 TF** (1556.3 µs) | 86–90 | **not met** (+21.3 %) |
+| `gdn_input_proj` `[12288,2048]` `T = 4096` | 76.5–77.5 TF | 75.72–75.92 | **82.18 TF** (2508.6 µs) | 86–90 | **not met** (+8.3 %) |
+| `linear_pair` `k = 5120` `T = 4096` | — | 1468.2 µs | **1177.4 µs** | — | −19.8 % |
+
+Against the 97.0 TFLOP/s `BF16_F32ACC` reference the prefill routes now sit at 82.8–85.3 % (attn/gdn)
+and 72.4–73.6 % (`linear_add`); the bar was 88.7–92.8 %. The paired same-process candidate numbers in §2
+(7.1 %, 6.1 %, 9.4 %, 8.3 %, 16.6 % at `T = 4096`) are the protocol-matched improvement; the absolute
+TFLOP/s in this table is the acceptance figure.
+
+## 5. Accepted gaps & rebase conflict resolution policy
+
+- **The compute bars are unmet** and cannot be met by dispatch inside this kernel class (§2). The largest
+  remaining lever is a native `IMMA`/TMA-staged Q8 prefill Op, which is a new implementation with its own
+  FP32/FP64-oracle qualification, not a schedule change. The bandwidth bar the task set (`K = 4096`
+  decode ≥ 210 GB/s) is met at 213.2.
+- **The `[17408,3072]` Q8 four-output lane shares `kTargetRoutes` and is not timed locally.** Its
+  `128x128` launcher is oracle-checked (`run_q8_target_case` at `T = 129` and `300`, both A16 and
+  column-invariant), but this host has neither a Q8 `[17408,3072]` candidate-sweep entry in
+  `infernix_attn_input_proj_bench` (only the FP8 lane has one) nor a Qwen3.5-122B artifact, so its
+  crossover is inherited from the two measured lanes rather than measured. If it ever regresses, the fix
+  is a separate `kN17408Routes` table, not a revert of the measured lanes.
+- **Single-width wave exceptions are deliberately not frozen**: attn target `T = 256` (+5.5 %) and
+  `T = 384` (+2.0 %) against `MmaR64C128`, attn companion `T = 560` (+3.0 %) against `MmaR128C80`,
+  `linear_pair` `512..1024` (±6 %). Each is a 48-SM wave-quantisation dip worth 2–6 % at one width;
+  encoding them would add bands a different row count would not reproduce. The gdn `97..128` band keeps
+  `MmaR64C128` because that tile is 6–11 % ahead there.
+- **`linear_add`'s `49..991` bands were re-confirmed, not re-fitted** — the incumbent tile is the sweep
+  argmin at every width re-measured in that range.
+- **Rebase conflict policy for these files:** keep `linear_add`'s wide prefill tile as `MmaR128C64` (an
+  upstream `MmaR128C128` promotion costs 27 % on this device) and keep its 2560/1792 band edges with their
+  numbers in the comment; keep the decode route at `DecodeR16` for both admitted `K`, which requires the
+  `K`-templated GEMV in `q8_linear_add_gemm_simt.cu` — an upstream change that re-bakes `K` into a single
+  width silently drops `K = 4096` back to the SIMT; keep the gdn split-K ceiling at 96 as an accuracy
+  bound (a merge that "optimises" it to a wider plain tile fails the 3.15e-3 A16 criterion at 96 aggregate
+  columns); keep the attn crossovers at 129/129/385 with their measurements; and do not reintroduce a
+  `GroupRows` template parameter without a real-route A/B, since the sweep evidence for it is falsified
+  (§2).
