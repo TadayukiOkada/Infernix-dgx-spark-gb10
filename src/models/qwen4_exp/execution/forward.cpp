@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/execution/forward.h"
 
+#include "core/temporary_switches.h"
+
 #include "infernix/ops/attn_input_proj.h"
 #include "infernix/ops/causal_conv1d_silu.h"
 #include "infernix/ops/embedding.h"
@@ -312,13 +314,13 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     try {
         auto scope = work_.scope();
         if (block.ple) { ple(*block.ple, residual, batch); }
-        Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
-        Tensor xa     = mix(block.attn_hc, residual, &inject);
-        Tensor y      = mixer(layer, batch, xa);
-        // The attention half's inject, then the MLP half's mix. One fused Op folding the inject into the
-        // mixer's reads (candidates §7.3 D6) measured flat (removed 2026-10-28).
-        ops::hyper_connection_inject(y, inject, residual, s);
-        Tensor xm = mix(block.mlp_hc, residual, &inject);
+        // The attention half's coefficients, then the MLP half's (inject_mix reads the first while
+        // the mix writes the second).
+        Tensor inject_a = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
+        Tensor inject   = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
+        Tensor xa       = mix(block.attn_hc, residual, &inject_a);
+        Tensor y        = mixer(layer, batch, xa);
+        Tensor xm       = inject_mix(block.mlp_hc, y, inject_a, residual, &inject);
         // The combine injects its output directly unless a tap records it.
         const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
         Tensor ym = moe(block.moe, xm, layer,
@@ -398,10 +400,10 @@ void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor
     try {
         auto scope = work_.scope();
         if (block.ple) { ple(*block.ple, residual, batch); }
-        Tensor xa = mix(block.attn_hc, residual, &inject);
-        Tensor y  = mixer(layer, batch, xa);
-        ops::hyper_connection_inject(y, inject, residual, device_.stream);
-        (void)mix(block.mlp_hc, residual, &inject, &xm);
+        Tensor inject_a = work_.alloc(DType::FP32, {inject.ne[0], inject.ne[1]}); // the attention half's
+        Tensor xa       = mix(block.attn_hc, residual, &inject_a);
+        Tensor y        = mixer(layer, batch, xa);
+        (void)inject_mix(block.mlp_hc, y, inject_a, residual, &inject, &xm);
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
     }
@@ -536,6 +538,23 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
     Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
     ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
                               x, p.combine ? inject : nullptr, work_, s);
+    return x;
+}
+
+Tensor Forward::inject_mix(const HyperConnectionParameters& p, const Tensor& y, const Tensor& pending, Tensor& residual,
+                           Tensor* inject, Tensor* into) {
+    // TEMPORARY (INFERNIX_TMP_HC_INJECT_FOLD) until the decode A/B.
+    static const bool fold = temporary_switches::flag("INFERNIX_TMP_HC_INJECT_FOLD");
+    const cudaStream_t s = device_.stream;
+    if (!fold) {
+        ops::hyper_connection_inject(y, pending, residual, s);
+        return mix(p, residual, inject, into);
+    }
+    const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
+    const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
+    Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
+    ops::hyper_connection_inject_mix(y, pending, residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank,
+                                     config_.rms_norm_eps, x, p.combine ? inject : nullptr, work_, s);
     return x;
 }
 
@@ -1369,10 +1388,12 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
                                            .width        = call.width};
         Tensor y = attention(p.attention, xa, attention_call);
         if (call.kv_only) { return; }
-        ops::hyper_connection_inject(y, inject, residual, s);
 
-        // MoE over the device-resident experts, with the shared expert.
-        Tensor xm = mix(p.mlp_hc, residual, &inject);
+        // MoE over the device-resident experts, with the shared expert; the attention half's inject
+        // goes in with the MLP half's mix (its coefficients stay in `inject_a`).
+        Tensor inject_a = inject;
+        inject          = work_.alloc(DType::FP32, {S, T});
+        Tensor xm       = inject_mix(p.mlp_hc, y, inject_a, residual, &inject);
         const auto& m        = config_.moe;
         const std::int32_t E = dim(m.experts), K = dim(m.top_k), I = dim(m.intermediate);
         Tensor logits = work_.alloc(DType::FP32, {E + 1, T});

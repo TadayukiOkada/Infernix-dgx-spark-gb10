@@ -52,6 +52,16 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
                           std::int32_t rank, float eps, Tensor& x, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
+/// hyper_connection_inject(y, pending_inject, residual) then hyper_connection_mix(residual, ...), with
+/// the same bits in x, inject and the residual (updated in place). Where the fused route serves the
+/// mix (T <= 16), the inject folds into its reads of the residual, which its second kernel writes
+/// back, so no separate inject runs; elsewhere the two Ops run in turn. `inject` (the mix's output)
+/// must not be `pending_inject`. Workspace: hyper_connection_mix_workspace_capacity_bytes.
+void hyper_connection_inject_mix(const Tensor& y, const Tensor& pending_inject, Tensor& residual,
+                                 const Tensor& norm_weight, const Weight& down, const Weight& up,
+                                 LinearPolicy policy, std::int32_t streams, std::int32_t rank, float eps,
+                                 Tensor& x, Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream);
+
 /// The workspace hyper_connection_mix needs for every T in [1, max_tokens].
 [[nodiscard]] std::size_t hyper_connection_mix_workspace_capacity_bytes(
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,

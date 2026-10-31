@@ -173,9 +173,7 @@ void run(QType gu, QType down, std::mt19937& rng) {
     const moe::CpuIsa isas[] = {moe::CpuIsa::kScalar, moe::CpuIsa::kNeon};
     for (const auto isa : isas) {
         if (!moe::cpu_isa_supported(isa) || (!g_only_isa.empty() && g_only_isa != moe::cpu_isa_name(isa))) { continue; }
-        // The 256-bit ISAs' tiled rows have a kernel per width 1-8; the other ISAs and FP8 take fewer.
-        const bool tiled = !fp8 && (isa == moe::CpuIsa::kAvx2 || isa == moe::CpuIsa::kAvxVnni);
-        for (const int ncols : tiled ? std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8} : std::vector<int>{1, 2, 3, 5, 8}) {
+        for (const int ncols : {1, 2, 3, 5, 8}) {
             // Columns are taken from the end for the narrow widths, so the special columns are covered.
             const int first = moe::kMaxColumns - ncols;
             std::vector<std::uint16_t> y(static_cast<std::size_t>(H) * ncols, 0xFFFF);

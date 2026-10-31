@@ -72,6 +72,26 @@ constexpr Registration kSwitches[] = {
     // Diagnostic (2026-10-29): =<MB/s>; the artifact read queues (core/direct_read_queue.cpp) hold each finished read
     // until a device of that rate would have delivered it, to measure the SSD tier on a slower drive. Same bits.
     {"INFERNIX_TMP_SSD_MBPS", Scope::All, Kind::Value},
+    // W4A4 and two-term narrow expert kernels: a job of two or more columns runs them two at a time,
+    // converting each weight unit once per pair (ops/offloaded_sparse_moe/cuda/moe_layer.cu, "column
+    // pairs"; candidates §0j-1). Same bits. Default on (GB10, 2026-10-30); =0 takes the singles.
+    {"INFERNIX_TMP_NARROW_PAIRS", Scope::All, Kind::Flag},
+    // Flash-Next n-gram rows: RAM-mode calls of 16,384+ rows gathered on eight threads, and a large
+    // call's reader threads take its blocks in a scattered (stride permutation) order (both
+    // models/qwen4_exp/program/ngram_volume.cpp; candidates §8.3 GX-08, BX-04). Default on (GB10);
+    // =0 takes the single-threaded ascending reads. Same rows and cache contents.
+    {"INFERNIX_TMP_NGRAM_PARALLEL_GATHER", Scope::Qwen4Exp, Kind::Flag},
+    {"INFERNIX_TMP_NGRAM_SCATTER", Scope::Qwen4Exp, Kind::Flag},
+    // f16-accumulate-prefill on Q8 (Dense8): past 8,192 tokens only the problems measured faster take the route
+    // (ops/linear/q8/q8_f16acc.cu q8_f16acc_admits).
+    {"INFERNIX_TMP_Q8_F16ACC_ADMIT", Scope::Qwen4Exp, Kind::Flag},
+    // Flash-Next: each block's attention-half inject folded into the MLP half's fused mixer reads
+    // (ops::hyper_connection_inject_mix; models/qwen4_exp/execution/forward.cpp; candidates §7.3 D6).
+    // Same bits.
+    {"INFERNIX_TMP_HC_INJECT_FOLD", Scope::Qwen4Exp, Kind::Flag},
+    // Flash-Next dflash2-pairs: DFlash2 rounds of up to <value> rows (2..8; 2: today's pairs only)
+    // (models/qwen4_exp/program/program_impl.h dflash2_rows_). Bits as dflash2-pairs'.
+    {"INFERNIX_TMP_DFLASH2_ROWS", Scope::Qwen4Exp, Kind::Value},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 
