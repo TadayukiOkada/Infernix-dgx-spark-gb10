@@ -12,6 +12,7 @@
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
+#include "ops/linear/q8/q8_a8.h"
 #include "ops/linear/q8/q8_dispatch.h"
 #include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/qsa_group.h"
@@ -186,9 +187,18 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy, LinearRoutes::Exact);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy, LinearRoutes::Exact);
         // The query does not see the route flags: the f16-accumulate route's encoded activation wherever
-        // the interval reaches it.
-        return column_invariant(policy) ? 0
-                                        : detail::q8_f16acc_workspace_capacity_bytes(output_rows, input_rows, max_tokens);
+        // the interval reaches it, and the W8A8 prefill route's encoded batch wherever its policy and
+        // the interval reach it (the larger of the two; only one runs per call).
+        if (column_invariant(policy)) { return 0; }
+        {
+            const std::size_t f16acc =
+                detail::q8_f16acc_workspace_capacity_bytes(output_rows, input_rows, max_tokens);
+            const std::size_t a8 = allows_a8(policy)
+                                       ? detail::q8_a8_workspace_capacity_bytes(
+                                             output_rows, input_rows, max_tokens)
+                                       : 0;
+            return f16acc > a8 ? f16acc : a8;
+        }
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);

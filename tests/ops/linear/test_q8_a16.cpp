@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -41,9 +42,25 @@ constexpr std::array kGeometries{
     Geometry{2560, 12800, 383U},
     // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
     Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
-    Geometry{10240, 5120, 389U},
+    Geometry{10240, 5120, 389U}, Geometry{25600, 5120, 397U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
     Geometry{2560, 4096, 331U}};
+
+// The problems registered for the W8A8 fast-path prefill route (ops/linear/q8/q8_a8.cu's table),
+// restricted to the geometries above. The route is LOSSY (int8 activations) and only the A8/A4
+// policies admit it, at prefill widths; below kQ8A8MinTokens = 128 the call keeps the exact route.
+bool q8_a8_registered(std::int32_t n, std::int32_t k) {
+    static constexpr std::pair<int, int> kProblems[]{
+        {1024, 2048},   {1024, 5120},   {2048, 4096},   {2048, 4608},   {2048, 16384},
+        {4608, 4608},   {5120, 4608},   {5120, 6144},   {5120, 10240},  {5120, 17408},
+        {5120, 25600},  {6144, 5120},   {9216, 2048},   {12288, 2048},  {14336, 5120},
+        {17408, 5120},  {34816, 5120},  {16384, 2560},  {12800, 2560},  {13952, 2560},
+        {1024, 2560},   {128, 2560},    {2560, 2560},   {1280, 2560},   {2560, 6144},
+        {2560, 12800},  {2560, 640},    {6144, 2560},   {10240, 2560},  {10240, 5120},
+        {12288, 2560},  {320, 10240},   {10240, 320}, {25600, 5120}};
+    return std::any_of(std::begin(kProblems), std::end(kProblems),
+                       [&](const auto& p) { return p.first == n && p.second == k; });
+}
 
 int q8_a16_conformance() {
     int failures = 0;
@@ -127,6 +144,24 @@ int q8_a16_conformance() {
         }
         failures += run_shape("Q8_A16", ActivationCompute::A16, make_q8_g32_fp16_weight,
                               {shape.n, shape.k, shape.seed, Comparison::Sampled, true, calls});
+        // The W8A8 fast-path prefill route (AllowA8 from 128 columns) meets the A8 activation
+        // criterion against the same FP64 oracle; the sub-128 probes below the admission gate run
+        // the exact route and must stay within it too.
+        if (q8_a8_registered(shape.n, shape.k)) {
+            static const std::vector<Invocation> kA8Calls{
+                {127, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {128, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {129, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {255, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {256, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {257, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {1024, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {2048, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+                {2049, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8},
+            };
+            failures += run_shape("Q8_A8", ActivationCompute::A8, make_q8_g32_fp16_weight,
+                                  {shape.n, shape.k, shape.seed, Comparison::Sampled, true, kA8Calls});
+        }
     }
     return failures;
 }

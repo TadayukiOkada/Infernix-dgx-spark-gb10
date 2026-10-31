@@ -1,3 +1,4 @@
+#include "ops/linear/q8/q8_a8.h"
 #include "ops/linear/q8/q8_dispatch.h"
 #include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/q8/q8_launch.h"
@@ -145,6 +146,15 @@ void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
             throw std::invalid_argument("q8 linear: the f16-accumulate route requires caller workspace");
         }
         q8_linear_f16acc(x, w, out, *workspace, stream);
+        return;
+    }
+    // The W8A8 prefill route (q8_a8.h): only the A8/A4 activation policies admit it, and only at
+    // prefill widths; A16Only, A16ColumnInvariant and the reproducible route keep the exact tiles.
+    if (allows_a8(policy) && q8_a8_admits(w.n, w.k, x.ne[1])) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("q8 linear: the a8 prefill route requires caller workspace");
+        }
+        q8_linear_a8(x, w, out, *workspace, stream);
         return;
     }
     select_q8_launch(w.n, w.k, x.ne[1], policy, routes)(x, w, out, stream);

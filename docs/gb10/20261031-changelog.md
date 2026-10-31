@@ -1675,3 +1675,146 @@ TFLOP/s in this table is the acceptance figure.
   columns); keep the attn crossovers at 129/129/385 with their measurements; and do not reintroduce a
   `GroupRows` template parameter without a real-route A/B, since the sweep evidence for it is falsified
   (§2).
+
+# GB10 (sm_121a) Branch Changelog — 2026-10-31 — T9: Q8 W8A8 (IMMA.16832.S8) fast-path prefill route
+
+Task: `docs/tasks/20261031-performance-tasks.md` T9 (P1). Implement the W8A8 prefill route for
+`Q8_G32_FP16`: BF16 activations quantized per 32-element K group to int8 + FP32 scale (the
+`ggml_a8.h` Q8_1-style codec), `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` products with the
+exact int32 group dots scaled into FP32 per group, gated behind `LinearPolicy::AllowA8` at
+`T >= kQ8A8MinTokens = 128`; the A16 / `--reproducible` / column-invariant routes keep the exact
+tiles unchanged.
+
+## 1. Accounting
+
+- Base commit: `6ab2e0939` (T8, `dev-rebased-20261028`); HEAD at completion `556c17a36` (a docs-only
+  `AGENTS.md` commit landed mid-task, unrelated). No commit created (task instruction).
+  `git diff --check` clean.
+- Files changed (3 added, 4 modified; 532 new lines + 60 insertions / 4 deletions):
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/linear/q8/q8_a8.h` | A | route contract: `q8_a8_problem` / `q8_a8_admits` / `q8_a8_workspace_capacity_bytes` / `q8_linear_a8`, `kQ8A8MinTokens = 128`, `kQ8A8BatchColumns = 2048` |
+| `src/ops/linear/q8/q8_a8_mma.cuh` | A | `q8_a8_quantize_x_kernel` (four threads per (column, slice) item, `a8::slice_scale`/`a8::code`, writes codes directly in B-fragment order) and `q8_a8_mma_kernel<Full, Output>` (128×128×64-stage three-deep `cp.async` ring, 8 warps of 4 m16 × 4 n8, grouped raster `kGroupRows = 4`, magic-accumulator `scaled_term` FP32 group scaling) |
+| `src/ops/linear/q8/q8_a8.cu` | A | 34-problem registration table (includes `{25600, 5120}`, added during T9 — see §2), workspace sizing to 16-column fragment blocks, per-batch quantize + tile launches |
+| `src/ops/linear/q8/q8_dispatch.cpp` | M | the a8 gate after the F16Accumulate block: `allows_a8(policy) && q8_a8_admits(...)` → `q8_linear_a8` (requires caller workspace) |
+| `src/ops/linear/linear.cpp` | M | Q8 workspace capacity case = max(f16acc, a8 when `allows_a8`), 0 for column-invariant |
+| `src/ops/linear/q8/sources.cmake` | M | `q8_a8.cu` |
+| `tests/ops/linear/test_q8_a16.cpp` | M | `kA8Calls` = `{127,128,129,255,256,257,1024,2048,2049}` × `AllowA8` through `ActivationCompute::A8` over the registered problems (A8 rel-L2 criterion 0.04 against the FP32 oracle); `Geometry{25600, 5120, 397U}` + the mirrored `kProblems` entry |
+
+- CUDA stack allowlist: **unchanged**. `infernix_cuda_stack_check` passes; no
+  `check_cuda_stack.py update` ran. `q8_a8_mma_kernel` is `STACK:0 LOCAL:0` (`REG:253/255` for the
+  predicated/`Full` instances), the quantizer `REG:31 STACK:0 LOCAL:0` — `cuobjdump -res-usage` on
+  the linked `infernix-serve`.
+- Rebuilds: ~15 single-invocation `ninja -C build-native -j "$(nproc)"` builds
+  (`infernix-serve infernix_linear_bench infernix_ops_linear_test`), each preceded by
+  `find src/ops/linear/q8 -name '*.cu' -exec touch {} +` (build-native CUDA depfiles do not track
+  headers). No concurrent ninja, no clean/reconfigure.
+
+## 2. Task-premise corrections & architectural rationale
+
+- **The task's 135–175 TF/s acceptance bar is NOT met.** The shipped route reaches **90.8–98.4
+  TFLOP/s** at `T = 4096` (best `34816×5120` = 97.1; `T = 512` best 98.4) — +13 % over the A16
+  baselines on the four A16-tuned shapes (81.8–84.8) and **2.6×** on `{25600, 5120}` (35.9 → 94.5).
+  The NCU decomposition explains the ceiling: the tile kernel is issue/latency-bound, not
+  DRAM-bound (SM 39 %, memory 42 %; stalls: `wait` 25 %, `selected` 23 %,
+  `math_pipe_throttle` 16 %, `barrier`/`short_scoreboard` 7 % each). `REG:253` fixes the launch at
+  one 256-thread CTA per SM (8 warps), and the per-slice `scaled_term` + accumulator FFMAs (8 FFMA
+  per IMMA) plus the staging loop fill the issue slots before the 247.4 TOP/s IMMA pipe saturates
+  (tensor ≈ 31 %). Closing the bar needs a warp-specialized producer/consumer pipeline with TMA
+  and mbarriers, not a schedule knob — measured dead levers below.
+- **`{25600, 5120}` was unregistered in the initial table although it is a task bench-loop shape.**
+  Registered during T9 (rows are a 128 multiple, `k % 64 == 0`, and FP32-output heads exit the
+  dispatch before the a8 gate, so the BF16-only route cannot capture them). Its A16 fallback ran at
+  35.9 TF/s; it is the route's largest single win.
+- **Task-doc location corrections:** `LinearPolicy`/`LinearRoutes` live in `ops/linear.h`, not
+  `types.h`; the tests are driven through the family binary
+  `./build-native/tests/infernix_ops_linear_test linear_q8_a16` (CTest names are per family,
+  `infernix_linear_q8_a16_test`; there is no per-family ninja target).
+- **Tooling corrections:** `ckt profile` reports "ncu produced no kernel records" for
+  `infernix_linear_bench`; direct `ncu --profile-from-start off -k regex:q8_a8_mma --launch-count 1
+  … --profile` works (synthetic bench inputs only). The bench `TC_profile` column prints the
+  registered `BF16_F32ACC` Q8 label, not the pipe actually executed.
+- **Two correctness bugs found and fixed during the fragment-order redesign** (both would have
+  shipped silently on a single green run):
+  1. the weight-code staging loop decoded the item index with `j = item >> 7` instead of
+     `item >> 8`, so half the copies landed in the wrong slice and `j = 2,3` wrote past the
+     two-slice `a` plane into the neighbouring `xb`/scale planes — whole-stage shared-memory
+     corruption;
+  2. the ring loop committed a `cp.async` group only when it issued a new stage, so at the K tail
+     `cp_wait<STAGES-2>` could return with the newest group (the one the last stage consumes)
+     still in flight — nondeterministic single-element failures that moved between runs. The
+     shipped loop commits per issued stage and tightens the wait by the remaining-stage slack
+     (`wait<0>` on the last stage). The GGML route hides the same hazard by committing an empty
+     group every iteration.
+- **Measured dead levers** (full task-loop or two-shape A/B): 512-thread/16-warp CTA (−2…−4 %),
+  `kGroupRows` 16 (−5 %) and 8 (≈ 0 vs 4 — 4 shipped), `STAGES = 4` (−8 %), `STAGES = 2`
+  (prefetch depth 1, worse). Keeping the debug probe arguments as runtime kernel parameters cost
+  ~13 % (81 → 93 TF/s) — the probe infrastructure was removed before shipping, which was itself the
+  largest single perf change of the task.
+- **Design:** the quantizer emits the activation codes in B-fragment order under the permuted-K
+  labelling of `ggml_a8_tile.cuh` (entry `l`, `g = l >> 2`, `t = l & 3` = words `2t, 2t+1` of
+  columns `g` and `8+g` of a 16-column block, XOR-swizzled physical index), so the ring copies each
+  512-byte fragment block as sixteen 16-byte `cp.async.cg` and the MMA reads two n8 tiles' B
+  fragments per `LDS.128`; weight codes stage in row order (two 16-byte units per row and slice) and
+  the row scales are consumed as raw binary16 at the MMA (one 32-bit `LDS` per m16 tile), which
+  removed the scale-expansion pass and one of the two per-stage barriers. Arithmetic per output is
+  `acc = Σ_s fma(fl32(P_s·w_s), d_s, acc)` in slice order — the same magic-accumulator semantics as
+  the GGML A8 routes; `|P_s| < 2^19` bounds the accumulator.
+
+## 3. Subsystem breakdown
+
+- **`src/ops/linear/q8/`** — new route (quantizer + tiles + launcher, §1 table); dispatch gate and
+  workspace capacity wired as §1. The A16 files (`q8_a16_*.cuh`, `q8_schedule.cuh`,
+  `q8_gemm.cu`… ) are untouched: `--reproducible`, `A16Only` and the column-invariant routes never
+  enter `q8_a8.cu`.
+- **`tests/ops/linear/test_q8_a16.cpp`** — A8 conformance matrix over the registered problems at
+  the 128-boundary and batch-tail token counts; existing A16 expectations unchanged.
+
+## 4. Verification
+
+- **CTest** (no `--parallel`, per the single-GPU numerical-failure rule): 30/30 passed in 348.6 s —
+  `ctest --test-dir build-native -R "infernix_linear_.*_test$|infernix_cuda_stack_check"`,
+  including `infernix_cuda_stack_check` (1.57 s), `infernix_linear_q8_a16_test` (16.84 s) and the
+  fused Q8 families. `infernix_ops_linear_test linear_q8_a16` OK on four consecutive runs
+  (the earlier nondeterministic race, §2.2, was caught by diffing failure sets across runs).
+- **Resources** (linked `infernix-serve`, `cuobjdump -res-usage`): `q8_a8_mma_kernel`
+  `REG:253/255 STACK:0 LOCAL:0`, dynamic shared 3 × 17920 = 53760 B (opt-in);
+  `q8_a8_quantize_x_kernel` `REG:31 STACK:0 LOCAL:0`. Allowlist delta: none.
+- **Bench** (`infernix_linear_bench --qtype Q8_G32_FP16 --warmup 2 --repeat 10`, `explicit` rows;
+  TFLOP/s column; A16 = `--policy a16`, A8 = `--policy a8`):
+
+| shape | T | A16 | A8 | Δ |
+|---|---|---|---|---|
+| `16384×2560` | 512 | 83.3 | 90.8 | +9 % |
+| `16384×2560` | 4096 | 84.5 | 95.6 | +13 % |
+| `17408×5120` | 512 | 82.4 | 92.7 | +13 % |
+| `17408×5120` | 4096 | 83.8 | 96.0 | +15 % |
+| `34816×5120` | 512 | 86.1 | 98.4 | +14 % |
+| `34816×5120` | 4096 | 81.8 | 97.1 | +19 % |
+| `14336×5120` | 512 | 80.9 | 90.9 | +12 % |
+| `14336×5120` | 4096 | 84.8 | 94.8 | +12 % |
+| `25600×5120` | 512 | 54.6 | 96.6 | +77 % |
+| `25600×5120` | 4096 | 35.9 | 94.5 | +163 % |
+
+  (Every cell above is a measured `explicit` row from this task; the `25600×5120` A16 rows are the
+  unregistered fallback of the initial table.)
+
+## 5. Accepted gaps & follow-ups
+
+- **The 135–175 TF/s bar stands unmet** (best 98.4). The route is a net win at every registered
+  shape and every measured width, so it ships under the LOSSY `AllowA8`/`AllowA4` policies; the
+  exact A16 route remains the default. Reaching the bar requires the producer/consumer redesign
+  (§2); the register budget (253) must come down for any two-CTA occupancy plan.
+- The quantizer is ~3–5 % of the route's measured time at `T = 4096` (two 2048-column batches);
+  fusing it into the tile prologue or overlapping it with the previous batch's tiles is untried.
+- The route admits only the registered table; runtime-shape problems keep the A16 tiles. Adding a
+  shape is a table entry plus the mirrored test list — both are now exercised for
+  `{25600, 5120}`.
+- Gating is policy-only (`AllowA8`/`AllowA4`): there is no per-shape A8-vs-A16 crossover table, so
+  a shape where the 0.04-criterion route is slower than A16 would still take A8. None was measured
+  in the registered set.
+- **Rebase conflict policy:** `q8_a8*.{h,cu,cuh}` are new files (accept wholesale); the
+  `q8_dispatch.cpp` a8 gate must stay after the F16Accumulate block and after the FP32-output
+  early-exit; the `linear.cpp` workspace case must keep the max(f16acc, a8) form; the
+  `cp_wait` slack logic (§2.2) must not be "simplified" back to a constant `wait<STAGES-2>`.
