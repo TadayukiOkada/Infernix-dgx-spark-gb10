@@ -549,8 +549,10 @@ constexpr std::array kQualified{
     // q8-sliced-k takes the flag on the artifact's 303 Q8 weights (shared expert, hyper-connections,
     // MTP drafters, LM head; the NVFP4 problems ignore it, its T=1 problems tie the exact route at
     // the Op level). Neither reads the KV format. gdn-conv-fused's NVFP4 route is implemented but
-    // registers nothing here: measured slower than the composed decode route on this artifact
-    // (120.2 us against 96.2 + 2.8 per GDN layer call, -3.3 % plain decode; fast_path_applies).
+    // registers nothing here: still slower than the composed decode route on this artifact after the
+    // T6 epilogue prefetch (2026-10-31, W4Dense plain decode, --fast-path gdn-conv-fused against the
+    // default, 2 rounds each: -0.11 .. -0.19 tok/s on every test, i.e. -0.2 .. -0.4 %, from 46.0;
+    // -3.7 % before T6 removed 3.0 .. 5.9 us/layer call from the fused launch).
     // The two paths' model-quality joint gate on this artifact is the recorded follow-up.
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
@@ -694,9 +696,11 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     // two-term row-scaled A4 TMA route at prefill widths (T >= 128).
     case FastPath::Nvfp4A4Pair: return configuration.dense == DenseKernels::Nvfp4;
     // W4Dense's NVFP4 projections carry their own fused decode convolution ([16384,2560]) - an
-    // implemented candidate: measured on GB10 (2026-10-30, T1) its epilogue form runs 120.2 us of
-    // the shared A16 GEMV schedule against the composed route's 96.2 + 2.8 (its own convolution
-    // kernel), -3.3 % plain decode, so it registers nowhere (its Q8 route is the faster fusion).
+    // implemented candidate: its epilogue form runs the shared A16 GEMV schedule, and after the T6
+    // row-scratch prefetch it costs 3.6 us more than the unfused projection at B = 1 (its own state
+    // traffic is ~1.1 us of that) against the composed route's ~4.1 us convolution kernel, i.e. a tie
+    // at the Op level and -0.2 .. -0.4 % on the artifact's plain decode (2026-10-31, W4Dense; -3.3 %
+    // before T6), so it registers nowhere (its Q8 route is the faster fusion).
     // W4Dense's Q8 weights (the shared expert, hyper-connections, MTP drafters, LM head) take the
     // sliced-K decode routes the flag serves; the dispatch ignores the flag on NVFP4 problems.
     case FastPath::Q8SlicedK:

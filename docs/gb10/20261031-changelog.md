@@ -1019,3 +1019,236 @@ carries: the entire swept family sits 1.4..1.9× above its pure-transfer floor a
 - `bench/ops/nvfp4_route_sweep.cu`: keep the `residual` candidate flag and the exact-A16 reference
   for 2-term candidates. Without them the pair route is skipped as "disagrees with the reference"
   and its timings silently disappear from every future audit.
+
+# GB10 changelog — 2026-10-31 (T6: parallelize/coalesce the NVFP4 fused GdnConvSnapshot epilogue — per-row scratch line prefetched behind the contraction)
+
+## 1. Accounting
+
+- Base commit: `7a1b17941` (`dev-rebased-20261028`). No commit created (task instruction 7 — the
+  reviewer commits).
+- Files changed (10 tracked, 0 added, 0 deleted):
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/linear/common/epilogue.cuh` | M | `LinearRowPrefetch<Output>` detection trait (`words`/`units`, `{0,0}` for an output that reads nothing but its accumulator) and the optional row-scratch argument on `linear_finish_row` |
+| `src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh` | M | `nvfp4_a16_gemv_kernel` claims a per-row scratch line in shared, fills one row per thread after `pdl::enter_streaming()` and before the contraction, and hands the row's line to the row consumer |
+| `src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh` | M | the same line in `nvfp4_a16_sliced_k_mma_kernel`, filled before the prologue copies and published by the mainloop's existing first barrier; new row-consumer branch passing the line to a six-argument `apply_row` |
+| `src/ops/gdn_input_proj/q8/q8_gdn_conv_columns.cuh` | M | `GdnConvSnapshotColumnsOutput` owns the line layout (`kPrefetchColumns`/`kPrefetchUnits`/`kPrefetchWords`) and its fill (`prefetch_unit`/`prefetch_row`); `store_row` gains a prefetched path sharing the convolution tail; `GdnConvSnapshotPrefetchedRowEpilogue` is the line-carrying hand-off |
+| `src/ops/linear/nvfp4/shapes/n16384_k2560.cu` | M | `launch_nvfp4_n16384_k2560_conv_snapshot` selects the prefetched epilogue |
+| `bench/ops/gdn_input_proj_conv_snapshot_bench.cu` | M | `--format nvfp4-flash`: the Qwen4Exp-Flash [16384, 2560] parent through the public routes-form `gdn_input_proj_conv_snapshot` (W=1, B=1..8, no workspace) |
+| `bench/README.md` | M | documents `--format nvfp4-flash` and that `--batch` is its token count |
+| `src/models/qwen4_exp/program/fast_paths.cpp` | M | the two `gdn-conv-fused` NVFP4 comments (the `kQualified` block and `fast_path_applies`) carry T6's measurements instead of T1's NSYS `120.2 us` figures; no qualification added (§4) |
+| `tests/models/qwen4_exp/test_fast_paths.cpp` | M | the W4Dense block comment carries the same; the `applies && !qualified` assertion is unchanged |
+| `docs/maintainer/model-quality.md` | M | §6.7's `gdn-conv-fused` row updated to the T6 verdict and numbers |
+
+- CUDA stack allowlist: **unchanged** — zero new `STACK`/`LOCAL` symbols, so no ratchet and no
+  `check_cuda_stack.py update` run (§4).
+- Rebuilds: 9 single-invocation `ninja -C build-native -j "$(nproc)"` builds
+  (`infernix-serve`, both GDN benches, `infernix_ops_recurrent_test`,
+  `infernix_qwen4_exp_fast_paths_test`, `infernix_bench`), each preceded by
+  `find src/ops/… -name '*.cu' -exec touch {} +` because `build-native` CUDA depfiles do not track
+  headers.
+
+## 2. Architectural rationale & task premise analysis (`20261031-performance-tasks.md` T6)
+
+**What held.** The regression is real and sits where the task said. In the fused route each fully
+reduced row is finished by one thread (`lane == 0` of its owning warp), and that thread issued the
+row's seven global reads — the four BF16 `conv_weight` taps and the three BF16 history taps of
+`conv_states` — *after* the contraction's final `__syncthreads()`. The decode grid is 1024 CTAs over
+48 SMs, ≈ 21 waves at 2 CTAs/SM, so every wave paid a full DRAM round trip in its tail with nothing
+left in flight to cover it; the standalone convolution does the same traffic in ≈ 4 µs because there
+it is the whole kernel and every thread participates. Hoisting the reads into the contraction, where
+the codes/scales streaming already keeps the pipelines busy, is the right lever and is what shipped.
+
+**Premise corrections from measurement.**
+
+1. *`src/models/qwen4_exp/execution_plan.cpp` and `LinearRoutes::GdnConvFused` do not exist.* The
+   fusion is not a `LinearRoutes` value. `FastPath::GdnConvFused` in
+   `src/models/qwen4_exp/program/fast_paths.cpp` is the gate: `forward()` sets
+   `FastPathSelection::gdn_conv_fused`, and `execution/forward.cpp:640` turns that flag into the
+   routes-form Op call. The `LinearRoutes` argument of `ops::gdn_input_proj_conv_snapshot` selects the
+   *projection's* route set (exact vs q8-sliced-k), not the fusion. The registration decision therefore
+   belongs in `program/fast_paths.cpp`'s `kQualified`.
+2. *The named verification targets do not exist.* `infernix_ops_gdn_input_proj_test` and
+   `infernix_qwen4_exp_model_test` are not CTest names. The real ones are
+   `infernix_gdn_input_proj_test`, `infernix_gdn_input_proj_conv_snapshot_test` and
+   `infernix_gdn_input_proj_conv_record_test` — all three are
+   `build-native/tests/infernix_ops_recurrent_test` with a selector argument — plus
+   `infernix_qwen4_exp_fast_paths_test`.
+3. *The task's absolute microsecond bars are unreachable in the reproducible harness, so the
+   acceptance test as written cannot be satisfied by any implementation.* The bar is "≤ 96.5 µs,
+   beating composed 99.0 µs", where 99.0 is a 96.2 µs projection plus a 2.8 µs convolution read off an
+   NSYS graph-node trace of the running model (the T1 record). The same projection in this tree's
+   cold-L2, CUDA-graph-body-timed harness — the harness a fused number must be compared in — costs
+   **100.5 … 103.1 µs** depending on the hour, so the projection alone already exceeds the fused bar
+   before one tap is read. The criteria used here are the invariant ones: the fused launch must cost
+   the unfused projection plus its own unavoidable state traffic, and it must beat the composed route
+   measured under the same conditions, with the plain projection measured in the same session as the
+   control. Both are reported (§4), together with the end-to-end A/B, which is the reproducible
+   tiebreaker on this host.
+4. *The epilogue's cost is CTA-tail latency, not load count or coalescing.* "7 serial uncoalesced
+   loads" is right about the serialization and wrong about the pattern: a warp finishing 32
+   consecutive channels reads 64 contiguous bytes per tap — two full sectors. Re-laying or vectorizing
+   the taps buys nothing; only leaving the tail does. The measured recovery (§4) is the round trip.
+5. *The `[16384, 5120]` launcher named in the task is not the Qwen4Exp route.*
+   `nvfp4_gdn_snapshot_decode_launch` serves the 27B-class GDN parent from
+   `nvfp4_gdn_snapshot_plan.cpp`, and its output map (`GdnConvOutput`/`Nvfp4GdnConvEpilogue`) is shared
+   with the Q8 and FP8 record routes. Qwen4Exp's fused decode calls
+   `ops::gdn_input_proj_conv_snapshot` on the `[16384, 2560]` parent
+   (`execution/forward.cpp:656` → `launch_nvfp4_n16384_k2560_conv_snapshot`). The hook added here is
+   output-owned and optional, so that shape can claim the same line later with no kernel change; it is
+   left unclaimed (§5).
+6. *The hook's first design was wrong in two ways that measurement caught.* (a) Splitting the line
+   into independent units spread over the whole CTA, and publishing it with a warp-scoped sync instead
+   of a CTA barrier, both measured **slower** (B=1: 106.2 / 106.7 µs against the shipped 105.3 µs, and
+   no gain at B=4/8), because each thread then issued half as many independent loads and the barrier
+   the second resident CTA was covering went away. The shipped form — one thread fills one whole row,
+   one CTA barrier — wins. (b) Adding the six-argument `apply_row` to the *existing*
+   `GdnConvSnapshotRowEpilogue` silently captured the **Q8** fused route, whose contraction never fills
+   a line: it selected the prefetched store with a null line and corrupted `infernix_gdn_input_proj_test`
+   (`Q8 [16384,2560] B=8 fast in place replay`: non-finite outputs, guard overwritten). The prefetched
+   hand-off is therefore a separate type, selected by the launcher that fills lines — a compile-time
+   choice, with no null case and no duplicated epilogue code in the Q8 kernels.
+
+**Why a shared scratch line rather than registers.** The row's owner could keep seven values in
+registers, but the route serves up to eight contraction columns, so a full line is 4 + 4·8 words and
+at B = 8 one thread would own 36 loads; worse, register-resident values stay live across the whole
+contraction, which the GEMV's ~118-register budget cannot absorb. A shared line keeps the loads out of
+the row consumer's register pressure and lets the fill be spread. The layout is the output's property,
+so contractions stay output-agnostic and a plain linear route — which declares neither trait member —
+compiles the line and the fill away entirely.
+
+**Why the fill sits after `pdl::enter_streaming()`.** `conv_states` is written by the preceding kernel
+in the decode graph, so the prefetch is a producer-dependent read; issuing it before the PDL wait would
+race the producer (the same rule that lets the immutable `scales` be staged early and nothing else).
+
+## 3. Subsystem breakdown
+
+- `linear/common` (M): `LinearRowPrefetch` is a `std::void_t`-detected trait over
+  `Output::kPrefetchWords`/`kPrefetchUnits`, defaulted to `{0, 0}`. It is a struct with
+  `static constexpr` members, not a `requires`-guarded expression: the latter eagerly instantiates
+  `Output::kPrefetchWords` on outputs that do not declare it (nvcc rejected
+  `LinearBf16SegmentedOutput<6144,1024,6144,1024>`), and a `constexpr` helper instead is rejected as a
+  host call from the kernel. `linear_finish_row` gained a trailing
+  `const std::uint32_t* row_prefetch = nullptr` and prefers a six-argument `apply_row` when the
+  epilogue has one, so every existing epilogue selects exactly the branch it selected before.
+- `linear/nvfp4` (M): both decode contractions declare
+  `__shared__ std::uint32_t row_prefetch[kBlockRows * kPrefetchWords]` (one word when the output claims
+  nothing), fill it one row per thread through `output.prefetch_row`, and pass the row's line into the
+  row consumer. The GEMV publishes with the one `__syncthreads()` the fill requires; the sliced-K MMA
+  publishes with the barrier the pipeline already executes before its first scale read, adding no
+  synchronization. The sliced-K fill passes `token_begin + live_columns`, i.e. the line is indexed by
+  *absolute* contraction column — the index the row consumer uses for `destination[sequence * rows +
+  row]`; a relative index would read back a neighbouring row's line whenever `token_begin != 0`.
+- `gdn_input_proj/q8` (M): word 0..3 of a row's line are the four `conv_weight` taps (BF16 pattern in
+  the low half), and word 4 + 4·c .. 7 + 4·c are contraction column `c`'s three history taps plus its
+  `snapshot_base_slots[c]`, so the row consumer needs no `initial_state_slots`/`snapshot_base_slots`
+  indirection either. A z row (row ≥ 10240) fills and reads nothing. `store_row` is now
+  `store_row<Columns, Prefetched>`: the two instantiations share the convolution, SiLU and
+  window-publish tail verbatim and differ only in where the seven values come from, which is what keeps
+  the un-prefetched path — and every other caller of this output map, including the whole Q8 route —
+  bit-identical. The convolution's FMA order and the published window bits are unchanged, so the
+  route's FP64 oracle criterion is unchanged and its test is the same one.
+- `bench` (M): the `nvfp4-flash` fixture is the routes-form snapshot Op on the Flash-Next parent with a
+  synthetic `conv_weight` and the bench's own L2 flush, graph-body-timed like every other fixture. It
+  exists because the fused decode route had no op-level benchmark at its own shape — the existing
+  `nvfp4` fixture is the 27B [16384, 5120] parent, which is precisely why the T1 "near-tie at the Op
+  level" did not reproduce in the model.
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+**Tests** — run serially; `--parallel` produces real numerical failures on this single-GPU host:
+
+```
+1/5 infernix_cuda_stack_check .................... Passed    1.53 sec
+2/5 infernix_qwen4_exp_fast_paths_test ........... Passed    0.00 sec
+3/5 infernix_gdn_input_proj_test ................. Passed   10.55 sec
+4/5 infernix_gdn_input_proj_conv_snapshot_test ... Passed   28.01 sec
+5/5 infernix_gdn_input_proj_conv_record_test ..... Passed    7.95 sec
+100% tests passed, 0 tests failed out of 5
+```
+
+`infernix_gdn_input_proj_conv_snapshot_test` is the FP64-oracle qualification of the fused route over
+B = 1..8 including the in-place-replay configurations, so the shipped convolution and published window
+are the bits the Op contract promises. The stack gate is green with zero new spills, so the allowlist
+was not touched.
+
+**Kernel resources** (`cuobjdump --dump-resource-usage`, fused instantiations):
+
+| kernel | REG | STACK | LOCAL | SHARED |
+|---|---|---|---|---|
+| `nvfp4_a16_gemv_kernel` × `GdnConvSnapshotColumnsOutput` × `GdnConvSnapshotPrefetchedRowEpilogue` | 118 | 0 | 0 | 5888 |
+| `nvfp4_a16_sliced_k_mma_kernel` × the same output and epilogue | 100 | 0 | 0 | 38400 |
+
+**Op latency** — cold 32 MiB L2 flush, CUDA-graph-body-timed, 5 warmup / 30 repeat, median µs; one
+public Op call per timed graph; the plain projection measured in the same session is the control:
+
+| columns B | fused before T6 | fused after T6 | plain projection | `causal_conv1d_silu_snapshot` | composed | fused − composed |
+|---|---|---|---|---|---|---|
+| 1 | 109.248 | **105.280** | 102.400 | 4.10 | 106.50 | **−1.22** |
+| 2 | 114.656 | **110.432** | 103.968 | 4.19 | 108.16 | +2.27 |
+| 4 | 113.344 | **108.768** | 104.160 | 6.14 | 110.30 | **−1.53** |
+| 8 | 115.424 | **112.352** | 104.992 | 6.14 | 111.13 | +1.22 |
+
+T6 removed **3.0 … 5.9 µs** of fused-route latency (mean −4.2 µs). The residual over the unfused
+projection is 3.6 µs at B = 1 in five paired alternating samples (+3.04, +3.36, +3.78, +3.90, +3.84),
+against 248 KB of extra state traffic — `conv_weight` 80 KB, history read 60 KB, window publish 60 KB,
+selectors ≈ 0 — which is ≈ 1.1 µs at this shape's measured 229 GB/s. So ≈ 2.5 µs of the epilogue is
+still not hidden, and the fused/composed column above swings by more than that with the control's own
+session drift (the plain projection measured 100.5 … 103.1 µs across runs today).
+
+**End-to-end decode** — `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix`, `infernix_bench -p 4096
+-n 128,256 -pg '4096,128;4096,256' -r 2 --warmup 1 --concurrency 1 --kv-dtype fp8`, alternating
+default / `--fast-path gdn-conv-fused`, 2 rounds each, `decode_output_tok_s_median`:
+
+| test | off | on | Δ mean |
+|---|---|---|---|
+| tg 128 | 46.06 / 45.97 | 45.86 / 45.83 | **−0.17** |
+| tg 256 | 45.99 / 45.85 | 45.73 / 45.74 | **−0.19** |
+| pp4096 + tg128 | 44.87 / 44.85 | 44.82 / 44.68 | **−0.11** |
+| pp4096 + tg256 | 44.95 / 44.89 | 44.84 / 44.77 | **−0.12** |
+
+Per-arm standard deviations are 0.03 … 0.08 tok/s, so all eight paired samples are outside noise: the
+fused route is **0.2 … 0.4 % slower end to end**. Against T1's measurement of the same artifact
+(45.78 default vs 44.09 fused, −3.7 %), T6 recovers ≈ 90 % of the regression.
+
+**Registration decision.** `FastPath::GdnConvFused` for `DenseKernels::Nvfp4` therefore **stays
+unregistered**. The project's shipping rule is that a numerics-changing fast path registers only where
+it is measured faster, and this route is not: it convolves the FP32 projection instead of
+`bf16(projection)`, so it changes the q/k/v bits, and it is slower on the only measurement this host
+reproduces to 0.1 %. It remains implemented, oracle-qualified, and runnable under
+`--fast-path gdn-conv-fused`; `tests/models/qwen4_exp/test_fast_paths.cpp` keeps its
+`applies && !qualified` assertion, and the "measured slower (120.2 µs …)" comments in
+`program/fast_paths.cpp` and that test now carry this task's numbers as the reason.
+
+## 5. Accepted gaps & follow-ups
+
+- **The route is at parity, not faster, and is therefore still unregistered** — the one acceptance
+  criterion T6 does not meet. What is left is ≈ 2.5 µs of the epilogue the row scratch line does not
+  hide. The candidate causes, in the order worth testing: the fill's `__syncthreads()` at the end of a
+  wave (the second resident CTA is draining, so it may not cover it); the fill's own issue cost ahead of
+  a mainloop already at 93 % of the read roofline; and the row consumer's stores, which now leave the CTA
+  tail with real dependents. The next lever is an NCU comparison of the fused and unfused
+  `nvfp4_a16_gemv_kernel` on synthetic operands at `[16384, 2560]` — `stall_barrier` and `stall_long_sb`
+  in the tail — not another schedule change.
+- **The `[16384, 5120]` fused route (`nvfp4_gdn_snapshot_decode_launch`) does not claim the line.** It
+  is a different product route (27B-class GDN, `nvfp4_gdn_snapshot_plan.cpp`), its output map is shared
+  with the Q8 and FP8 record paths, and it is outside T6's acceptance criteria. The kernel-side hook is
+  generic, so claiming it is a change to `GdnConvOutput`/`Nvfp4GdnConvEpilogue` alone; it should come
+  with the record/snapshot tests in the same change.
+- **The model-quality joint gate for the NVFP4 fused convolution was not run.** It is required only to
+  ship the route, which this task did not do; the route stays a candidate, which the reproducibility
+  assertion already covers (`{GdnConvFused}` alone keeps `request_invariant()` true).
+- **E2E was measured on one artifact and one workload** (W4Dense, fp8 KV, concurrency 1, plain decode).
+  MTP verification and the Dense8/IQ3_S artifacts were not run: verification and prefill stay composed,
+  and the other two artifacts do not use NVFP4 dense kernels, so neither can exercise this route. The
+  full `./bench/run_kv_matrix_bench.sh` matrix was not run for the same reason.
+- **Harness note for future audits:** `--format nvfp4-flash` is the only op-level benchmark for the
+  Qwen4Exp fused decode route. The `nvfp4` fixture in the same bench is the 27B [16384, 5120] parent,
+  and comparing the two shapes is what made T1's Op-level result disagree with the model.
+- **Rebase conflict policy for these files:** the row-prefetch hook is optional and output-declared — an
+  upstream change that adds a contraction must keep `LinearRowPrefetch`'s default `{0, 0}` reachable so
+  outputs without a line compile unchanged, and must not merge the prefetched epilogue back into
+  `GdnConvSnapshotRowEpilogue` (§2.6b). On conflict, keep `GdnConvSnapshotPrefetchedRowEpilogue` a
+  distinct type, keep the sliced-K fill's `token_begin + live_columns` absolute column bound, and keep
+  the GEMV fill after `pdl::enter_streaming()`.

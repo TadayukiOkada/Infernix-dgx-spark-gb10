@@ -69,6 +69,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int live_columns =
         MaskedColumns ? min(ActiveTokens, operands.tokens - token_begin) : ActiveTokens;
 
+    // An output may claim a line of 32-bit words per row that this contraction fills before its
+    // mainloop and hands back to its row consumer (see nvfp4_a16_gemv_kernel). Its global reads are
+    // independent of the contraction, so issuing them here hides their memory round trip behind the
+    // mainloop instead of serializing it in the single finishing warp's tail.
+    using Prefetch = LinearRowPrefetch<Output>;
+    constexpr int kPrefetchWords = RowPolicy::kPaired ? 0 : Prefetch::words;
+    __shared__ std::uint32_t
+        row_prefetch[kPrefetchWords == 0 ? 1 : kBlockRows * kPrefetchWords];
+
+    if constexpr (kPrefetchWords != 0) {
+        // One thread fills one row's whole line before the copies go out; the mainloop's first
+        // barrier publishes them, so the fill costs no extra synchronization here. The line covers
+        // the CTA's contraction columns by their absolute index, which is what the row consumer
+        // below names when it reads a column's window back.
+        for (int local = tid; local < kBlockRows; local += Schedule::kThreads) {
+            output.prefetch_row(row_prefetch + local * kPrefetchWords,
+                                row_policy.weight_row(row0, local, operands.rows),
+                                token_begin + live_columns);
+        }
+    }
+
     const auto stage_activation = [&](int stage, int group_k0) {
         constexpr auto kActivationCache = Schedule::kActivationCache;
         constexpr bool kPadded          = Schedule::kActivationStage == Nvfp4ActivationStage::PaddedZero;
@@ -274,6 +295,20 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                     if (local_token + 1 < live_columns)
                         epilogue.apply_pair(destination, row_a, token0 + 1, sum.y * top_scale,
                                             sum.w * bottom_scale);
+                } else if constexpr (kPrefetchWords != 0 && requires(const float (&vals)[2]) {
+                                         epilogue.apply_row(destination, row_a, token0, vals, 2,
+                                                            static_cast<const std::uint32_t*>(
+                                                                nullptr));
+                                     }) {
+                    const int active = max(0, min(2, live_columns - local_token));
+                    if (active > 0) {
+                        const float values_a[2]{sum.x * top_scale, sum.y * top_scale};
+                        const float values_b[2]{sum.z * bottom_scale, sum.w * bottom_scale};
+                        epilogue.apply_row(destination, row_a, token0, values_a, active,
+                                           row_prefetch + (tile_row + gid) * kPrefetchWords);
+                        epilogue.apply_row(destination, row_b, token0, values_b, active,
+                                           row_prefetch + (tile_row + gid + 8) * kPrefetchWords);
+                    }
                 } else if constexpr (requires(const float (&vals)[2]) {
                                          epilogue.apply_row(destination, row_a, token0, vals, 2);
                                      }) {

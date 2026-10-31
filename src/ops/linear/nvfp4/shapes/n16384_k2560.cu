@@ -176,7 +176,7 @@ void launch_nvfp4_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weig
         static_cast<__nv_bfloat16*>(value.data),
         static_cast<__nv_bfloat16*>(z.data),
     };
-    const GdnConvSnapshotRowEpilogue epilogue{};
+    const GdnConvSnapshotPrefetchedRowEpilogue epilogue{};
     launch_decode_routes(operands, output, epilogue, stream);
 }
 } // namespace infernix::ops::detail

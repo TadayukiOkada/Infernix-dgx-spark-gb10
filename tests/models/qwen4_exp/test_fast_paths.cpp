@@ -340,9 +340,10 @@ int main() {
     // W4Dense (NVFP4 dense, both expert activation precisions, every KV format): q8-sliced-k routes
     // the artifact's Q8 weights (its NVFP4 problems ignore the flag) and dflash2-pairs joins the
     // owner's every-configuration registration; both are registered. gdn-conv-fused's [16384,2560]
-    // NVFP4 route is implemented (it applies, so --fast-path can run it) but measured slower than
-    // the composed decode route on GB10 (120.2 us against 96.2 + 2.8 per GDN layer call), so it
-    // registers nowhere. The fused convolution is per column and keeps a request invariant;
+    // NVFP4 route is implemented (it applies, so --fast-path can run it) but measured no faster than
+    // the composed decode route on GB10 - a tie at the Op level and -0.2 .. -0.4 % on the artifact's
+    // plain decode after the T6 epilogue prefetch (2026-10-31), so it registers nowhere. The fused
+    // convolution is per column and keeps a request invariant;
     // q8-sliced-k and dflash2-pairs couple a request to its round, which the reproducible route
     // therefore excludes.
     for (const bool a4 : {false, true}) {

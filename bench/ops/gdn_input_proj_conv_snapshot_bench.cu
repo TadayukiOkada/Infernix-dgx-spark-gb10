@@ -33,6 +33,7 @@ using namespace infernix;
 namespace {
 
 constexpr std::int32_t kHidden             = 5120;
+constexpr std::int32_t kFlashHidden        = 2560;
 constexpr std::int32_t kQueryRows          = 2048;
 constexpr std::int32_t kKeyRows            = 2048;
 constexpr std::int32_t kValueRows          = 6144;
@@ -62,6 +63,7 @@ enum class CacheState : std::uint8_t {
 enum class Format : std::uint8_t {
     Q4Q5,
     Nvfp4,
+    Nvfp4Flash,
     Fp8,
     Q8,
     All,
@@ -198,10 +200,11 @@ CacheMode parse_cache(std::string_view value) {
 Format parse_format(std::string_view value) {
     if (value == "q4q5") return Format::Q4Q5;
     if (value == "nvfp4") return Format::Nvfp4;
+    if (value == "nvfp4-flash") return Format::Nvfp4Flash;
     if (value == "fp8") return Format::Fp8;
     if (value == "q8") return Format::Q8;
     if (value == "all") return Format::All;
-    throw std::invalid_argument("--format must be q4q5, nvfp4, fp8, q8, or all");
+    throw std::invalid_argument("--format must be q4q5, nvfp4, nvfp4-flash, fp8, q8, or all");
 }
 
 Form parse_form(std::string_view value) {
@@ -238,7 +241,9 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --format q4q5|nvfp4|fp8|q8|all  Default q4q5.\n"
+                 "  --format q4q5|nvfp4|nvfp4-flash|fp8|q8|all  Default q4q5. nvfp4-flash is the\n"
+                 "                Qwen3.8-Flash-Next [16384,2560] parent and its routes-form fused\n"
+                 "                convolution (W=1, so --batch sweeps the decode sequences).\n"
                  "  --form snapshot|record|both  Default snapshot.\n"
                  "  --nvfp4-policy a16|a4        Default a4.\n"
                  "  --fp8-policy a16|a8          Default a8.\n"
@@ -503,6 +508,59 @@ private:
     DeviceBuffer conv_weight_;
     bench::L2FlushBuffer flush_;
     ops::LinearPolicy policy_;
+};
+
+// The Qwen3.8-Flash-Next GDN q/k/v/z parent [16384,2560] with the width-four causal convolution and
+// SiLU fused into its projection epilogue: the routes form of the snapshot Op (W=1, one column per
+// sequence, B=1..8, no workspace), which is what the model's 36 GDN layers run in decode. The
+// nvfp4 fixture above is the 27B [16384,5120] parent and its workspace-dispatched route.
+class Nvfp4FlashFixture {
+public:
+    explicit Nvfp4FlashFixture(std::size_t flush_bytes)
+        : parent_(bench::make_nvfp4_weight(kChannels + kZRows, kFlashHidden)),
+          conv_weight_(bench::make_bf16(static_cast<std::size_t>(kChannels) * 4, 113U)),
+          flush_(flush_bytes) {
+        bench::flush_l2(flush_, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    [[nodiscard]] const char* profile() const noexcept { return "nvfp4-flash"; }
+
+    [[nodiscard]] GdnGeometry geometry() const noexcept {
+        return {kFlashHidden, kQueryRows, kKeyRows, kValueRows, kZRows};
+    }
+
+    [[nodiscard]] std::size_t workspace_capacity(Form form, std::int32_t,
+                                                 std::int32_t tokens) const {
+        if (form != Form::Snapshot) {
+            throw std::invalid_argument("the routes-form snapshot has no record form");
+        }
+        if (tokens != 1) {
+            throw std::invalid_argument("the routes-form snapshot takes W=1; sweep --batch");
+        }
+        return 0;
+    }
+
+    void launch(Form form, const Tensor& x, Tensor& conv_states, const Tensor& initial,
+                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& conv_record,
+                Tensor& query, Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                cudaStream_t stream) {
+        (void)form;
+        (void)valid_columns;
+        (void)conv_record;
+        (void)workspace;
+        const Tensor convolution_weight(conv_weight_.p, DType::BF16, {kChannels, 4});
+        ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
+                                          initial, snapshot_base, query, key, value, z,
+                                          ops::LinearRoutes::Exact, stream);
+    }
+
+    void flush(cudaStream_t stream) { bench::flush_l2(flush_, stream); }
+
+private:
+    bench::PackedQuantizedWeight parent_;
+    DeviceBuffer conv_weight_;
+    bench::L2FlushBuffer flush_;
 };
 
 class Fp8Fixture {
@@ -930,8 +988,10 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
-        const char* configured_format = options.format == Format::Q4Q5    ? "q4q5"
-                                        : options.format == Format::Nvfp4 ? "nvfp4"
+        const char* configured_format = options.format == Format::Q4Q5       ? "q4q5"
+                                        : options.format == Format::Nvfp4    ? "nvfp4"
+                                        : options.format == Format::Nvfp4Flash
+                                            ? "nvfp4-flash"
                                         : options.format == Format::Fp8   ? "fp8"
                                         : options.format == Format::Q8    ? "q8"
                                                                           : "all";
@@ -953,6 +1013,10 @@ int main(int argc, char** argv) {
         if (options.format == Format::Nvfp4 || options.format == Format::All) {
             Nvfp4Fixture fixture(static_cast<std::size_t>(options.flush_bytes),
                                  options.nvfp4_policy);
+            run_fixture(fixture, options, context.stream, results);
+        }
+        if (options.format == Format::Nvfp4Flash) {
+            Nvfp4FlashFixture fixture(static_cast<std::size_t>(options.flush_bytes));
             run_fixture(fixture, options, context.stream, results);
         }
         if (options.format == Format::Fp8 || options.format == Format::All) {

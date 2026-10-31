@@ -29,6 +29,55 @@ struct GdnConvSnapshotColumnsOutput {
     __nv_bfloat16* value;                    // [6144,B]
     __nv_bfloat16* z;                        // [6144,B]
 
+    // The row scratch a contraction may preload: the four convolution taps, then per contraction
+    // column c its three history taps (each a BF16 pattern in the low half of its word) and that
+    // sequence's snapshot slot, at 4 + 4*c. A convolution row reads its own taps and its live
+    // columns' windows; a z row reads none. The line is sized for the widest contraction the route
+    // serves (one column per sequence, B <= 8) and is filled unit by unit, so a caller may spread a
+    // line over threads or fill it from one.
+    static constexpr int kPrefetchColumns = 8;
+    static constexpr int kPrefetchUnits   = 1 + kPrefetchColumns;
+    static constexpr int kPrefetchWords   = 4 * kPrefetchUnits;
+
+    // Fills one unit of a row's line: unit 0 the four convolution taps, unit 1 + c the window of
+    // contraction column c. A unit whose column is at or beyond `columns` (the exclusive upper bound
+    // on the absolute column indices the call covers) or beyond the line writes nothing. See
+    // prefetch_row, which a contraction calls for each row of its tile before the contraction.
+    __device__ __forceinline__ void prefetch_unit(std::uint32_t* words, int row, int unit,
+                                                  int columns) const {
+        if (row >= kGdnChannels) { return; }
+        constexpr std::int64_t kChannels = kGdnChannels;
+        if (unit == 0) {
+#pragma unroll
+            for (int tap = 0; tap < 4; ++tap) {
+                words[tap] =
+                    bf16_word(conv_weight[static_cast<std::int64_t>(tap) * kChannels + row]);
+            }
+            return;
+        }
+        const int column = unit - 1;
+        if (column >= columns || column >= kPrefetchColumns) { return; }
+        const __nv_bfloat16* initial = conv_states +
+            static_cast<std::int64_t>(initial_state_slots[column]) * (3 * kChannels);
+        std::uint32_t* window        = words + 4 + 4 * column;
+#pragma unroll
+        for (int tap = 0; tap < 3; ++tap) {
+            window[tap] = bf16_word(initial[static_cast<std::int64_t>(tap) * kChannels + row]);
+        }
+        window[3] = static_cast<std::uint32_t>(snapshot_base_slots[column]);
+    }
+
+    // Fills a whole row line. A contraction calls this once per row of its tile before the
+    // contraction, so the memory round trip overlaps it instead of running in the row consumer's
+    // tail; store_row below reads the same values from global memory where no line was preloaded.
+    __device__ __forceinline__ void prefetch_row(std::uint32_t* words, int row,
+                                                 int columns) const {
+#pragma unroll
+        for (int unit = 0; unit < kPrefetchUnits; ++unit) {
+            prefetch_unit(words, row, unit, columns);
+        }
+    }
+
     // One fully reduced row over contraction columns [column_begin, column_begin + active). Every
     // history the row needs is loaded before the row publishes any window, so a sequence's
     // snapshot slot may be its own initial slot (the decode configuration). Distinct sequences
@@ -38,6 +87,37 @@ struct GdnConvSnapshotColumnsOutput {
     __device__ __forceinline__ void store_row(int row, int column_begin,
                                               const float (&projected)[Columns],
                                               int active) const {
+        store_row<Columns, false>(row, column_begin, projected, active, nullptr);
+    }
+
+    // The same row over a line the contraction preloaded with prefetch_row.
+    template <int Columns>
+    __device__ __forceinline__ void store_row(int row, int column_begin,
+                                              const float (&projected)[Columns], int active,
+                                              const std::uint32_t* words) const {
+        static_assert(Columns <= kPrefetchColumns,
+                      "a preloaded row line covers the route's widest contraction");
+        store_row<Columns, true>(row, column_begin, projected, active, words);
+    }
+
+    __device__ __forceinline__ void store(int row, int column, float projected) const {
+        const float values[1]{projected};
+        store_row(row, column, values, 1);
+    }
+
+private:
+    static __device__ __forceinline__ std::uint32_t bf16_word(__nv_bfloat16 value) {
+        return static_cast<std::uint32_t>(__bfloat16_as_ushort(value));
+    }
+
+    static __device__ __forceinline__ __nv_bfloat16 bf16_pattern(std::uint32_t word) {
+        return __ushort_as_bfloat16(static_cast<unsigned short>(word));
+    }
+
+    template <int Columns, bool Prefetched>
+    __device__ __forceinline__ void store_row(int row, int column_begin,
+                                              const float (&projected)[Columns], int active,
+                                              const std::uint32_t* words) const {
         if (row >= kGdnChannels) {
 #pragma unroll
             for (int column = 0; column < Columns; ++column) {
@@ -51,10 +131,13 @@ struct GdnConvSnapshotColumnsOutput {
 
         constexpr std::int64_t kChannels  = kGdnChannels;
         constexpr std::int64_t kSlotWidth = 3 * kChannels;
-        const float w0 = __bfloat162float(conv_weight[row]);
-        const float w1 = __bfloat162float(conv_weight[kChannels + row]);
-        const float w2 = __bfloat162float(conv_weight[2 * kChannels + row]);
-        const float w3 = __bfloat162float(conv_weight[3 * kChannels + row]);
+        float w[4];
+#pragma unroll
+        for (int tap = 0; tap < 4; ++tap) {
+            w[tap] = Prefetched ? __bfloat162float(bf16_pattern(words[tap]))
+                                : __bfloat162float(
+                                      conv_weight[static_cast<std::int64_t>(tap) * kChannels + row]);
+        }
 
         __nv_bfloat16 history[Columns][3];
         std::int32_t snapshot_slot[Columns];
@@ -62,12 +145,21 @@ struct GdnConvSnapshotColumnsOutput {
         for (int column = 0; column < Columns; ++column) {
             if (column < active) {
                 const int sequence = column_begin + column;
-                const __nv_bfloat16* initial =
-                    conv_states + static_cast<std::int64_t>(initial_state_slots[sequence]) * kSlotWidth;
-                history[column][0]    = initial[row];
-                history[column][1]    = initial[kChannels + row];
-                history[column][2]    = initial[2 * kChannels + row];
-                snapshot_slot[column] = snapshot_base_slots[sequence];
+                if constexpr (Prefetched) {
+                    const std::uint32_t* window = words + 4 + 4 * sequence;
+#pragma unroll
+                    for (int tap = 0; tap < 3; ++tap) {
+                        history[column][tap] = bf16_pattern(window[tap]);
+                    }
+                    snapshot_slot[column] = static_cast<std::int32_t>(window[3]);
+                } else {
+                    const __nv_bfloat16* initial = conv_states +
+                        static_cast<std::int64_t>(initial_state_slots[sequence]) * kSlotWidth;
+                    history[column][0]    = initial[row];
+                    history[column][1]    = initial[kChannels + row];
+                    history[column][2]    = initial[2 * kChannels + row];
+                    snapshot_slot[column] = snapshot_base_slots[sequence];
+                }
             }
         }
 
@@ -93,10 +185,10 @@ struct GdnConvSnapshotColumnsOutput {
             if (column < active) {
                 const int sequence = column_begin + column;
                 const float p      = projected[column];
-                float conv         = fmaf(w0, __bfloat162float(history[column][0]), 0.0F);
-                conv               = fmaf(w1, __bfloat162float(history[column][1]), conv);
-                conv               = fmaf(w2, __bfloat162float(history[column][2]), conv);
-                conv               = fmaf(w3, p, conv);
+                float conv         = fmaf(w[0], __bfloat162float(history[column][0]), 0.0F);
+                conv               = fmaf(w[1], __bfloat162float(history[column][1]), conv);
+                conv               = fmaf(w[2], __bfloat162float(history[column][2]), conv);
+                conv               = fmaf(w[3], p, conv);
                 destination[static_cast<std::int64_t>(sequence) * destination_rows + local_row] =
                     __float2bfloat16_rn(silu(conv));
 
@@ -107,11 +199,6 @@ struct GdnConvSnapshotColumnsOutput {
                 snapshot[2 * kChannels + row] = __float2bfloat16_rn(p);
             }
         }
-    }
-
-    __device__ __forceinline__ void store(int row, int column, float projected) const {
-        const float values[1]{projected};
-        store_row(row, column, values, 1);
     }
 };
 
@@ -125,6 +212,21 @@ struct GdnConvSnapshotRowEpilogue {
     __device__ __forceinline__ void apply_row(const Output& output, int row, int column_begin,
                                               const float (&projected)[Columns], int active) const {
         output.store_row(row, column_begin, projected, active);
+    }
+};
+
+// The hand-off for a contraction that preloaded each row's scratch line before its mainloop: the
+// line travels with the row to the prefetched store. It is a separate type rather than another
+// overload of the one above because a contraction either fills lines or does not, and a contraction
+// that does not must not select the prefetched store with a null line.
+struct GdnConvSnapshotPrefetchedRowEpilogue : GdnConvSnapshotRowEpilogue {
+    using GdnConvSnapshotRowEpilogue::apply_row;
+
+    template <class Output, int Columns>
+    __device__ __forceinline__ void apply_row(const Output& output, int row, int column_begin,
+                                              const float (&projected)[Columns], int active,
+                                              const std::uint32_t* words) const {
+        output.store_row(row, column_begin, projected, active, words);
     }
 };
 

@@ -257,11 +257,29 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     static_assert(Schedule::kBlockRows % 4 == 0 && 128 % Schedule::kBlockRows == 0);
     static_assert(!Rows::kPaired || Schedule::kRowsPerWarp % 2 == 0);
     __shared__ Nvfp4A16GemvSharedStorage<Geometry, Schedule> shared;
+    // An output may claim a line of 32-bit words per row that this contraction fills before its
+    // mainloop and hands back to the row consumer. Its global reads are independent of the
+    // contraction, so issuing them here hides their memory round trip behind the mainloop instead
+    // of serializing it in every CTA tail; the layout is the output's, and one thread fills one
+    // row. Only the unpaired form has a row consumer, so a paired policy never prefetches.
+    using Prefetch = LinearRowPrefetch<Output>;
+    constexpr int kPrefetchWords = Rows::kPaired ? 0 : Prefetch::words;
+    __shared__ std::uint32_t
+        row_prefetch[kPrefetchWords == 0 ? 1 : Schedule::kBlockRows * kPrefetchWords];
     const int block = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int local0 = warp * Schedule::kRowsPerWarp;
     // The scales and codes are immutable: a programmatic dependent stages the scales before it waits.
     nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared, block, rows, policy);
     pdl::enter_streaming();
-    const int local0 = warp * Schedule::kRowsPerWarp;
+    if constexpr (kPrefetchWords != 0) {
+        // One thread fills one row's whole line: its loads are independent, so they all go out
+        // together, and the fill costs a single CTA barrier that the second resident block covers.
+        for (int local = threadIdx.x; local < Schedule::kBlockRows; local += Schedule::kThreads) {
+            output.prefetch_row(row_prefetch + local * kPrefetchWords,
+                                nvfp4_a16_parent_row<Schedule>(block, local, rows, policy), 1);
+        }
+        __syncthreads();
+    }
     int parent[Schedule::kRowsPerWarp];
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
@@ -285,7 +303,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                 epilogue.apply_pair(output, parent[r], 0, totals[r], totals[r + 1]);
             else {
                 const float value[1]{totals[r]};
-                linear_finish_row(output, epilogue, parent[r], 0, value, 1);
+                const std::uint32_t* line =
+                    kPrefetchWords == 0 ? nullptr
+                                        : row_prefetch + (local0 + r) * kPrefetchWords;
+                linear_finish_row(output, epilogue, parent[r], 0, value, 1, line);
             }
         }
     }

@@ -740,6 +740,10 @@ private launchers, candidate selection, duplicated compositions, or route labels
 `T=1..6` sweep is the production MTP verification interval; Record begins at `T=2`.
 `--form snapshot|record|both` selects the semantic form. NVFP4 accepts public `a16`/`a4`, while FP8
 accepts `a16`/`a8`; the reported profile names caller policy, not a private resolved route.
+`--format nvfp4-flash` measures the Qwen4Exp-Flash shape behind the fused NVFP4 decode route, the
+[16384, 2560] parent of `gdn_input_proj_conv_snapshot` in its routes form. It takes `--form snapshot`
+and `W = 1`, so its token count is `--batch` (one sequence per contraction column) and it needs no
+workspace; `--nvfp4-policy` and Record do not apply to it.
 
 CUDA Graph replay is the default execution mode. The graph contains external timing event nodes
 around the complete Op body, while L2 eviction stays outside the timed interval. Cold-cache results
@@ -768,6 +772,9 @@ cmake --build build --parallel --target infernix_gdn_input_proj_conv_snapshot_be
 ./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
   --format fp8 --fp8-policy a8 --form both --batch 1 --sweep 1:16 \
   --execution both --cache both --warmup 5 --repeat 30
+./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
+  --format nvfp4-flash --batch 1 --execution graph --cache cold \
+  --warmup 5 --repeat 30
 ```
 
 `--execution eager|both` is available only to attribute launch behavior; it calls the same public
