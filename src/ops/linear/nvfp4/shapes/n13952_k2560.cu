@@ -17,6 +17,10 @@ namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next QSA QKVG+indexer packed input projection [13952, 2560]. Same schedule family
 // as [16384, 2560]; only the row count differs.
+// GB10 2026-10-31 (T5): T = 33..48 splits out of the T <= 64 band onto the 32-row K128 MMA tile
+// (118.5 -> 111.7us at T = 48, 74.3% -> 78.9% of the 246 GB/s READ reference); T = 49..64 keeps the
+// 64-row two-stage tile, which is 0.8% ahead there. Every other 1..64 width already sat at the
+// sweep argmin, and no candidate beats 116.6us at T = 64. launch_routes mirrors both bands.
 using Geometry = Nvfp4Geometry<13952, 2560>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -29,6 +33,7 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
+    if (tokens <= 48) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>;
     if (tokens <= 96) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;
     if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
@@ -61,6 +66,12 @@ void launch_routes(const Nvfp4A16Operands& operands, Output output, cudaStream_t
     if (tokens <= 32) {
         launch_nvfp4_a16_sliced_k_mma<
             Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 1, 2>, Geometry::kInputRows>>(
+            operands, output, epilogue, stream);
+        return;
+    }
+    if (tokens <= 48) {
+        launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<
+            Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>, Geometry::kInputRows>>(
             operands, output, epilogue, stream);
         return;
     }

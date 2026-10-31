@@ -19,6 +19,18 @@ namespace {
 // Qwen3.8-Flash-Next GDN q/k projection [2048, 2560] (16 key heads x 128).
 // Same schedule family as [12800, 2560]; only the row count changes. A4 is not
 // enabled for these dense shapes.
+// GB10 2026-10-31 (T5): retuned over T = 1..64 against the full candidate set (cold 32 MiB L2, 25
+// repeats, minimum), then re-checked against the HEAD binary in an interleaved production-only A/B
+// (3 alternating rounds). T = 2..8 takes the RowTiles-1 8-token sliced-K tile (16.83 -> 16.10us,
+// -4.4%) and T = 25..32 the 32-token RowTiles-1 sliced-K tile in place of the 16-row K128 MMA tile
+// (21.86 -> 21.60us). Both sit inside this shape's A/B noise floor -- the byte-identical
+// [2560, 2560] table swings +-6.8% in the same run -- so they stand as sweep argmins that never
+// measured worse, not as demonstrated gains. The 4-warp Direct-scale GEMV at 4 CTAs/SM that the
+// sweep preferred at T = 1 (13.6us) did not survive that A/B (15.90us against 15.74us for the
+// family's 8-warp StagedRaw tile), so T = 1 keeps the family tile. T = 33..64 measures ~23.3us
+// (56..58% of the 246 GB/s READ reference) and no candidate goes below 20.5us; the shape has no A4
+// admission and its pair gate is at 65 tokens (the 2-term route is 6..22% behind across 33..64), so
+// no faster route covers these widths.
 using Geometry = Nvfp4Geometry<2048, 2560>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -28,10 +40,10 @@ using C2 = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::Sh
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
-    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
+    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
     if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 2>>;
-    if (tokens <= 32) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 16, 128, 16, 8, 2, 3>>;
+    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1>>;
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 32, 128, 16, 16, 2, 2>>;
     if (tokens <= 96) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
     if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 128, 32, 16, 2, 1>>;
@@ -50,6 +62,17 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 bool uses_a4(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
+// GB10 2026-10-31 (T5): pair gate 128 -> 65. This shape registers no 1-term A4 ladder, so the
+// 2-term row-scaled pair route is the only alternative its A16 table faces above the decode band,
+// and from T = 65 it wins by 20..27%: cold 32 MiB L2, 25 repeats, minimum, pair against the public
+// route at T = 65 / 72 / 80 / 88 / 96 / 112 / 127 is 25.34 / 24.90 / 26.53 / 26.24 / 26.11 / 26.56 /
+// 26.91us against 34.34 / 33.92 / 34.34 / 33.76 / 34.02 / 34.62 / 35.07us (53.1..55.2% against
+// 39.2..42.3% of the 246 GB/s READ reference). It is not free below that -- at T = 64 the pair route
+// measures 24.54us against 23.36us for the A16 tile -- so the gate sits at the measured crossover,
+// not at the verification band. Reaching it still needs a policy that permits the 2-term residual
+// (LinearPolicy residual or LinearRoutes::Nvfp4A4Pair); A16Only/Exact artifacts keep the table
+// above unchanged, and the route was already registered and tested here at T = 65/96/127, so no new
+// kernel enters any configuration.
 const Nvfp4LinearShape kNvfp4N2048K2560{
-    2048, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 128};
+    2048, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail

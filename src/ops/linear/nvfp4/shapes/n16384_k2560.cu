@@ -118,7 +118,15 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
     return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
 }
 
-bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
+// GB10 2026-10-31 (T5): the A4 admission starts at the 2-term/prefill width, not at 33. Measured
+// on the public route (cold 32 MiB L2, 25 repeats, minimum), the 1-term A4 ladder this shape
+// registers is 7..11% SLOWER than the A16 table across the MTP-verification widths -- T = 33:
+// 136.26us against 124.61us (73.8% against 80.6% of the 246 GB/s READ reference), T = 48: 136.74
+// against 123.74 (75.0% against 82.9%), T = 64: 136.26 against 126.91 (76.9% against 82.6%) --
+// and 25..37% faster from T = 65, where it wins outright (T = 65: 111.52us against 148.10, 94.1%
+// against 70.9%; T = 128: 114.11 against 181.86, 99.6% against 62.5%). select_a4 keeps its
+// T <= 64 rungs so a future gate change has its measured per-width argmin recorded.
+bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 65; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N16384K2560{

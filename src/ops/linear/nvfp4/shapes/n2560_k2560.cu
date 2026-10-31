@@ -19,6 +19,15 @@ namespace {
 // Qwen3.8-Flash-Next PLE value projection [2560, 2560].
 // Same schedule family as [12800, 2560]; only the row count changes. A4 is not
 // enabled for these dense shapes.
+// GB10 2026-10-31 (T5): audited over T = 1..64 against 60 candidate tiles (cold 32 MiB L2, 25
+// repeats, minimum); the table already sits at the sweep argmin at every width, so nothing moved.
+// Two task premises did not survive measurement: the T = 2 SIMT C2 tile is the fastest thing
+// measured there (16.96..19.30us depending on the pass, ahead of every sliced-K and GEMV tile in
+// every pass), and the T = 25..32 RowTiles-1 runtime-K tile that looked 4.7% ahead in one run is
+// 3.7% behind in another. T = 33..64 measures 25.5..29.5us (55..65% of the 246 GB/s READ
+// reference, pass-dependent at these ~25us widths): no candidate goes below 25.2us, and the shape
+// has no A4 admission with its pair gate at 65 tokens (the 2-term route is 12..27% behind across
+// 33..48 and level at 64), so nothing faster covers these widths.
 using Geometry = Nvfp4Geometry<2560, 2560>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -49,6 +58,17 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 bool uses_a4(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
+// GB10 2026-10-31 (T5): pair gate 128 -> 65. This shape registers no 1-term A4 ladder, so the
+// 2-term row-scaled pair route is the only alternative its A16 table faces above the decode band,
+// and from T = 65 it wins by 18..25%: cold 32 MiB L2, 25 repeats, minimum, pair against the public
+// route at T = 65 / 72 / 80 / 88 / 96 / 112 / 127 is 26.34 / 26.62 / 26.72 / 27.55 / 28.32 / 28.32 /
+// 28.61us against 35.33 / 34.66 / 34.62 / 34.78 / 34.40 / 34.88 / 35.30us (62.0..64.2% against
+// 47.3..52.1% of the 246 GB/s READ reference). Below it the pair route does not pay: at T = 64 it
+// measures 26.94us against 27.46us, a wash, and at T = 33/48 it is 27%/12% behind -- so the gate
+// sits at the measured crossover, not at the verification band. Reaching it still needs a policy
+// that permits the 2-term residual (LinearPolicy residual or LinearRoutes::Nvfp4A4Pair);
+// A16Only/Exact artifacts keep the table above unchanged, and the route was already registered and
+// tested here at T = 65/96/127, so no new kernel enters any configuration.
 const Nvfp4LinearShape kNvfp4N2560K2560{
-    2560, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 128};
+    2560, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail

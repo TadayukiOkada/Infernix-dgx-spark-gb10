@@ -11,6 +11,7 @@
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
+#include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
@@ -66,6 +67,54 @@ void launch_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stre
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
         LinearIdentityEpilogue{}, stream);
 }
+
+// Production never runs the bare schedules below: every shape table wraps its schedule in
+// Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>, which bakes K into the kernel. That
+// changes ptxas' scheduling, so a bare candidate can be measurably faster than the route the
+// engine is actually able to select. These mirrors instantiate the same static-K kernel the
+// shape table does, and are the only admissible evidence when a band is retuned.
+template <class Schedule, int K>
+void launch_sliced_static(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    if (w.k != K) return;
+    launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Schedule, K>>(
+        nvfp4_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
+        LinearIdentityEpilogue{}, stream);
+}
+
+template <class Schedule, int K>
+void launch_mma_static(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    if (w.k != K) return;
+    launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<Schedule, K>>(
+        nvfp4_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
+        LinearIdentityEpilogue{}, stream);
+}
+
+template <class Schedule, int K>
+void launch_gemv_static(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    if (w.k != K) return;
+    launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Schedule, K>>(
+        nvfp4_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
+        LinearIdentityEpilogue{}, stream);
+}
+
+// The schedule is variadic so its template-argument commas survive macro expansion.
+#define INFER_NX_SLICED_STATIC(name, tmin, tmax, ...)                                             \
+    {"sk_" name "_k2560", launch_sliced_static<__VA_ARGS__, 2560>, tmin, tmax, 2560},             \
+        {"sk_" name "_k5120", launch_sliced_static<__VA_ARGS__, 5120>, tmin, tmax, 5120},         \
+        {"sk_" name "_k6144", launch_sliced_static<__VA_ARGS__, 6144>, tmin, tmax, 6144},         \
+        {"sk_" name "_k17408", launch_sliced_static<__VA_ARGS__, 17408>, tmin, tmax, 17408},
+
+#define INFER_NX_MMA_STATIC(name, tmin, tmax, ...)                                                \
+    {"mk_" name "_k2560", launch_mma_static<__VA_ARGS__, 2560>, tmin, tmax, 2560},                \
+        {"mk_" name "_k5120", launch_mma_static<__VA_ARGS__, 5120>, tmin, tmax, 5120},            \
+        {"mk_" name "_k6144", launch_mma_static<__VA_ARGS__, 6144>, tmin, tmax, 6144},            \
+        {"mk_" name "_k17408", launch_mma_static<__VA_ARGS__, 17408>, tmin, tmax, 17408},
+
+#define INFER_NX_GEMV_STATIC(name, tmin, tmax, ...)                                               \
+    {"gk_" name "_k2560", launch_gemv_static<__VA_ARGS__, 2560>, tmin, tmax, 2560},               \
+        {"gk_" name "_k5120", launch_gemv_static<__VA_ARGS__, 5120>, tmin, tmax, 5120},           \
+        {"gk_" name "_k6144", launch_gemv_static<__VA_ARGS__, 6144>, tmin, tmax, 6144},           \
+        {"gk_" name "_k17408", launch_gemv_static<__VA_ARGS__, 17408>, tmin, tmax, 17408},
 
 // Specializations for static-K Gemv & Simt
 template <int K>
@@ -168,6 +217,49 @@ const RouteCandidate kCandidates[] = {
     {"sliced_r32_t32_w4_s1", launch_sliced<Nvfp4SlicedInstance<32, 4, 1, 2>>, 1, 32, 0},
     {"sliced_r32_t32_w4_s2", launch_sliced<Nvfp4SlicedInstance<32, 4, 2, 2>>, 1, 32, 0},
 
+    // Static-K mirrors of the shape tables' production instantiations (see the comment on
+    // launch_sliced_static). A band may only be retuned onto a route measured here.
+    INFER_NX_SLICED_STATIC("r16_t8_w8_s2", 1, 8, Nvfp4SlicedInstance<8, 8, 2, 2>)
+    INFER_NX_SLICED_STATIC("r16_t8_w8_s1", 1, 8, Nvfp4SlicedInstance<8, 8, 2>)
+    INFER_NX_SLICED_STATIC("r16_t8_w4_s2", 1, 8, Nvfp4SlicedInstance<8, 4, 2, 2>)
+    INFER_NX_SLICED_STATIC("r16_t16_w8_s2", 1, 16, Nvfp4SlicedInstance<16, 8, 2, 2>)
+    INFER_NX_SLICED_STATIC("r16_t16_w8_s1", 1, 16, Nvfp4SlicedInstance<16, 8, 2>)
+    INFER_NX_SLICED_STATIC("r16_t16_w4_s2", 1, 16, Nvfp4SlicedInstance<16, 4, 2, 2>)
+    INFER_NX_SLICED_STATIC("r32_t24_w4_s1", 1, 24, Nvfp4SlicedInstance<24, 4, 1, 2>)
+    INFER_NX_SLICED_STATIC("r32_t24_w4_s2", 1, 24, Nvfp4SlicedInstance<24, 4, 2, 2>)
+    INFER_NX_SLICED_STATIC("r16_t24_w8_s1", 1, 24, Nvfp4SlicedInstance<24, 8, 1, 1>)
+    INFER_NX_SLICED_STATIC("r32_t24_w8_s2", 1, 24, Nvfp4SlicedInstance<24, 8, 2, 2>)
+    INFER_NX_SLICED_STATIC("r32_t32_w4_s1", 1, 32, Nvfp4SlicedInstance<32, 4, 1, 2>)
+    INFER_NX_SLICED_STATIC("r32_t32_w4_s2", 1, 32, Nvfp4SlicedInstance<32, 4, 2, 2>)
+    INFER_NX_SLICED_STATIC("r16_t32_w4_s1", 1, 32, Nvfp4SlicedInstance<32, 4, 1>)
+    INFER_NX_SLICED_STATIC("r32_t32_w8_s2", 1, 32, Nvfp4SlicedInstance<32, 8, 2, 2>)
+    INFER_NX_SLICED_STATIC("r32_t48_w4_s2", 1, 48, Nvfp4SlicedInstance<48, 4, 2, 2>)
+    INFER_NX_SLICED_STATIC("r32_t64_w4_s2", 1, 64, Nvfp4SlicedInstance<64, 4, 2, 2>)
+
+    INFER_NX_MMA_STATIC("r32_t64_k128_s1", 16, 0, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>)
+    INFER_NX_MMA_STATIC("r64_t64_k128_s1", 16, 0, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>)
+    INFER_NX_MMA_STATIC("r64_t64_k128_s2", 16, 0, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>)
+    INFER_NX_MMA_STATIC("r64_t96_k128_s1", 32, 0, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>)
+    INFER_NX_MMA_STATIC("r32_t32_k128_s2", 8, 128, Nvfp4A16MmaSchedule<32, 32, 128, 16, 16, 2, 2>)
+    INFER_NX_MMA_STATIC("r64_t128_k128_s2", 32, 0, Nvfp4A16MmaSchedule<64, 128, 128, 32, 16, 2, 1>)
+
+    INFER_NX_GEMV_STATIC("r16_staged", 1, 1,
+                         Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw,
+                                              Nvfp4CodeCache::Default, 2>)
+    INFER_NX_GEMV_STATIC("r16_direct", 1, 1,
+                         Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct,
+                                              Nvfp4CodeCache::Default, 2>)
+    INFER_NX_GEMV_STATIC("r16_direct_m4", 1, 1,
+                         Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct,
+                                              Nvfp4CodeCache::Default, 4>)
+    INFER_NX_GEMV_STATIC("r8_direct_m4", 1, 1,
+                         Nvfp4A16GemvSchedule<4, 2, 16, 4, Nvfp4ScaleAccess::Direct,
+                                              Nvfp4CodeCache::Default, 4>)
+    INFER_NX_GEMV_STATIC("r4_direct_m4", 1, 1,
+                         Nvfp4A16GemvSchedule<2, 2, 16, 4, Nvfp4ScaleAccess::Direct,
+                                              Nvfp4CodeCache::Default, 4>)
+
+
     // Full MMA (including new small/high-occupancy GB10 tiles)
     // BlockRows, BlockTokens, BlockK, WarpRows, WarpTokens, ActivationStages, MinBlocksPerSm
     {"mma_r32_t16_k64_s2_a4",  launch_mma<Nvfp4A16MmaSchedule<32, 16, 64, 16, 8, 2, 4>>, 4, 64, 0},
@@ -217,6 +309,10 @@ struct A4RouteCandidate {
     A4CandidateLaunch launch;
     int min_t = 1;
     int max_t = 0;
+    // The 2-term residual TMA GEMM reads its activation as planes, so it needs the residual
+    // workspace layout (terms = kNvfp4A4ResidualTerms, row-scaled) rather than the 1-term one the
+    // other A4 candidates share; handing it the latter fails the plane-vs-call check.
+    bool residual = false;
 };
 
 void launch_a4_production(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A4Workspace ws,
@@ -224,6 +320,13 @@ void launch_a4_production(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A4
     const std::size_t cap =
         ops::linear_workspace_capacity_bytes(QType::NVFP4, w.n, w.k, ops::LinearPolicy::AllowA4,
                                              1, x.ne[1]);
+    // Below a shape's pair threshold and without an A4 admission the capacity query is zero, which
+    // means the public route provably selects A16 for every width in the interval -- so take the
+    // A16-only overload instead of building a zero-length arena, which the arena contract rejects.
+    if (cap == 0) {
+        ops::linear(x, w, out, stream);
+        return;
+    }
     WorkspaceArena arena(DeviceSpan{ws.codes, cap});
     ops::linear(x, w, out, ops::LinearPolicy::AllowA4, arena, stream);
 }
@@ -267,6 +370,11 @@ using A4PrefillSchedule = Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCode
 
 const A4RouteCandidate kA4Candidates[] = {
     {"production", launch_a4_production, 1, 0},
+
+    // The 2-term residual TMA route the shape tables register as their pair entry. The engine admits
+    // it only at or above pair_min_tokens, so this candidate is the evidence for that gate: a shape
+    // whose pair time beats production at a lower width can lower the gate.
+    {"a4_pair", launch_nvfp4_a4_pair, 1, 0, true},
 
     // --- NEW Smaller BlockTokens=16 & BlockRows=32/64 GB10 schedules (4 CTAs/SM) ---
     {"a4_mma_t16_r32_k64_w4_s2_m4",   launch_a4_mma_cand<Nvfp4A4MmaSchedule<16, 32, 64, 1, 4, 2, 4>>, 1, 64},
@@ -353,6 +461,12 @@ std::vector<int> parse_tokens(const std::string& spec) {
     return out;
 }
 
+// A candidate that never times is invisible in the report, so name the reason: a launch that throws
+// and a launch whose output disagrees with the reference are different findings.
+void report_skip(const char* phase, const char* name, int tokens, const char* reason) {
+    std::fprintf(stderr, "  skip %-24s T=%d %s: %s\n", name, tokens, phase, reason);
+}
+
 bool check_numeric_agreement(const std::vector<__nv_bfloat16>& got,
                              const std::vector<__nv_bfloat16>& ref) {
     if (got.size() != ref.size()) return false;
@@ -409,11 +523,15 @@ int main(int argc, char** argv) {
         DeviceBuffer x_storage(static_cast<std::size_t>(k) * max_t * 2);
         DeviceBuffer out_storage(out_count * 2);
         DeviceBuffer ref_storage(out_count * 2);
+        DeviceBuffer exact_storage(out_count * 2);
         const std::size_t ws_cap =
             is_a4 ? std::max<std::size_t>(
                         ops::linear_workspace_capacity_bytes(
                             QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, 1, max_t),
-                        nvfp4_a4_workspace_capacity_bytes(max_t, k) * 2)
+                        std::max(nvfp4_a4_workspace_capacity_bytes(max_t, k) * 2,
+                                 nvfp4_a4_workspace_capacity_bytes(max_t, k) +
+                                     nvfp4_a4_workspace_capacity_bytes(
+                                         max_t, k, kNvfp4A4ResidualTerms, true)))
                   : 4096;
         DeviceBuffer ws_storage(ws_cap);
         CUDA_CHECK(bench::fixture::fill_values(static_cast<__nv_bfloat16*>(x_storage.p),
@@ -424,6 +542,7 @@ int main(int argc, char** argv) {
         const Tensor x   = Tensor(x_storage.p, DType::BF16, {k, max_t});
         const Tensor out = Tensor(out_storage.p, DType::BF16, {n, max_t});
         const Tensor ref = Tensor(ref_storage.p, DType::BF16, {n, max_t});
+        const Tensor ex  = Tensor(exact_storage.p, DType::BF16, {n, max_t});
 
         cudaEvent_t ev_start{}, ev_stop{};
         CUDA_CHECK(cudaEventCreate(&ev_start));
@@ -461,22 +580,40 @@ int main(int argc, char** argv) {
             ys.ne[1]    = t;
             Tensor rs   = ref;
             rs.ne[1]    = t;
+            Tensor es   = ex;
+            es.ne[1]    = t;
             const std::size_t out_elems = static_cast<std::size_t>(n) * t;
             const std::size_t out_bytes = out_elems * sizeof(__nv_bfloat16);
 
             WorkspaceArena ws_arena(DeviceSpan{ws_storage.p, ws_cap});
             Nvfp4A4Workspace a4_ws =
                 is_a4 ? allocate_nvfp4_a4_workspace(ws_arena, t, k) : Nvfp4A4Workspace{};
+            // Second bump allocation from the same arena: disjoint from a4_ws, which the capacity
+            // above already accounts for.
+            Nvfp4A4Workspace pair_ws =
+                is_a4 ? allocate_nvfp4_a4_workspace(ws_arena, t, k, kNvfp4A4ResidualTerms, true)
+                      : Nvfp4A4Workspace{};
 
             if (is_a4) {
                 launch_a4_mma_cand<Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>>(xs, qw.weight, rs,
                                                                                 a4_ws, stream);
+                // The 2-term residual route is a different approximation from the 1-term one the
+                // other A4 candidates are checked against, and two routes each inside tolerance of
+                // exact can exceed it against each other. It is therefore judged against the exact
+                // A16 output, which is the contract the fast path has to meet; without this the
+                // pair route is dropped by the gate and reads as "no data".
+                launch_production(xs, qw.weight, es, stream);
             } else {
                 launch_production(xs, qw.weight, rs, stream);
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::vector<__nv_bfloat16> ref_host(out_elems);
             CUDA_CHECK(cudaMemcpy(ref_host.data(), rs.data, out_bytes, cudaMemcpyDeviceToHost));
+            std::vector<__nv_bfloat16> exact_host(out_elems);
+            if (is_a4) {
+                CUDA_CHECK(
+                    cudaMemcpy(exact_host.data(), ex.data, out_bytes, cudaMemcpyDeviceToHost));
+            }
             std::vector<__nv_bfloat16> got(out_elems);
 
             const double total_bytes =
@@ -497,7 +634,7 @@ int main(int argc, char** argv) {
                         continue;
 
                     const bool is_prod = (std::strcmp(cand.name, "production") == 0);
-                    Nvfp4A4Workspace run_ws = a4_ws;
+                    Nvfp4A4Workspace run_ws = cand.residual ? pair_ws : a4_ws;
                     if (is_prod) {
                         run_ws.codes = static_cast<std::uint8_t*>(ws_storage.p);
                     }
@@ -507,15 +644,25 @@ int main(int argc, char** argv) {
                         CUDA_CHECK(cudaMemsetAsync(ys.data, 0, out_bytes, stream));
                         cand.launch(xs, qw.weight, ys, run_ws, stream);
                         CUDA_CHECK(cudaStreamSynchronize(stream));
+                    } catch (const std::exception& e) {
+                        cudaGetLastError();
+                        report_skip("launch", cand.name, t, e.what());
+                        ok = false;
                     } catch (...) {
                         cudaGetLastError();
+                        report_skip("launch", cand.name, t, "unknown exception");
                         ok = false;
                     }
                     if (!ok) continue;
 
                     CUDA_CHECK(cudaMemcpy(got.data(), ys.data, out_bytes, cudaMemcpyDeviceToHost));
-                    const bool numeric_ok = is_prod || check_numeric_agreement(got, ref_host);
-                    if (!numeric_ok) continue;
+                    const bool numeric_ok =
+                        is_prod ||
+                        check_numeric_agreement(got, cand.residual ? exact_host : ref_host);
+                    if (!numeric_ok) {
+                        report_skip("numeric", cand.name, t, "disagrees with the reference output");
+                        continue;
+                    }
 
                     for (int w_i = 0; w_i < warmup; ++w_i) {
                         bench::flush_l2(flush, stream);
@@ -576,8 +723,13 @@ int main(int argc, char** argv) {
                     CUDA_CHECK(cudaMemsetAsync(ys.data, 0, out_bytes, stream));
                     cand.launch(xs, qw.weight, ys, stream);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
+                } catch (const std::exception& e) {
+                    cudaGetLastError();
+                    report_skip("launch", cand.name, t, e.what());
+                    ok = false;
                 } catch (...) {
                     cudaGetLastError();
+                    report_skip("launch", cand.name, t, "unknown exception");
                     ok = false;
                 }
                 if (!ok) continue;

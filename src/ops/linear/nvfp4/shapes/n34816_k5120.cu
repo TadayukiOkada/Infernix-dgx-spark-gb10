@@ -6,6 +6,14 @@
 // The A4 route is unchanged (it dominates every width it admits on this shape).
 // GB10 2026-10-31: Nvfp4A4Pair is registered (T >= 65) so --routes fast serves the 2-term residual
 // route; the A16 table above remains the fallback for A16Only artifacts.
+// GB10 2026-10-31 (T5): the T = 17..32 verification bands were still the 2026-10-30 fit and lost
+// 9..17% to the 2-stage / RowTiles-2 sliced-K tiles (491.9 -> 446.8 at T = 20, 550.1 -> 457.9 at
+// T = 32; 84.2% -> 92.7% and 76.0% -> 91.3% of the 246 GB/s READ reference). Those two tiles are
+// selected in the runtime-K form: the same Nvfp4ScheduleInstance<Schedule, 5120> bake the engine
+// normally uses measures 525.8us for <24,4,1,2> against 449.0us with K read from the operands,
+// because baking K lets ptxas fully unroll the K-group loop and it schedules worse at this tile.
+// T = 33..64 is unchanged: the 32-row K128 tile that looks 5.4% ahead at T = 48 in one run is
+// 0.2% behind in the other, so the 2026-10-30 fit stands.
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -25,8 +33,10 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
-    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 1, 2>>;
-    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
+    if (tokens <= 24)
+        return nvfp4_linear_a16_sliced_k_dyn<Geometry, Nvfp4SlicedInstance<24, 4, 2, 2>>;
+    if (tokens <= 32)
+        return nvfp4_linear_a16_sliced_k_dyn<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
     if (tokens <= 48)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
     if (tokens <= 64)

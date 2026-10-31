@@ -16,6 +16,12 @@
 // 64-row tile pays for the 128-row slab padding; T = 97..128 takes the 64-row K128 tile (-15%).
 // Nvfp4A4Pair is now registered so --routes fast serves the 2-term residual route from T = 65
 // (the A16 fallback above still serves A16Only artifacts and the pair's excluded widths).
+// GB10 2026-10-31 (T5): decode and verification retune (same sweep, 25 repeats, minimum).
+// T = 2..16 goes to the RowTiles-2 16-token sliced-K tile, which beats both the SIMT C2 tile at
+// T = 2 (184.5 -> 180.5us) and the RowTiles-1 tile the rest of the band used (185.8 -> 180.3 at
+// T = 8); T = 17..32 goes to the 32-token RowTiles-1 tile over the 24-token 8-warp tile
+// (208.9 -> 192.1us at T = 24, 82.2% -> 89.4% of the 246 GB/s READ reference). T = 33..64 stands:
+// the 64-row two-stage tile that looks 3.0% ahead at T = 64 in one run is 1.4% behind in another.
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -25,9 +31,6 @@ namespace {
 using Geometry = Nvfp4Geometry<14336, 5120>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
-using C2      = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using T64R64  = Nvfp4A4MmaSchedule<64, 64, 256, 2, 4, 2, 1>;
@@ -37,9 +40,7 @@ using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
-    if (tokens <= 2) return nvfp4_linear_a16_simt<Geometry, 2, C2, true>;
-    if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2>>;
-    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 8, 1>>;
+    if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1>>;
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;
     if (tokens <= 96) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;

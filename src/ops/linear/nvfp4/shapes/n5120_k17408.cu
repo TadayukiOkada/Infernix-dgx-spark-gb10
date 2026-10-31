@@ -5,6 +5,15 @@
 // 249), and the T >= 129 tail (T = 384: 1606 -> 900 us, T = 512: 1564 -> 1222) replaces the
 // RTX 5090 t256 tile, which lost 22..44% at every prefill width. The A4 admission (T >= 8) is
 // unchanged; the A16 table serves the A16-only and pair-eligible routes.
+// GB10 2026-10-31 (T5): T = 2..16 keeps the RowTiles-2 sliced-K tiles but selects them in the
+// runtime-K form, which measures 21% faster than the K-baked twin the table ran (281.9 -> 222.3us
+// at T = 2 and 287.0 -> 228.2 at T = 16; 72.1% -> 90.6% of the 246 GB/s READ reference). Baking K
+// lets ptxas fully unroll the K-group loop, and at this K that costs more than it saves -- see
+// nvfp4_linear_a16_sliced_k_dyn. The two RowTiles-2 widths stay separate entries: the 8-token tile
+// is 0.7% ahead of the 16-token one at T = 2 (220.6us against 222.3) and 0.4% at T = 8.
+// T = 17..32 is unchanged (already at the sweep argmin) and T = 33..64 stays at ~69%: no
+// A16 tile reaches the 85% bar there, where the A4 route this shape admits from T = 8 serves
+// 244..251us instead.
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -24,7 +33,10 @@ using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
-    if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
+    if (tokens <= 8)
+        return nvfp4_linear_a16_sliced_k_dyn<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
+    if (tokens <= 16)
+        return nvfp4_linear_a16_sliced_k_dyn<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
     if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 1, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
     if (tokens <= 64)

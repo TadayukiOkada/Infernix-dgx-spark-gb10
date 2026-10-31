@@ -52,6 +52,20 @@ void nvfp4_linear_a16_sliced_k(const Tensor& x, const Weight& w, Tensor& y, cuda
         LinearIdentityEpilogue{}, stream);
 }
 
+// The bare-schedule (runtime-K) form of nvfp4_linear_a16_sliced_k. Baking K lets ptxas unroll the
+// K-group loop, which helps the narrow tiles and costs the wide-token ones dearly: at [34816,5120]
+// the baked <24,4,1,2> measures 525.8us against 449.0us for the same schedule with K read from the
+// operands, and at [5120,17408] the baked <16,8,2,2> measures 287.0us against 228.2us (GB10, cold
+// L2). A shape table therefore picks per band; the full-MMA tiles have no such gap, so only the
+// sliced-K launch has a runtime-K form.
+template <class Geometry, class Schedule>
+void nvfp4_linear_a16_sliced_k_dyn(const Tensor& x, const Weight& w, Tensor& y,
+                                   cudaStream_t stream) {
+    launch_nvfp4_a16_sliced_k_mma<Schedule>(
+        nvfp4_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n},
+        LinearIdentityEpilogue{}, stream);
+}
+
 template <class Geometry, class Schedule>
 void nvfp4_linear_a4_mma(const Weight& w, Tensor& y, Nvfp4A4Workspace workspace, int tokens,
                          cudaStream_t stream) {

@@ -3,6 +3,11 @@
 // sliced-K tiles and the K64 64-row MMA tile are the GB10 winners: -13..-21% over the DFlash2 and
 // speculative verification widths T = 17..32, -26% at T = 192, 2..5% elsewhere. The A4 admission
 // (T >= 17) is unchanged; the A16 table serves the A16-only and pair-eligible routes.
+// GB10 2026-10-31 (T5): T = 17..32 was still 18..26% off the sweep argmin (114.9 -> 86.7us at
+// T = 20, 122.1 -> 90.0 at T = 32; 64.2% -> 85.1% and 61.3% -> 83.2% of the 246 GB/s READ
+// reference). The same two sliced-K tiles win, taken in the runtime-K form, which measures 24%
+// faster than the K-baked twin the table used (see nvfp4_linear_a16_sliced_k_dyn). T = 33..64 is
+// unchanged at ~69%: no A16 tile reaches 85% there, and this shape admits A4 from T = 17.
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -23,8 +28,10 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
-    if (tokens <= 20) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 1, 2>>;
-    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
+    if (tokens <= 20)
+        return nvfp4_linear_a16_sliced_k_dyn<Geometry, Nvfp4SlicedInstance<24, 4, 1, 2>>;
+    if (tokens <= 32)
+        return nvfp4_linear_a16_sliced_k_dyn<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
     if (tokens <= 64)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>;
     if (tokens <= 96)

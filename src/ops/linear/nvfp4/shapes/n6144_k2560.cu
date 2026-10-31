@@ -16,6 +16,10 @@ namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next GDN value/z and QSA query/gate [6144, 2560].
 // Same schedule family as [12800, 2560]; only the row count changes.
+// GB10 2026-10-31 (T5): T = 17..24 takes the 4-warp RowTiles-2 sliced-K tile over the 8-warp
+// RowTiles-1 one (43.0 -> 41.2us at T = 24, 87.6% -> 91.5% of the 246 GB/s READ reference) and
+// T = 33..64 the 64-row single-stage K128 MMA tile over the 32-row two-stage one (52.5 -> 50.2us
+// at T = 64). Every other 1..64 width already sat at the sweep argmin.
 using Geometry = Nvfp4Geometry<6144, 2560>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -27,9 +31,9 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
-    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 8, 1>>;
+    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 1, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
-    if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 32, 16, 2, 2>>;
+    if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
     if (tokens <= 96) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;
     if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 128, 32, 16, 2, 1>>;
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;

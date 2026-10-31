@@ -632,3 +632,390 @@ measured in the same session as the candidate (absolute-µs bars drift ±3.5% wi
   tile on `N = 5120`, the `T >= 129` 128-row K64 A16 tiles on `[14336, 5120]` / `[16384, 5120]`,
   and the 11-shape A4/pair registrations (an upstream table that re-adds `throw std::logic_error`
   in `launch_a4` silently reverts `2.6..3.4x` on the `K = 2560` linears for `AllowA4` artifacts).
+
+---
+
+# GB10 changelog — 2026-10-31 (T5: NVFP4 A16 decode & MTP-verify (T = 1..64) bandwidth-cliff retune across the nine cliff shapes)
+
+## 1. Accounting
+
+- **Base**: `b7e1b9649` (`dev-rebased-20261028`).
+- **Files changed**: 13 modified, 0 added, 0 deleted (`+305 / -33`), excluding this changelog.
+  `git diff --check` is clean on the final tree.
+  - Ops & launch (1): `src/ops/linear/nvfp4/nvfp4_launch.cuh` (M) — adds
+    `nvfp4_linear_a16_sliced_k_dyn<Geometry, Schedule>`, the runtime-`K` twin of
+    `nvfp4_linear_a16_sliced_k` (which bakes `K` through `Nvfp4ScheduleInstance`). No existing
+    signature changed; no other quantization family touched.
+  - Shape dispatch tables (11): `n34816_k5120.cu`, `n16384_k5120.cu`, `n14336_k5120.cu`,
+    `n5120_k17408.cu`, `n5120_k6144.cu`, `n2560_k6144.cu`, `n2048_k2560.cu`, `n6144_k2560.cu`,
+    `n13952_k2560.cu` (M) — decode/verification band re-selection inside `select_a16` (plus the
+    mirrored `launch_routes` ladder in `n13952_k2560.cu`); `n16384_k2560.cu` (M) — A4 admission
+    gate only (`uses_a4` from 33 to 65 tokens; its A16 table and `launch_routes` are untouched,
+    see §4.6); `n2560_k2560.cu`, `n2048_k2560.cu` (M) — `pair_min_tokens` 128 → 65 only (§4.5);
+    `n2560_k2560.cu`'s `select_a16` is byte-identical and served as this task's A/B drift control.
+  - Bench (1): `bench/ops/nvfp4_route_sweep.cu` (M) — 27 runtime-`K`/`K`-baked candidate mirrors so
+    a band can be timed against its own baked twin inside one process; an `a4_pair` candidate so the
+    pair gate is measurable; per-candidate skip reasons on stderr (a candidate that threw and a
+    candidate that failed numeric agreement were both invisible before); the 2-term residual
+    workspace for the pair candidate (it was handed the 1-term layout and died the
+    plane-vs-call check, which read as "no data") plus an exact-A16 reference for it, because the
+    sweep's A4 reference is itself a 1-term A4 candidate; and a `launch_a4_production` fix — below a
+    shape's A4/pair admission the capacity query returns 0 and the arena contract rejects a
+    zero-length span, which silently deleted the A4-policy baseline at exactly those widths.
+- **Allowlist delta**: none. `tools/cuda_stack/cuda_stack_allowlist.json` is untouched (it holds
+  zero nvfp4 entries, so every nvfp4 kernel must be spill-free) and `infernix_cuda_stack_check`
+  passes. The 5 new runtime-`K` `nvfp4_a16_sliced_k_mma_kernel` instantiations in `infernix-serve`
+  measure `REG:104/108/114/120/122 STACK:0 SHARED:17408..50176 LOCAL:0`; no kernel in the tree
+  gained a `STACK`/`LOCAL` symbol, so no ratchet (up or down) applies.
+- **Rebuild count**: 8 `ninja` invocations on `build-native`, each preceded by
+  `find src/ops/linear/nvfp4 -name '*.cu' -exec touch {} +` (CUDA depfiles are dead in this tree) —
+  1 failed (the sweep bench included only `nvfp4_launch.h`, not the `.cuh` defining the inline pair
+  launcher), 2 rebuilt op + bench targets, 1 rebuilt after the un-reproduced `[2048, 2560]` GEMV
+  promotion was reverted, 2 rebuilt the bench harness fixes (skip reasons and residual workspace,
+  then the exact-A16 reference) together with the `[16384, 2560]` gate change, 1 rebuilt the two
+  `pair_min_tokens` registrations, and 1 rebuilt the comment corrections that followed them. The
+  four gates in §4.1 were re-run on each binary that changed shipped code.
+
+## 2. Architectural rationale & task premise analysis (`20261031-performance-tasks.md` T5)
+
+Measurement discipline first, because four of the task's premises died on it.
+
+All numbers come from `bench/infernix_nvfp4_route_sweep`: one process per shape (weights,
+quantization and reference built once, every candidate timed in one CUDA context — never one
+process per token width), cold 32 MiB L2 flush, `--warmup 3 --repeat 25`, selection on the
+**minimum**, never the median. At these widths the median is host-jitter polluted: two
+byte-identical instantiations have been observed 10..31% apart on median while agreeing to 0.3% on
+minimum.
+
+Acceptance evidence is an **interleaved production-only A/B** against the rebuilt `b7e1b9649`
+binary (`--filter zzzz` keeps only the public route): HEAD and candidate alternate per shape, 3
+rounds, min-of-rounds. Two *separate* full passes disagree by 4..17% on bands nobody touched, and
+the byte-identical `[2560, 2560]` control table swings ±6.8% inside a single interleaved run — so
+absolute-µs bars and single-pass deltas are inadmissible for the ~20 µs shapes and are quoted as
+ranges where used. READ_% is against this host's 246 GB/s sustained-read reference, computed from
+the launch's operand traffic (packed codes + one scale byte per 16 values for weight *and*
+activation, plus the bf16 output).
+
+1. **The `[5120, 17408]` cliff was the baked-`K` instantiation, not the tile (new mechanism,
+   fixed).** The task asks to promote T = 2..16 from RowTiles 1 to RowTiles 2; that promotion was
+   already in the base table (`<16, 8, 2, 2>` since the 2026-10-30 fit). What the table did not
+   have was a runtime-`K` launch: `nvfp4_linear_a16_sliced_k` wraps the schedule in
+   `Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>`, and the kernel's
+   `#pragma unroll` over `kGroups` then fully unrolls the K-group loop. For the wide-token
+   sliced-K tiles ptxas schedules that worse than the rolled form:
+
+   | instantiation | T = 2 | T = 8 | T = 16 |
+   |---|---|---|---|
+   | baked `<16, 8, 2, 2>` (base) | 281.9 µs | 284.0 µs | 287.0 µs |
+   | runtime-`K` `<16, 8, 2, 2>` | 222.3 µs | 223.5 µs | 228.2 µs |
+
+   Same at `[34816, 5120]`: baked `<24, 4, 1, 2>` 525.8 µs against 449.0 µs runtime-`K`. The
+   full-MMA tiles show no such gap, so only the sliced-K launch got a runtime-`K` form, and each
+   shape table picks per band rather than globally. This is the single largest lever in the task:
+   it is worth 13..26% on the affected bands and is invisible to a tile-name comparison.
+2. **`[34816, 5120]` T = 2 was already at its bar at base; its real cliff was T = 17..32.** The
+   doc baseline of 498.59 µs is stale — HEAD measures 431.07 µs (94.7%) there, because the
+   2026-10-30 GB10 fit already retired the SIMT/RowTiles-1 tile. Promoting T ≤ 8 to
+   `<8, 8, 2, 2>` as specified is a *regression* on this shape (432.4 µs against 430.9 µs for the
+   RowTiles-1 tile the table keeps), so that band is unchanged. The shipped change is T = 17..32 →
+   runtime-`K` 2-stage tiles: −4.9% / −3.9% / −3.5% at T = 20 / 24 / 32.
+3. **`[16384, 5120]` T = 2 was genuinely still on the SIMT C2 tile.** Removed in favour of the
+   RowTiles-2 16-token sliced-K tile (215.20 → 208.00 µs, −3.3%, 92.4% READ), meeting the ≤209 µs
+   bar; the `using C2` alias went with it.
+4. **`[14336, 5120]`: RowTiles 2 to T = 16, one 32-token tile across T = 17..32.** The T = 2 SIMT
+   C2 tile and the 24-token 8-warp tile are both gone; T = 17..32 collapses from two bands to the
+   `<32, 4, 1>` tile (−7.0% at T = 20, −8.0% at T = 24).
+5. **Lowering `uses_a4` from `>= 8` to `>= 2` on `[5120, 17408]` would regress (premise
+   rejected).** The A4 1-term ladder's best at T = 2 is 228.6 µs and its production time at T = 8
+   is 233.3 µs, against 218.7 / 221.1 µs for the retuned A16 tiles. A4 stays admitted from T = 8,
+   where it is the faster route.
+6. **Removing the T = 2 SIMT C2 tile on `[2560, 2560]` is wrong (premise rejected).** It is the
+   sweep argmin there (16.96 µs), ahead of every sliced-K and GEMV candidate measured at that
+   width; the table is untouched.
+7. **The `[2048, 2560]` GEMV promotion did not reproduce (reverted).** The selection sweep put the
+   4-warp Direct-scale / 4-CTAs-per-SM GEMV at 13.6 µs against the family's 8-warp StagedRaw tile,
+   but the interleaved A/B measures 15.90 against 15.74 µs. The band is back at the family tile;
+   the two `[2048, 2560]` changes that survived (T ≤ 8 RowTiles 2 → 1, T = 25..32 sliced-K over the
+   16-row MMA tile) are −4.4% and −1.2%, inside this shape's ±7% noise floor, and are recorded as
+   argmins that never measured worse rather than as demonstrated gains.
+8. **`[16384, 2560]`, `[10240, 2560]`, `[12800, 2560]` A16 tables left alone.** Their best
+   candidates were ≤3.5% and did not reproduce across two independent passes; `launch_routes` in
+   `n16384_k2560.cu` therefore needed no mirror change.
+9. **`pair_min_tokens = 128 → 65` on `[2560, 2560]` and `[2048, 2560]`; `[6144, 2560]` unchanged.**
+   The 2-term route had never been timed by this harness at all — it needed two harness fixes before
+   it produced data, and then it lost to the admitted ladder everywhere in 33..64 but won by
+   18..27% from T = 65 on the two shapes that register no 1-term ladder. See §4.5 for the numbers,
+   the reason 33 is the wrong gate, and the A16 ladder defect that pair is papering over.
+10. **The shipped fast route, not just the A16 table, decides the T = 32..64 bars**: see §4.6.
+
+## 3. Subsystem breakdown
+
+Every change below is a selection inside `select_a16` (and the mirrored `launch_routes` ladder in
+`n13952_k2560.cu`); `Sliced<a, b, c, d>` is `Nvfp4SlicedInstance<Tokens, Warps, Stages, RowTiles>`,
+`Mma<…>` is `Nvfp4A16MmaSchedule`, and `dyn` is the new runtime-`K` launcher.
+
+| shape | band | base | shipped | interleaved Δ |
+|---|---|---|---|---|
+| `[34816, 5120]` | 17..24 | `Sliced<24,4,1,2>` | `dyn Sliced<24,4,2,2>` | −4.9% (T20), −3.9% (T24) |
+| | 25..32 | `Sliced<32,4,1,2>` | `dyn Sliced<32,4,1,2>` | −3.5% (T32) |
+| `[16384, 5120]` | 2 | SIMT `C2` | `Sliced<16,8,2,2>` | −3.3% (T2) |
+| | 3..16 | `Sliced<16,8,2>` | `Sliced<16,8,2,2>` | −1.1% (T16) |
+| | 17..24 | `Sliced<24,8,1>` | `dyn Sliced<24,4,1,2>` | −8.1% (T20) |
+| | 25..32 | `Sliced<32,4,1>` | `dyn Sliced<32,4,1,2>` | −5.0% (T32) |
+| | 33..64 | `Mma<64,64,128,32,16,1,2>` | `Mma<32,64,128,16,16,1,3>` | −2.6% (T48), +1.1% (T64) |
+| `[14336, 5120]` | 2 | SIMT `C2` | `Sliced<16,8,2,2>` | −1.4% (T2) |
+| | 3..16 | `Sliced<16,8,2>` | `Sliced<16,8,2,2>` | −2.0% (T16) |
+| | 17..32 | `Sliced<24,8,1>`, `Sliced<32,4,1>` | `Sliced<32,4,1>` | −7.0% (T20), −8.0% (T24) |
+| `[5120, 17408]` | 2..8 | `Sliced<16,8,2,2>` baked | `dyn Sliced<8,8,2,2>` | −15.7% (T2) |
+| | 9..16 | `Sliced<16,8,2,2>` baked | `dyn Sliced<16,8,2,2>` | −18.2% (T16) |
+| `[5120, 6144]` | 17..20 | `Sliced<24,4,1,2>` baked | `dyn Sliced<24,4,1,2>` | −14.7% (T20) |
+| | 21..32 | `Sliced<32,4,1,2>` baked | `dyn Sliced<32,4,1,2>` | −17.4% (T24), −21.4% (T32) |
+| `[2560, 6144]` | 17..24 | `Sliced<24,8,1,1>`, `Sliced<24,8,2,2>` | `dyn Sliced<24,4,2,2>` | −12.5% (T20), −18.0% (T24) |
+| | 25..32 | `Mma<32,32,128,16,16,2,2>` | `Sliced<32,4,1>` | −6.9% (T32) |
+| `[2048, 2560]` | 2..8 | `Sliced<8,8,2,2>` | `Sliced<8,8,2>` | −4.4% (T2), −3.9% (T8) |
+| | 25..32 | `Mma<32,16,128,16,8,2,3>` | `Sliced<32,4,1>` | −1.2% (T32) |
+| | 1 | 8-warp StagedRaw GEMV | (reverted) | +1.0% → reverted |
+| `[6144, 2560]` | 17..24 | `Sliced<24,8,1>` | `Sliced<24,4,1,2>` | −1.8% (T20), −1.7% (T24) |
+| | 33..64 | `Mma<32,64,128,32,16,2,2>` | `Mma<64,64,128,32,16,1,2>` | −6.7% (T48), −9.0% (T64) |
+| `[13952, 2560]` | 33..48 | (in 33..64 `Mma<64,64,128,32,16,2,1>`) | `Mma<32,64,128,16,16,1,3>` | −7.4% (T48) |
+
+`n13952_k2560.cu` keeps `select_a16` and `launch_routes` (the fused QSA split path) in lockstep:
+the new T = 33..48 band was added to both, and the two ladders were diffed line by line.
+
+Three registration gates also moved; none of them is a tile selection, and each is measured in
+§4.5 / §4.6:
+
+| shape | gate | base | shipped | measured effect |
+|---|---|---|---|---|
+| `[16384, 2560]` | `uses_a4` | `max_tokens >= 33` | `max_tokens >= 65` | the admitted A4 ladder is 7..11% slower than the A16 table in 33..64; from 65 it is 25..37% quicker (the A16 table takes 33..59% longer) |
+| `[2560, 2560]` | `pair_min_tokens` | 128 | 65 | pair route 18..25% faster than the table across 65..127; 12..27% slower across 33..48 and level at 64 |
+| `[2048, 2560]` | `pair_min_tokens` | 128 | 65 | pair route 20..27% faster across 65..127; 6..22% behind across 33..64 |
+
+`[6144, 2560]`'s pair gate was checked and left at 128; `[10240, 2560]` and `[12800, 2560]` keep
+their 33-token A4 admission, where the A4 ladder is at worst level with A16 in 33..64.
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+### 4.1 Numerical and resource gates
+
+`ctest --test-dir build-native -R
+'^(infernix_linear_nvfp4_a16_test|infernix_linear_nvfp4_a4_test|infernix_nvfp4_a16_slice_ring_test|infernix_cuda_stack_check)$'
+--output-on-failure`, run serially (parallel CTest produces false numerical failures on this
+single-GPU host). On the final binary: **4/4 Passed in 18.1 s** — `#28 infernix_cuda_stack_check`
+1.54 s, `#266 infernix_linear_nvfp4_a16_test` 3.53 s (it also carries
+`verify_workspace_envelopes(QType::NVFP4, …)`), `#267 infernix_nvfp4_a16_slice_ring_test` 4.63 s,
+`#268 infernix_linear_nvfp4_a4_test` 8.42 s. The same four passed on each earlier binary that
+changed a shipped route. Every retuned band is dispatched by these tests through the public
+`ops::linear` route, and the sweep independently checks each timed candidate against the production
+reference (abs 1/16, rel 1/32) and for token invariance before timing it.
+
+### 4.2 Task acceptance bars (interleaved A/B, min of 3 alternating rounds, µs / % of 246 GB/s)
+
+| bar | doc baseline | HEAD measured | shipped | verdict |
+|---|---|---|---|---|
+| `[34816, 5120]` T = 2 ≤ 436 µs | 498.59 (81.9%) | 431.07 (94.7%) | 429.89 (95.0%) | **met** (met at base; band unchanged) |
+| `[16384, 5120]` T = 2 ≤ 209 µs | 216.90 (88.6%) | 215.20 (89.4%) | 208.00 (92.4%) | **met** |
+| `[5120, 17408]` T = 2..16 ≤ 235–245 µs | 262–285 (72–78%) | 259.4–275.4 (73–78%) | 218.7–225.3 (91.1–93.3%) | **met** |
+| `[2560, 6144]`, `[5120, 6144]`, K = 2560 at T = 32..64 ≥ 85–91% | 60–75% | — | A16-only: 67.6–83.0% (T32), 55.5–75.3% (T48/64) | **partly met**; see §4.5, §4.6, §5 |
+
+### 4.3 Shipped-state bandwidth (same A/B, candidate side)
+
+| shape | T = 2 | T = 16 | T = 20 | T = 24 | T = 32 | T = 48 | T = 64 |
+|---|---|---|---|---|---|---|---|
+| `[34816, 5120]` | 95.0% | 94.1%* | 92.6% | 92.0% | 91.6% | 83.3% | 81.7% |
+| `[16384, 5120]` | 92.4% | 92.7%* | 90.9% | 91.2% | 89.8% | 80.9% | 79.5% |
+| `[14336, 5120]` | 92.8% | 92.7% | 89.3% | 88.7% | 86.3% | 77.2%* | 76.3% |
+| `[5120, 17408]` | 93.3% | 91.1% | 87.5%* | 87.1%* | 85.6% | 66.2% | 66.7% |
+| `[5120, 6144]` | 89.0% | 88.3%* | 83.8% | 84.3% | 83.0% | 66.5% | 67.8% |
+| `[2560, 6144]` | 85.3% | 82.7%* | 77.2% | 76.4% | 67.6% | 61.6% | 63.5% |
+| `[6144, 2560]` | 84.8%* | 86.2%* | 83.4% | 83.8% | 81.6% | 72.1% | 75.3% |
+| `[13952, 2560]` | 91.7%* | 92.5%* | 87.9%* | 87.6%* | 86.2%* | 79.6% | 75.7% |
+
+`*` = width whose band this task did not change (carried over from the 2026-10-30 fit); its HEAD
+row in the same A/B agrees to within the noise floor stated in §2.
+
+Across the 10 shapes and 10 widths in the interleaved run the candidate side is **−2.9% total**
+(14 736.83 → 14 307.36 µs), with the whole delta coming from the retuned bands and the unchanged
+bands flat to ±0.3% on the ≥ 175 µs shapes.
+
+### 4.4 Rejected candidates (measured, not shipped)
+
+Three bands won in one pass and lost in the next, and were reverted rather than shipped:
+`[2560, 2560]` T = 25..32 → runtime-`K` `<32, 4, 1>` (+3.7% then −4.7%), `[34816, 5120]`
+T = 33..48 → `Mma<32,64,128,16,16,1,3>` (−0.2% then −5.4%), `[14336, 5120]` T = 33..64 →
+`Mma<64,64,128,32,16,2,1>` (+1.4% then −3.0%). `[34816, 5120]` T = 17..24 keeps the 2-stage tile
+although its 1-stage twin is 0.7..1.0% ahead in the selection sweep — inside the noise floor, so
+the extra instantiation was not bought.
+
+### 4.5 Pair gate (`pair_min_tokens`)
+
+The 2-term route could not be measured at all until the sweep itself was fixed, and it failed twice
+for unrelated reasons, both hidden by the harness's silent skip:
+
+1. it was handed the **1-term** workspace (`allocate_nvfp4_a4_workspace(…, terms = 1, false)`) and
+   died in `make_nvfp4_a4_tma_descriptors` with *"NVFP4 TMA residual planes do not match the call"*
+   (`nvfp4_a4_tma.cuh:103`) — the pair GEMM always runs `kNvfp4A4ResidualTerms = 2` row-scaled;
+2. after that it was judged against the sweep's A4 reference, which is itself a **1-term** A4 MMA
+   candidate, and was dropped as *"disagrees with the reference output"*. It now compares against an
+   exact A16 launch of the same operands, and agrees within the harness tolerance at every width.
+
+Both failures pre-date this task and read as "no data"; the skip-reason output added here is what
+made them visible. Reachability, for the record: `uses_pair` (`nvfp4_dispatch.cpp:25-29`) needs a
+policy that permits the 2-term residual or `LinearRoutes::Nvfp4A4Pair`, so the `--policy a4`
+production column below never runs pair — only the forced `a4_pair` candidate does. In the product
+that is `FastPath::Nvfp4A4Pair` (`qwen4_exp/program/fast_paths.cpp:786`), which sits on the
+request-variant list (`:774`) and is qualified per configuration (`:538-544`), so a gate change
+touches neither the reproducible route nor the kernel set of any configuration.
+
+Measured (same harness, cold 32 MiB L2, 25 repeats, minimum; "table" = the public route that shape
+actually runs under the policy shown — the A16 table for `[2560, 2560]` / `[2048, 2560]`, which
+register no 1-term ladder at all, and the admitted 1-term ladder for `[6144, 2560]` under
+`--policy a4`):
+
+| shape | gate | pair T = 33 / 48 / 64 | table T = 33 / 48 / 64 | pair T = 65 … 127 | table T = 65 … 127 | verdict |
+|---|---|---|---|---|---|---|
+| `[2560, 2560]` | 128 → **65** | 33.02 / 30.85 / 26.94 µs | 25.98 / 27.52 / 27.46 µs | **26.34 … 28.61 µs** (62.0..64.2%) | 35.33 … 35.30 µs (47.3..52.1%) | **wins 18..25% from 65** |
+| `[2048, 2560]` | 128 → **65** | 27.55 / 25.44 / 24.80 µs | 22.56 / 23.42 / 23.36 µs | **25.34 … 26.91 µs** (53.1..55.2%) | 34.34 … 35.07 µs (39.2..42.3%) | **wins 20..27% from 65** |
+| `[6144, 2560]` | 128 (kept) | 52.29 / 55.81 / 53.25 µs | 45.38 / 45.70 / 45.73 µs (1-term ladder) | 52.99 … 55.90 µs | 47.07 … 49.06 µs | **kept at 128**; its real competitor is the A16 table, see below |
+
+So the task's suggested `128 → 65 or 33` is right only as far as 65, and only on the two shapes that
+register no 1-term ladder: across T = 33..64 pair is 6..27% *behind* their A16 table (the one
+exception being `[2560, 2560]` at T = 64, a 1.9% wash), so a 33-token gate would be a regression
+there. The two gates now sit exactly at the measured crossover, and only for artifacts whose policy
+permits the residual term; A16Only/Exact artifacts are untouched.
+
+`[6144, 2560]` needs a policy note rather than a number, because pair and the 1-term ladder are
+**never live under the same policy** there: `allows_a4` is true only for `LinearPolicy::AllowA4`
+(`include/infernix/ops/linear.h:113,134`), where `uses_pair`'s `!(allows_a4 && uses_a4)` clause
+suppresses pair from the ladder's 33-token admission, while `allows_a4_residual` is true only for
+`AllowA4Residual`, whose capacity query returns 0 for the 1-term layout. So the pair route on that
+shape competes only with the A16 table — where it measures 52.29 … 55.90 µs against that table's
+53.66 … 69.41 µs, i.e. 1..19% ahead from T = 33 upward except at T = 48 (−2.4%). Lowering its gate
+to 33 is therefore a candidate, not a regression — but it would move the whole verification band of
+a residual-permitting artifact onto a different kernel set on a 1%-of-noise margin at the narrow end,
+so it is left to the model-level fast-path qualification (§5.2) instead of being shipped on sweep
+data alone.
+
+Two disclosures attached to that change:
+
+- The reason pair wins above 65 is a defect in the A16 ladder, not a property of pair: the table
+  steps from 23.4 µs at T = 64 to 34.3 µs at T = 65 on `[2048, 2560]` (27.5 → 35.3 µs on
+  `[2560, 2560]`) because its next rung is a 64-token tile that pads 65 tokens to 128 columns. A
+  full candidate sweep of that band finds no A16 tile below 32.6 µs, so pair is genuinely the best
+  available route there; fixing the 65..127 rung is listed as a follow-up (§5.2) and would reopen
+  this gate question.
+- Both the capacity query and the dispatcher key off the same `shape.pair_min_tokens`
+  (`nvfp4_dispatch.cpp:26-28` and `:41-45`), so the gate stays self-consistent; the envelope check
+  `verify_workspace_envelopes` — run by `infernix_linear_nvfp4_a16_test` over intervals including
+  `[1, 128]` and `[24, 129]`, which straddle the new 65 — passes, confirming every public point in an
+  interval still fits the space its interval reserves.
+- With the gate at 128, the `NVFP4_A4_PAIR` cases at T = 65 / 96 / 127 in
+  `tests/ops/linear/test_nvfp4_a4.cpp` did **not** exercise the pair route on these two shapes —
+  `uses_pair` failed the token test and the call fell back to the A16 table, so the coverage the
+  width list implies did not exist. After this change those cases really do run pair, which is why
+  the A4 test was re-run in full (§4.1).
+
+### 4.6 What the shipped fast route actually runs at T = 32..64
+
+The T = 32..64 bar is written against the decode/verify band, which the acceptance sweep measures
+under the A16 policy. Artifacts converted with an A4 activation policy run a different ladder there,
+so both are reported (separate passes of the same harness, production route only, cold 32 MiB L2,
+25 repeats, minimum; the two passes agree to 0.4% where they overlap — `[16384, 2560]` T = 32,
+110.60 against 110.18 µs):
+
+| shape | A16 policy T=32 / 48 / 64 | A4 policy T=32 / 48 / 64 |
+|---|---|---|
+| `[5120, 6144]` | 88.83 / 109.22 / 108.99 µs (83.0 / 68.3 / 69.3%) | 84.61 / 87.55 / 87.58 µs (**87.1 / 85.2 / 86.2%**) |
+| `[2560, 6144]` | 54.85 / 62.78 / 61.54 µs (68.9 / 59.9 / 62.1%) | 46.14 / 47.97 / 48.99 µs (80.4 / 78.5 / 78.0%) |
+| `[6144, 2560]` | 48.42 / 58.27 / 58.59 µs (79.3 / 66.3 / 67.5%) | 48.48 / 47.58 / 47.87 µs (77.9 / 81.2 / 82.6%) |
+| `[16384, 2560]` † | 110.53 / 129.18 / 131.04 µs (90.8 / 79.4 / 80.0%) | 109.70 / 123.84 / 126.78 µs (91.5 / 82.8 / 82.7%) |
+| `[2560, 2560]` | 22.94 / 27.30 / 27.33 µs (69.0 / 59.6 / 61.1%) | 23.52 / 29.25 / 29.34 µs (67.3 / 55.6 / 56.9%) |
+| `[2048, 2560]` | 21.60 / 23.49 / 23.14 µs (57.4 / 55.6 / 58.0%) | 22.72 / 23.42 / 22.94 µs (55.9 / 55.8 / 58.5%) |
+
+`†` — this row is from the post-change route-gate pass, so its A4-policy column is the A16 table
+(see below); every other row is from the selection passes described above, where the A4-policy
+column for `[16384, 2560]` still read 110.18 / 141.28 / 142.02 µs (91.1 / 72.6 / 73.8%).
+
+`[16384, 2560]` is the one place this audit changed a route gate. Its 1-term A4 ladder was admitted
+from T = 33 and was **7..11% slower than the A16 table** across the whole MTP-verification band
+(T = 33: 136.26 µs against 124.61; T = 48: 136.74 against 123.74; T = 64: 136.26 against 126.91),
+while its time drops 25..37% from T = 65, where it wins outright (equivalently, the A16 table takes
+33..59% longer there — T = 65: 111.52 against 148.10 µs, 94.1 against 70.9%; T = 128: 114.11 against
+181.86, 99.6 against 62.5%). `uses_a4` therefore admits at 65 instead of 33, which is what the
+`†` row above measures. `select_a4` keeps its T ≤ 64 rungs so the measured per-width argmin stays
+recorded, but below the gate they are unreachable through the public route — the capacity query
+returns 0 there and the dispatcher takes the A16 table — so they remain live only for the sweep's
+forced A4 candidate. The other K = 2560
+shapes keep their 33-token admission: there the A4 ladder is at worst level with A16 in 33..64
+([10240, 2560] 88.6 against 88.4 µs, [12800, 2560] 102.4 against 102.4, [13952, 2560] 111.5 against
+116.4) and far ahead above it, so narrowing those gates would trade nothing.
+
+## 5. Accepted gaps, honest ceilings & rebase conflict resolution policy
+
+### 5.1 The T = 33..64 bandwidth bar was not reached on the small-N shapes, and the sweep says why
+
+The bar asks for ≥ 85..91% of the 246 GB/s READ reference across T = 32..64. After the retune the
+shipped state reaches it at [5120, 6144] on the A4 policy (85.2..87.1%) and comes closest at
+[16384, 2560] (80.9..83.9%) and [6144, 2560] (66.3..82.6%); it stays 55..80% at [2560, 6144],
+[2560, 2560], [2048, 2560], [10240, 2560], [12800, 2560] and [13952, 2560]. This is not a tile the
+sweep failed to pick. At every one of those widths the best of the ~60 candidates per shape is
+within a few percent of what now ships, while the pure-transfer floor sits far below both:
+
+| shape | best candidate T=48 / 64 | production T=48 / 64 | transfer floor T=48 / 64 |
+|---|---|---|---|
+| `[2560, 6144]` | 61.86 / 61.54 µs (60.8 / 62.1%) | 62.78 / 61.54 µs (59.9 / 62.1%) | 37.64 / 38.20 µs |
+| `[2560, 2560]` | 26.94 / 27.01 µs (60.4 / 61.8%) | 27.30 / 27.33 µs (59.6 / 61.1%) | 16.27 / 16.69 µs |
+| `[2048, 2560]` | 22.46 / 22.88 µs (58.2 / 58.7%) | 23.49 / 23.14 µs (55.6 / 58.0%) | 13.07 / 13.43 µs |
+| `[6144, 2560]` | 55.97 / 55.90 µs (69.0 / 70.7%) | 58.27 / 58.59 µs (66.3 / 67.5%) | 38.64 / 39.54 µs |
+| `[10240, 2560]` | 85.25 / 87.23 µs (75.3 / 75.3%) | 88.38 / 87.68 µs (72.7 / 74.9%) | 64.22 / 65.64 µs |
+| `[12800, 2560]` | 101.92 / 102.46 µs (78.7 / 80.0%) | 102.40 / 103.94 µs (78.3 / 78.9%) | 80.20 / 81.96 µs |
+| `[13952, 2560]` | 111.46 / 115.84 µs (78.4 / 77.1%) | 111.46 / 118.11 µs (78.4 / 75.6%) | 87.40 / 89.30 µs |
+| `[16384, 2560]` | 124.32 / 124.86 µs (82.5 / 83.9%) | 126.82 / 124.96 µs (80.9 / 83.9%) | 102.58 / 104.81 µs |
+
+Reaching 85% at `[2048, 2560]` T = 64 means 15.8 µs; the fastest of sixty tiles measured there is
+22.88 µs, and the whole DRAM footprint of that launch is 3.3 MiB. Candidate selection is exhausted
+for these bands — closing them needs a mechanism the current family does not contain (a split-K /
+narrow-row decomposition that fills 48 SMs from what is a 64-CTA launch today, or one kernel fusing
+the several K = 2560 projections that share an activation), not another entry in the table. No NCU
+attribution was collected for these bands, so the cause is stated only as far as this evidence
+carries: the entire swept family sits 1.4..1.9× above its pure-transfer floor at these shapes.
+
+### 5.2 Accepted gaps and follow-ups
+
+- `[5120, 6144]` T = 17..32 lands at 83.0..84.3% against the 85..91% bar (−14.7 / −17.4 / −21.4%
+  interleaved). The remaining 1..2 points are inside this harness's pass-to-pass spread at 87 µs.
+- `[2560, 2560]` and `[2048, 2560]` T = 33..64 stay at 55..61%: no A4 admission, the pair gate is at
+  65 (pair loses that band, §4.5), and no candidate goes below 22.5 µs against a 13..17 µs floor
+  (§5.1).
+- `pair_min_tokens` stays at 128 on `[6144, 2560]`: under the policy that admits its 1-term ladder
+  the pair route is suppressed, and under the residual policy its competitor is the A16 table, where
+  pair is only 0.8..19% ahead and behind at T = 48 — too thin to move a fast path's kernel set on
+  sweep data alone (§4.5).
+- Follow-ups, in the order they look worth trying: the `[2048, 2560]` / `[2560, 2560]` 65..127 A16
+  rung, which pads 65 tokens into a 64-token tile and costs 47% at a single token (fixing it is the
+  honest fix under the pair gate lowered in §4.5, and would reopen that gate); an interleaved A/B of
+  the `[6144, 2560]` pair gate at 33 under a residual-permitting policy, together with the
+  model-level fast-path qualification under `docs/maintainer/model-quality.md`; a T = 33..64
+  sliced-K / split-K rung for the N ≤ 2560 shapes (the sweep has no sliced tile above 32 tokens,
+  which is exactly the band that misses the bar); and a launch-overhead measurement to say how much
+  of the 22..27 µs at `[2048, 2560]` / `[2560, 2560]` is kernel versus launch.
+
+### 5.3 Rebase conflict resolution policy
+
+- `nvfp4_launch.cuh`: keep both launchers. `nvfp4_linear_a16_sliced_k_dyn` is not a duplicate of the
+  baked form — it is 13..26% faster for wide-token sliced-K tiles. If upstream deletes it or bakes
+  `K` into every sliced-K band, restore the per-band choice and re-measure; the full-MMA tiles have
+  no runtime-`K` form and none is needed.
+- Shape tables: the accepted end state is the interleaved-A/B winner per band, not the sweep argmin.
+  On conflict, keep `[2560, 2560]`'s T = 2 SIMT `C2` tile and `[2048, 2560]`'s 8-warp `StagedRaw`
+  GEMV (both re-tested against the alternatives and lost), keep the `C2` removals and RowTiles-2
+  T ≤ 16 tiles on `[16384, 5120]` and `[14336, 5120]`, keep the new `[13952, 2560]` 33..48 band in
+  **both** `select_a16` and `launch_routes`, keep `uses_a4(...) >= 65` on `[16384, 2560]`, and keep
+  `pair_min_tokens = 65` on `[2560, 2560]` / `[2048, 2560]` against an upstream revert to 128 (and
+  against an upstream push down to 33, which the T = 33..64 measurements reject).
+- Any upstream change to these tables is a routing change: re-validate it with the same
+  production-only interleaved A/B (≥ 3 alternating rounds, min-of-rounds, byte-identical control
+  shape) before accepting it. A single sweep pass is not evidence at these widths — see §2.
+- `bench/ops/nvfp4_route_sweep.cu`: keep the `residual` candidate flag and the exact-A16 reference
+  for 2-term candidates. Without them the pair route is skipped as "disagrees with the reference"
+  and its timings silently disappear from every future audit.
