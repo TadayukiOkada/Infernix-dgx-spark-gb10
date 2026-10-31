@@ -9,25 +9,26 @@
 // =============================================================================
 
 #include "ops/linear/q8/q8_shapes.h"
-#include "ops/linear/q8/q8_stream_launch.cuh"
 
 namespace infernix::ops::detail {
-namespace {
-// Qwen3.8-Flash-Next hyper-connection down + inject: the register-streamed route at 1-3 and 9-64 columns (2-7x
-// faster than the MMA tile there), the few-row SIMT route at 4-8 (M1 sweep). K1: 2 row(s) per warp, 8 warps
-// splitting each row's K, x read through L1.
-template <int MaxCols, int ColsPerPass>
-using Stream = Q8A16StreamSchedule<10240, 2, 8, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
-} // namespace
 
+// GB10 (sm_121a) T3 retune 2026-10-31: same design as [320,10240] (see its comment); the 324-row
+// tail rides the runtime-K predicated path of the same schedules. Sweep T = 1..4096: T = 6..64
+// 44..34 us on the 8-K-warp family vs 47..239 us on the streamed/SIMT pair it replaces, and the
+// streamed route's T = 1..2 edge (+5.6/+5.7 us, tie from T = 4) is the accepted cost of keeping
+// the 64-column
+// contract on one bit family. Beyond the contract the 8-K-warp 16-row rung holds to 80 (41.6 us
+// at 65), then the 4-K-warp 48-token pair takes 81..129 (55.6/82.4 us at 96/128 vs the old MMA
+// tile's 105); from 130 the RowTiles2 rung loses
+// to the 32-row K128 MMA here (111.1 vs 150.5 us at 256), so the MMA ladder starts early.
 Q8Launch select_q8_n324_k10240(std::int32_t tokens) {
-    if (tokens <= 2) return launch_q8_a16_stream_linear<Stream<8, 8>>;
-    if (tokens <= 4) return launch_q8_a16_stream_linear<Stream<4, 4>>;
-    if (tokens == 5) return launch_q8_a16_stream_linear<Stream<5, 5>>;
-    if (tokens <= 64) return launch_q8_a16_simt_r1_t8_w8;
-    if (tokens <= 256) return launch_q8_a16_mma_r32_t16;
-    if (tokens <= 512) return launch_q8_a16_mma_r64x16_t48_k128_a1;
-    if (tokens <= 1024) return launch_q8_a16_mma_r64x16_t128_k128_a2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
+    if (tokens <= 80) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
+    if (tokens <= 112) return launch_q8_a16_sliced_r16_t48_w4_s2;
+    if (tokens <= 129) return launch_q8_a16_sliced_r16_t48_w4_s1;
+    if (tokens <= 640) return launch_q8_a16_mma_r32_t32_k128_a1;
+    if (tokens <= 1024) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 3072) return launch_q8_a16_mma_r64x32_t128_k64_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 

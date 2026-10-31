@@ -107,5 +107,23 @@ using SlicedR16T40W16S1 =
 using SlicedR32T48W4S1 =
     Q8A16SlicedKMmaSchedule<48, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                             Q8ActivationStage::RuntimeActive, 0, 48, false, 2>;
+// T3 (2026-10-31) skinny-N / LoRA / drafter retune tiles from the GB10 route sweep. The two
+// [320,324]x10240 rungs keep the shape's 64-column contract on one 8-K-warp family, and the
+// 16x4 and 48x4 tiles take the mid bands where the K-warps budget, not the token slab, is
+// binding. The sweep's faster 32-row/16-K-warp RowTiles2 tile spills 8..16 B at the REG:128
+// launch-bounds clamp (256 threads over 16 warps), so the zero-spill 48x4 pair replaces it.
+using SlicedR16T16W4S1 =
+    Q8A16SlicedKMmaSchedule<16, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 16, false, 1>;
+using SlicedR16T48W4S2 =
+    Q8A16SlicedKMmaSchedule<48, 4, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 48, false, 1>;
+using SlicedR16T48W4S1 =
+    Q8A16SlicedKMmaSchedule<48, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 48, false, 1>;
+// T3 K128 tiles: the 32-row 64-token pair for the 97..192 band of the 1024-row shapes and the
+// shared-expert down.
+using MmaR32T64K128A1         = Q8A16MmaSchedule<32, 64, 128, 16, 16, 1, 1>;
+using MmaR32T64W16x32K128A1   = Q8A16MmaSchedule<32, 64, 128, 16, 32, 1, 1>;
 } // namespace q8_instances
 } // namespace infernix::ops::detail

@@ -12,12 +12,18 @@
 
 namespace infernix::ops::detail {
 
+// GB10 (sm_121a) T3 retune 2026-10-31: bench/ops/q8_route_sweep.cu over T = 1..512. The 4-K-warp
+// sliced rungs beat the T = 33..64 MMA band by 41% (17.9..22.2 vs 25..40 us) and the 8-warp rung
+// also takes T = 1 (15.9 vs the SIMT pair's 16.5..16.9), so the decode half is one sliced ladder;
+// the new 32x64 K128 tile then holds 129..192 (25.2 us), the 64x16 K128 tile holds 193..256
+// (28.5 us vs 36.7), and the 64x32 t96 K128 tile holds 257..512 (42.8 us vs 47.0 at 512).
 Q8Launch select_q8_n1024_k2048(std::int32_t tokens) {
-    if (tokens == 1) return launch_q8_a16_simt_r8_t4;
     if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s2;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
-    if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
+    if (tokens <= 64) return launch_q8_a16_sliced_r16_t32_w4_s1;
+    if (tokens <= 128) return launch_q8_a16_sliced_r32_t48_w4_s1;
+    if (tokens <= 192) return launch_q8_a16_mma_r32_t64_k128_a1;
+    if (tokens <= 256) return launch_q8_a16_mma_r64x16_t48_k128_a1;
+    if (tokens <= 512) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     return launch_q8_a16_mma_r64_t128;
 }
 

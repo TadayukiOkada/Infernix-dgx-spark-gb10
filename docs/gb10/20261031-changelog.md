@@ -284,3 +284,144 @@ MMA tiles, and re-bands the seven tables around them.
 - **Screening-only ptxas warning** (`minnctapersm` ignored) on `mma_r128t64k128w16x16a2m1` in
   `bench/ops/q8_permutation_routes.inc`; harmless, and it documents that `MinBlocksPerSm = 2` is
   unreachable for a 512-thread tile.
+
+# GB10 changelog — 2026-10-31 (T3: Q8 skinny/LoRA/drafter shapes (`[320,10240]`, `[324,10240]`, `[10240,320]`, `[2560,640]`, `[1024,2048]`, `[1024,5120]`, `[1280,2560]`) across T = 1..4096)
+
+## 1. Accounting
+
+- **Base**: `ac8528dfc` (`dev-rebased-20261028`).
+- **Files changed**: 10 modified, 0 added, 0 deleted (`+112 / -56`).
+  - Ops & quantization (4): `src/ops/linear/q8/q8_instances.cuh` (M), `q8_sliced_k_mma.cu` (M),
+    `q8_mma.cu` (M), `q8_launch.h` (M).
+  - Shape dispatch tables (6): `src/ops/linear/q8/shapes/n320_k10240.cu` (M),
+    `n324_k10240.cu` (M), `n2560_k640.cu` (M), `n1024_k2048.cpp` (M), `n1024_k5120.cpp` (M),
+    `n1280_k2560.cu` (M). (`n10240_k320.cu` inspected and retained unchanged; see rationale below.)
+- **Allowlist delta**: none. `tools/cuda_stack/cuda_stack_allowlist.json` is untouched; all 5 new
+  instantiations compile with `STACK:0 LOCAL:0`.
+
+## 2. Architectural rationale & task premise analysis (`20261031-performance-tasks.md` T3)
+
+1. **Eliminating the `61..227 us` (`8.7..25.4%` `READ_%`) serial/SIMT cliff on `[320, 10240]` and
+   `[324, 10240]` (`98x`/pass)**:
+   - On HEAD, `select_q8_n320_k10240` and `select_q8_n324_k10240` dispatched `Q8A16StreamSchedule`
+     (`T <= 5`) and `launch_q8_a16_simt_r1_t8_w8` (`T = 6..64`), which sliced `T` into 8-token
+     passes and re-read the 5.2 MiB weight matrix up to 8 times (`59..227 us` at `T = 16..64`).
+   - Both shapes carry a **64-column bit-invariance contract** in `q8_a16_column_invariance()`
+     (`tests/ops/linear/test_q8_a16.cpp:216`). Because `Q8A16StreamSchedule` (`8` warps per row),
+     `simt_r1_t8_w8`, and `Q8A16SlicedKMmaSchedule` (`8` K-warps per 16-row tile) accumulate across K
+     in different orders, mixing families inside `T = 1..64` breaks column invariance.
+   - Moving `T = 1..80` onto the single 8-K-warp sliced-K MMA family (`sliced_r16_t8_w8_s2_m3` for
+     `T <= 32`, `sliced_r16_t16_w8_s2_m1` for `T = 33..80`) preserves exact 64-column bit invariance
+     while cutting `T = 16..64` latency by **`2.3x..6.8x`** (`63.4..222.0 us -> 27.4..32.6 us`,
+     `59..64%` `READ_%` on `[320, 10240]`; `65.3..227.1 us -> 27.5..33.6 us`, `55..65%` `READ_%` on
+     `[324, 10240]`). The accepted cost of keeping a single bit family across `T = 1..64` is
+     `+3.1..+5.6 us` at `T = 1..4` (`19.3..27.5 us -> 24.3..31.4 us`), which is recovered starting at
+     `T = 5` (`-19.4%` at `T = 5`, `-23.4%` at `T = 8`, `-49.8%` at `T = 9`).
+   - Above the 64-column contract (`T > 64`), new zero-spill 4-K-warp 48-token sliced rungs
+     (`SlicedR16T48W4S2`, `SlicedR16T48W4S1`) and `SlicedR32T48W4S1` (`T = 130..384` on `[320, 10240]`)
+     plus `MmaR32T32K128A1` / `MmaR64x32T64K128A1` / `MmaR64x32T128K64A2` / `MmaR128x64T128K64A1`
+     cut `T = 65..2048` latency by `10..62%`. (A swept 16-K-warp `RowTiles = 2` schedule spilled
+     `8..16 B` at the `REG:128` 256-thread launch bound and was rejected in favor of the zero-spill
+     4-K-warp 48-token pair.)
+2. **Replacing `Q8A16StreamSchedule` on `[2560, 640]` (`49x`/pass) and retuning `[1024, 2048]`,
+   `[1024, 5120]`, and `[1280, 2560]`**:
+   - **`[2560, 640]`**: Replaced the 4-band `Q8A16StreamSchedule` ladder (`T = 1..16`, which stalled
+     at `13.6..21.3 us` / `33.5..54.9%` `READ_%` for `T = 5..16`) and `mma_r32_t24` (`T = 17..32`,
+     `16.2 us`) with a single `launch_q8_a16_mma_r32_t32_k128_a1` (`MmaR32T32K128A1`) schedule across
+     `T = 1..32`, plus `MmaR32T64K128A1` at `T = 49..64`. Because a single non-split-K MMA schedule
+     computes each token column independently, `T = 1..32` satisfies the 16-column invariance contract
+     while cutting `T = 9..32` from `16.2..21.3 us` to `13.2..14.2 us` (`-18.7%..-35.2%`, `53..65%`
+     `READ_%`), trading `+0.6/+1.5 us` at `T = 1..2`.
+   - **`[1024, 2048]` & `[1024, 5120]`**: Replaced the premature `T = 33..96` MMA transition (which
+     dropped to `30..40%` `READ_%`) with single-slice 4-K-warp sliced rungs (`SlicedR16T16W4S1`,
+     `SlicedR16T32W4S1`, `SlicedR32T48W4S1`, `sliced_r32_t16_w4_s2`) and the new 32-row 64-token K128
+     MMA tile (`MmaR32T64K128A1`), cutting `T = 33..256` latency by **`18..48%`** across both shapes
+     and `-18.0%` at `[1024, 2048] T = 1`, plus `-11.9%` at `[1024, 5120] T = 4096` (`MmaR128x64T128K64A1`).
+   - **`[1280, 2560]`**: Preserved `select_q8_n1280_k2560_invariant` through `T = 48` (required by the
+     48-column invariance test) and retuned `T = 49..256` with `SlicedR32T48W4S1`,
+     `MmaR32T64W16x32K128A1`, and `MmaR64x32T64K128A1` (`-15.4%..-39.9%` across `T = 65..256`) and
+     `MmaR128x64T128K64A1` at `T > 3072` (`-6.0%..-7.1%` at `T = 4096`).
+3. **Why `[10240, 320]` (`n10240_k320.cu`) is unchanged & hardware ceiling disclosures**:
+   - **`[10240, 320]` at `T = 4..8` and `T = 4096`**: The task prompt assumed `n10240_k320` used a
+     serial token loop, but HEAD already dispatches `Stream<4,4>` (`T = 1`), `StreamShared<8,8>`
+     (`T = 2`, `T = 5..8`), and `simt_r8_t4` (`T = 3..4`) at `19.3..24.6 us` (`71.8..88.6%` `READ_%`).
+     In the 149-route sweep (`sweep_10240x320.log`), the fastest candidate at `T = 4..8` is
+     `mma_r32_t16` / `mma_r32_t24` at `19.1..20.1 us` (no route reaches `<= 16.5 us`), and switching
+     `T = 4..8` to MMA breaks the 8-column invariance contract (`q8_a16_column_invariance`) unless
+     `T = 1..2` also switches to `mma_r32_t16` (`21.02 us` at `T = 1`, regressing `T = 1` by `+1.1 us`).
+     At `T = 4096`, `K = 320` has only 5 K-tiles of 64, so kernel launch + epilogue + per-tile
+     staging overhead caps `mma_r64_t128` at `544.6 us` (`49.3 TFLOP/s`) and `MmaR128x64T128K64A1` is
+     slower (`585.2 us`, `45.9 TFLOP/s`). Thus `n10240_k320.cu` is already at the exact-route Pareto
+     frontier across `T = 1..4096`.
+   - **`[320, 10240]` and `[324, 10240]` at `T = 512`**: `MmaR32T32K128A1` improves `T = 512` from
+     `136.0 us` (`24.7 TFLOP/s`) to `120.7..122.7 us` (`27.3..27.8 TFLOP/s`, `-9.8%`) and `T = 513`
+     from `161.6 us` to `117.5 us` (`-27.3%`). Reaching `60 TFLOP/s` at `N = 320, T = 512` is
+     bounded by the narrow `N = 320` output dimension (at `BM = 32`, `N = 320` is only 10 row tiles,
+     whereas `BM = 128` wastes 46% of the 3rd M-tile and runs slower at `T = 512`; only at `T = 4096`
+     does `[320, 10240]` reach `50.7 TFLOP/s` / `69.2%` `READ_%`).
+
+## 3. Subsystem breakdown
+
+| File | Action | Mechanism |
+|---|---|---|
+| `src/ops/linear/q8/q8_instances.cuh` | M | +3 sliced-K schedules (`SlicedR16T16W4S1`, `SlicedR16T48W4S2`, `SlicedR16T48W4S1`) and +2 K128 MMA schedules (`MmaR32T64K128A1`, `MmaR32T64W16x32K128A1`). |
+| `src/ops/linear/q8/q8_sliced_k_mma.cu`, `q8_mma.cu`, `q8_launch.h` | M | Instantiate and declare the 5 new named launchers. |
+| `src/ops/linear/q8/shapes/n320_k10240.cu` | M | Replace `Stream` / `simt_r1_t8_w8` with `sliced_r16_t8_w8_s2_m3` (`T<=32`) and `sliced_r16_t16_w8_s2_m1` (`T<=80`), then `sliced_r16_t48_w4_s2` (`T<=112`), `sliced_r16_t48_w4_s1` (`T<=129`), `sliced_r32_t48_w4_s1` (`T<=384`), `mma_r32_t32_k128_a1` (`T<=640`), `mma_r64x32_t64_k128_a1` (`T<=1024`), `mma_r64x32_t128_k64_a2` (`T<=3072`), `mma_r128x64_t128_k64_a1` (`>3072`). |
+| `src/ops/linear/q8/shapes/n324_k10240.cu` | M | Same 8-K-warp sliced ladder through `T = 129`, then `mma_r32_t32_k128_a1` (`T<=640`), `mma_r64x32_t64_k128_a1` (`T<=1024`), `mma_r64x32_t128_k64_a2` (`T<=3072`), `mma_r128x64_t128_k64_a1` (`>3072`). |
+| `src/ops/linear/q8/shapes/n2560_k640.cu` | M | Replace `Stream` (`T<=16`) + `mma_r32_t24` (`T<=32`) with `mma_r32_t32_k128_a1` (`T<=32`) and `mma_r32_t32` (`T=49..64`) with `mma_r32_t64_k128_a1`. |
+| `src/ops/linear/q8/shapes/n1024_k2048.cpp` | M | Unify `T<=16` onto `sliced_r16_t16_w8_s2`, extend sliced-K through `T=128` (`sliced_r16_t32_w4_s1` `<=64`, `sliced_r32_t48_w4_s1` `<=128`), `mma_r32_t64_k128_a1` (`<=192`), `mma_r64x16_t48_k128_a1` (`<=256`), `mma_r64x32_t96_k128_a1` (`<=512`). |
+| `src/ops/linear/q8/shapes/n1024_k5120.cpp` | M | `sliced_r16_t16_w4_s1` (`<=32`), `sliced_r16_t32_w4_s1` (`<=64`), `sliced_r32_t16_w4_s2` (`<=96`), `mma_r32_t64_k128_a1` (`<=129`), `mma_r64x16_t48_k128_a1` (`<=256`), `mma_r64x32_t64_k64_a2` (`<=512`), `mma_r64_t128` (`<=1024`), `mma_r128x64_t128_k64_a1` (`>1024`). |
+| `src/ops/linear/q8/shapes/n1280_k2560.cu` | M | Above `T<=48` invariant family: `sliced_r32_t48_w4_s1` (`<=96`), `mma_r32_t64_w16x32_k128_a1` (`<=129`), `mma_r64x32_t64_k128_a1` (`<=256`), `mma_r64_t128` (`<=3072`), `mma_r128x64_t128_k64_a1` (`>3072`). |
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+- **Build**: `ninja -C build-native -j "$(nproc)" infernix-serve infernix_linear_bench infernix_ops_linear_test`
+  clean (exit 0, zero warnings).
+- **Per-symbol resources** (`cuobjdump -res-usage build-native/apps/infernix-serve`):
+  all 5 new schedule families have `STACK:0 LOCAL:0`:
+  - `SlicedR16T16W4S1`: `REG:138..141`, `SHARED:13568`
+  - `SlicedR16T48W4S1`: `REG:182..187`, `SHARED:29952`
+  - `SlicedR16T48W4S2`: `REG:163..179`, `SHARED:0` (dynamic SMEM)
+  - `MmaR32T64K128A1`: `REG:78..88`, `SHARED:30208`
+  - `MmaR32T64W16x32K128A1`: `REG:104..113`, `SHARED:30208`
+- **Gates**: `ctest --test-dir build-native -R '^(infernix_linear_q8_a16_test|infernix_cuda_stack_check)$'`
+  **100% passed** (2/2: `infernix_cuda_stack_check` 1.50 s, `infernix_linear_q8_a16_test` 13.62 s —
+  covering FP64 oracle conformance and `q8_a16_column_invariance` across all 64/48/16/8-column
+  contracts).
+- **Interleaved A/B** vs rebuilt HEAD (`/tmp/t3/bench_head`, `--qtype Q8 --routes fast`, 2 rounds x
+  (2 warmup + 7 repeat)):
+
+| Shape | T | HEAD (us) | NEW (us) | Δ% | HEAD `READ_%` | NEW `READ_%` |
+|---|---|---|---|---|---|---|
+| `[320, 10240]` | 1 / 2 / 4 | 19.28 / 21.31 / 27.46 | 24.34 / 24.38 / 31.39 | +26.2% / +14.4% / +14.3% | 73.9 / 67.2 / 52.8 | 58.7 / 58.8 / 39.9 |
+| | 5 / 8 / 9 | 31.55 / 34.58 / 48.54 | **25.44 / 26.50 / 24.38** | **-19.4% / -23.4% / -49.8%** | 46.2 / 42.8 / 30.4 | **55.1 / 55.9 / 61.2** |
+| | **16 / 32 / 64** | 63.36 / 114.50 / 222.03 | **27.39 / 27.47 / 32.61** | **-56.8% / -76.0% / -85.3% (`2.3x..6.8x`)** | 24.5 / 14.8 / 8.8 | **59.0 / 63.9 / 60.2** |
+| | 65 / 96 / 129 | 104.26 / 105.26 / 106.34 | **39.76 / 54.10 / 61.31** | **-61.9% / -48.6% / -42.3%** | 18.9 / 21.5 / 24.2 | **48.4 / 40.6 / 39.8** |
+| | 256 / 512 / 513 | 115.63 / 135.98 / 161.62 | **89.95 / 122.69 / 117.54** | **-22.2% / -9.8% / -27.3%** | 30.4 / 42.5 / 36.0 | **40.2 / 47.4 / 49.1** |
+| | 1024 / 2048 | 180.02 / 385.89 | **159.55 / 289.58** | **-11.4% / -25.0%** | 56.7 / 49.4 | **64.0 / 64.5** |
+| `[324, 10240]` | 1 / 2 / 4 | 19.78 / 20.80 / 26.43 | 25.41 / 26.53 / 26.43 | +28.5% / +27.5% / 0.0% | 74.8 / 71.5 / 57.8 | 54.5 / 54.5 / 55.5 |
+| | 5 / 8 / 9 | 31.06 / 33.20 / 48.96 | **28.50 / 29.49 / 26.46** | **-8.2% / -11.2% / -45.9%** | 46.7 / 46.0 / 30.2 | **51.8 / 49.2 / 57.1** |
+| | **16 / 32 / 64** | 65.33 / 118.61 / 227.14 | **28.50 / 27.46 / 33.62** | **-56.4% / -76.9% / -85.2% (`2.3x..6.8x`)** | 24.0 / 14.4 / 8.7 | **55.1 / 64.6 / 57.3** |
+| | 65 / 96 / 129 | 103.23 / 104.29 / 104.27 | **41.90 / 56.24 / 65.44** | **-59.4% / -46.1% / -37.2%** | 19.1 / 21.6 / 24.9 | **46.3 / 39.5 / 37.7** |
+| | 256 / 512 / 513 | 113.58 / 123.78 / 159.57 | **103.26 / 118.66 / 118.62** | **-9.1% / -4.1% / -25.7%** | 32.2 / 46.7 / 36.6 | **35.5 / 48.3 / 49.2** |
+| | 1024 / 2048 | 167.76 / 386.02 | **157.58 / 295.68** | **-6.1% / -23.4%** | 61.0 / 49.4 | **64.9 / 63.7** |
+| `[2560, 640]` | 1 / 2 | 11.57 / 11.63 | 12.13 / 13.15 | +4.8% / +13.1% | 64.5 / 58.6 | 58.6 / 50.3 |
+| | 5 / 8 / 9 | 13.63 / 14.59 / 20.29 | **13.15 / 13.15 / 13.15** | **-3.5% / -9.9% / -35.2%** | 54.9 / 51.9 / 36.0 | **59.4 / 60.1 / 60.3** |
+| | 16 / 32 / 64 | 21.33 / 16.21 / 15.10 | **14.18 / 13.18 / 14.14** | **-33.5% / -18.7% / -6.4%** | 33.5 / 43.3 / 54.5 | **52.9 / 64.7 / 61.8** |
+| `[1024, 2048]` | 1 | 16.13 | **13.23** | **-18.0%** | 56.6 | **73.9** |
+| | 33 / 64 / 65 | 27.46 / 30.48 / 34.64 | **16.27 / 18.26 / 21.41** | **-40.7% / -40.1% / -38.2%** | 34.7 / 34.9 / 30.9 | **60.4 / 58.4 / 52.1** |
+| | 96 / 129 / 256 | 34.62 / 34.70 / 36.67 | **24.38 / 24.42 / 28.50** | **-29.6% / -29.6% / -22.3%** | 33.1 / 35.5 / 42.1 | **47.0 / 50.3 / 54.2** |
+| | 448 / 512 | 46.93 / 47.01 | **40.85 / 42.82** | **-13.0% / -8.9%** | 43.1 / 46.5 | **49.5 / 51.0** |
+| `[1024, 5120]` | 32 / 33 / 64 | 38.75 / 66.38 / 70.45 | **35.70 / 34.66 / 39.74** | **-7.9% / -47.8% / -43.6%** | 62.6 / 36.0 / 36.1 | **69.8 / 70.1 / 66.7** |
+| | 65 / 96 / 129 | 85.82 / 81.76 / 83.79 | **51.10 / 53.09 / 58.19** | **-40.5% / -35.1% / -30.6%** | 30.2 / 33.6 / 34.7 | **48.8 / 53.7 / 50.9** |
+| | 192 / 256 / 384 | 84.78 / 86.91 / 98.11 | **66.29 / 66.46 / 88.91** | **-21.8% / -23.5% / -9.4%** | 38.5 / 41.2 / 42.6 | **49.3 / 54.1 / 46.5** |
+| | 448 / 512 / 4096 | 106.34 / 108.38 / 670.66 | **97.15 / 100.19 / 590.66** | **-8.6% / -7.6% / -11.9%** | 42.3 / 44.5 / 33.5 | **45.9 / 48.1 / 38.5** |
+| `[1280, 2560]` | 65 / 96 / 129 | 45.87 / 44.90 / 47.09 | **27.55 / 29.54 / 35.68** | **-39.9% / -34.2% / -24.2%** | 34.5 / 36.5 / 38.5 | **61.1 / 56.2 / 49.5** |
+| | 192 / 256 / 4096 | 46.93 / 47.01 / 403.28 | **38.72 / 39.78 / 374.70** | **-17.5% / -15.4% / -7.1%** | 42.9 / 47.2 / 35.0 | **52.0 / 54.3 / 37.7** |
+
+## 5. Rebase conflict resolution policy
+
+- Preserve the GB10 8-K-warp sliced-K column-invariant ladders on `[320, 10240]` and `[324, 10240]`,
+  the single-schedule `MmaR32T32K128A1` `T = 1..32` ladder on `[2560, 640]`, the zero-spill
+  `SlicedR16T48W4S1`/`S2` and `MmaR32T64K128A1` mid-band schedules across `[1024, 2048]`,
+  `[1024, 5120]`, and `[1280, 2560]`, and `n10240_k320.cu`'s existing stream/MMA dispatch.

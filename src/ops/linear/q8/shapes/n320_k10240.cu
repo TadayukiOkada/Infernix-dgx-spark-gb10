@@ -9,25 +9,32 @@
 // =============================================================================
 
 #include "ops/linear/q8/q8_shapes.h"
-#include "ops/linear/q8/q8_stream_launch.cuh"
 
 namespace infernix::ops::detail {
-namespace {
-// Qwen3.8-Flash-Next final mixer down: the register-streamed route at 1-3 and 9-64 columns (2-7x faster than
-// the MMA tile there), the few-row SIMT route at 4-8 (M1 sweep). K1: 2 row(s) per warp, 8 warps splitting each
-// row's K, x read through L1.
-template <int MaxCols, int ColsPerPass>
-using Stream = Q8A16StreamSchedule<10240, 2, 8, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
-} // namespace
 
+// GB10 (sm_121a) T3 retune 2026-10-31: bench/ops/q8_route_sweep.cu over T = 1..4096. The
+// register-streamed/SIMT pair left T = 6..64 re-reading the whole 5.2 MB weight once per 8-token
+// slab and per 8-column pass (59..218 us at T = 16..64, 9..26% of the read roofline): the sliced-K
+// 8-K-warp family holds one weight pass across the whole contracted width at 23..43 us (2.5..5.1x).
+// The 64-column bit contract pins T = 1..64 to that one family, which accepts the streamed
+// route's T = 1..4 edge (+5.1/+3.1/+3.9 us at 1/2/4, won back from T = 5 on). Beyond the contract
+// the ladder
+// follows the sweep argmin: the 8-K-warp 16-row rung to 80 (36.4 us at 65), then the zero-spill
+// 4-K-warp 48-token pair to 129 (51.7/72.7 us at 96/128, where the old MMA tile paid 103..111),
+// the registered 48-token RowTiles2 rung to 384 (95.0/97.3 us at 256/384 vs the MMA's 109..115;
+// at 448 its 10-slice padding pays 135 and the 32-row K128 MMA takes over), then the K128/K64
+// MMA tiles (T = 512 best
+// 121.5 us = 27.7 TFLOP/s; N = 320 is too narrow to fill the wide tiles, so the task's 60 TF bar
+// is not reachable at this width).
 Q8Launch select_q8_n320_k10240(std::int32_t tokens) {
-    if (tokens <= 2) return launch_q8_a16_stream_linear<Stream<8, 8>>;
-    if (tokens <= 4) return launch_q8_a16_stream_linear<Stream<4, 4>>;
-    if (tokens == 5) return launch_q8_a16_stream_linear<Stream<5, 5>>;
-    if (tokens <= 64) return launch_q8_a16_simt_r1_t8_w8;
-    if (tokens <= 256) return launch_q8_a16_mma_r32_t16;
-    if (tokens <= 512) return launch_q8_a16_mma_r64x16_t48_k128_a1;
-    if (tokens <= 1024) return launch_q8_a16_mma_r64x16_t128_k128_a2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
+    if (tokens <= 80) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
+    if (tokens <= 112) return launch_q8_a16_sliced_r16_t48_w4_s2;
+    if (tokens <= 129) return launch_q8_a16_sliced_r16_t48_w4_s1;
+    if (tokens <= 384) return launch_q8_a16_sliced_r32_t48_w4_s1;
+    if (tokens <= 640) return launch_q8_a16_mma_r32_t32_k128_a1;
+    if (tokens <= 1024) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 3072) return launch_q8_a16_mma_r64x32_t128_k64_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 

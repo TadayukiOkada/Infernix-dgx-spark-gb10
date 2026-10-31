@@ -44,6 +44,9 @@ void launch_q8_a16_mma_r128x32_t128_k64_a2(const Tensor&, const Weight&, Tensor&
 void launch_q8_a16_mma_r16_t32_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q8_a16_mma_r32_t32_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q8_a16_mma_r128x16_t64_k128_a2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// T3 (2026-10-31) GB10 skinny/LoRA/drafter tiles.
+void launch_q8_a16_mma_r32_t64_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_mma_r32_t64_w16x32_k128_a1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_q8_a16_simt_r4_t4_w2_g16_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q8_a16_simt_r4_t5_w2_g16_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -65,4 +68,8 @@ void launch_q8_a16_sliced_r16_t32_w4_s1(const Tensor&, const Weight&, Tensor&, c
 void launch_q8_a16_sliced_r16_t32_w8_s1_m2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q8_a16_sliced_r16_t40_w16_s1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q8_a16_sliced_r32_t48_w4_s1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// T3 (2026-10-31) GB10 skinny/LoRA/drafter sliced-K tiles.
+void launch_q8_a16_sliced_r16_t16_w4_s1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_sliced_r16_t48_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_q8_a16_sliced_r16_t48_w4_s1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 } // namespace infernix::ops::detail

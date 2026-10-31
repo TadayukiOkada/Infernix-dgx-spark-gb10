@@ -9,25 +9,20 @@
 // =============================================================================
 
 #include "ops/linear/q8/q8_shapes.h"
-#include "ops/linear/q8/q8_stream_launch.cuh"
 
 namespace infernix::ops::detail {
-namespace {
-// Qwen3.8-Flash-Next shared expert down: the register-streamed route up to 16 columns, the MMA tiles beyond (M1
-// sweep). K1: 4 row(s) per warp, x staged in shared memory per pass.
-template <int MaxCols, int ColsPerPass>
-using Stream = Q8A16StreamSchedule<640, 4, 1, 4, MaxCols, ColsPerPass, Q8StreamX::Shared, 2>;
-using StreamGlobal8 = Q8A16StreamSchedule<640, 4, 1, 8, 8, 8, Q8StreamX::Global, 2>;
-} // namespace
 
+// GB10 (sm_121a) T3 retune 2026-10-31: bench/ops/q8_route_sweep.cu over T = 1..256. The streamed
+// route held the 16-column contract but idled at 13..22 us (34..55% of the read roofline) where
+// the K128 32x32 tile is flat at 11.3..13.6 us; one MMA schedule now covers T = 1..32, keeping
+// every column independent within the schedule (the 16-column contract) and winning at every
+// width except T = 1..2, where the streamed pass is 0.6/1.5 us faster. Beyond T = 32 the sweep
+// argmin: the 16-token tile to 48, the new 32x64 K128 tile to 64, then the pre-existing K128/K64
+// ladder.
 Q8Launch select_q8_n2560_k640(std::int32_t tokens) {
-    if (tokens <= 2) return launch_q8_a16_stream_linear<StreamGlobal8>;
-    if (tokens <= 4) return launch_q8_a16_stream_linear<Stream<4, 4>>;
-    if (tokens <= 8) return launch_q8_a16_stream_linear<Stream<8, 8>>;
-    if (tokens <= 16) return launch_q8_a16_stream_linear<Stream<16, 8>>;
-    if (tokens <= 32) return launch_q8_a16_mma_r32_t24;
+    if (tokens <= 32) return launch_q8_a16_mma_r32_t32_k128_a1;
     if (tokens <= 48) return launch_q8_a16_mma_r32_t16;
-    if (tokens <= 64) return launch_q8_a16_mma_r32_t32;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t64_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x32_t64_k64_a2;
     return launch_q8_a16_mma_r64_t128;

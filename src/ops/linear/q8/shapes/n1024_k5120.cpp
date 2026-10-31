@@ -12,13 +12,23 @@
 
 namespace infernix::ops::detail {
 
+// GB10 (sm_121a) T3 retune 2026-10-31: bench/ops/q8_route_sweep.cu over T = 1..4096. T = 17..64
+// was the cliff — the 64-column MMA tile idled at 30..70 us (43..62% roofline) where the 4-K-warp
+// sliced rungs hold 33..41 us (up to 41% faster); T = 65..96 stays sliced too (48.9 vs 84.9). The
+// new 32x64 K128 tile takes 97..129 (57.9 us), the 64x16 K128 tile takes 130..256 (66.5 vs 86.9),
+// the 64x32 K64 tile takes 257..512 (100.2 vs 108.4 at 512), and r128x64 K64 takes T > 1024 where
+// it beats r64_t128 by 12% at 4096 (591 vs 671 us).
 Q8Launch select_q8_n1024_k5120(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_simt_r4_t4_w2_g16_s2;
     if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s2;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
-    if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
-    return launch_q8_a16_mma_r64_t128;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t16_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_sliced_r16_t32_w4_s1;
+    if (tokens <= 96) return launch_q8_a16_sliced_r32_t16_w4_s2;
+    if (tokens <= 129) return launch_q8_a16_mma_r32_t64_k128_a1;
+    if (tokens <= 256) return launch_q8_a16_mma_r64x16_t48_k128_a1;
+    if (tokens <= 512) return launch_q8_a16_mma_r64x32_t64_k64_a2;
+    if (tokens <= 1024) return launch_q8_a16_mma_r64_t128;
+    return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 
 } // namespace infernix::ops::detail
