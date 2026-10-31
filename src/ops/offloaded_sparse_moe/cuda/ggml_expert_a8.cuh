@@ -105,6 +105,36 @@ __device__ __forceinline__ int a8_slice_dot(const ggml::fast::Slice& w, const in
 
 // Jobs of more than narrow_max columns are the wide tiles' (an 8-bit call of more than kA8MaxCallColumns
 // columns), and their CTAs exit.
+// --------------------------------------------------------------------------- staged weight rows
+//
+// A narrow 8-bit CTA reads its own weight rows, and a slice's fields (the block's fp16 scale, its
+// sub-scale bytes, the code words and the sign bytes) are scattered through the row: read straight
+// from the record, a slice decode is a handful of sub-4-byte requests, 14.5 L1 sectors per request
+// on the IQ3_S gate/up (ncu) and a long-scoreboard stall on every one of them. Staging the rows by
+// 16-byte asynchronous copies makes the same read coalesced, and the copies are in flight while the
+// pass's activation rows are read.
+
+// Shared bytes of a staged run of `rows` rows of `row_bytes` each: both ends are rounded out to
+// whole 16-byte pieces, so a run costs its bytes plus at most 31.
+__host__ __device__ __forceinline__ constexpr int staged_run_bytes(int rows, int row_bytes) {
+    return (rows * row_bytes + 31) & ~15;
+}
+
+// Copies [begin, begin + bytes) of the record into the 16-byte aligned `stage`, returning where the
+// run begins inside it (ggml_tile.cuh's unit staging: the source end is rounded out to whole
+// pieces, whose tail cp.async zero-fills). Every thread copies the pieces it addresses.
+__device__ __forceinline__ int stage_row_run(const std::uint8_t* record, int begin, int bytes, std::uint8_t* stage) {
+    const auto at        = reinterpret_cast<std::uintptr_t>(record + begin);
+    const int pad        = static_cast<int>(at & 15U);
+    const std::uint8_t* source = reinterpret_cast<const std::uint8_t*>(at & ~std::uintptr_t{15});
+    const int total      = (pad + bytes + 15) & ~15;
+    for (int i = static_cast<int>(threadIdx.x) * 16; i < total; i += kGgmlThreads * 16) {
+        const int left = total - i;
+        ggml::tile::cp_async16(stage + i, source + i, left < 16 ? left : 16);
+    }
+    return pad;
+}
+
 template <QType GU>
 __global__ void __launch_bounds__(kGgmlThreads)
     gate_up_kernel_ggml_a8(const std::uint8_t* __restrict__ x_rows, MoeDispatch dispatch, MoeExpertSource source,
@@ -112,6 +142,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
                            const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
                            PassPhase phase, int narrow_max) {
     constexpr int C = kA8Columns;
+    extern __shared__ __align__(16) std::uint8_t weights[];
     const int job   = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert = dispatch.jobs[job];
@@ -121,9 +152,17 @@ __global__ void __launch_bounds__(kGgmlThreads)
     if (count > narrow_max) { return; } // a wide job: the wide tiles compute it
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int part = lane % a8::kGateUpPartials, up = lane / a8::kGateUpPartials;
-    const int i    = blockIdx.x * kGgmlGateUpUnits + warp; // intermediate
+    const int i0   = static_cast<int>(blockIdx.x) * kGgmlGateUpUnits;
+    const int i    = i0 + warp; // intermediate
     const int row_bytes = static_cast<int>(source.ggml.gate_row_bytes);
-    const std::uint8_t* row = record + (static_cast<std::size_t>(up) * moe::kIntermediate + i) * row_bytes;
+    const int run_bytes = kGgmlGateUpUnits * row_bytes;
+    const int run_stage = staged_run_bytes(kGgmlGateUpUnits, row_bytes);
+    // This CTA's gate rows and its up rows are two contiguous runs of the record; the pass loop
+    // reads every one of them once per pass, so they are staged once, before it.
+    const int pad_gate = stage_row_run(record, i0 * row_bytes, run_bytes, weights);
+    const int pad_up   = stage_row_run(record, (moe::kIntermediate + i0) * row_bytes, run_bytes, weights + run_stage);
+    ggml::tile::cp_async_commit();
+    const std::uint8_t* row = weights + (up != 0 ? run_stage + pad_up : pad_gate) + (i - i0) * row_bytes;
     pdl::trigger_dependents();
     for (int pass = 0; pass < count; pass += C) {
         const int n = min(C, count - pass);
@@ -133,11 +172,13 @@ __global__ void __launch_bounds__(kGgmlThreads)
             const int token = c < n ? dispatch.entries[first + pass + c] / top_k : 0;
             xs[c] = reinterpret_cast<const std::int32_t*>(x_rows + static_cast<std::size_t>(token) * moe::wide::kA16XRowBytes);
         }
+        ggml::tile::cp_async_wait<0>();
+        __syncthreads(); // every thread's pieces of both runs have landed
         float acc[C];
 #pragma unroll
         for (int c = 0; c < C; ++c) { acc[c] = 0.0F; }
         for (int s = part; s < kGgmlXSlices; s += a8::kGateUpPartials) {
-            const ggml::fast::Slice w = ggml::fast::slice<GU>(row, s);
+            const ggml::fast::Slice w = ggml::fast::slice<GU, true>(row, s);
             const float wd            = a8::f16_to_f32(w.d);
 #pragma unroll
             for (int c = 0; c < C; ++c) {
@@ -175,6 +216,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
     constexpr int C = kA8Columns;
     __shared__ __align__(16) std::int32_t codes[C][kGgmlHSlices * a8::kSliceWords];
     __shared__ float scales[C][kGgmlHSlices];
+    extern __shared__ __align__(16) std::uint8_t weights[];
     const int job = job_base + static_cast<int>(blockIdx.y);
     // A programmatic dependent of the gate/up pass (down_kernel's PDL contract): only h_plane is read
     // after the wait, and every CTA waits.
@@ -193,8 +235,13 @@ __global__ void __launch_bounds__(kGgmlThreads)
     const int part = threadIdx.x % kGgmlDownLanes;
     const int row  = blockIdx.x * kGgmlDownRows + threadIdx.x / kGgmlDownLanes;
     const int row_bytes = static_cast<int>(source.ggml.down_row_bytes);
-    const std::uint8_t* w = record + 2 * static_cast<std::size_t>(moe::kIntermediate) * source.ggml.gate_row_bytes +
-                            static_cast<std::size_t>(row) * row_bytes;
+    // The CTA's 32 rows are one contiguous run of the record, and every one of them is read once per
+    // pass: staged once, before it, exactly as the gate/up pass stages its eight rows.
+    const int run_begin = 2 * static_cast<int>(moe::kIntermediate) * static_cast<int>(source.ggml.gate_row_bytes) +
+                          static_cast<int>(blockIdx.x) * kGgmlDownRows * row_bytes;
+    const int pad        = stage_row_run(record, run_begin, kGgmlDownRows * row_bytes, weights);
+    ggml::tile::cp_async_commit();
+    const std::uint8_t* w = weights + pad + (row - static_cast<int>(blockIdx.x) * kGgmlDownRows) * row_bytes;
     for (int pass = 0; pass < count; pass += C) {
         const int n = min(C, count - pass);
         for (int item = threadIdx.x; item < n * kGgmlHSlices; item += kGgmlThreads) {
@@ -207,12 +254,13 @@ __global__ void __launch_bounds__(kGgmlThreads)
             dst[1]             = make_int4(o.q[4], o.q[5], o.q[6], o.q[7]);
             scales[c][s]       = o.d;
         }
-        __syncthreads();
+        ggml::tile::cp_async_wait<0>();
+        __syncthreads(); // the pass's codes are written, and every thread's pieces of the run landed
         float acc[C];
 #pragma unroll
         for (int c = 0; c < C; ++c) { acc[c] = 0.0F; }
         for (int s = part; s < kGgmlHSlices; s += a8::kDownPartials) {
-            const ggml::fast::Slice ws = ggml::fast::slice<D>(w, s);
+            const ggml::fast::Slice ws = ggml::fast::slice<D, true>(w, s);
             const float wd             = a8::f16_to_f32(ws.d);
 #pragma unroll
             for (int c = 0; c < C; ++c) {
@@ -474,13 +522,19 @@ void launch_expert_pass_ggml_a8(const MoeDispatch& dispatch, const MoeExpertSour
     auto* h_plane        = reinterpret_cast<std::uint16_t*>(layout.h_rows);
     const int narrow_max = wide ? moe::kMaxColumns : std::numeric_limits<int>::max();
     if (part != PassPart::Down) {
-        gate_up_kernel_ggml_a8<GU><<<dim3(moe::kIntermediate / kGgmlGateUpUnits, jobs), kGgmlThreads, 0, stream>>>(
+        // The two staged runs of this CTA's gate and up rows.
+        const int run = staged_run_bytes(kGgmlGateUpUnits, static_cast<int>(source.ggml.gate_row_bytes));
+        const dim3 gate_up_grid(moe::kIntermediate / kGgmlGateUpUnits, jobs);
+        const std::size_t gate_up_stage = static_cast<std::size_t>(2 * run);
+        gate_up_kernel_ggml_a8<GU><<<gate_up_grid, kGgmlThreads, gate_up_stage, stream>>>(
             layout.x_limbs, dispatch, source, top_k, job_records, flags, base, h_plane, phase, narrow_max);
         check_launch("ggml a8 gate/up");
     }
     if (part == PassPart::GateUp) { return; }
+    const std::size_t down_stage =
+        static_cast<std::size_t>(staged_run_bytes(kGgmlDownRows, static_cast<int>(source.ggml.down_row_bytes)));
     CUDA_CHECK(pdl::launch_with(part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic,
-                                {dim3(moe::kHidden / kGgmlDownRows, jobs), dim3(kGgmlThreads), 0, stream},
+                                {dim3(moe::kHidden / kGgmlDownRows, jobs), dim3(kGgmlThreads), down_stage, stream},
                                 down_kernel_ggml_a8<D>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
                                 flags, base, static_cast<const std::uint16_t*>(h_plane), outputs, phase, narrow_max));
     if (wide) { launch_wide_pass_ggml_a8<GU, D>(dispatch, source, top_k, job_records, flags, base, jobs, layout, outputs, stream); }

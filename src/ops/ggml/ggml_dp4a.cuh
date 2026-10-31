@@ -76,31 +76,45 @@ struct Slice {
     std::uint16_t dmin;
 };
 
+// A weight row's bytes: through the read-only path from global memory, or with plain loads from the
+// shared memory a CTA staged them into (slice<..., Shared>). The generic address selects ld.shared
+// for the second; __ldg on a shared address is not a thing, so the two forms are compiled apart.
+template <bool Shared = false>
 __device__ __forceinline__ std::uint32_t ld_u16(const std::uint8_t* p) {
-    return __ldg(reinterpret_cast<const unsigned short*>(p));
+    if constexpr (Shared) {
+        return *reinterpret_cast<const unsigned short*>(p);
+    } else {
+        return __ldg(reinterpret_cast<const unsigned short*>(p));
+    }
 }
 
 // Four bytes at a 2-byte-aligned address.
+template <bool Shared = false>
 __device__ __forceinline__ std::uint32_t ld_u32_a2(const std::uint8_t* p) {
-    return ld_u16(p) | (ld_u16(p + 2) << 16);
+    return ld_u16<Shared>(p) | (ld_u16<Shared>(p + 2) << 16);
 }
 
+template <bool Shared = false>
 __device__ __forceinline__ std::uint32_t ld_u32_a4(const std::uint8_t* p) {
-    return __ldg(reinterpret_cast<const unsigned int*>(p));
+    if constexpr (Shared) {
+        return *reinterpret_cast<const unsigned int*>(p);
+    } else {
+        return __ldg(reinterpret_cast<const unsigned int*>(p));
+    }
 }
 
 // N little-endian words at a 2-byte-aligned address: N aligned 4-byte loads (and a further one when
 // the address is not 4-byte aligned, never past the words' last byte otherwise) and funnel shifts,
 // half the load instructions of N ld_u32_a2 (decode at one or two columns is bound by the LSU queue).
-template <int N>
+template <int N, bool Shared = false>
 __device__ __forceinline__ void ld_words_a2(const std::uint8_t* p, std::uint32_t (&out)[N]) {
     const auto at        = reinterpret_cast<std::uintptr_t>(p);
     const unsigned shift = static_cast<unsigned>(at & 3U) * 8U;
     const auto* w        = reinterpret_cast<const std::uint8_t*>(at & ~std::uintptr_t{3});
     std::uint32_t v[N + 1];
 #pragma unroll
-    for (int i = 0; i < N; ++i) { v[i] = ld_u32_a4(w + 4 * i); }
-    v[N] = shift != 0 ? ld_u32_a4(w + 4 * N) : 0U;
+    for (int i = 0; i < N; ++i) { v[i] = ld_u32_a4<Shared>(w + 4 * i); }
+    v[N] = shift != 0 ? ld_u32_a4<Shared>(w + 4 * N) : 0U;
 #pragma unroll
     for (int i = 0; i < N; ++i) { out[i] = __funnelshift_r(v[i], v[i + 1], shift); }
 }
@@ -146,17 +160,17 @@ __device__ __forceinline__ int2 iq4nl_values(std::uint32_t q4) {
 }
 
 // Slice s (elements 32s..32s+31) of a row of F blocks.
-template <QType F>
+template <QType F, bool Shared = false>
 __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     Slice o;
     o.min  = 0;
     o.dmin = 0;
     if constexpr (F == QType::GGML_Q2_0) {
         const std::uint8_t* b = row + (s / 2) * 18;
-        o.d    = static_cast<std::uint16_t>(ld_u16(b));
+        o.d    = static_cast<std::uint16_t>(ld_u16<Shared>(b));
         o.sub0 = o.sub1 = 1;
         std::uint32_t qw[2];
-        ld_words_a2<2>(b + 2 + 8 * (s % 2), qw);
+        ld_words_a2<2, Shared>(b + 2 + 8 * (s % 2), qw);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const std::uint32_t w = qw[h];
@@ -169,10 +183,10 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
         }
     } else if constexpr (F == QType::GGML_IQ4_NL) {
         const std::uint8_t* b = row + s * 18;
-        o.d    = static_cast<std::uint16_t>(ld_u16(b));
+        o.d    = static_cast<std::uint16_t>(ld_u16<Shared>(b));
         o.sub0 = o.sub1 = 1;
         std::uint32_t qs[4];
-        ld_words_a2<4>(b + 2, qs);
+        ld_words_a2<4, Shared>(b + 2, qs);
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
             const int2 v = iq4nl_values(qs[w]);
@@ -182,14 +196,14 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     } else if constexpr (F == QType::GGML_IQ4_XS) {
         const std::uint8_t* b = row + (s / 8) * 136;
         const int ib = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
-        const std::uint32_t scales_h = ld_u16(b + 2);
+        o.d = static_cast<std::uint16_t>(ld_u16<Shared>(b));
+        const std::uint32_t scales_h = ld_u16<Shared>(b + 2);
         const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
         o.sub0 = o.sub1 = ls - 32;
         const std::uint8_t* qs = b + 8 + 16 * ib;
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
-            const int2 v = iq4nl_values(ld_u32_a4(qs + 4 * w));
+            const int2 v = iq4nl_values(ld_u32_a4<Shared>(qs + 4 * w));
             o.q[w]     = v.x;
             o.q[w + 4] = v.y;
         }
@@ -197,8 +211,8 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
         constexpr int kBytes = F == QType::GGML_Q4_K ? 144 : 176;
         const std::uint8_t* b = row + (s / 8) * kBytes;
         const int sb = s % 8, ch = sb / 2, shift = 4 * (sb % 2);
-        o.d    = static_cast<std::uint16_t>(ld_u16(b));
-        o.dmin = static_cast<std::uint16_t>(ld_u16(b + 2));
+        o.d    = static_cast<std::uint16_t>(ld_u16<Shared>(b));
+        o.dmin = static_cast<std::uint16_t>(ld_u16<Shared>(b + 2));
         int sc, m;
         scale_min_k4(sb, b + 4, sc, m);
         o.sub0 = o.sub1 = sc;
@@ -206,23 +220,23 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
         const std::uint8_t* qs = b + (F == QType::GGML_Q4_K ? 16 : 48) + 32 * ch;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
-            std::uint32_t v = (ld_u32_a4(qs + 4 * w) >> shift) & 0x0F0F0F0FU;
-            if constexpr (F == QType::GGML_Q5_K) { v |= ((ld_u32_a4(b + 16 + 4 * w) >> sb) & 0x01010101U) << 4; }
+            std::uint32_t v = (ld_u32_a4<Shared>(qs + 4 * w) >> shift) & 0x0F0F0F0FU;
+            if constexpr (F == QType::GGML_Q5_K) { v |= ((ld_u32_a4<Shared>(b + 16 + 4 * w) >> sb) & 0x01010101U) << 4; }
             o.q[w] = static_cast<int>(v);
         }
     } else if constexpr (F == QType::GGML_Q6_K) {
         const std::uint8_t* b = row + (s / 8) * 210;
         const int sb = s % 8, half = sb / 4, quarter = sb % 4;
-        o.d = static_cast<std::uint16_t>(ld_u16(b + 208));
+        o.d = static_cast<std::uint16_t>(ld_u16<Shared>(b + 208));
         const std::uint8_t* ql = b + 64 * half + 32 * (quarter & 1);
         const std::uint8_t* qh = b + 128 + 32 * half;
         const int lshift = quarter >= 2 ? 4 : 0, hshift = 2 * quarter;
-        const std::uint32_t subs = ld_u16(b + 192 + 8 * half + 2 * quarter);
+        const std::uint32_t subs = ld_u16<Shared>(b + 192 + 8 * half + 2 * quarter);
         o.sub0 = static_cast<std::int8_t>(subs & 0xFFU);
         o.sub1 = static_cast<std::int8_t>(subs >> 8);
         std::uint32_t lw[8], hw[8];
-        ld_words_a2<8>(ql, lw);
-        ld_words_a2<8>(qh, hw);
+        ld_words_a2<8, Shared>(ql, lw);
+        ld_words_a2<8, Shared>(qh, hw);
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
             const std::uint32_t lo = (lw[w] >> lshift) & 0x0F0F0F0FU;
@@ -232,11 +246,11 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     } else if constexpr (F == QType::GGML_IQ2_S) {
         const std::uint8_t* b = row + (s / 8) * 82;
         const int ib = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
+        o.d = static_cast<std::uint16_t>(ld_u16<Shared>(b));
         const int qh = b[66 + ib], sc = b[74 + ib];
         o.sub0 = 2 * (sc & 0xF) + 1;
         o.sub1 = 2 * (sc >> 4) + 1;
-        const std::uint32_t qs = ld_u32_a2(b + 2 + 4 * ib), signs = ld_u32_a2(b + 34 + 4 * ib);
+        const std::uint32_t qs = ld_u32_a2<Shared>(b + 2 + 4 * ib), signs = ld_u32_a2<Shared>(b + 34 + 4 * ib);
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const int index = ((qs >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300);
@@ -248,11 +262,11 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     } else if constexpr (F == QType::GGML_IQ3_XXS) {
         const std::uint8_t* b = row + (s / 8) * 98;
         const int ib = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
-        const std::uint32_t aux = ld_u32_a2(b + 66 + 4 * ib);
+        o.d = static_cast<std::uint16_t>(ld_u16<Shared>(b));
+        const std::uint32_t aux = ld_u32_a2<Shared>(b + 66 + 4 * ib);
         o.sub0 = o.sub1 = 2 * static_cast<int>(aux >> 28) + 1;
         std::uint32_t qw[2];
-        ld_words_a2<2>(b + 2 + 8 * ib, qw);
+        ld_words_a2<2, Shared>(b + 2 + 8 * ib, qw);
         const std::uint32_t qs0 = qw[0], qs1 = qw[1];
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
@@ -265,13 +279,13 @@ __device__ __forceinline__ Slice slice(const std::uint8_t* row, int s) {
     } else if constexpr (F == QType::GGML_IQ3_S) {
         const std::uint8_t* b = row + (s / 8) * 110;
         const int sb = s % 8;
-        o.d = static_cast<std::uint16_t>(ld_u16(b));
+        o.d = static_cast<std::uint16_t>(ld_u16<Shared>(b));
         const int qh = b[66 + sb];
         o.sub0 = o.sub1 = 2 * ((b[106 + sb / 2] >> (4 * (sb % 2))) & 0xF) + 1;
         std::uint32_t qw[2];
-        ld_words_a2<2>(b + 2 + 8 * sb, qw);
+        ld_words_a2<2, Shared>(b + 2 + 8 * sb, qw);
         const std::uint32_t qs0 = qw[0], qs1 = qw[1];
-        const std::uint32_t signs = ld_u32_a2(b + 74 + 4 * sb);
+        const std::uint32_t signs = ld_u32_a2<Shared>(b + 74 + 4 * sb);
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const std::uint32_t qs = l < 2 ? qs0 : qs1;

@@ -1818,3 +1818,210 @@ tiles unchanged.
   `q8_dispatch.cpp` a8 gate must stay after the F16Accumulate block and after the FP32-output
   early-exit; the `linear.cpp` workspace case must keep the max(f16acc, a8) form; the
   `cp_wait` slack logic (§2.2) must not be "simplified" back to a constant `wait<STAGES-2>`.
+
+---
+
+# GB10 changelog — 2026-10-31 (T10: offloaded_sparse_moe NVFP4 / Q8-GGUF narrow & wide expert kernels — shared-memory staging of the narrow 8-bit expert weight rows)
+
+## 1. Accounting
+
+- Branch `dev-rebased-20261028`; task base commit `711f4b248` (`origin/main` = `52bcb0245`).
+  `git diff --check` clean; nothing committed or pushed; `.tandem/` and `task_orchestrator.py` untouched.
+- Files changed (T10): 2 modified, +104/−39 lines. `cuda-kernel-toolkit/` intentionally excluded
+  from the enumeration (integrated toolkit, untouched).
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/ggml/ggml_dp4a.cuh` | M | `ld_u16`/`ld_u32_a2`/`ld_u32_a4`/`ld_words_a2` and `fast::slice` gained a `bool Shared = false` template flag, threaded through every format branch (`Q2_0`, `IQ4_NL`, `IQ4_XS`, `Q4_K`/`Q5_K`, `Q6_K`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`), so a row staged into shared memory decodes with `ld.shared` instead of `__ldg`. The default keeps every existing (global) call site bit-identical. The read-only codebook loads (`d_iq3s_grid`, `d_iq2s_grid`, `d_iq3xxs_grid`, `d_ksigns_iq2xs`) stay `__ldg` — they are true global `__device__` tables |
+| `src/ops/offloaded_sparse_moe/cuda/ggml_expert_a8.cuh` | M | `staged_run_bytes()` / `stage_row_run()` and shared-memory staging of the narrow 8-bit kernels' weight rows: `gate_up_kernel_ggml_a8` stages its 4 gate rows and 4 up rows (two runs, 8.4–8.8 KiB dynamic shared) and `down_kernel_ggml_a8` its 32 down rows (5.8–10.6 KiB) with `ggml::tile::cp_async16` before the pass loop, waits with `cp_async_wait<0>()` + `__syncthreads()` and decodes with `fast::slice<F, true>`; both launchers pass the stage size as dynamic shared |
+
+## 2. Architectural rationale & task premise analysis (`20261031-performance-tasks.md` T10)
+
+The task's mechanism ("overlap first-pass activation/scale reads with weight `cp.async` staging
+before `stage_wait()`, double-buffer K-tile staging across 48 SMs in wide expert prefill") was
+checked against each named target file before changing anything. Four of its premises did not hold
+on this tree; the defect it was reaching for was elsewhere on the same route.
+
+1. **`cuda/narrow_expert.cu` is not a production route.** It is compiled only into
+   `infernix_offloaded_moe_cuda_test` (`tests/ops/test_offloaded_moe_cuda.cu`); the narrow kernels
+   that a real call runs are `moe_layer.cu`'s A4/A16/A4r kernels and
+   `ggml_expert_a8.cuh`'s 8-bit pair. It has no `cp.async` staging to overlap, so the requested
+   change there would have measured nothing. Left untouched.
+2. **The NVFP4 narrow kernels already stage before they read.** `moe_layer.cu`'s A4
+   `gate_up_kernel`/`down_kernel` and `nvfp4_expert_a8.cuh`'s `gate_up_kernel_nvfp4_a8` issue
+   `stage_async` (per-thread `cp.async.cg`, 16 B) for the record's slice before the pass loop and
+   `stage_wait()` before the decode; only the *activation* (`x_rows`) pointers are formed before the
+   wait, and their loads are independent of the record. Two variants that moved the activation reads
+   ahead of the wait and one that replaced `stage_async` with a single-thread `cp.async.bulk` +
+   mbarrier per slice were measured on the NVFP4 decode bench: **neutral** (T=1 warm 93.6–102 µs for
+   both binaries), so all three were reverted. The A4 kernels are latency-bound, not staging-order
+   bound (3.58 warps/scheduler, `long_scoreboard` dominant, 101 regs, 50,048 B shared → 2 CTAs/SM).
+3. **The wide kernels are already double-buffered.** `wide_expert_a16.cuh` (`ScheduleA16`: 1 CTA/SM,
+   544 threads, 2 stages) and `wide_expert_a8.cuh` (`ScheduleA8`: 2 CTAs/SM, 288 threads, 2 stages)
+   are warp-specialized producer/consumer pipelines over `cp.async.bulk.shared::cta.global` +
+   `cta_mbarrier_*` with `kStages = 2` — the "double-buffering K-tile staging across 48 SMs" the
+   task asks for already exists. Their `TFLOP/s` at `T = 4096` (a4 43.6, a8 25.6, a16 19.8) is far
+   below any Tensor Core ceiling because the tiles are latency/issue-bound, not pipe-bound (ncu at
+   `T = 4096`: tensor 24.8 %, LSU 29.4 %, warps_active 36.9 %). **No wide change shipped, and the
+   ≥ 90 %-of-active-TC-pipe bar is not reachable by a staging change** — see §5.
+4. **The task's test target name is wrong.** There is no `infernix_ops_moe_test`; the ctest names
+   are `infernix_ops_offloaded_moe_test` (the op binary) and the
+   `infernix_offloaded_moe_{cuda,layer,wide,plan,team,idle,...}_test` suite.
+5. **Where the actual defect was.** The Q8/GGUF narrow 8-bit kernels — named in the target list but
+   outside the task's stated mechanism — read 14.5–17.5 L1 sectors per global load request (ncu):
+   a slice's fields (the block's fp16 scale, its sub-scale bytes, the code words, the sign bytes)
+   are scattered through the row, so every one of a thread's sub-4-byte `__ldg`s pulls a sector and
+   stalls on `long_scoreboard`. This is the route's bandwidth defect, and staging the rows is what
+   fixes it: it converts those scattered requests into one coalesced `cp.async` sweep per CTA whose
+   copies are in flight while the pass's activation rows are read and (in the down kernel) while the
+   pass's `h` values are quantized into shared memory.
+6. **`__launch_bounds__(128, 3)` / ≤ 64 registers** applies to the wide kernels; the narrow 8-bit
+   pair runs at 90 (gate/up) and 54 (down) registers under `__launch_bounds__(128)` with
+   `STACK:0 LOCAL:0`. Clamping gate/up to 64 registers to reach 8 CTAs/SM would spill, which the
+   one-way `infernix_cuda_stack_check` ratchet forbids, so the clamp was not applied.
+7. **Bug class found while landing this** (worth keeping for future staging work): staging several
+   runs into one dynamic shared buffer means *every* consumer pointer must carry the run base. The
+   first version read `weights + pad_up + warp * row_bytes` for the up rows and silently decoded the
+   gate rows in the up lanes — 100 % of outputs wrong, deterministic, and invisible in the SASS
+   (the `LDGSTS`/`DEPBAR`/`BAR`/`LDS` ordering was correct). Isolated with a standalone `nvcc`
+   repro under `/tmp` that `#include`s the real header
+   (`-I src -I include -std=c++20 -arch=sm_121a`, ~30 s per cycle instead of a full-tree rebuild)
+   and dumps the staged bytes: `stage_row_run` was correct, the consumer pointer was not.
+
+## 3. Subsystem breakdown
+
+- **ops/ggml (decoder)** — `M ggml_dp4a.cuh`: the `Shared` load flag is the only change; it exists
+  because `__ldg` on a shared address is not a thing, and duplicating the eight-branch decoder would
+  have forked the exact arithmetic. Default `false` keeps the global path byte-identical (verified by
+  hash, §4.2).
+- **ops/offloaded_sparse_moe (narrow 8-bit experts)** — `M ggml_expert_a8.cuh`: `stage_row_run`
+  follows `ggml_tile.cuh`'s staging convention (the pad is taken from the *absolute* address, so no
+  assumption about the record's alignment; the source end is rounded out to whole 16-byte pieces
+  whose tail `cp.async` zero-fills). The gate/up kernel stages both runs with one `commit` and waits
+  once per pass; the down kernel's wait is folded into the barrier that already guards the pass's
+  codes, so it adds no barrier. Records are read at most 15 bytes past a run's end and before its
+  begin, which is inside the record (the down block follows the up block, and the pitch is
+  16-rounded) — the same convention the wide tiles' bulk copies already rely on.
+- No change to the A4/A16/A4r narrow kernels, the NVFP4 a8 kernels, the wide tiles, the CPU route,
+  the converter, or any public contract.
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+Build: `find src/ops/offloaded_sparse_moe -name '*.cu' -exec touch {} +` (header edits do not
+trigger ninja rebuilds in this tree) then one
+`ninja -C build-native -j "$(nproc)" infernix-serve bench/infernix_offloaded_moe_decode_bench
+bench/infernix_offloaded_moe_wide_bench infernix_ops_offloaded_moe_test` (shared device link).
+
+### 4.1 Numerical and resource gates
+
+- `ctest --test-dir build-native -R "offloaded_moe|cuda_stack_check" --output-on-failure` →
+  **20/20 passed** (253 s, no `--parallel`, which causes numerical failures on this host),
+  including `infernix_cuda_stack_check` and `infernix_offloaded_moe_layer_test` (106.6 s).
+- `infernix_ops_offloaded_moe_test offloaded_moe_ggml_a8` → **ok** (the a8 GPU kernels are
+  bit-equal to the CPU 8-bit route at every format pair, width, placement, fork and CPU-miss
+  configuration — 196 failures before the fix in §2.7, 0 after).
+- Bit-exactness against the pre-change binary: `output fnv1a` identical for all 8 supported
+  gate/up × down pairs at `T = 1,8`, and unchanged for the NVFP4 a4 route at `T = 64..4096`.
+- Resources (`cuobjdump -res-usage` on `moe_layer.cu.o`): `gate_up_kernel_ggml_a8` `REG:90
+  STACK:0 LOCAL:0`, `down_kernel_ggml_a8` `REG:54 STACK:0 LOCAL:0`. No `ggml_a8` symbol is in
+  `tools/cuda_stack/cuda_stack_allowlist.json`, so the ratchet was neither raised nor lowered.
+
+### 4.2 Q8/GGUF narrow decode (interleaved A/B, 3 alternating rounds, `--bank ggml --ggml-wide a8
+--placement frames --cold`, IQ3_S/IQ4_NL; GB/s = unique expert-record bytes / median)
+
+| T | experts | base µs | cand µs | Δ | base GB/s | cand GB/s |
+|---|---|---|---|---|---|---|
+| 1 | 10 | 151.4 | **134.0** | **−11.5 %** | 123.4 | **139.5** |
+| 2 | 18 | 257.9 | **220.0** | **−14.7 %** | 130.4 | **152.9** |
+| 4 | 37 | 525.9 | **454.2** | **−13.6 %** | 131.5 | **152.2** |
+| 8 | 73 | 1017.4 | **885.8** | **−12.9 %** | 134.1 | **154.0** |
+
+Gate/up staging alone (measured before the down kernel was staged) was worth only 0.8–1.3 %; the
+down kernel's rows were the dominant scattered-read cost. Without `--cold` the `T = 1` point reads
+67.7 µs (276 GB/s) — that is the 18.7 MB working set served from the 24 MiB L2, not a UMA figure, and
+is not claimed against the bandwidth bar.
+
+### 4.3 Why, per kernel (ncu, synthetic bench fixtures, `T = 1`, isolated)
+
+| kernel | µs base → cand | L2 bytes base → cand | long_scoreboard | barrier | warps_active | occupancy limit |
+|---|---|---|---|---|---|---|
+| `gate_up_kernel_ggml_a8<IQ3_S>` | 140.9 → 132.6 | 21.86 → 21.85 MB | 13.2 → 13.0 | 0.9 → 0.9 | 40.0 % → 40.1 % | registers (5 CTAs, 90 regs) |
+| `down_kernel_ggml_a8<IQ4_NL>` | 106.9 → **63.2** | 14.03 → **9.96 MB** | 26.6 → **12.8** | 7.7 → 2.8 | 66.0 % → 39.9 % | shared memory (5 CTAs) |
+
+The down kernel trades occupancy (register-limited 9 CTAs → shared-limited 5) for a halved
+long-scoreboard and 29 % less L2 traffic; the trade wins by 41 % in isolation and is what the
+end-to-end −12…−15 % comes from.
+
+### 4.4 Q8/GGUF prefill (same route, `T = 64..1024`, median µs; `frames` / `staged`)
+
+| T | base | cand | Δ |
+|---|---|---|---|
+| 64 | 4662.8 / 13445.4 | **4146.6 / 11449.9** | **−11.1 % / −14.8 %** |
+| 256 | 9461.0 / 23441.6 | 9253.6 / **18753.7** | −2.2 % / **−20.0 %** |
+| 1024 | 14622.8 / 25362.7 | 14622.4 / **22446.1** | 0.0 % / **−11.5 %** |
+
+The `frames` column is where the wide tiles dominate (jobs above `moe::kMaxColumns` columns never
+touch the narrow kernels), which is why only the `staged` column — where more jobs stay narrow —
+moves across the board.
+
+### 4.5 Unaffected routes (no-regression check)
+
+- NVFP4 decode bench (`infernix_offloaded_moe_decode_bench`, CUDA-graph timed): `T = 1 top_k=10`
+  warm 84.6/88.5 µs (base) vs 84.5/90.2 µs (cand), cold 134.0/135.3 vs 133.8/132.9 — within run to
+  run spread; `exact=yes` at every point.
+- NVFP4 a4 prefill (`--activation a4 --placement frames`): ±1 % in both candidate-order directions
+  (ordering bias, not a change); `output fnv1a` identical at `T = 64, 256, 1024, 4096`.
+
+## 5. Accepted gaps, honest ceilings & rebase conflict policy
+
+### 5.1 Bars that were NOT met
+
+- **≥ 221.4 GB/s (90 % of 246.0 GB/s) resident narrow decode: unmet on both banks.** Q8/GGUF
+  `T = 1` cold reaches 139.5 GB/s (was 123.4) — 56 % of the bar. NVFP4 `T = 1` cold is 206 GB/s
+  (27.65 MB / 134 µs) and 327 GB/s warm, i.e. the bar is met only when the records are L2-resident,
+  which is not a UMA measurement. `docs/gb10_roadmap.md`'s expected decode window is 190–246 GB/s;
+  the GGUF narrow route is still below it.
+- **Wide prefill +10–20 % and ≥ 90 % of the active Tensor Core pipe: unmet, and not reachable by
+  the requested change.** The wide tiles are already double-buffered warp-specialized TMA pipelines
+  (§2.3); at `T = 4096` the a4 route runs at 43.6 TF/s with tensor-pipe utilization 24.8 % and
+  warps_active 36.9 %, so the limiter is issue/latency coverage in the tile loop, not K-tile
+  staging. Closing that needs a tile/pipeline redesign (more resident rows per CTA, deeper stages
+  within the 99 KiB/SM budget), which is out of scope for a staging task and was not attempted.
+- **≤ 64 registers under `__launch_bounds__(128, 3)`**: not applied to the narrow 8-bit kernels —
+  see §2.6; they are spill-free at their natural 90/54 registers.
+
+### 5.2 What still limits the staged kernels (measured, untried fixes)
+
+- `gate_up_kernel_ggml_a8` is now the dominant kernel (132.6 µs isolated) and is unchanged in
+  character: 40.1 % warps active, register-limited to 5 CTAs/SM at 90 registers, `long_scoreboard`
+  13.0 from the per-thread `x`-code `__ldg`s (15 dependent 16-byte loads per thread per pass).
+  Candidates, none measured: stage the pass's `x` rows into shared as the down kernel stages `h`
+  (costs 2.9 KiB per column, so it is occupancy-negative at 8 columns); a depth-2 prefetch of the
+  next slice's `x` words (+ ~12 registers, still 5 CTAs); or splitting the 8-column pass so fewer
+  registers are live.
+- `down_kernel_ggml_a8` is now shared-memory-limited (5 CTAs). A `Q2_0` down format (330 B rows)
+  costs 10,576 B of stage versus 5,776 B for `IQ4_NL`, so the `Q2_0` pairs pay more of the
+  occupancy cost; both were checked bit-exact and the `IQ4_NL` pair is the shipped default.
+- `ggml_a8_encode_x_kernel` is 7.9 µs isolated at `T = 1` on a single 96-thread CTA (6.2 % warps
+  active) — ~6 % of the call, untouched here.
+- The staging is one-shot per CTA, not double-buffered across passes: a call whose experts have
+  more than `kA8Columns = 8` columns re-reads the staged rows from shared per pass (no extra global
+  traffic), so multi-pass calls gain less than the `T = 1..8` points above.
+
+### 5.3 Rebase conflict resolution policy
+
+- `ggml_dp4a.cuh`: the `Shared` template parameter must keep its `= false` default on all five
+  helpers and on `fast::slice` — the global path's bit-identity (and therefore the CPU-route
+  equivalence of every non-staged ggml kernel) depends on it. Do not "simplify" it back to `__ldg`
+  in the `Shared` branch: `__ldg` on a shared address is undefined and produced 100 % wrong
+  outputs before the split.
+- `ggml_expert_a8.cuh`: keep `staged_run_bytes` `__host__ __device__ __forceinline__ constexpr`
+  (nvcc rejects a host-only `constexpr` from a `__global__` without `--expt-relaxed-constexpr`,
+  which this build does not pass). Keep the pad taken from the absolute address, and keep the run
+  base in every consumer pointer (§2.7). If a future rebase reintroduces `narrow_expert.cu` as a
+  production route, it needs its own staging decision — it currently has none.
+- GB10 invariants that shaped this: 48 SMs and 24 MiB L2 make the `T = 1` GGUF working set
+  L2-resident (warm numbers are not UMA bandwidth); 99 KiB shared/SM makes shared staging an
+  explicit occupancy trade that must be measured, not assumed; UMA sustained read ~247 GB/s means
+  the narrow route is memory-latency-bound at these column counts, so sector-per-request efficiency,
+  not bytes, was the lever.
