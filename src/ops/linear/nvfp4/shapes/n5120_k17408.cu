@@ -45,7 +45,7 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 257) return nvfp4_a4_tma_route<Nvfp4GeometryId::N5120K17408>();
+    if (tokens >= 257) return nvfp4_a4_tma_route<>();
     if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R128>();
     if (tokens <= 48) return nvfp4_a4_mma_route<Geometry, T64R64>();
@@ -57,6 +57,6 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 8; }
 } // namespace
 
-const Nvfp4LinearShape kNvfp4N5120K17408{5120, 17408, launch_a16, launch_nvfp4_a4<select_a4>,
-                                         uses_a4};
+const Nvfp4LinearShape kNvfp4N5120K17408{
+    5120, 17408, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail

@@ -425,3 +425,210 @@ MMA tiles, and re-bands the seven tables around them.
   the single-schedule `MmaR32T32K128A1` `T = 1..32` ladder on `[2560, 640]`, the zero-spill
   `SlicedR16T48W4S1`/`S2` and `MmaR32T64K128A1` mid-band schedules across `[1024, 2048]`,
   `[1024, 5120]`, and `[1280, 2560]`, and `n10240_k320.cu`'s existing stream/MMA dispatch.
+
+---
+
+# GB10 changelog — 2026-10-31 (T4: enable and retune NVFP4 `A4` (1-term) and `Nvfp4A4Pair` (2-term) TMA prefill across the 11 prefill shapes)
+
+## 1. Accounting
+
+- **Base**: `71da249c6` (`dev-rebased-20261028`).
+- **Files changed**: 23 modified, 0 added, 0 deleted (`+309 / -147`), excluding this changelog.
+  `git diff --check` is clean on the final tree.
+  - Ops & quantization (9): `src/ops/linear/nvfp4/nvfp4_schedule.cuh` (M) — per-descriptor
+    `Nvfp4A4TmaPromotions` replaces the single `WeightCodePromotion` template argument;
+    `nvfp4_a4_tma.cuh` (M) — `nvfp4_make_tma_planes` / `make_nvfp4_a4_tma_descriptors` take one
+    promotion per descriptor (`a_codes`, `b_codes`, `b_scales`);
+    `nvfp4_a4_tma.cu` (M) — the `Nvfp4GeometryId` switch is replaced by a `K`-dispatched launcher
+    (`launch<K, Tiled128Rows, Tiled128Stages, Promotions>`); `nvfp4_a4_tma_launch.h` (M) —
+    `launch_nvfp4_a4_tma_linear` loses its geometry-id parameter;
+    `nvfp4_launch.cuh` (M) — `nvfp4_a4_tma_route<Layout>` builds the route from the schedule
+    (launch + scale layout + reciprocal quantize) instead of the caller restating three pointers;
+    `attn_input_proj/nvfp4/nvfp4_attn_input_a4_tma.cu`, `gdn_input_proj/nvfp4/…`,
+    `linear_add/nvfp4/…`, `linear_swiglu/nvfp4/…` (M) — call-site updates to the named promotion
+    constants only (behaviour unchanged; they already passed `L2_128B` for the weight codes).
+  - Shape dispatch tables (11): `n6144_k2560.cu`, `n10240_k2560.cu`, `n12800_k2560.cu`,
+    `n13952_k2560.cu`, `n16384_k2560.cu`, `n2560_k6144.cu` (M) — register the A4 1-term ladder
+    (`launch_nvfp4_a4<select_a4>` + a measured `uses_a4` admission) where they previously threw
+    `std::logic_error`; `n5120_k6144.cu`, `n5120_k17408.cu`, `n14336_k5120.cu`, `n16384_k5120.cu`,
+    `n34816_k5120.cu` (M) — register `launch_nvfp4_a4_pair` with `pair_min_tokens = 65`, plus the
+    GB10 A16 prefill re-fit on `[14336, 5120]` / `[16384, 5120]`.
+  - Bench (2): `bench/ops/nvfp4_route_sweep.cu` (M) — promotion-named TMA candidates, weight-scale
+    and all-descriptor variants, and `a4_split_{1q1g,2q1g,1q2g}` differential candidates that
+    separate the quantizer cost from the GEMM cost; `bench/ops/linear_bench.cu` (M) — the
+    `NVFP4_F32ACC` profile is now reported per registered shape at its real `uses_a4`/pair admission
+    threshold instead of a 5-shape list with a blanket `T >= 2`.
+  - Tests (1): `tests/ops/linear/test_nvfp4_a4.cpp` (M) — 6 shapes × 22 A4-policy invocations
+    (incl. 5 graph-replay) and 5 more shapes under `NVFP4_A4_PAIR`.
+- **Allowlist delta**: none. `tools/cuda_stack/cuda_stack_allowlist.json` is untouched and
+  `infernix_cuda_stack_check` passes, so none of the 6 new A4 ladders, the 11 new pair records, or
+  the 3 new A16 instantiations introduced a `STACK`/`LOCAL` symbol.
+
+## 2. Architectural rationale & task premise analysis (`20261031-performance-tasks.md` T4)
+
+Measured on this host (`sm_121a`, 48 SMs, 24 MiB L2, 128 GiB unified LPDDR5X — 246 GB/s measured
+sustained read), cold 32 MiB L2, `--warmup 2 --repeat 10`, baseline = rebuilt `71da249c6` binary
+measured in the same session as the candidate (absolute-µs bars drift ±3.5% with thermal state).
+
+1. **`--policy a4` falls back to `BF16_F32ACC` on 6 shapes (confirmed, fixed)**: `uses_a4` returned
+   `false` and `launch_a4` threw for `[6144, 2560]`, `[10240, 2560]`, `[12800, 2560]`,
+   `[13952, 2560]`, `[16384, 2560]` and `[2560, 6144]`. Each now carries the same ladder as its
+   proven sibling (`nvfp4_a4_tma_route<>` at `T >= 257`, `nvfp4_a4_tma_route<Tiled128>` at
+   `T = 129..256` for `K = 2560`, `Nvfp4A4MmaSchedule` rungs below), admitted by a measured
+   threshold (`T >= 33` for `K = 2560`, `T >= 17` for `[2560, 6144]`, where the A16 GEMV/sliced-K
+   decode tiles still win). This is a real production route, not a bench-only one:
+   `tools/convert/quasar_nvfp4.py` assigns `activation_policy="AllowA4"` to `/gdn/*`, `/attention/*`
+   and `/mlp/*`, so a QUASAR NVFP4 artifact asks for A4 on exactly these parameters and silently
+   got the BF16-accumulate A16 route. `2.62x..3.36x` at `T = 4096` (§4 table).
+2. **`Nvfp4A4Pair` missing on the 5 `K = 5120`/`N = 5120` shapes (confirmed, fixed)**: their
+   `Nvfp4LinearShape` records had 5 fields, so `--routes fast` ran the A16 table at every width.
+   Registering `launch_nvfp4_a4_pair` with `pair_min_tokens = 65` gives `2.02x..2.85x` at
+   `T = 4096` and moves the three `K = 5120` shapes from `64.96..72.12` useful TFLOP/s to
+   `182.54..187.26` — **the doc's `>= 165..195` useful (`330..390` hardware OMMA) bar is met.**
+   The `Grouped, 8` A16 fallback the doc names is the existing raster (`nvfp4_tma_raster_blocks`,
+   `group_n = k > 6144 ? 4 : 8`); it needed no change, and the A16 tables behind it were still the
+   RTX 5090 fit, so they were re-fit too (item 5).
+3. **Implementation step 1 — promote `a_codes`, `b_codes` *and* `b_scales` (partly falsified)**:
+   the linear A4 TMA route previously had one promotion knob, defaulting to `NONE` on all three
+   descriptors; it is now one named constant per descriptor. At the same geometry
+   (`t256_r128_s3_m1`, `T = 4096`) only the weight panel pays, and only at `K <= 6144`:
+   `[5120, 6144]` `1251.6 us → 990.6 us` (`-20.9%`) with `b_codes = L2_128B`; adding
+   `b_scales` costs `+19.6%` (`1185.2 us`) and adding `a_codes` too is neutral (`988.3 us`,
+   `0.2%`); at `[5120, 17408]` every combination is within `0.3%` (`2942..2950 us`) and at
+   `[16384, 2560]` promotion is a `+1.0%` loss. The shipped default is therefore
+   `{a_codes: NONE, b_codes: L2_128B, b_scales: NONE}` — the doc's `a_codes`/`b_scales` promotion
+   is not shipped. End-to-end at `T = 4096` the promotion change is inside the noise on the 5
+   already-A4 shapes (`1003.6 → 1005.4` and `2940.7 → 2933.6 us`): the quantizer, not the weight
+   panel, owns the residual gap (item 6).
+4. **Implementation step 2 — switch `N = 5120` prefill to `Tiled128 (BM = 128, GroupM = 8)` (falsified)**:
+   the 128-token/64-row TMA tile is the *slowest* prefill candidate at both shapes —
+   `[5120, 6144]` `1583.9 us` vs `990.6 us` for the shipped `Tiled256` tile (`+60%`),
+   `[5120, 17408]` `3842.1 us` vs `2945.2 us` (`+30%`). A `GroupTokens` raster-band override was
+   added to test the `GroupM = 8` half of the claim and never won beyond noise
+   (`K = 17408`: `g8 +8%`, `g16 +79%`; `K = 6144`: `g2 +11%`, `g8/g16` within `0.7%`), so the knob
+   and its raster parameter were removed rather than left as a dead template argument.
+   The `Tiled128` layout is kept only where it genuinely wins (`T = 129..256` on the `K = 2560`
+   shapes and on the 2-term residual route, which is `Tiled128`-native).
+5. **A16 fallback re-fit on `[14336, 5120]` / `[16384, 5120]` (new finding, in the doc's scope)**:
+   both tables still carried the RTX 5090 `t256` tail `Nvfp4A16MmaSchedule<64,256,64,32,32,2,1>`,
+   the slowest candidate at every prefill width. The 128-row K64 GB10 tile
+   `<128,64,64,64,16,2,2>` takes `T >= 129` (`-12.6%` / `-19.8%` at `T = 4096`, `-36%` at `T = 256`
+   on `[16384, 5120]`), and the 64-row K128 tile takes `T = 97..128` (`-15%` / `-5.7%`). At
+   `T = 160..192` the old `64x128` tile paid `+26..28%` for slab padding that the 64-row tile
+   avoids. After the change the production route sits at the swept argmin at every width tested
+   (`|Δ| <= 1%` at `T = 96..512`, two runs).
+6. **The `>= 330..360` / `>= 320..355` / `>= 300..360` `--policy a4` bars are not reachable from
+   dispatch, and the doc's baseline for `[5120, 17408]` is stale**: the differential candidates
+   (`t(2q1g) - t(1q1g)` = quantizer, `t(1q2g) - t(1q1g)` = GEMM alone) split `T = 4096` as:
+
+   | shape | `1q1g` total | quantizer `Q` | GEMM `G` | end-to-end | GEMM alone |
+   |---|---|---|---|---|---|
+   | `[5120, 17408]` | 2939.3 us | 807.5 us | 2151.6 us | 248.4 TF/s | **339.4 TF/s** (77.1% of 440) |
+   | `[5120, 6144]` | 982.4 us | 306.2 us | 743.5 us | 262.3 TF/s | **346.6 TF/s** (78.8%) |
+   | `[34816, 5120]` | 4024.7 us | 274.5 us | 4225.2 us | 362.8 TF/s | **345.6 TF/s** (78.5%) |
+   | `[16384, 2560]` | 1284.2 us | 69.2 us | 1195.9 us | 267.6 TF/s | **287.3 TF/s** (65.3%) |
+
+   The GEMM is at 77–79% of the 440 TF/s `OMMA.16864` reference where the tile family is at its
+   structural limit (`Stages = 4` does not fit the 99 KiB SMEM at `BlockTokens = 256` /
+   `BlockRows = 128`, and per-CTA `ldmatrix` traffic exceeds tensor-core issue time), and at
+   `K = 2560` the same tile reaches only 287 TF/s — below the doc's `>= 300` floor for that whole
+   family. The remaining `21..25%` on `K = 6144/17408` is the quantizer, which is stream-serialized
+   ahead of the GEMM (`pdl::launch_consumer` becomes programmatic-dependent only under graph
+   capture, so an eager A4 call cannot overlap the two) and moves its operands at 196–226 GB/s,
+   80–92% of the 246 GB/s measured sustained read. Closing those bars needs a cross-kernel change
+   (a second stream or a fused quantize→GEMM producer/consumer pipeline), not a tile, promotion or
+   raster choice; it is listed as an accepted gap rather than attempted here.
+7. **Bench reporting correction**: at `T >= 128` the old `linear_bench` predicate labelled
+   `[5120, 6144]` `--routes fast` as `NVFP4_F32ACC` (`76.38 TF/s` above) although no pair route was
+   registered and the A16/BF16 route actually ran. The profile column is now derived from each
+   record's real `uses_a4`/`pair_min_tokens` admission, so a `NVFP4_F32ACC` row means the tensor-core
+   route really executed. The `[5120, 17408]` A4 baseline quoted by the doc (`196.79 TF/s`) measures
+   `248.29 TF/s` on the unmodified base binary; `[5120, 6144]` (`258.97`) measures `256.79`.
+
+## 3. Subsystem breakdown
+
+| Subsystem | File | Action | Mechanism |
+|---|---|---|---|
+| Ops (schedule) | `nvfp4_schedule.cuh` | M | `Nvfp4A4TmaPromotions{a_codes,b_codes,b_scales}` + 4 named constants; default `{NONE, L2_128B, NONE}`; dead `GroupTokens` argument removed |
+| Ops (TMA) | `nvfp4_a4_tma.cuh` | M | per-descriptor `l2_promotion` on the plane/2-D `a_codes`, `b_codes`, `b_scales` maps; raster keeps its capacity-derived `group_n` |
+| Ops (TMA) | `nvfp4_a4_tma.cu`, `nvfp4_a4_tma_launch.h` | M | `K`-dispatched launcher (`{2560, 5120, 6144, 17408}` → Tiled128 `<128, 3, m1/m2, r64>` + Tiled256 `<256, 3, m1>`); geometry-id parameter dropped |
+| Ops (route) | `nvfp4_launch.cuh` | M | `nvfp4_a4_tma_route<Layout>` returns `{launch, scales, reciprocal_quantize}` built from the schedule |
+| Ops (fused) | 4 × `*_a4_tma.cu` | M | named promotion constants only |
+| Shapes | 6 × `n*_k2560.cu` / `n2560_k6144.cu` | M | A4 ladder + measured admission where `launch_a4` threw |
+| Shapes | 5 × `n*_k5120.cu` / `n5120_k*.cu` | M | pair record (`launch_nvfp4_a4_pair`, `65`); `[14336,5120]`/`[16384,5120]` A16 prefill re-fit |
+| Bench | `nvfp4_route_sweep.cu` | M | promotion variants + `a4_split_*` differential candidates for the `Q`/`G` attribution |
+| Bench | `linear_bench.cu` | M | per-shape `uses_a4`/pair admission table for the `NVFP4_F32ACC` profile |
+| Tests | `test_nvfp4_a4.cpp` | M | A4 policy on the 6 newly enabled shapes; pair on the 5 newly registered ones |
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+- Build: `ninja -C build-native -j "$(nproc)" infernix-serve infernix_linear_bench
+  infernix_nvfp4_route_sweep infernix_ops_linear_test` in one invocation after touching the nvfp4
+  `.cu` files (the CUDA depfiles in this tree do not track headers). Note that
+  `infernix_linear_nvfp4_a16_test` / `infernix_linear_nvfp4_a4_test` named by the task doc are no
+  longer build targets — the op tests compile into the family executable `infernix_ops_linear_test`,
+  which CTest runs per member.
+- Tests (serial; `--parallel` produces spurious numerical failures on this single-GPU host):
+  `infernix_linear_nvfp4_a4_test` (now 11 A4 shapes + 13 pair shapes),
+  `infernix_linear_nvfp4_a16_test`, `infernix_nvfp4_a16_slice_ring_test`,
+  `infernix_nvfp4_tma_staging_race_test` and `infernix_cuda_stack_check` pass; the whole linear
+  family (20 CTest entries driven by `infernix_ops_linear_test`) passes — `20/20`, 376.8 s.
+- A/B (`T = 4096`, `--warmup 2 --repeat 10`, base = rebuilt `71da249c6`; `0.99..1.01x` = unchanged
+  within thermal drift):
+
+  | shape | route | base us | T4 us | Δ | base TF/s | T4 TF/s | profile |
+  |---|---|---|---|---|---|---|---|
+  | `[5120, 6144]` | a4 | 1003.6 | 1005.4 | 1.00x | 256.79 | 256.32 | NVFP4 (unchanged) |
+  | | fast | 3373.9 | 1670.0 | **2.02x** | 76.38 | 154.31 | NVFP4 (mislabeled → correct) |
+  | | exact | 3380.9 | 3417.0 | 0.99x | 76.22 | 75.42 | BF16 |
+  | `[5120, 17408]` | a4 | 2940.7 | 2933.6 | 1.00x | 248.29 | 248.89 | NVFP4 |
+  | | fast | 10916.7 | 4903.7 | **2.23x** | 66.88 | 148.90 | BF16 → NVFP4 |
+  | | exact | 10949.4 | 10899.3 | 1.00x | 66.68 | 66.99 | BF16 |
+  | `[14336, 5120]` | a4 | 1861.5 | 1865.5 | 1.00x | 323.02 | 322.32 | NVFP4 |
+  | | fast | 8853.6 | 3294.0 | **2.69x** | 67.92 | 182.54 | BF16 → NVFP4 |
+  | | exact | 8860.5 | 7477.1 | **1.19x** | 67.86 | 80.42 | BF16 |
+  | `[16384, 5120]` | a4 | 2074.3 | 2079.6 | 1.00x | 331.29 | 330.45 | NVFP4 |
+  | | fast | 10578.8 | 3708.8 | **2.85x** | 64.96 | 185.29 | BF16 → NVFP4 |
+  | | exact | 10625.9 | 8876.9 | **1.20x** | 64.67 | 77.41 | BF16 |
+  | `[34816, 5120]` | a4 | 4106.5 | 4107.1 | 1.00x | 355.61 | 355.55 | NVFP4 |
+  | | fast | 20247.4 | 7798.1 | **2.60x** | 72.12 | 187.26 | BF16 → NVFP4 |
+  | | exact | 20047.7 | 20006.8 | 1.00x | 72.84 | 72.99 | BF16 |
+  | `[6144, 2560]` | a4 | 1658.7 | 572.1 | **2.90x** | 77.68 | 225.24 | BF16 → NVFP4 |
+  | `[10240, 2560]` | a4 | 2733.9 | 868.2 | **3.15x** | 78.55 | 247.36 | BF16 → NVFP4 |
+  | `[12800, 2560]` | a4 | 3412.8 | 1042.1 | **3.27x** | 78.65 | 257.58 | BF16 → NVFP4 |
+  | `[13952, 2560]` | a4 | 3740.5 | 1126.3 | **3.32x** | 78.22 | 259.79 | BF16 → NVFP4 |
+  | `[16384, 2560]` | a4 | 4338.6 | 1292.0 | **3.36x** | 79.20 | 265.94 | BF16 → NVFP4 |
+  | `[2560, 6144]` | a4 | 1716.1 | 655.2 | **2.62x** | 75.08 | 196.67 | BF16 → NVFP4 |
+  | K = 2560 × 5, `[2560, 6144]` | fast | — | — | 0.99–1.01x | 122.7–174.7 | 122.4–173.8 | NVFP4 (pair already registered) |
+  | K = 2560 × 6 | exact | — | — | 0.99–1.01x | 74.7–78.9 | 74.7–79.5 | BF16 (untouched tables) |
+
+- Acceptance summary: the `K = 5120` `--routes fast` bar is **met** (`182.54..187.26` useful TFLOP/s
+  vs `165..195`); the `K = 2560` shapes **switch** to `NVFP4_F32ACC` as required but land at
+  `196.7..265.9 TF/s`, not `300..360`; `[5120, 17408]` (`248.89`) and `[5120, 6144]` (`256.32`)
+  stay at their base values, below the `330..360` / `320..355` bars, for the measured reason in §2.6.
+
+## 5. Accepted gaps & rebase conflict resolution policy
+
+- **Unmet bars**: `--policy a4` at `T = 4096` stays at `196.7..265.9 TF/s` on the newly enabled
+  shapes and at `248.9 / 256.3` on `[5120, 17408]` / `[5120, 6144]`. Cause and the missing lever are
+  quantified in §2.6 (GEMM at 65–79% of the pipe at its SMEM/`ldmatrix` limit; the quantizer
+  serialized ahead of it at 80–92% of sustained read). The follow-up is a quantize/GEMM overlap
+  (multi-stream or a fused producer-consumer kernel), which is an execution-contract change in Ops
+  and was not attempted at T4's scope.
+- **Not shipped, with evidence**: `a_codes`/`b_scales` L2 promotion (neutral to `+19.6%`), the
+  `Tiled128 (BM = 128)` prefill switch for `N = 5120` (`+30..60%`), and the `GroupTokens` raster
+  override (never better than `0.7%`; removed together with its raster parameter).
+- **Still A4-disabled**: `[128, 2560]`, `[512, 2560]`, `[2048, 2560]`, `[2560, 2560]` keep
+  `uses_a4 == false` and their pair-only records — outside T4's named shape list; `[2048, 2560]`
+  and `[2560, 2560]` belong to T5's decode sweep.
+- **Route-shift note for reviewers**: because `uses_pair` excludes widths an A4 1-term admits, an
+  `AllowA4` artifact on the 6 newly enabled shapes now runs the 1-term route at `T >= 33` where it
+  previously ran the 2-term pair from `T >= 65` (`[16384, 2560]`: `1977 → 1292 us`). The term count
+  is the artifact's `ActivationPolicy` choice (`AllowA4` vs `AllowA4Residual`), which is the
+  pre-existing contract on the 5 already-enabled shapes; no artifact's declared semantics changed.
+- **Rebase policy**: preserve the per-descriptor `Nvfp4A4TmaPromotions` default
+  `{NONE, L2_128B, NONE}` (upstream's single `WeightCodePromotion` argument re-loses `21%` at
+  `K = 6144`), the `K`-dispatched TMA launcher over any geometry-id switch, the `Tiled256` prefill
+  tile on `N = 5120`, the `T >= 129` 128-row K64 A16 tiles on `[14336, 5120]` / `[16384, 5120]`,
+  and the 11-shape A4/pair registrations (an upstream table that re-adds `throw std::logic_error`
+  in `launch_a4` silently reverts `2.6..3.4x` on the `K = 2560` linears for `AllowA4` artifacts).

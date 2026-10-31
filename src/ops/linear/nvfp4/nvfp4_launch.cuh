@@ -61,16 +61,18 @@ void nvfp4_linear_a4_mma(const Weight& w, Tensor& y, Nvfp4A4Workspace workspace,
         stream, {}, pdl::Dependency::Programmatic);
 }
 
-template <Nvfp4GeometryId Geometry, Nvfp4ScaleLayout Layout>
+template <Nvfp4ScaleLayout Layout>
 void nvfp4_linear_a4_tma(const Weight& weight, Tensor& out, Nvfp4A4Workspace scratch, int tokens,
                          cudaStream_t stream) {
-    launch_nvfp4_a4_tma_linear(Geometry, nvfp4_a4_operands(weight, scratch, tokens, Layout),
+    launch_nvfp4_a4_tma_linear(nvfp4_a4_operands(weight, scratch, tokens, Layout),
                                static_cast<__nv_bfloat16*>(out.data), stream);
 }
 
-template <Nvfp4GeometryId Geometry, Nvfp4ScaleLayout Layout = Nvfp4ScaleLayout::Tiled256>
+// The 1-term TMA GEMM: the shape picks only the activation-scale tile, and the launcher owns the
+// instantiated schedules for the registered Ks (see nvfp4_a4_tma.cu).
+template <Nvfp4ScaleLayout Layout = Nvfp4ScaleLayout::Tiled256>
 constexpr Nvfp4A4Route nvfp4_a4_tma_route() {
-    return {nvfp4_linear_a4_tma<Geometry, Layout>, Layout, false};
+    return {nvfp4_linear_a4_tma<Layout>, Layout, false};
 }
 
 template <class Geometry, class Schedule>

@@ -580,16 +580,36 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
     // Report Tensor Core utilization only when the exact registered problem and extent determine
     // that the public route executes the named MMA profile.
     if (point.qtype == QType::NVFP4) {
-        const bool nvfp4_a4_problem =
-            (point.n == 14336 && point.k == 5120) || (point.n == 16384 && point.k == 5120) ||
-            (point.n == 34816 && point.k == 5120) || (point.n == 5120 && point.k == 6144) ||
-            (point.n == 5120 && point.k == 17408);
+        // Shapes whose record registers the A4 1-term ladder, with the token count at which their
+        // uses_a4 admits it (src/ops/linear/nvfp4/shapes/*.cu). Below the threshold the public
+        // route runs the A16 table, which issues BF16 MMA.
+        struct A4Admission {
+            int n, k, min_tokens;
+        };
+        constexpr A4Admission kA4Admissions[] = {
+            {14336, 5120, 4},   {16384, 5120, 1},   {34816, 5120, 1},    {5120, 6144, 17},
+            {5120, 17408, 8},   {2560, 6144, 17},   {6144, 2560, 33},    {10240, 2560, 33},
+            {12800, 2560, 33},  {13952, 2560, 33},  {16384, 2560, 33},
+        };
+        bool nvfp4_a4_problem = false;
+        for (const auto& admission : kA4Admissions) {
+            if (point.n == admission.n && point.k == admission.k &&
+                point.t >= admission.min_tokens) {
+                nvfp4_a4_problem = true;
+                break;
+            }
+        }
+        // The 2-term residual route runs the same NVFP4 profile; its admission is the pair record's
+        // pair_min_tokens and the absence of an A4 1-term admission at that width.
+        const bool pair_requested =
+            point.policy == LinearPolicy::AllowA4Residual ||
+            infernix::ops::has_route(point.routes, infernix::ops::LinearRoutes::Nvfp4A4Pair);
         const bool nvfp4_a4_pair_problem =
-            point.n >= 2048 && (point.k == 2560 || point.k == 6144) && point.t >= 128 &&
-            (point.policy == LinearPolicy::AllowA4Residual ||
-             infernix::ops::has_route(point.routes, infernix::ops::LinearRoutes::Nvfp4A4Pair));
-        if ((point.policy == LinearPolicy::AllowA4 && nvfp4_a4_problem && point.t >= 2) ||
-            nvfp4_a4_pair_problem) {
+            pair_requested &&
+            ((point.n >= 2048 && (point.k == 2560 || point.k == 6144) && point.t >= 128) ||
+             ((point.k == 5120 || point.k == 17408) && point.t >= 65 &&
+              !(point.policy == LinearPolicy::AllowA4 && nvfp4_a4_problem)));
+        if ((point.policy == LinearPolicy::AllowA4 && nvfp4_a4_problem) || nvfp4_a4_pair_problem) {
             profile = "NVFP4_F32ACC";
             return kNvfp4Fp32AccumulateTFLOPs;
         }

@@ -248,8 +248,22 @@ void launch_a4_tma_cand(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A4Wo
         stream);
 }
 
-constexpr auto kNoPromo  = CU_TENSOR_MAP_L2_PROMOTION_NONE;
-constexpr auto kL2_128B  = CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+// Differential candidates: the quantize and the GEMM are stream-serialised in eager mode, so a
+// repeated pass (idempotent: it rewrites the same planes / the same output) separates the two costs
+// by subtraction from the single-pass time.
+template <class Schedule, int QuantizePasses, int GemmPasses>
+void launch_a4_tma_repeats(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A4Workspace ws,
+                           cudaStream_t stream) {
+    for (int pass = 0; pass < QuantizePasses; ++pass)
+        launch_nvfp4_a4_quantize(x, w, ws, Schedule::kScaleLayout, stream, false);
+    for (int pass = 0; pass < GemmPasses; ++pass)
+        launch_nvfp4_a4_tma_mma<Schedule>(
+            nvfp4_a4_operands(w, ws, x.ne[1], Schedule::kScaleLayout),
+            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
+            stream);
+}
+
+using A4PrefillSchedule = Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, 1, 128>;
 
 const A4RouteCandidate kA4Candidates[] = {
     {"production", launch_a4_production, 1, 0},
@@ -289,21 +303,33 @@ const A4RouteCandidate kA4Candidates[] = {
     {"a4_mma_t128_r128_k256_w8_s1_m2", launch_a4_mma_cand<Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>>, 32, 0},
     {"a4_mma_t128_r128_k256_w8_s2_m1", launch_a4_mma_cand<Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>>, 32, 0},
 
-    // --- TMA Schedules: NEW 128x64 (2 CTAs/SM), 128x128 (2 CTAs/SM & 1 CTA/SM), 256x64, 256x128 ---
-    {"a4_tma_t128_r64_s2_m2",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 2, kNoPromo, 1, 64>>, 32, 0},
-    {"a4_tma_t128_r64_s2_m2_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 2, kL2_128B, 1, 64>>, 32, 0},
-    {"a4_tma_t128_r64_s3_m2",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 2, kNoPromo, 1, 64>>, 32, 0},
-    {"a4_tma_t128_r64_s3_m2_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 2, kL2_128B, 1, 64>>, 32, 0},
-    {"a4_tma_t128_r128_s2_m1",    launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 1, kNoPromo, 1, 128>>, 32, 0},
-    {"a4_tma_t128_r128_s2_m1_l2", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 1, kL2_128B, 1, 128>>, 32, 0},
-    {"a4_tma_t128_r128_s4_m1",    launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 4, 1, kNoPromo, 1, 128>>, 32, 0},
-    {"a4_tma_t128_r128_s4_m1_l2", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 4, 1, kL2_128B, 1, 128>>, 32, 0},
-    {"a4_tma_t256_r64_s2_m1",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 2, 1, kNoPromo, 1, 64>>, 128, 0},
-    {"a4_tma_t256_r64_s2_m1_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 2, 1, kL2_128B, 1, 64>>, 128, 0},
-    {"a4_tma_t256_r64_s3_m1",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNoPromo, 1, 64>>, 128, 0},
-    {"a4_tma_t256_r64_s3_m1_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kL2_128B, 1, 64>>, 128, 0},
-    {"a4_tma_t256_r128_s3_m1",    launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNoPromo, 1, 128>>, 128, 0},
-    {"a4_tma_t256_r128_s3_m1_l2", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kL2_128B, 1, 128>>, 128, 0},
+    // --- TMA Schedules: 128x64 (2 CTAs/SM), 128x128 (2 & 1 CTA/SM), 256x64, 256x128; the _l2
+    // suffix promotes the weight panel, _ws also the weight scales, and _all adds the activation
+    // codes. ---
+    {"a4_tma_t128_r64_s2_m2",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 2, kNvfp4A4TmaNoPromotions, 1, 64>>, 32, 0},
+    {"a4_tma_t128_r64_s2_m2_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 2, kNvfp4A4TmaWeightCodeL2_128B, 1, 64>>, 32, 0},
+    {"a4_tma_t128_r64_s3_m2",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 2, kNvfp4A4TmaNoPromotions, 1, 64>>, 32, 0},
+    {"a4_tma_t128_r64_s3_m2_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 2, kNvfp4A4TmaWeightCodeL2_128B, 1, 64>>, 32, 0},
+    {"a4_tma_t128_r64_s3_m2_all", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 2, kNvfp4A4TmaL2_128B, 1, 64>>, 32, 0},
+    {"a4_tma_t128_r128_s2_m1",    launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 1, kNvfp4A4TmaNoPromotions, 1, 128>>, 32, 0},
+    {"a4_tma_t128_r128_s2_m1_l2", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 1, kNvfp4A4TmaWeightCodeL2_128B, 1, 128>>, 32, 0},
+    {"a4_tma_t128_r128_s4_m1",    launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaNoPromotions, 1, 128>>, 32, 0},
+    {"a4_tma_t128_r128_s4_m1_l2", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaWeightCodeL2_128B, 1, 128>>, 32, 0},
+    {"a4_tma_t128_r128_s4_m1_all", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaL2_128B, 1, 128>>, 32, 0},
+    {"a4_tma_t256_r64_s2_m1",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 2, 1, kNvfp4A4TmaNoPromotions, 1, 64>>, 128, 0},
+    {"a4_tma_t256_r64_s2_m1_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 2, 1, kNvfp4A4TmaWeightCodeL2_128B, 1, 64>>, 128, 0},
+    {"a4_tma_t256_r64_s3_m1",     launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaNoPromotions, 1, 64>>, 128, 0},
+    {"a4_tma_t256_r64_s3_m1_l2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, 1, 64>>, 128, 0},
+    {"a4_tma_t256_r64_s3_m1_all", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaL2_128B, 1, 64>>, 128, 0},
+    {"a4_tma_t256_r128_s3_m1",    launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaNoPromotions, 1, 128>>, 128, 0},
+    {"a4_tma_t256_r128_s3_m1_l2", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, 1, 128>>, 128, 0},
+    {"a4_tma_t256_r128_s3_m1_ws", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightL2_128B, 1, 128>>, 128, 0},
+    {"a4_tma_t256_r128_s3_m1_all", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaL2_128B, 1, 128>>, 128, 0},
+    // Cost split for the prefill tile: t(1q1g) = Q + G, so t(2q1g) - t(1q1g) = the quantizer and
+    // t(1q2g) - t(1q1g) = the GEMM alone.
+    {"a4_split_1q1g",            launch_a4_tma_repeats<A4PrefillSchedule, 1, 1>, 128, 0},
+    {"a4_split_2q1g",            launch_a4_tma_repeats<A4PrefillSchedule, 2, 1>, 128, 0},
+    {"a4_split_1q2g",            launch_a4_tma_repeats<A4PrefillSchedule, 1, 2>, 128, 0},
 };
 
 std::vector<int> parse_tokens(const std::string& spec) {

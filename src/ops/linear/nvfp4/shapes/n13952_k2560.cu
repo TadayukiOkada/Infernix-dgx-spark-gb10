@@ -13,12 +13,10 @@
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
-#include <stdexcept>
-
 namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next QSA QKVG+indexer packed input projection [13952, 2560]. Same schedule family
-// as [16384, 2560]; only the row count differs. A4 is not enabled for this dense shape.
+// as [16384, 2560]; only the row count differs.
 using Geometry = Nvfp4Geometry<13952, 2560>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -105,15 +103,25 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
     select_a16(x.ne[1])(x, w, y, stream);
 }
 
-[[noreturn]] void launch_a4(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
-    throw std::logic_error("nvfp4 A4 route is not enabled for the [13952, 2560] shape");
+using T16R64  = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 2, 2>;
+using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+
+Nvfp4A4Route select_a4(std::int32_t tokens) {
+    if (tokens >= 257) return nvfp4_a4_tma_route<>();
+    if (tokens >= 129) return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
+    if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
+    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
+    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R128>();
+    return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
 }
 
-bool uses_a4(std::int32_t, std::int32_t) { return false; }
+bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N13952K2560{
-    13952, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 65};
+    13952, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
 
 void launch_nvfp4_n13952_k2560_split(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, Tensor& iq, Tensor& ik,
@@ -130,7 +138,7 @@ void launch_nvfp4_n13952_k2560_split(const Tensor& x, const Weight& weight, Tens
             allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k, kNvfp4A4ResidualTerms, true);
         launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled128, stream);
         using TmaSched = Nvfp4ScheduleInstance<
-            Nvfp4A4TmaMmaSchedule<128, 3, 1, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+            Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B,
                                   kNvfp4A4ResidualTerms, 128>,
             Geometry::kInputRows>;
         launch_nvfp4_a4_tma_mma<TmaSched>(

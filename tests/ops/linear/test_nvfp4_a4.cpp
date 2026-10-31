@@ -59,9 +59,29 @@ int run_nvfp4_a4() {
     for (auto [n, k, seed] : {std::tuple{16384, 2560, 731U}, std::tuple{13952, 2560, 733U},
                               std::tuple{12800, 2560, 739U}, std::tuple{10240, 2560, 743U},
                               std::tuple{6144, 2560, 751U}, std::tuple{2560, 6144, 757U},
-                              std::tuple{2560, 2560, 761U}, std::tuple{2048, 2560, 769U}}) {
+                              std::tuple{2560, 2560, 761U}, std::tuple{2048, 2560, 769U},
+                              std::tuple{5120, 6144, 787U}, std::tuple{5120, 17408, 797U},
+                              std::tuple{14336, 5120, 809U}, std::tuple{16384, 5120, 811U},
+                              std::tuple{34816, 5120, 821U}}) {
         failures += run_shape("NVFP4_A4_PAIR", ActivationCompute::A4, make_nvfp4_weight,
                               {n, k, seed, Comparison::Sampled, true, pair_invocations});
+    }
+    // Single-term A4 on the dense shapes that register it (GB10, 2026-10-31). Their uses_a4 admits
+    // the ladder from T = 33 (K = 2560) / T = 17 ([2560, 6144]), so the widths on both sides of
+    // every route boundary are covered: below it the public route runs the A16 table.
+    std::vector<Invocation> dense_a4_invocations;
+    for (int t : {1,   16,  17,  32,  33,  34,  64,  128, 129, 192, 256, 257, 384, 512, 513, 1024,
+                  2048}) {
+        dense_a4_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4});
+    }
+    for (int t : {33, 129, 257, 513, 1024}) {
+        dense_a4_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
+    }
+    for (auto [n, k, seed] : {std::tuple{16384, 2560, 823U}, std::tuple{13952, 2560, 827U},
+                              std::tuple{12800, 2560, 829U}, std::tuple{10240, 2560, 839U},
+                              std::tuple{6144, 2560, 853U}, std::tuple{2560, 6144, 857U}}) {
+        failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
+                              {n, k, seed, Comparison::Sampled, true, dense_a4_invocations});
     }
     return failures;
 }

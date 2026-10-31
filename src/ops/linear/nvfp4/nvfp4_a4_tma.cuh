@@ -70,7 +70,9 @@ inline CUtensorMap nvfp4_make_tma_planes(void* address, std::uint64_t columns, s
                                          std::uint64_t row_stride_bytes, std::uint64_t planes,
                                          std::uint64_t plane_stride_bytes,
                                          std::uint32_t box_columns, std::uint32_t box_rows,
-                                         CUtensorMapSwizzle swizzle, const char* operation) {
+                                         CUtensorMapSwizzle swizzle, const char* operation,
+                                         CUtensorMapL2promotion l2_promotion =
+                                             CU_TENSOR_MAP_L2_PROMOTION_NONE) {
     CUtensorMap map{};
     const std::uint64_t global_dim[]     = {columns, rows, planes};
     const std::uint64_t global_stride[]  = {row_stride_bytes, plane_stride_bytes};
@@ -78,8 +80,7 @@ inline CUtensorMap nvfp4_make_tma_planes(void* address, std::uint64_t columns, s
     const std::uint32_t element_stride[] = {1, 1, 1};
     nvfp4_check_driver(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, address,
                                               global_dim, global_stride, box_dim, element_stride,
-                                              CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-                                              CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                              CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, l2_promotion,
                                               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
                        operation);
     return map;
@@ -104,16 +105,17 @@ Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
         d.a_codes  = nvfp4_make_tma_planes(const_cast<std::uint8_t*>(p.x), p.k / 2, p.tokens,
                                            p.k / 2, Schedule::kTerms, p.code_plane, 64, tile,
                                            CU_TENSOR_MAP_SWIZZLE_64B,
-                                           "encode residual activation codes TMA");
+                                           "encode residual activation codes TMA",
+                                           Schedule::kPromotions.a_codes);
         d.a_scales = nvfp4_make_tma_planes(const_cast<std::uint8_t*>(p.x_scales), tile, scale_rows,
                                            tile, Schedule::kTerms, p.scale_plane, tile, 16,
                                            CU_TENSOR_MAP_SWIZZLE_NONE,
                                            "encode residual activation scales TMA");
     } else {
         d.a_codes = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x),
-                                      CU_TENSOR_MAP_DATA_TYPE_UINT8, p.k / 2, p.tokens, p.k / 2,
-                                      64, tile, CU_TENSOR_MAP_SWIZZLE_64B,
-                                      "encode activation codes TMA");
+                                      CU_TENSOR_MAP_DATA_TYPE_UINT8, p.k / 2, p.tokens, p.k / 2, 64,
+                                      tile, CU_TENSOR_MAP_SWIZZLE_64B, "encode activation codes TMA",
+                                      Schedule::kPromotions.a_codes);
         // The quantizer and descriptor agree on both token and group tile dimensions.
         d.a_scales = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x_scales),
                                        CU_TENSOR_MAP_DATA_TYPE_UINT8, tile, scale_rows, tile, tile,
@@ -123,11 +125,12 @@ Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
     d.b_codes =
         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
                           p.k / 2, p.rows, p.k / 2, 64, code_rows, CU_TENSOR_MAP_SWIZZLE_64B,
-                          "encode weight codes TMA", Schedule::kWeightCodePromotion);
+                          "encode weight codes TMA", Schedule::kPromotions.b_codes);
     d.b_scales =
         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
                           static_cast<std::uint64_t>(p.rows) * p.k / 256, 16, 16, 64,
-                          CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
+                          CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA",
+                          Schedule::kPromotions.b_scales);
     return d;
 }
 
@@ -173,8 +176,8 @@ struct Nvfp4A4TmaSharedStorage {
 // (8 token tiles for K <= 6144, 4 token tiles for K = 17408) and walking token index fastest
 // within each band makes `active_n` SMs share each weight tile simultaneously while keeping
 // the active activation band (< 10 MiB) resident in GB10's 24 MiB L2 across all weight rows.
-__device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y, int token_count,
-                                                        int k) {
+__device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y,
+                                                        int token_count, int k) {
     (void)token_count;
     const int tiles_m    = static_cast<int>(gridDim.x);
     const int tiles_n    = static_cast<int>(gridDim.y);

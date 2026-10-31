@@ -132,9 +132,33 @@ struct Nvfp4A4MmaSchedule {
     static_assert((kSegmentsPerRow & (kSegmentsPerRow - 1)) == 0);
 };
 
+// Per-descriptor L2 prefetch promotion for the A4 TMA route. Promotion asks the TMA engine for a
+// wider line than the box needs, which pays only for an operand a group of co-resident CTAs re-reads
+// while it is still resident: the weight panel across the token tiles of its group, and the
+// activation band across the weight tiles of its group. The activation-scale map is fetched as whole
+// tile-contiguous boxes and is never promoted.
+struct Nvfp4A4TmaPromotions {
+    CUtensorMapL2promotion a_codes;
+    CUtensorMapL2promotion b_codes;
+    CUtensorMapL2promotion b_scales;
+};
+
+inline constexpr Nvfp4A4TmaPromotions kNvfp4A4TmaNoPromotions{
+    CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+    CU_TENSOR_MAP_L2_PROMOTION_NONE};
+inline constexpr Nvfp4A4TmaPromotions kNvfp4A4TmaWeightCodeL2_128B{
+    CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_NONE};
+inline constexpr Nvfp4A4TmaPromotions kNvfp4A4TmaWeightL2_128B{
+    CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_128B};
+inline constexpr Nvfp4A4TmaPromotions kNvfp4A4TmaL2_128B{
+    CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_128B};
+
 template <int BlockTokens, int Stages, int MinBlocksPerSm,
-          CUtensorMapL2promotion WeightCodePromotion = CU_TENSOR_MAP_L2_PROMOTION_NONE,
-          int Terms = 1, int BlockRows = 128>
+          Nvfp4A4TmaPromotions Promotions = kNvfp4A4TmaWeightCodeL2_128B, int Terms = 1,
+          int BlockRows = 128>
 struct Nvfp4A4TmaMmaSchedule {
     static constexpr int kStaticK = 0;
     // Terms > 1 is the A4 residual profile: each stage holds that many activation planes, each
@@ -155,7 +179,7 @@ struct Nvfp4A4TmaMmaSchedule {
     static_assert(BlockRows != 128 || MinBlocksPerSm == 1,
                   "BlockRows=128 TMA needs >128 regs/consumer thread and spills under MinBlocksPerSm>=2");
 
-    static constexpr auto kWeightCodePromotion = WeightCodePromotion;
+    static constexpr auto kPromotions = Promotions;
 
     static constexpr int kBlockTokens      = BlockTokens;
     static constexpr int kBlockRows        = BlockRows;

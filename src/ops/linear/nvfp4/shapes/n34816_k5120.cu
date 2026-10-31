@@ -4,6 +4,8 @@
 // 32-row K128 tile takes T = 49..64 (-7%) and T = 97..128 (-8.6%), and the 128-row K64 tile
 // replaces the RTX 5090 t256 tail over the whole prefill range (T = 192..384: -17..-37%).
 // The A4 route is unchanged (it dominates every width it admits on this shape).
+// GB10 2026-10-31: Nvfp4A4Pair is registered (T >= 65) so --routes fast serves the 2-term residual
+// route; the A16 table above remains the fallback for A16Only artifacts.
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -43,9 +45,9 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 257) return nvfp4_a4_tma_route<Nvfp4GeometryId::N34816K5120>();
+    if (tokens >= 257) return nvfp4_a4_tma_route<>();
     if (tokens >= 129)
-        return nvfp4_a4_tma_route<Nvfp4GeometryId::N34816K5120, Nvfp4ScaleLayout::Tiled128>();
+        return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
     if (tokens <= 24) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T64R128>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T64R64>();
@@ -56,6 +58,6 @@ bool uses_a4(std::int32_t, std::int32_t) { return true; }
 
 } // namespace
 
-const Nvfp4LinearShape kNvfp4N34816K5120{34816, 5120, launch_a16, launch_nvfp4_a4<select_a4>,
-                                         uses_a4};
+const Nvfp4LinearShape kNvfp4N34816K5120{
+    34816, 5120, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail

@@ -6,7 +6,7 @@ namespace infernix::ops::detail {
 void launch_nvfp4_a4_tma_gdn(const Nvfp4A4Operands& p, __nv_bfloat16* qkv, __nv_bfloat16* z,
                              cudaStream_t stream) {
     launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
-        Nvfp4A4TmaMmaSchedule<256, 3, 1, CU_TENSOR_MAP_L2_PROMOTION_L2_128B>, 5120>>(
+        Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCodeL2_128B>, 5120>>(
         p, Nvfp4GdnInputOutput{qkv, z}, LinearIdentityEpilogue{}, stream);
 }
 } // namespace infernix::ops::detail

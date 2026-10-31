@@ -8,6 +8,13 @@
 // Generated at: 2026-10-25 01:18:41 UTC
 // =============================================================================
 
+// Qwen3.8-Flash-Next MLP up/gate projection [16384, 5120].
+// GB10 (sm_121a) 2026-10-31: the prefill A16 route carried the RTX 5090 fit. bench/ops/
+// nvfp4_route_sweep.cu (cold 32 MiB L2, two runs) puts the T >= 129 widths on the 128-row K64 tile
+// Nvfp4A16MmaSchedule<128,64,64,64,16,2,2> -- the old T >= 129 t256 tile lost 19% at T = 4096
+// (10624 -> 8622 us) and 36% at T = 256 -- and T = 97..128 on the 64-row K128 tile (-5.7%).
+// Nvfp4A4Pair is now registered so --routes fast serves the 2-term residual route from T = 65
+// (the A16 fallback above still serves A16Only artifacts and the pair's excluded widths).
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -35,8 +42,8 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1>>;
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
     if (tokens <= 96) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;
-    if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 256, 64, 32, 32, 2, 1>>;
+    if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
+    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>>;
 }
 
 void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
@@ -44,9 +51,9 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 257) return nvfp4_a4_tma_route<Nvfp4GeometryId::N16384K5120>();
+    if (tokens >= 257) return nvfp4_a4_tma_route<>();
     if (tokens >= 129)
-        return nvfp4_a4_tma_route<Nvfp4GeometryId::N16384K5120, Nvfp4ScaleLayout::Tiled128>();
+        return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T64R64>();
     return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
@@ -55,6 +62,6 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t) { return true; }
 } // namespace
 
-const Nvfp4LinearShape kNvfp4N16384K5120{16384, 5120, launch_a16, launch_nvfp4_a4<select_a4>,
-                                         uses_a4};
+const Nvfp4LinearShape kNvfp4N16384K5120{
+    16384, 5120, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail
