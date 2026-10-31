@@ -74,7 +74,10 @@ Q8Launch select_q8_n6144_k2560(std::int32_t tokens) {
     if (tokens <= 32) return grouped<S3>;
     if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
-    if (tokens <= 512) return launch_q8_a16_mma_r64_t128;
+    if (tokens <= 511) return launch_q8_a16_mma_r64_t128;
+    // T1 2026-10-31: the sweep kept r64_t128 ahead through T = 513 (275 us vs 285) with the
+    // 128x128 Grouped-8 tile taking over beyond (production-equal at T = 1024/4096); the
+    // blanket 256 crossover first shipped today regressed T = 257 by 11%.
     return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 } // namespace infernix::ops::detail

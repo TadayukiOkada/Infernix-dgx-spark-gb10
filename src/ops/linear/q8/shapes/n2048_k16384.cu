@@ -48,7 +48,13 @@ Q8Launch select_q8_n2048_k16384(std::int32_t tokens) {
     if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
     if (tokens <= 32) return launch_q8_a16_sliced<Geometry, 32, C32>;
     if (tokens <= 128) return launch_grouped;
-    return launch_q8_a16_mma_r64_t128;
+    if (tokens <= 448) return launch_q8_a16_mma_r64_t128;
+    // T1 2026-10-31: 128x128 Grouped-8 tile from T = 449. N = 2048 gives 16 M-tiles, so the
+    // grid only reaches the 48 SMs x 2 CTAs wave from ~T = 449: the sweep measured r64_t128
+    // ahead at T = 385 (579 us vs 643) and r128x64 ahead at T = 513 (648 us vs 678) and in
+    // production at T = 512 (61.0 vs 52.9 TFLOP/s); the boundary is the sweep-interpolated
+    // midpoint, not a measured tie.
+    return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 
 } // namespace infernix::ops::detail

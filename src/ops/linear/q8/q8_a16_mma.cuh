@@ -244,17 +244,31 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     };
 
     const int nkt = (BM != 96) ? ((k + BK - 1) / BK) : (padded_k / BK);
-    stage_x(0, 0);
-    stage_w(0);
-    infernix::ops::cp_commit();
+    if constexpr (Cfg::kActivationStages == 1) {
+        stage_w(0);
+        infernix::ops::cp_commit();
+        infernix::ops::cp_wait<0>();
+        __syncthreads();
+        stage_x(0, 0);
+        infernix::ops::cp_commit();
+    } else {
+        stage_x(0, 0);
+        stage_w(0);
+        infernix::ops::cp_commit();
+    }
 
 #pragma unroll Cfg::kKLoopUnroll
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt % Cfg::kStages;
-        infernix::ops::cp_wait<0>();
-        __syncthreads();
+        if constexpr (Cfg::kActivationStages != 1) {
+            infernix::ops::cp_wait<0>();
+            __syncthreads();
+        }
 
         dequant_w(kt);
+        if constexpr (Cfg::kActivationStages == 1) {
+            infernix::ops::cp_wait<0>();
+        }
         __syncthreads();
 
         const int next = kt + 1;
@@ -313,6 +327,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
 
         if constexpr (Cfg::kActivationStages == 1) {
             if (next < nkt) {
+                infernix::ops::cp_wait<0>();
                 __syncthreads();
                 stage_x(0, next);
                 infernix::ops::cp_commit();

@@ -58,7 +58,7 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 640, select_q8_n2560_k640, nullptr, select_q8_n2560_k640_invariant},
     // NInfer's tunings for its own 2560-wide groupings.
     shape<Q8N6144K2560>(select_q8_n6144_k2560),   shape<Q8N10240K2560>(select_q8_n10240_k2560),
-    shape<Q8N12288K2560>(select_q8_n12288_k2560),
+    shape<Q8N10240K5120>(select_q8_n10240_k5120), shape<Q8N12288K2560>(select_q8_n12288_k2560),
 };
 
 // Shapes without a tuned entry use the runtime-shape templates: predicated SIMT for decode and

@@ -28,9 +28,13 @@ Q8Launch select_q8_n2560_k12800(std::int32_t tokens) {
     if (tokens <= 48) return launch_q8_a16_mma_r64x16_t128_k128_a2;
     if (tokens <= 64) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
-    if (tokens <= 256) return launch_q8_a16_mma_r64_t128;
-    if (tokens <= 512) return launch_q8_a16_mma_r128x64_t128_k64_a1;
-    return launch_q8_a16_mma_r64x32_t128_k64_a2;
+    if (tokens <= 448) return launch_q8_a16_mma_r64_t128;
+    // T1 2026-10-31: the 128x128 Grouped-8 tile now runs to the top (production: 72.7 vs
+    // 59.6 TFLOP/s at T = 1024, 75.8..76.2 vs 60.1..60.5 at T = 4096 over the r64x32 a2
+    // tile). The 257..448 band moves to r64_t128: the 2026-10-31 sweep measured it ~9%
+    // under r128x64 at T = 257/385 (20 M-tiles x 2 N-tiles under-fills 48 SMs x 2 CTAs),
+    // with the sweep's crossover interpolated at ~450.
+    return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 
 // The q8-sliced-k fast path (LinearRoutes::Q8SlicedK): the T-dependent winners. The swept T = 1

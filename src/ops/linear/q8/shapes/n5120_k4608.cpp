@@ -22,8 +22,9 @@ Q8Launch select_q8_n5120_k4608(std::int32_t tokens) {
     if (tokens <= 48) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
-    if (tokens <= 128 || (tokens > 256 && tokens <= 384)) return launch_q8_a16_mma_r64_t128;
-    return launch_q8_a16_mma_r64x16_t256_k64_a2;
+    if (tokens <= 511) return launch_q8_a16_mma_r64_t128;
+    // T1 2026-10-31: 128x128 Grouped-8 tile from T = 512 (see the [4608, 4608] table).
+    return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 
 } // namespace infernix::ops::detail

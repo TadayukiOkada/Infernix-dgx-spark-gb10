@@ -20,8 +20,12 @@ Q8Launch select_q8_n12288_k2048(std::int32_t tokens) {
     if (tokens <= 8) return launch_q8_a16_simt_r8_t8;
     if (tokens <= 48) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
-    if (tokens <= 128) return launch_q8_a16_mma_r64_t128;
-    return launch_q8_a16_mma_r64x16_t256_k64_a2;
+    if (tokens <= 255) return launch_q8_a16_mma_r64_t128;
+    // T1 2026-10-31: 128x128 Grouped-8 tile from T = 256 here (its 96 M-tiles x 2 N-tiles
+    // grid fills the SMs even at two-token tiles; measured 49.8 vs 31.3 TFLOP/s over the old
+    // r64x16_t256 band at T = 257). The 129..255 r64x16_t256 band was replaced by r64_t128,
+    // which the 2026-10-31 sweep measured ~32% faster at the swept widths.
+    return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 
 } // namespace infernix::ops::detail

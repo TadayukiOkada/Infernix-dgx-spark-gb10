@@ -41,6 +41,7 @@ constexpr std::array kGeometries{
     Geometry{2560, 12800, 383U},
     // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
     Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
+    Geometry{10240, 5120, 389U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
     Geometry{2560, 4096, 331U}};
 
@@ -59,6 +60,9 @@ int q8_a16_conformance() {
         }
         if (shape.n == 6144 && shape.k == 5120) {
             for (int t : {191, 192, 193}) calls.push_back({t});
+        }
+        if ((shape.n == 10240 && shape.k == 5120) || (shape.n == 6144 && shape.k == 2560)) {
+            for (int t : {255, 257}) calls.push_back({t});
         }
         if (shape.k == 4608) {
             for (int t : {6, 11, 12, 13, 14, 19, 20, 21, 27, 28, 29}) calls.push_back({t});
