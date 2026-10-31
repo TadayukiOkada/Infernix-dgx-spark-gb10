@@ -41,12 +41,19 @@ void launch_grouped(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
 }
 } // namespace
 
+// GB10 (sm_121a) decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over
+// T = 1..64. T = 9..16 left 16% of the read roofline idle on the 16-column ActiveOnly tile; the
+// 16-K-warp/2-block tile holds 89.7..92.3%. T = 17..32 was the cliff (58.3% at T = 25, where the
+// 32-column tile spills past static shared memory): the 4-K-warp/32-token tile keeps one slice and
+// 85.8..87.4% across the band. T = 33..64 was worse — the Grouped-8 tile below T = 128 measured
+// 42..48% here, so the 16-row K128 MMA tile (63.9..73.3%, +30..38%) takes the band, and grouped
+// stays only where it is the only schedule that fits (T = 65..128).
 Q8Launch select_q8_n2048_k16384(std::int32_t tokens) {
     if (tokens == 1) return launch_q8_a16_simt_r8_t4;
     if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
-    if (tokens <= 16) return launch_q8_a16_sliced<Geometry, 16, C16>;
-    if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
-    if (tokens <= 32) return launch_q8_a16_sliced<Geometry, 32, C32>;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w16_s1_m2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r16_t32_k128_a1;
     if (tokens <= 128) return launch_grouped;
     if (tokens <= 448) return launch_q8_a16_mma_r64_t128;
     // T1 2026-10-31: 128x128 Grouped-8 tile from T = 449. N = 2048 gives 16 M-tiles, so the

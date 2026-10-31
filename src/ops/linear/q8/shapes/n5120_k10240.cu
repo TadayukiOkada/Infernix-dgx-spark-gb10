@@ -33,12 +33,20 @@ using C48 = Q8A16SlicedKMmaSchedule<48, 4, 1, 2, Access::Shared, Cache::ca, Cach
 
 } // namespace
 
+// GB10 (sm_121a) decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over
+// T = 1..64. Single-token GEMV-style SIMT wins T = 1..3 here (94..96% READ; the sliced family pays
+// its staging round trip on a 52 MB weight that a row-per-warp scan streams perfectly). T = 6..16
+// moves from the 8-K-warp tile to the 16-K-warp one, which removes the T = 15 spike (294 us / 77.5%
+// -> 251 us / 90.7%); T = 17..32 to the 8-K-warp/32-token tile, whose capacity covers the width in
+// one slice (85..88% vs the 24-token tile's 79..81%); and T = 33..64 to the 512-thread K128 tile,
+// flat at 82..84% where the 64x32 tile decayed to 73%.
 Q8Launch select_q8_n5120_k10240(std::int32_t tokens) {
+    if (tokens == 1) return launch_q8_a16_simt_r1_t8_w8;
+    if (tokens <= 3) return launch_q8_a16_simt_r1_t4_w8;
     if (tokens <= 5) return launch_q8_a16_sliced_r16_t16_w8_s2;
-    if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
-    if (tokens <= 16) return launch_q8_a16_sliced<Geometry, 16, C16>;
-    if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w16_s1;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
+    if (tokens <= 64) return launch_q8_a16_mma_r128x16_t64_k128_a2;
     if (tokens <= 96) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;

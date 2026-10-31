@@ -44,6 +44,12 @@ using MmaR64x32T128K64A2  = Q8A16MmaSchedule<64, 128, 64, 32, 32, 2, 2>;
 using MmaR128x32T64K64A2  = Q8A16MmaSchedule<128, 64, 64, 32, 32, 2, 2>;
 using MmaR128x64T128K64A1 = Q8A16MmaSchedule<128, 128, 64, 64, 32, 1, 2>;
 using MmaR128x32T128K64A2 = Q8A16MmaSchedule<128, 128, 64, 32, 32, 2, 1>;
+// T2 (2026-10-31) decode/verify tiles from the GB10 route sweep: the two-token-warp K128 tiles for
+// the 2048-row shapes, whose 16-row tiles keep the whole 9.4..32 MB weight in flight on 64-thread
+// CTAs, and the 512-thread K128 tile that holds T = 33..64 at 83..86% for the 5120/6144-row shapes.
+using MmaR16T32K128A1      = Q8A16MmaSchedule<16, 32, 128, 16, 16, 1, 1>;
+using MmaR32T32K128A1      = Q8A16MmaSchedule<32, 32, 128, 16, 16, 1, 1>;
+using MmaR128x16T64K128A2M1 = Q8A16MmaSchedule<128, 64, 128, 16, 32, 2, 1>;
 
 using SimtR8T4         = Q8A16SimtSchedule<8, 4, 1, 32, 2, Cache::cg, 2>;
 using SimtR8T5         = Q8A16SimtSchedule<8, 5, 1, 32, 2, Cache::cg, 2>;
@@ -69,5 +75,37 @@ using SlicedR32T16W4S2 =
 using SlicedR32T16W8S2 =
     Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                             Q8ActivationStage::RuntimeActive, 0, 16, false, 2>;
+// T2 (2026-10-31) decode/verify sliced-K tiles. Every one keeps the whole verification width in a
+// single token slice (TokenCapacity = BlockTokens), which is what the sub-90% cliffs at
+// T = BlockTokens + 1 were: a schedule whose capacity is below the width re-reads the entire weight
+// for the overflow slice. Single-stage (s1) tiles win here because the K slice they own is already
+// only K/KWarps wide, so the second stage's shared-memory buffer buys nothing on GB10's 99 KiB.
+using SlicedR16T8W8S2M3 =
+    Q8A16SlicedKMmaSchedule<8, 8, 2, 3, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 8, false, 1>;
+using SlicedR16T8W16S1 =
+    Q8A16SlicedKMmaSchedule<8, 16, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 8, false, 1>;
+using SlicedR16T16W16S1 =
+    Q8A16SlicedKMmaSchedule<16, 16, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 16, false, 1>;
+using SlicedR16T16W16S1M2 =
+    Q8A16SlicedKMmaSchedule<16, 16, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 16, false, 1>;
+using SlicedR16T16W8S2M1 =
+    Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 16, false, 1>;
+using SlicedR16T32W4S1 =
+    Q8A16SlicedKMmaSchedule<32, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 32, false, 1>;
+using SlicedR16T32W8S1M2 =
+    Q8A16SlicedKMmaSchedule<32, 8, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 32, false, 1>;
+using SlicedR16T40W16S1 =
+    Q8A16SlicedKMmaSchedule<40, 16, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 40, false, 1>;
+using SlicedR32T48W4S1 =
+    Q8A16SlicedKMmaSchedule<48, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+                            Q8ActivationStage::RuntimeActive, 0, 48, false, 2>;
 } // namespace q8_instances
 } // namespace infernix::ops::detail

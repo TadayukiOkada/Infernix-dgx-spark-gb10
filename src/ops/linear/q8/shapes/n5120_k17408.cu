@@ -39,13 +39,18 @@ using C64 = Q8A16SlicedKMmaSchedule<64, 4, 1, 2, Access::Shared, Cache::ca, Cach
                                     Stage::RuntimeActive, 0, 64, false, 2>;
 } // namespace
 
+// GB10 (sm_121a) decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over
+// T = 1..64. The 16-K-warp tiles (BlockTokens 8/16, one slice per width) beat the 8-K-warp ladder
+// across T = 1..16 (92..94.5% READ vs 86..90.4%, and 89.8% vs 76.4% at T = 16, where the 16-token
+// tile's two-row staging runs out of shared memory); T = 17..32 keeps the existing two-row-tile
+// bands, which measured within noise of every candidate. T = 33..64 moves to the 512-thread K128
+// tile: 83..86% where the 64x32 tile fell to 72..77%.
 Q8Launch select_q8_n5120_k17408(std::int32_t tokens) {
-    if (tokens <= 4) return launch_q8_a16_sliced<Geometry, 4, C4>;
-    if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
-    if (tokens <= 16) return launch_q8_a16_sliced<Geometry, 16, C16>;
+    if (tokens <= 8) return launch_q8_a16_sliced_r16_t8_w16_s1;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w16_s1;
     if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
     if (tokens <= 32) return launch_q8_a16_sliced<Geometry, 32, C32>;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 64) return launch_q8_a16_mma_r128x16_t64_k128_a2;
     if (tokens <= 96) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;

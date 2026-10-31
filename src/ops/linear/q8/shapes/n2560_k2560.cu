@@ -27,18 +27,36 @@ using Stream = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8Stream
 // variants measured faster on GB10 (3.2% at T=1, 14.5% at T=2) but are REJECTED: they change the
 // column-invariance reference bits and fail the oracle infernix_linear_q8_a16_test, so T<=2 stays
 // on the untouched stream<4,4> reference route.
+// GB10 (sm_121a) decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over
+// T = 9..64. The MMA tiles above the frozen T <= 8 band ran at 60..65% READ; the single-slice
+// sliced-K tiles take 68..83% (T = 24 measured 36.0% on the 128-thread K128 tile, whose 40 CTAs
+// cannot stream the 6.6 MB weight). T <= 8 stays on the stream<4,4>/SIMT bit family: this shape
+// carries an 8-column invariance contract in infernix_linear_q8_a16_test, and the sliced candidates
+// that measure faster there (up to +23%) do not reproduce those reference bits. They are reachable
+// through the q8-sliced-k fast path below, which the column-invariant policy never selects.
 Q8Launch select_q8_n2560_k2560(std::int32_t tokens) {
     if (tokens <= 2) return launch_q8_a16_stream_linear<Stream<4, 4>>;
     if (tokens <= 4) return launch_q8_a16_simt_r8_t4;
     if (tokens <= 5) return launch_q8_a16_simt_r8_t5;
     if (tokens <= 6) return launch_q8_a16_simt_r8_t6;
     if (tokens <= 8) return launch_q8_a16_simt_r8_t8;
-    if (tokens <= 48) return launch_q8_a16_mma_r64x16_t128_k128_a2;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
+    if (tokens <= 48) return launch_q8_a16_sliced_r32_t48_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t32_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x32_t64_k128_a1;
     if (tokens <= 1024) return launch_q8_a16_mma_r64x32_t128_k64_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;
+}
+
+// The q8-sliced-k fast path (LinearRoutes::Q8SlicedK): the swept T = 1..16 winners the bit contract
+// keeps off the exact table (82..85% READ over 60..79%, +18..28%). Beyond T = 16 the exact table's
+// own bands already hold the best measured schedule, so it takes over.
+Q8Launch select_q8_n2560_k2560_fast(std::int32_t tokens) {
+    if (tokens <= 4) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
+    return select_q8_n2560_k2560(tokens);
 }
 
 } // namespace infernix::ops::detail

@@ -74,6 +74,9 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 // The T-dependent sliced-K winners of the GB10 retune for the shared-expert gate and DFlash2's
 // feature_projection; a column's bits depend on the call's width, so they are fast-path routes only.
 [[nodiscard]] Q8Launch select_q8_n1280_k2560_fast(std::int32_t tokens);
+// The [2560,2560] MTP projections' T = 1..16 sliced-K winners: faster than the frozen
+// stream<4,4>/SIMT bit family of the exact table but not bit-compatible with it, so fast path only.
+[[nodiscard]] Q8Launch select_q8_n2560_k2560_fast(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k12800_fast(std::int32_t tokens);
 // The [16384,2560] GDN projection on the same routes, rows [0,10240) written to qkv [10240,T] and
 // rows [10240,16384) to z [6144,T] (gdn_input_proj).

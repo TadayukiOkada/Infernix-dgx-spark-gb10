@@ -16,15 +16,22 @@ namespace infernix::ops::detail {
 
 // GB10 (sm_121a, 48 SMs) retune 2026-10-23: GB10 retune keeps the same-signature simt bands
 // (contiguous t4<=7 / t8<=32, both sweep-gated bit-exact k_slices=1 serial and T-invariant; the
-// r8_t8 band is measured only through 32, so T>=33 stays on the production MMA route). The
-// sliced-K T<=2 candidate was rejected as REDUCTION_CHANGED by ckt ab on the Exact route.
+// r8_t8 band is measured only through 32, so T>=33 stays on the production MMA route).
+//
+// GB10 decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over T = 1..64. T = 1
+// moves off the SIMT GEMV (73.3% READ) onto the 4-K-warp sliced tile (85.1%, +13.9%); this shape has
+// no column-invariance contract, so the reduction order is qualified by the FP64 oracle in
+// infernix_linear_q8_a16_test rather than by bit-exactness against the previous route. T = 17..32
+// was the cliff: the 8-K-warp tile's capacity of 16 forced a second 9.4 MB weight pass (58.9..70%),
+// now one slice of the 4-K-warp/32-token tile (79.8..84.6%, +16..29%). T = 33..64 takes the 16-row
+// K128 MMA tile (62..70.6% vs 60..62%), which reaches 128 CTAs on N = 2048 where the 64-row tiles
+// reached 32.
 Q8Launch select_q8_n2048_k4608(std::int32_t tokens) {
     if (tokens > 32768) throw std::invalid_argument("q8 linear: column extent exceeds 32768");
-    if (tokens <= 1) return launch_q8_a16_simt_r8_t4;
+    if (tokens <= 1) return launch_q8_a16_sliced_r16_t16_w4_s2;
     if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s2;
-    if (tokens <= 48) return launch_q8_a16_mma_r64x16_t48_k128_a1;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r16_t32_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
     return launch_q8_a16_mma_r64_t128;
 }

@@ -35,12 +35,19 @@ using C56 =
     Q8A16SlicedKMmaSchedule<56, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
 } // namespace
 
+// GB10 (sm_121a) decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over
+// T = 1..64. T = 17..32 sat at 79..86% and T = 33..64 at 72..83% because both bands ran a tile
+// whose TokenCapacity is below the width, so for_each_token_slice re-reads the whole 31 MB weight
+// for the overflow slice: the 8-K-warp/32-token and 16-K-warp/40-token tiles hold one slice through
+// their band (85..89.5%), and the 512-thread K128 tile takes 84..86% from T = 41, where the 64x32
+// tile decayed to 76..79%.
 Q8Launch select_q8_n6144_k5120(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_sliced<Geometry, 4, C4>;
     if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
     if (tokens <= 16) return launch_q8_a16_sliced<Geometry, 16, C16>;
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s2;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
+    if (tokens <= 40) return launch_q8_a16_sliced_r16_t40_w16_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r128x16_t64_k128_a2;
     if (tokens <= 96) return launch_q8_a16_mma_r96_t96;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;

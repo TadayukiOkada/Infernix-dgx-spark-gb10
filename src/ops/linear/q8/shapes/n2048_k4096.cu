@@ -30,11 +30,18 @@ using C64 = Q8A16SlicedKMmaSchedule<64, 8, 1, 2, Access::Shared, Cache::ca, Cach
                                     Stage::RuntimeActive>;
 } // namespace
 
+// GB10 (sm_121a) decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over
+// T = 1..64. T = 17..32 left 25..31% of the read roofline idle on the 8-K-warp tile, whose capacity
+// of 16 forces a second full weight pass from T = 17; the 4-K-warp/32-token tile keeps the whole
+// width in one slice (76.8..79.6% READ, +5..13%). T = 33..64 moves to the 16-row K128 MMA tile,
+// which holds 65..69% where the 64x32 tile fell to 60%: at N = 2048 its 64-row tiles launch only
+// 32 CTAs, too few to keep the weight stream in flight, while 16-row tiles reach 128.
 Q8Launch select_q8_n2048_k4096(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_sliced<Geometry, 4, C4>;
     if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t16_w8_s2;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r16_t32_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
     return launch_q8_a16_mma_r64_t128;
 }
