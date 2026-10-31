@@ -24,7 +24,15 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
         allows_residual(policy)) {
         return Nvfp4GdnInputRoute::A16;
     }
-    if (allows_a4(policy)) { return Nvfp4GdnInputRoute::A4; }
+    if (allows_a4(policy)) {
+        // GB10 (sm_121a, 48 SMs), 2026-10-31 (T7): the A16 dequant tiles stream this projection's
+        // 42 MiB parent faster than the A4 lane until its quantizer is amortised. Cold-cache sweep
+        // (infernix_gdn_input_proj_bench, warmup 3 / repeat 15): T=1 202.6 us A16 against 212.8
+        // A4, T=4 207.7 against 213.8, T=8 208.8 against 213.8, T=16 211.8 against 215.9. Above
+        // 16 the A16 tile table collapses (237.4 at T=17, 366.7 at T=31) while A4 holds ~216-219,
+        // so the hand-over is exactly at 17.
+        return tokens <= 16 ? Nvfp4GdnInputRoute::A16 : Nvfp4GdnInputRoute::A4;
+    }
     throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
 }
 

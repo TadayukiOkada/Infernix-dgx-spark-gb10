@@ -30,22 +30,19 @@ void nvfp4_gdn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q
         nvfp4_gdn_input_decode_launch(x, weight, qkv, z, stream);
         return;
     }
-    if (tokens <= 2) {
-        nvfp4_gdn_input_small_t_launch(x, weight, qkv, z, stream);
-        return;
-    }
     const auto p        = nvfp4_a16_operands(x, weight);
     const auto output   = Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
                                             static_cast<__nv_bfloat16*>(z.data)};
     const auto epilogue = LinearIdentityEpilogue{};
-    if (tokens <= 8) {
-        launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, 5120>>(
-            p, output, epilogue, stream);
-        return;
-    }
+    // GB10 (sm_121a) 2026-10-31 (T7): the 16-token RowTiles-2 sliced-K tile the sibling standalone
+    // [16384, 5120] table ships takes the whole 2..16 band. It replaces the exact SIMT kernel at
+    // T=2, which measured 215.7 us against the A4 lane's 212.8 and against this tile, and the
+    // RowTiles-1 tiles the rest of the band ran; RowTiles only sets how many row tiles share a CTA
+    // and its launch bounds, so a column's 8 K slices and their order are unchanged.
     if (tokens <= 16) {
-        launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, 5120>>(
-            p, output, epilogue, stream);
+        launch_nvfp4_a16_sliced_k_mma<
+            Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2, 2>, 5120>>(p, output, epilogue,
+                                                                           stream);
         return;
     }
     if (tokens <= 24) {

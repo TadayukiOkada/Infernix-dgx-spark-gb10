@@ -37,9 +37,6 @@ void nvfp4_linear_add_invariant_ring_launch(const Tensor& x, const Weight& weigh
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream);
 
-void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                     cudaStream_t stream);
-
 void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 Nvfp4A4Workspace workspace, cudaStream_t stream);
 // AllowA4Residual: the workspace's planes (two or three) into one accumulator, MMA tiles only.

@@ -1252,3 +1252,221 @@ reproduces to 0.1 %. It remains implemented, oracle-qualified, and runnable unde
   `GdnConvSnapshotRowEpilogue` (§2.6b). On conflict, keep `GdnConvSnapshotPrefetchedRowEpilogue` a
   distinct type, keep the sliced-K fill's `token_begin + live_columns` absolute column bound, and keep
   the GEMV fill after `pdl::enter_streaming()`.
+
+---
+
+# GB10 changelog — 2026-10-31 (T7: retune the fused NVFP4 `linear_add` / `gdn_input_proj` / `attn_input_proj` decode & prefill schedules)
+
+Task: `docs/tasks/20261031-performance-tasks.md` T7 (P1). Scope as specified: the three fused NVFP4
+projections' decode/prefill schedule tables and the GDN A16-vs-A4 route gate.
+
+## 1. Accounting
+
+- Base commit: `d2350c3be` (`dev-rebased-20261028`). No commit created (task instruction — the reviewer
+  commits). `git diff --check` clean.
+- Files changed (14 tracked: 11 M, 3 D; 223 insertions, 291 deletions):
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/linear_add/nvfp4/nvfp4_linear_add_a16.cu` | M | `launch_matrix<K>` rewritten: every sliced-K band in the runtime-K (bare-schedule) form with `RowTiles = 2`; `T = 2..8` → `<8,8,2,2>` at `K = 6144`, and at `K = 17408` `<8,8,2,2>` under `wide_k` / `<8,4,2,2>` otherwise; `9..16` → `<16,…,2,2>`; `17..32` → `<32,4,1,2>`; the 2 K-warp `33..64` tiles dropped in favour of the bands' MMA tiles; the `T = 2..5` SIMT branch removed from `nvfp4_linear_add_a16_launch` |
+| `src/ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu` | **D** | superseded — no route reaches it after the retune |
+| `src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.h` | M | the dead `nvfp4_linear_add_small_t_launch` declaration removed |
+| `src/ops/linear_add/sources.cmake` | M | the deleted source removed from `infernix_ops` |
+| `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp` | M | `resolve_route` under `allows_a4`: `T ≤ 16` → `A16`, `T ≥ 17` → `A4` (was unconditionally `A4`) |
+| `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu` | M | `T = 2..16` → the runtime-`K`-baked `<16,8,2,2>` sliced-K tile; the `T ≤ 2` SIMT branch and the `RowTiles = 1` bands removed |
+| `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu` | **D** | superseded |
+| `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h` | M | dead declaration removed |
+| `src/ops/gdn_input_proj/sources.cmake` | M | the deleted source removed |
+| `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu` | M | `T = 2..16` → `<16,8,2,2>` baked-`K` sliced-K tile; SIMT branch and `RowTiles = 1` bands removed |
+| `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu` | **D** | superseded |
+| `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h` | M | dead declaration removed |
+| `src/ops/attn_input_proj/sources.cmake` | M | the deleted source removed |
+| `bench/ops/nvfp4_linear_add_bench.cu` | M | `--variants` candidate set extended for the T7 levers: `bench_a16_sliced_baked`/`bench_a16_sliced_rt` (RowTiles and runtime-`K` exposed separately), `bench_a16_gemv`, `bench_a4_tma_schedule` + `kBenchTmaScaleLayout` for the `BlockTokens`/`BlockRows`/`Stages` prefill sweep; the superseded `simt_small_t_prod` candidate removed; the pre-existing dangling-capture UB in the `a4`/`a16`/new candidate helpers fixed (`[=, &x, &packed, &out, &scratch]` — a stored `std::function` must not capture its function-pointer parameter by reference) |
+
+- Not changed, on measurement (§2): `nvfp4_linear_add_decode.cu` (the T=1 GEMV is already the argmin),
+  `nvfp4_linear_add_a4_tma.cu` / `nvfp4_linear_add_a4.cu` (the `Tiled128` premise is falsified),
+  `nvfp4_attn_input_plan.cpp` (the A4 hand-over at 4 is already measured-optimal), and
+  `src/ops/linear_swiglu/nvfp4/*` (audited, §5).
+- CUDA stack allowlist: **unchanged** — `infernix_cuda_stack_check` passes with zero new `STACK`/`LOCAL`
+  symbols and no now-unneeded entries (the three deleted kernels carried no allowlist entries), so no
+  ratchet and no `check_cuda_stack.py update` run.
+- Rebuilds: five single-invocation `ninja -C build-native -j "$(nproc)"` builds in this continuation
+  (retune, post-deletion, candidate `infernix_bench`, baseline `infernix_bench`, post-restore), plus the
+  candidate-sweep builds earlier in the task, each preceded by
+  `find src/ops/{linear_add,gdn_input_proj,attn_input_proj} -name '*.cu' -exec touch {} +` because
+  `build-native` CUDA depfiles do not track headers.
+
+## 2. Architectural rationale & task premise analysis (`20261031-performance-tasks.md` T7)
+
+**What held, and what shipped.** The three fused ops carried the RTX 5090 fit's `RowTiles = 1`,
+`K`-baked sliced-K tiles, and on GB10 the `K` baking is the dominant loss, not the SIMT-vs-tile choice
+the task named. Baking `K` into `Nvfp4ScheduleInstance` lets `ptxas` fully unroll the K-group loop, which
+costs far more than it saves at these widths: the same tile in the runtime-`K` form (`nvfp4_sliced_k_mma`
+with a runtime `kGroups`) is 30–42 % faster on the wide tiles — 322.4 → 226.3 µs (`K = 17408, T = 1`),
+403.5 → 252.0 (`T = 24`), 432.1 → 262.1 (`T = 32`), 118.6 → 96.3 (`K = 6144, T = 24`), 135.4 → 100.4
+(`T = 32`). `RowTiles` adds a further 1–4 % where both are legal. `RowTiles` only sets how many row tiles
+share a CTA and its launch bounds (`nvfp4_sliced_min_blocks_per_sm`), and the MMA's columns are
+independent, so a column's `K` slices and their reduction order — and therefore the bits — are
+unchanged: the shipped `RowTiles = 2` tiles are bit-identical to the tiles they replace. The `T = 2..5`
+SIMT kernel lost to the tile of the same K-warp count at every one of those bands (`K = 17408`: 237.5 /
+238.4 / 246.6 µs at `T = 2/4/5` against 228.2 / 230.2 / 231.3; `K = 6144`: 85.0 against 83.6), so it and
+its two siblings were deleted rather than left as an unreached fallback.
+
+**Premise corrections from measurement.**
+
+1. **The GEMV specialization (step 1) is a no-op: the two schedules are the same speed.** The claim is
+   that `nvfp4_linear_add_decode.cu`'s `Nvfp4A16GemvSchedule<8, 2, 16, 4, StagedRaw, Default, 2>` costs
+   `+18.7 µs` against the standalone table's `<8, 1, 16, 4, Direct, Default, 2>`. The standalone
+   `src/ops/linear/nvfp4/shapes/n5120_k6144.cu` does not use the `Direct` schedule the task quotes — it
+   uses the same `<8, 2, 16, 4, StagedRaw, Default, 2>` as the fused op, so the 79.62 µs figure it
+   attributes to `Direct` was never produced by it. Measured as candidates in one process (cold L2, pass
+   2, `K = 6144, T = 1`): shipped `w2 StagedRaw` **80.80 µs**, `w1 Direct` 81.7–83.8, `w1 StagedRaw`
+   82.5, `w2 Direct` 82.8–90.3. At `K = 17408, T = 1` the GEMV (226.3–227.1) ties the runtime-`K` 4-warp
+   tile (226.3–229.2). No change: the requested specialization is not faster, and the `T = 1` route is
+   the release's.
+2. **The `Tiled128` / `GroupM = 8` prefill premise (step 2, second half) does not exist as written and
+   regresses as implemented.** `Nvfp4A4TmaMmaSchedule<BlockTokens, Stages, MinBlocksPerSm, Promotions,
+   Terms, BlockRows>` has no `GroupM` parameter at all, and `kScaleLayout` is `Tiled128` iff
+   `BlockTokens == 128` — so "BM = 128, GroupM = 8" can only be expressed as `BlockTokens = 128` (which
+   forces `MinBlocksPerSm = 1`, the same occupancy the shipped `BlockTokens = 256` lane has) or
+   `BlockRows = 128`. Swept against the production lane (cold L2, pass 2): `a4_tma128_b3` is **+13 … +23 %
+   slower** at every prefill width (`K = 6144`: 184.3 vs 169.0 at `T = 512`, 336.9 vs 326.7 at 1024,
+   1431.6 vs 1177.6 at 4096; `K = 17408`: 489.5 vs 451.6 at 512, 3982.2 vs 3228.7 at 4096), and
+   `a4_tma256_b3_r64` is +16 … +21 % slower. Not shipped; `nvfp4_linear_add_a4_tma.cu` is untouched.
+3. **The task's absolute microsecond bars are protocol artifacts, so every judgement here is an A/B
+   delta against the saved HEAD binary in the same protocol.** Re-running the *HEAD* binary's own
+   acceptance command shows its `T = 1` baseline is not reproducible: `--t-sweep 1,1,1,1 --warmup 2
+   --repeat 10` gives 78.7 / 78.8 / 79.5 / 78.7 µs after the first point's 98.3 µs. Two distinct
+   artifacts explain it, both in the harness rather than the kernel:
+   - *first-point allocation inflation* — the process that also sizes the A4 workspace for `max_t = 4096`
+     reads its first point at 95.2–97.3 µs, while the same point with a sweep max of 64 reads 79.7–85.0
+     (`--policy a4` and `--policy a16` agree once the sweep is the same);
+   - *memory-clock droop* — the retuned tiles run ~25 % faster at boosted clocks and converge on the SIMT
+     kernel once the GPU is at sustained-load clocks (§5). The 12-identical-sample sequence
+     `176.99 × 9, then 225.9 / 190.7 / 203.6` for one unchanged kernel is the direct evidence.
+   The reported acceptance numbers are the sustained-load / task-command protocol; the boost-state
+   numbers are disclosed next to them rather than in place of them.
+4. **The GDN hand-over is at 17, not 16-or-3 as the task offered, and Attn needs no gate change.** Cold
+   sweep (`warmup 3 / repeat 15`): A16 wins `T = 1` 202.6 vs 212.8, `T = 4` 207.7 vs 213.8, `T = 8` 208.8
+   vs 213.8, `T = 16` 211.8 vs 215.9, then collapses above the tile table's reach (`T = 17` 237.4,
+   `T = 31` 366.7) while A4 holds ~216–219. Boundary set at exactly 17. For Attn the A16 lane is 1–3 µs
+   ahead at `T = 4/8` (185.0 / 185.2 vs 188.2 / 187.2), inside the run-to-run spread, so
+   `nvfp4_attn_input_plan.cpp` keeps its `T ≥ 4 → A4` gate.
+5. **The `K = 17408` `T = 2..4` bar needs the 8 K-warp tiles, which stay gated.** The 8 K-warp runtime-`K`
+   tiles are the argmin at every `K = 17408` width (223.1–228.2 for `T = 2..8` against 228.2–230.2 for the
+   4 K-warp twins) and would meet the ≤ 226 µs bar, but the K-warp count *is* the reduction order, so they
+   change bits relative to the release. They remain admitted only under `LinearRoutes::WideDownTile`
+   (batched decode/verification, where T5 qualified them); the ordinary A16/A4 route and prefill keep the
+   release's 4 K-warp tiles, which the sweep still puts ahead of the SIMT kernel and of every `K`-baked
+   tile. Shipping them on the other routes is a fast-path qualification (§5), not a dispatch edit.
+
+## 3. Subsystem breakdown
+
+- **ops / linear_add (NVFP4)** — dispatch table only; no kernel source changed. Numerics are unchanged
+  (`RowTiles` and runtime-`K` preserve each column's slice order), which `infernix_linear_add_nvfp4_test`
+  and the column-invariant and sliced-K pipeline tests re-check against their oracles.
+- **ops / gdn_input_proj (NVFP4)** — one route-gate change plus one tile band. The gate change *does*
+  alter the artifact's bits for `T = 1..16` under an A4-allowing policy: those widths now run the A16
+  dequant tiles instead of the A4 lane. Those A16 kernels are not new — they are the already-qualified
+  `A16Only` route's kernels, covered by `infernix_gdn_input_proj_test`'s independent oracle, and the E2E
+  MTP acceptance rate moved within noise (§4).
+- **ops / attn_input_proj (NVFP4)** — one tile band; policy gate untouched, so no bits change outside the
+  bands whose tile width changed.
+- **bench** — the candidate harness is the deliverable's measurement instrument: `--variants` now measures
+  `RowTiles`, runtime-`K`, GEMV schedule and A4 TMA shape as *separate* candidates so no lever is bundled
+  into another's verdict.
+- **Deleted** — the three `*_small_t.cu` SIMT kernels, their `sources.cmake` entries, their `plan.h`
+  declarations and the bench's `simt_small_t_prod` candidate, per the repository's no-backward-compat rule
+  for superseded routes. Nothing else referenced them (no production caller, no test).
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+- Build: one `ninja -C build-native -j "$(nproc)"` invocation for `infernix-serve`, the three benches,
+  `infernix_bench` and the three family test executables; clean (`BUILD_EXIT = 0`, 85 edges after the
+  deletions).
+- Tests, serial (this host's CTest `--parallel` produces real numerical failures):
+  `ctest --test-dir build-native -R "infernix_linear_add_.*test|infernix_gdn_input_proj_test|infernix_attn_input_proj_test|infernix_column_invariant_projections_test|infernix_groupwise_sliced_k_pipeline_test|infernix_cuda_stack_check" --output-on-failure`
+  → **100 % passed, 0 failed of 13, 90.5 s**, run twice (after the retune and after the deletions + tree
+  restore). The task's named targets `infernix_ops_linear_add_test` / `infernix_ops_gdn_input_proj_test` /
+  `infernix_ops_attention_test` are not CTest names; the op tests merge into
+  `infernix_ops_linear_fused_test` / `infernix_ops_recurrent_test` / `infernix_ops_projection_test`.
+- **Acceptance points — 5 alternating passes, one `T` per process, `warmup 2 / repeat 15`, median of 5**
+  (baseline = the saved HEAD binary; ranges are the pass minima/maxima):
+
+| point | HEAD | T7 | Δ |
+|---|---|---|---|
+| `linear_add` `K=17408` `a4` `T=2` | 235.52 (234.3–237.4) | **175.97** (175.9–176.1) | **−25.3 %** |
+| … `T=3` | 234.43 | 177.98 | −24.1 % |
+| … `T=4` | 235.36 | **176.13** | **−25.2 %** |
+| … `T=8` (A4 lane) | 226.14 | 226.08 | −0.0 % |
+| `linear_add` `K=6144` `a4` `T=2` | 84.96 | **73.57** | **−13.4 %** |
+| … `T=3` / `T=4` | 76.67 / 76.64 | 74.66 / 73.57 | −2.6 % / −4.0 % |
+| `gdn_input_proj` `a4` `T=1` | 212.83 (210.8–213.9) | **202.56** (201.6–205.7) | **−4.8 %** |
+| … `T=2` | 212.77 (211.9–212.8) | **208.74** (208.7–210.8) | **−1.9 %** |
+| … `T=4` / `T=16` | 211.81 / 214.88 | 209.76 / 212.80 | −1.0 % / −1.0 % |
+| `attn_input_proj` `a4` `T=2` | 185.18 (184.3–186.2) | **183.07** (182.1–183.1) | **−1.1 %** |
+| … `T=4` | 186.24 | 187.20 | +0.5 % (noise) |
+
+- **Task-command protocol** (the four commands in the task, 3 alternating passes per binary, median of 3) —
+  the protocol the acceptance bars were written in, and the one that puts the GPU under sustained DRAM
+  load. Largest movements, all improvements, none a regression beyond noise:
+  `linear_add K=17408 a16` `T=8/16/24/32/64` 286.7→230.4, 315.4→236.4, 344.1→251.7, 407.2→265.1,
+  647.0→354.3 µs (−19.6 / −25.1 / −26.8 / −34.9 / −45.2 %); `K=6144 a16` `T=24/32/64` 110.4→94.2,
+  126.7→98.3, 257.9→119.1 µs (−14.7 / −22.4 / −53.8 %); `K=17408 a4` `T=2` 235.5→228.4, `T=32`
+  235.5→231.5; `K=6144 a4` `T=512` 177.4→167.9; `gdn a4` `T=1/2/4/8/16` 211.8→202.6, 211.7→208.7,
+  212.0→208.7, 214.9→209.8, 216.9→211.8; `gdn a16` `T=2` 215.9→208.7; `attn a4` `T=2` 185.2→182.9.
+  Unchanged as intended: both `T=4096` points (227.9→227.1 TF/s at `K=17408`; `K=6144` is bimodal in both
+  binaries, §5) and the `T=1` points (both binaries 96.3/97.2 at `K=6144`, 233.5/233.5 at `K=17408`).
+- **E2E** — `./bench/run_kv_matrix_bench.sh` with `MODELS=nvfp4 KV_DTYPES=fp8 MODES=mtp` (W4Dense
+  `Qwen4ExpForCausalLM`, pp4096 / tg128 / tg256 / pp4096+tg128 / pp4096+tg256, `-r 2 --warmup 1`), 2
+  alternating passes per side against a HEAD-built `infernix_bench`: **parity, all five shapes within
+  ±2.1 % with mixed signs** (decode 65.7→64.8, 70.0→69.7, 95.2→96.6, 98.7→96.8 tok/s; prefill
+  3271.6→3206.2, 3246.2→3265.0, 3250.1→3205.4 tok/s), MTP accepted-tokens-per-round within ±2.1 %
+  (1.33→1.30, 1.62→1.61, 3.79→3.80, 4.25→4.20). The Op-level decode wins do not move this workload
+  end-to-end: at real decode widths the affected bands are a small share of a step that is dominated by
+  the host/SSD-offloaded experts (§5).
+
+## 5. Accepted gaps & rebase conflict resolution policy
+
+- **`linear_add K=17408, T = 2..4` misses the ≤ 226 µs bar.** Task-command protocol: 228.4 µs (`T = 2`)
+  and 227.3–235.8 µs (`T = 4`) against the bar, i.e. 1–4 % short; HEAD in the same protocol is 235.5 /
+  234.5. The single-point protocol reaches 176 µs there, but that is the boosted-clock state of the same
+  kernel and is not what a sustained decode stream sees, so it is disclosed and not claimed. Closing the
+  bar means the 8 K-warp tiles on the non-`wide_k` routes (§2.5), which changes the reduction order and
+  therefore needs the model-quality fast-path qualification for that configuration plus a measured-faster
+  registration — a qualification decision, not a schedule edit.
+- **The `T = 4096` prefill bars (≥ 310 / ≥ 320 TF/s) are not reachable by any schedule knob.** Measured
+  219.8 (HEAD 163.8, bimodal) at `K = 6144` and 227.3 (HEAD 227.3) at `K = 17408` — the doc's own
+  baselines, unchanged. The A4 prefill lane is quantizer-serialized ahead of the GEMM; the GEMM alone
+  sustains 339–346 TF/s, so the bar needs a cross-kernel producer/consumer or a second stream, not a tile
+  change. Two supporting measurements: `Tiled128` and `BlockRows = 64` variants are 13–23 % and 16–21 %
+  *slower* (§2.2), and the same A4 lane reaches **356.6 TF/s** in `nvfp4_linear_swiglu` at
+  `[34816, 5120]`, where the activation quantizer is 12 % of the traffic instead of ~50 % — the ceiling
+  tracks the quantizer's share, which is the serialization signature.
+- **`nvfp4_linear_swiglu` was audited, not changed.** The task title names it but the spec lists no
+  swiglu file, step, or bar and its bench is not in the verification list. Audit (`[34816, 5120]`,
+  `warmup 2 / repeat 10`): the A4 lane — the one the production policy runs — is at 226–228 GB/s for
+  `T = 1..16` and 224.8 / 222.9 at `T = 32 / 64`, i.e. already in the band the retuned ops reached, with
+  289.0 / 356.6 TF/s at 512 / 4096. The `A16Only` lane dips to 184.0 / 201.5 GB/s at `T = 32 / 64`
+  (against 227.3 at `T = 16`), which is the same `K`-baking signature and is the natural follow-up; it is
+  left alone here because that lane is the policy-fallback route with no acceptance bar and no spec step.
+- **Bits change only on the GDN `T = 1..16` A4 → A16 gate** (§3). The kernels it admits are the already
+  qualified `A16Only` route's, and the E2E MTP acceptance stayed within noise; no new kernel was added to
+  any configuration.
+- **E2E coverage is one artifact and one KV dtype** (W4Dense, fp8, MTP, concurrency 1, 2 passes/side).
+  IQ3_S and Dense8 were not run: their dense projections are not the NVFP4 routes this task retunes, and
+  the full 42-arm matrix is the orchestrator's campaign gate, not this task's verification list.
+- **Harness notes for future audits.** (a) The first point of a `--t-sweep` process is inflated ~17 µs by
+  the max-token A4 workspace allocation — measure a `T = 1` point either with a sweep whose max is small or
+  as a single-point process. (b) `--variants` numbers are all in the drooped-clock regime (29 candidates ×
+  18 launches share one process), so they are valid for ranking candidates and not for absolute bars.
+  (c) A candidate `std::function` in the bench must capture its launch function pointer by value; the
+  pre-existing `a4`/`a16` helpers captured it by reference out of a returned frame, which segfaulted the
+  first `--variants` candidate in this task (`EXIT = 139`).
+- **Rebase conflict policy for these files:** keep the fused sliced-K bands in the runtime-`K` form with
+  `RowTiles = 2` — an upstream change that re-bakes `K` into these instances reintroduces the 30–42 % loss
+  on this device; keep the `K = 17408` 8 K-warp tiles behind the `wide_k` argument and do not let a merge
+  promote them to the ordinary route without the fast-path qualification; keep the GDN A4 hand-over at 17
+  and the Attn one at 4 as measured values with their numbers in the comment; and keep
+  `nvfp4_{linear_add,gdn_input,attn_input}_small_t.cu` deleted — if an upstream change resurrects a SIMT
+  `T = 2..5` band, it must be re-measured against the runtime-`K` tile of the same K-warp count first.

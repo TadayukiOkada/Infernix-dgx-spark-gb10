@@ -10,7 +10,9 @@
 // behind its token bands, exposed so each can be timed independently on this device.
 #include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
+#include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -75,6 +77,55 @@ void bench_a16_sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
         d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
         d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
 }
+
+// The K-baked tile with the RowTiles lever exposed, so RowTiles and the runtime-K form are
+// measured as separate changes rather than bundled into one candidate.
+template <int Tokens, int Warps, int Stages, int RowTiles, int K>
+void bench_a16_sliced_baked(const Tensor& x, const Weight& weight, Tensor& out,
+                            cudaStream_t stream) {
+    d::launch_nvfp4_a16_sliced_k_mma<
+        d::Nvfp4ScheduleInstance<d::Nvfp4SlicedInstance<Tokens, Warps, Stages, RowTiles>, K>>(
+        d::nvfp4_a16_operands(x, weight),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
+}
+
+// The runtime-K (bare-schedule) form of the sliced-K tile, with the RowTiles lever exposed: baking
+// K lets ptxas unroll the K-group loop, which the standalone tables found slower at these widths.
+template <int Tokens, int Warps, int Stages, int RowTiles>
+void bench_a16_sliced_rt(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    d::launch_nvfp4_a16_sliced_k_mma<d::Nvfp4SlicedInstance<Tokens, Warps, Stages, RowTiles>>(
+        d::nvfp4_a16_operands(x, weight),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
+}
+
+template <class Schedule, int K>
+void bench_a16_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    d::launch_nvfp4_a16_gemv<d::Nvfp4ScheduleInstance<Schedule, K>>(
+        d::nvfp4_a16_operands(x, weight),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
+}
+
+// A TMA lane with an explicit schedule, so the BlockTokens/BlockRows/Stages shape can be swept
+// against the one the production launcher hardcodes.
+template <int BlockTokens, int Stages, int MinBlocksPerSm, int BlockRows, int K>
+void bench_a4_tma_schedule(const Weight& weight, Tensor& out, d::Nvfp4A4Workspace workspace,
+                           int tokens, cudaStream_t stream) {
+    using S = d::Nvfp4ScheduleInstance<
+        d::Nvfp4A4TmaMmaSchedule<BlockTokens, Stages, MinBlocksPerSm,
+                                 d::kNvfp4A4TmaWeightCodeL2_128B, 1, BlockRows>,
+        K>;
+    d::launch_nvfp4_a4_tma_mma<S>(
+        d::nvfp4_a4_operands(weight, workspace, tokens, S::kScaleLayout),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
+}
+
+template <int BlockTokens>
+inline constexpr d::Nvfp4ScaleLayout kBenchTmaScaleLayout =
+    BlockTokens == 128 ? d::Nvfp4ScaleLayout::Tiled128 : d::Nvfp4ScaleLayout::Tiled256;
 
 template <class Schedule, int K>
 void bench_a16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -267,7 +318,9 @@ int main(int argc, char** argv) {
                 const auto a4 = [&](const char* name, void (*gemm)(const Weight&, Tensor&,
                                                                    d::Nvfp4A4Workspace, int,
                                                                    cudaStream_t)) {
-                    return Cand{name, [&](cudaStream_t s) {
+                    // Capture the function pointer by value: the stored std::function outlives this
+                    // helper's frame, so a by-reference capture would dangle.
+                    return Cand{name, [=, &x, &packed, &out, &scratch](cudaStream_t s) {
                                    d::launch_nvfp4_a4_quantize(x, packed.weight, scratch,
                                                                d::Nvfp4ScaleLayout::RowMajor, s);
                                    gemm(packed.weight, out, scratch, tokens, s);
@@ -275,7 +328,9 @@ int main(int argc, char** argv) {
                 };
                 const auto a16 = [&](const char* name, void (*fn)(const Tensor&, const Weight&,
                                                                   Tensor&, cudaStream_t)) {
-                    return Cand{name, [&](cudaStream_t s) { fn(x, packed.weight, out, s); }};
+                    return Cand{name, [=, &x, &packed, &out](cudaStream_t s) {
+                                   fn(x, packed.weight, out, s);
+                               }};
                 };
                 std::vector<Cand> cands;
                 if (k6144) {
@@ -417,10 +472,109 @@ int main(int argc, char** argv) {
                                                                       tokens, s);
                     }});
                 }
+                // T7 (2026-10-31) candidates: the levers the task proposes for the fused add route,
+                // measured in the same process against the production schedules above.
+                const auto add_t7 = [&](auto ktag) {
+                    constexpr int K = decltype(ktag)::value;
+                    const auto gemv = [&](const char* name, void (*fn)(const Tensor&, const Weight&,
+                                                                       Tensor&, cudaStream_t)) {
+                        cands.push_back(Cand{name, [=, &x, &packed, &out](cudaStream_t s) {
+                                               fn(x, packed.weight, out, s);
+                                           }});
+                    };
+                    if (tokens == 1) {
+                        gemv("gemv_w2_staged_prod", [](const Tensor& x_, const Weight& w, Tensor& o,
+                                                       cudaStream_t s) {
+                            bench_a16_gemv<d::Nvfp4A16GemvSchedule<
+                                               8, 2, 16, 4, d::Nvfp4ScaleAccess::StagedRaw,
+                                               d::Nvfp4CodeCache::Default, 2>,
+                                           K>(x_, w, o, s);
+                        });
+                        gemv("gemv_w1_direct", [](const Tensor& x_, const Weight& w, Tensor& o,
+                                                  cudaStream_t s) {
+                            bench_a16_gemv<d::Nvfp4A16GemvSchedule<
+                                               8, 1, 16, 4, d::Nvfp4ScaleAccess::Direct,
+                                               d::Nvfp4CodeCache::Default, 2>,
+                                           K>(x_, w, o, s);
+                        });
+                        gemv("gemv_w1_staged", [](const Tensor& x_, const Weight& w, Tensor& o,
+                                                  cudaStream_t s) {
+                            bench_a16_gemv<d::Nvfp4A16GemvSchedule<
+                                               8, 1, 16, 4, d::Nvfp4ScaleAccess::StagedRaw,
+                                               d::Nvfp4CodeCache::Default, 2>,
+                                           K>(x_, w, o, s);
+                        });
+                        gemv("gemv_w2_direct", [](const Tensor& x_, const Weight& w, Tensor& o,
+                                                  cudaStream_t s) {
+                            bench_a16_gemv<d::Nvfp4A16GemvSchedule<
+                                               8, 2, 16, 4, d::Nvfp4ScaleAccess::Direct,
+                                               d::Nvfp4CodeCache::Default, 2>,
+                                           K>(x_, w, o, s);
+                        });
+                    }
+                    // The 2..5-token SIMT kernel this candidate used to measure is gone: the
+                    // runtime-K RowTiles-2 sliced-K tiles of every one of those bands beat it on
+                    // GB10, so nvfp4_linear_add_small_t.cu was removed with its route.
+                    const auto sliced_rt = [&](const char* name, void (*fn)(const Tensor&,
+                                                                            const Weight&, Tensor&,
+                                                                            cudaStream_t)) {
+                        cands.push_back(Cand{name, [=, &x, &packed, &out](cudaStream_t s) {
+                                               fn(x, packed.weight, out, s);
+                                           }});
+                    };
+#define INFER_NIX_BENCH_SLICED_RT(NAME, T, W, ST, RT)                                            \
+    sliced_rt(NAME, [](const Tensor& x_, const Weight& w, Tensor& o, cudaStream_t s) {            \
+        bench_a16_sliced_rt<T, W, ST, RT>(x_, w, o, s);                                           \
+    });
+#define INFER_NIX_BENCH_SLICED_BAKED(NAME, T, W, ST, RT)                                         \
+    sliced_rt(NAME, [](const Tensor& x_, const Weight& w, Tensor& o, cudaStream_t s) {            \
+        bench_a16_sliced_baked<T, W, ST, RT, K>(x_, w, o, s);                                     \
+    });
+                    INFER_NIX_BENCH_SLICED_RT("slicedrt_t8_w8_s2_r2", 8, 8, 2, 2)
+                    INFER_NIX_BENCH_SLICED_RT("slicedrt_t8_w4_s2_r2", 8, 4, 2, 2)
+                    INFER_NIX_BENCH_SLICED_RT("slicedrt_t16_w8_s2_r2", 16, 8, 2, 2)
+                    INFER_NIX_BENCH_SLICED_RT("slicedrt_t16_w4_s2_r2", 16, 4, 2, 2)
+                    INFER_NIX_BENCH_SLICED_RT("slicedrt_t32_w4_s1_r2", 32, 4, 1, 2)
+                    INFER_NIX_BENCH_SLICED_RT("slicedrt_t32_w4_s2_r2", 32, 4, 2, 2)
+                    INFER_NIX_BENCH_SLICED_RT("slicedrt_t64_w2_s2_r2", 64, 2, 2, 2)
+                    INFER_NIX_BENCH_SLICED_BAKED("slicedbkt8_w8_s2_r2", 8, 8, 2, 2)
+                    INFER_NIX_BENCH_SLICED_BAKED("slicedbkt8_w4_s2_r2", 8, 4, 2, 2)
+                    INFER_NIX_BENCH_SLICED_BAKED("slicedbkt16_w8_s2_r2", 16, 8, 2, 2)
+                    INFER_NIX_BENCH_SLICED_BAKED("slicedbkt16_w4_s2_r2", 16, 4, 2, 2)
+                    INFER_NIX_BENCH_SLICED_BAKED("slicedbkt32_w4_s1_r2", 32, 4, 1, 2)
+#undef INFER_NIX_BENCH_SLICED_BAKED
+#undef INFER_NIX_BENCH_SLICED_RT
+                    const auto tma = [&](const char* name,
+                                         void (*gemm)(const Weight&, Tensor&, d::Nvfp4A4Workspace,
+                                                      int, cudaStream_t),
+                                         d::Nvfp4ScaleLayout layout) {
+                        cands.push_back(Cand{name, [=, &x, &packed, &out, &scratch](cudaStream_t s) {
+                                               d::launch_nvfp4_a4_quantize(x, packed.weight, scratch,
+                                                                           layout, s);
+                                               gemm(packed.weight, out, scratch, tokens, s);
+                                           }});
+                    };
+                    tma("a4_tma128_b3",
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_tma_schedule<128, 3, 1, 128, K>(w, o, ws, t, s);
+                        },
+                        kBenchTmaScaleLayout<128>);
+                    tma("a4_tma256_b3_r64",
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_tma_schedule<256, 3, 1, 64, K>(w, o, ws, t, s);
+                        },
+                        kBenchTmaScaleLayout<256>);
+                };
+                if (k6144)
+                    add_t7(std::integral_constant<int, 6144>{});
+                else
+                    add_t7(std::integral_constant<int, 17408>{});
                 for (const Cand& cand : cands) {
                     const bench::ColdTiming timing = bench::measure_cold_launch_prepared(
                         restore, cand.launch, flush, stream, options.warmup, options.repeat);
-                    std::printf("K=%-5d T=%-4d %-24s median=%9.3f us min=%9.3f p95=%9.3f\n",
+                    std::printf("K=%-5d T=%-4d %-28s median=%9.3f us min=%9.3f p95=%9.3f\n",
                                 options.k, tokens, cand.name, timing.median_us, timing.min_us,
                                 timing.p95_us);
                     if (cfile) {

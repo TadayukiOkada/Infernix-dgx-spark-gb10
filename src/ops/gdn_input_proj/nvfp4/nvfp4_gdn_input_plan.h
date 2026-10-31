@@ -47,9 +47,6 @@ void nvfp4_gdn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream);
 
-void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                    cudaStream_t stream);
-
 void nvfp4_gdn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                Nvfp4A4Workspace workspace, cudaStream_t stream);
 
