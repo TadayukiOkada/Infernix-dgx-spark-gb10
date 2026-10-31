@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/program/ngram_volume.h"
 
+#include "core/temporary_switches.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>

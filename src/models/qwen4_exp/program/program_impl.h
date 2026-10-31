@@ -6828,7 +6828,7 @@ private:
     // copy is verified, so it bounds the width from below). `extents`: each row's drafts so far (at
     // most kPairMaxDrafts). One draft more every kProbeInterval pair rounds, as for one row.
     std::int32_t dflash2_pair_width(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> extents) {
-        std::array<std::array<double, kPairMaxDrafts + 1>, 2> tokens{};
+        std::array<std::array<double, kPairMaxDraftsCapacity + 1>, 2> tokens{};
         std::int32_t least = 0, most = 0;
         for (std::size_t b = 0; b < 2; ++b) {
             const Lane& lane = lanes_[lanes[b]];

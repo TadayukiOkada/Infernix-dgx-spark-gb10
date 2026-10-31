@@ -468,54 +468,62 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
                       MoeDispatch dispatch, MoeExpertSource source, int top_k,
                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ tiles,
                       const std::int32_t* __restrict__ first_tile, int job_base, int jobs, std::uint16_t* __restrict__ h_plane) {
+    using TileShared = ggml::tile::SharedT<ggml::tile::kRawChunksOf<GU>>;
     extern __shared__ __align__(16) unsigned char tile_shared[];
-    auto& sm = *reinterpret_cast<ggml::tile::Shared*>(tile_shared);
+    auto& sm = *reinterpret_cast<TileShared*>(tile_shared);
     __shared__ std::uint16_t up[kGgmlTileUnits][ggml::tile::kTileColumns];
+    __shared__ int tile_token[ggml::tile::kTileColumns];
     GgmlTile tl;
     if (!ggml_tile_of(dispatch, tiles, first_tile, job_base, jobs, tl)) { return; }
     const std::uint8_t* record = job_records[tl.job];
     if (record == nullptr) { return; }
     const int i0        = static_cast<int>(blockIdx.x) * kGgmlTileUnits;
     const int row_bytes = static_cast<int>(source.ggml.gate_row_bytes);
+    const int columns   = min(ggml::tile::kTileColumns, tl.count - tl.column0);
+    const int h_base    = tl.first + tl.column0;
+    const int col0      = tl.column0;
+    const int h_count   = tl.count;
+    if (threadIdx.x < ggml::tile::kTileColumns) {
+        const int c = static_cast<int>(threadIdx.x);
+        tile_token[c] = dispatch.entries[tl.first + min(col0 + c, h_count - 1)] / top_k;
+    }
+    __syncthreads();
     const auto row_of   = [&](int r) {
         return record +
                static_cast<std::size_t>(r < kGgmlTileUnits ? i0 + r : moe::kIntermediate + i0 + r - kGgmlTileUnits) * row_bytes;
     };
-    const auto token = [&](int c) { return dispatch.entries[tl.first + min(tl.column0 + c, tl.count - 1)] / top_k; };
     const auto limbs = [&](int c) {
-        return reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(token(c)) * moe::wide::kA16XRowBytes);
+        return reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(tile_token[c]) * moe::wide::kA16XRowBytes);
     };
-    ggml::tile::Accumulators acc;
-    const int columns = min(ggml::tile::kTileColumns, tl.count - tl.column0);
-    const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
+    ggml::tile::Accumulators<kGgmlTileThreads> acc;
     ggml::tile::compute<GU, kGgmlTileThreads>(sm, row_of, kGgmlXSlices, limbs, 0, columns, acc);
+    const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
     const int lane = threadIdx.x % 32;
+    std::uint16_t gate_y[ggml::tile::kNTiles][4];
 #pragma unroll
-    for (int mi = 0; mi < ggml::tile::kMTiles; ++mi) {
+    for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
 #pragma unroll
-        for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
-#pragma unroll
-            for (int q = 0; q < 4; ++q) {
-                const int r = ggml::tile::out_row(wt, lane, mi, q), c = ggml::tile::out_column(wt, lane, nt, q);
-                if (mi < wt.mtiles && nt < wt.ntiles && r >= kGgmlTileUnits) {
-                    up[r - kGgmlTileUnits][c] = ggml::output_bf16(acc.r[mi][nt][q], x_emax[token(c)], GU);
+        for (int q = 0; q < 4; ++q) {
+            const int r = ggml::tile::out_row(wt, lane, 0, q), c = ggml::tile::out_column(wt, lane, nt, q);
+            if (wt.mtiles > 0 && nt < wt.ntiles) {
+                const std::uint16_t val = ggml::output_bf16(acc.r[0][nt][q], x_emax[tile_token[c]], GU);
+                if (r >= kGgmlTileUnits) {
+                    up[r - kGgmlTileUnits][c] = val;
+                } else {
+                    gate_y[nt][q] = val;
                 }
             }
         }
     }
     __syncthreads();
 #pragma unroll
-    for (int mi = 0; mi < ggml::tile::kMTiles; ++mi) {
+    for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
 #pragma unroll
-        for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
-#pragma unroll
-            for (int q = 0; q < 4; ++q) {
-                const int r = ggml::tile::out_row(wt, lane, mi, q), c = ggml::tile::out_column(wt, lane, nt, q);
-                if (mi < wt.mtiles && nt < wt.ntiles && r < kGgmlTileUnits && tl.column0 + c < tl.count) {
-                    const std::uint16_t y = ggml::output_bf16(acc.r[mi][nt][q], x_emax[token(c)], GU);
-                    h_plane[static_cast<std::size_t>(tl.first + tl.column0 + c) * moe::wide::kA16HRowElements + i0 + r] =
-                        canon::swiglu_bf16(y, up[r][c]);
-                }
+        for (int q = 0; q < 4; ++q) {
+            const int r = ggml::tile::out_row(wt, lane, 0, q), c = ggml::tile::out_column(wt, lane, nt, q);
+            if (wt.mtiles > 0 && nt < wt.ntiles && r < kGgmlTileUnits && col0 + c < h_count) {
+                h_plane[static_cast<std::size_t>(h_base + c) * moe::wide::kA16HRowElements + i0 + r] =
+                    canon::swiglu_bf16(gate_y[nt][q], up[r][c]);
             }
         }
     }
@@ -598,22 +606,19 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
             return reinterpret_cast<const std::int32_t*>(h_plane +
                                                          static_cast<std::size_t>(entry(c)) * moe::wide::kA16HRowElements);
         };
-        ggml::tile::Accumulators acc;
+        ggml::tile::Accumulators<kGgmlTileThreads> acc;
         const int columns = min(ggml::tile::kTileColumns, tl.count - tl.column0);
-        const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
         ggml::tile::compute_resident<D, kDownStages, kGgmlTileThreads>(sm, mode, limbs, 0, columns, acc);
+        const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
 #pragma unroll
-        for (int mi = 0; mi < ggml::tile::kMTiles; ++mi) {
+        for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
 #pragma unroll
-            for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
-#pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    const int c = ggml::tile::out_column(wt, lane, nt, q);
-                    if (mi < wt.mtiles && nt < wt.ntiles && tl.column0 + c < tl.count) {
-                        const int row = row0 + ggml::tile::out_row(wt, lane, mi, q);
-                        reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(dispatch.entries[entry(c)]) * hidden +
-                                                                  row] = ggml::output_bf16(acc.r[mi][nt][q], h_emax[entry(c)], D);
-                    }
+            for (int q = 0; q < 4; ++q) {
+                const int c = ggml::tile::out_column(wt, lane, nt, q);
+                if (wt.mtiles > 0 && nt < wt.ntiles && tl.column0 + c < tl.count) {
+                    const int row = row0 + ggml::tile::out_row(wt, lane, 0, q);
+                    reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(dispatch.entries[entry(c)]) * hidden +
+                                                              row] = ggml::output_bf16(acc.r[0][nt][q], h_emax[entry(c)], D);
                 }
             }
         }
@@ -964,7 +969,7 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
     }
     // At most one partial tile per job plus one per 64 entries; CTAs past the pass's tiles exit.
     const unsigned tile_bound = static_cast<unsigned>(jobs + (entries + kGgmlTileColumns - 1) / kGgmlTileColumns);
-    constexpr int kTileShared = static_cast<int>(sizeof(ggml::tile::Shared));
+    constexpr int kTileShared = static_cast<int>(sizeof(ggml::tile::SharedT<ggml::tile::kRawChunksOf<GU>>));
     constexpr int kDownShared = static_cast<int>(sizeof(GgmlDownShared<D>));
     static const bool configured = [] {
         return cudaFuncSetAttribute(gate_up_tile_ggml<GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, kTileShared) ==

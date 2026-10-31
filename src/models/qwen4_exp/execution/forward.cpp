@@ -863,7 +863,6 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         } else {
             Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
             project(x, p.projection, projected, work_, s, dense_routes());
-            Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
             if (p.index_projection) {
                 Tensor indexed = work_.alloc(DType::BF16, {index_rows, T});
                 project(x, *p.index_projection, indexed, work_, s, dense_routes());

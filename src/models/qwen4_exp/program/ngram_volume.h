@@ -133,6 +133,9 @@ private:
     mutable std::vector<std::uint64_t> misses_;
     mutable std::vector<std::uint64_t> offsets_;
     mutable std::vector<std::size_t> first_miss_;
+    // INFERNIX_TMP_NGRAM_SCATTER: the blocks' offsets in reading order, and each one's sorted index.
+    mutable std::vector<std::uint64_t> scattered_offsets_;
+    mutable std::vector<std::size_t> scattered_blocks_;
     mutable Counters counters_;
 };
 
