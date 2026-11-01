@@ -604,7 +604,14 @@ __device__ __forceinline__ Stage& stage_of(ResidentShared<Stages, Stage>& sm, in
 // kLimbs); the warps' tiles are warp_tile<Threads>'s layout `Layout`, a warp of an inactive layout
 // slot (512 threads, layout 2) copying and decoding but computing nothing. Source says where the
 // stages come from (StageSource; `plane` for kPlane).
-template <QType F, Accum Mode, int Layout, StageSource Source, int Threads, int Stride = 1, class Sm, class RowOf, class Codebook = fast::DeviceCodebook<F>>
+//
+// RollSlices keeps one stage slice's limb fragments live at a time instead of the whole stage's.
+// A tile whose accumulator and fragment state already fills its registers has to put something
+// somewhere: the 512-thread gate/up tile spills at its 128-register launch bound with the stage
+// unrolled and rolls its way out of most of it, while the tiles that have registers to spare
+// spill more rolled than unrolled, so it is the caller's choice rather than a property of the loop.
+template <QType F, Accum Mode, int Layout, StageSource Source, int Threads, int Stride = 1, bool RollSlices = false,
+          class Sm, class RowOf, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, const LimbCopies<Threads>& copies,
                                              Accumulators<Threads>& acc, const std::uint8_t* plane, const Codebook& cb = Codebook{}) {
     constexpr bool Narrow = Mode == Accum::kNarrow;
@@ -693,7 +700,7 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
             __syncthreads();
         }
         const auto& cs = stage_of(sm, buf, st);
-#pragma unroll
+#pragma unroll (RollSlices ? 1 : kStageSlices)
         for (int j = 0; j < kStageSlices; ++j) {
             if (!wl.active) { break; } // warp-uniform
             // The limb fragments by ldmatrix: matrix f = (nt * 3 + l) * 2 + h holds columns
@@ -868,15 +875,18 @@ __device__ __forceinline__ void compute_loop(Sm& sm, RowOf row_of, int slices, c
 }
 
 // compute_loop for the CTA's accumulator mode and warp layout (the same for every warp).
-template <QType F, StageSource Source, int Threads, int Stride = 1, class Sm, class RowOf, class Codebook = fast::DeviceCodebook<F>>
+template <QType F, StageSource Source, int Threads, int Stride = 1, bool RollSlices = false, class Sm, class RowOf,
+          class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, const LimbCopies<Threads>& copies,
                                               int columns, Accum mode, Accumulators<Threads>& acc, const std::uint8_t* plane,
                                               const Codebook& cb = Codebook{}) {
     const auto run = [&](auto layout) {
         constexpr int kLayout = decltype(layout)::value;
         constexpr Accum kInt64 = kLimbsMode<F, Threads> ? Accum::kLimbs : Accum::kNarrow; // row_bases' int64 mode
-        mode == kInt64 ? compute_loop<F, kInt64, kLayout, Source, Threads, Stride>(sm, row_of, slices, copies, acc, plane, cb)
-                       : compute_loop<F, Accum::kWide, kLayout, Source, Threads, Stride>(sm, row_of, slices, copies, acc, plane, cb);
+        mode == kInt64
+            ? compute_loop<F, kInt64, kLayout, Source, Threads, Stride, RollSlices>(sm, row_of, slices, copies, acc, plane, cb)
+            : compute_loop<F, Accum::kWide, kLayout, Source, Threads, Stride, RollSlices>(sm, row_of, slices, copies, acc,
+                                                                                           plane, cb);
     };
     if (columns > 32) {
         run(std::integral_constant<int, 0>{});
@@ -895,7 +905,7 @@ __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, 
 // (warp_tile<Threads>(columns)); columns past the valid ones are computed on padding (column limbs
 // that the caller clamps to a valid column) and ignored. Every thread of the CTA (Threads of them)
 // calls it. The outputs are the same integers whichever accumulator the rows' scales allow.
-template <QType F, int Threads = kThreads, int Stride = 1, class RowOf, class ColumnLimbs, int RawChunks = kRawChunksOf<F>, class Codebook = fast::DeviceCodebook<F>>
+template <QType F, int Threads = kThreads, int Stride = 1, bool RollSlices = false, class RowOf, class ColumnLimbs, int RawChunks = kRawChunksOf<F>, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void compute(SharedT<RawChunks>& sm, RowOf row_of, int slices, ColumnLimbs limbs, int xsum_offset,
                                         int columns, Accumulators<Threads>& acc, const Codebook& cb = Codebook{}) {
     const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, limb_columns(columns));
@@ -903,7 +913,8 @@ __device__ __forceinline__ void compute(SharedT<RawChunks>& sm, RowOf row_of, in
     issue_limbs<F>(sm, 0, 0, copies);
     cp_async_commit();
     const Accum mode = row_bases<F, Threads, Stride>(sm, row_of, slices);
-    dispatch_loop<F, StageSource::kDecode, Threads, Stride>(sm, row_of, slices, copies, columns, mode, acc, nullptr, cb);
+    dispatch_loop<F, StageSource::kDecode, Threads, Stride, RollSlices>(sm, row_of, slices, copies, columns, mode, acc,
+                                                                        nullptr, cb);
 }
 
 // compute over a decoded plane: stage st's image at plane + st * sizeof(CodeStage) (decode_planes);

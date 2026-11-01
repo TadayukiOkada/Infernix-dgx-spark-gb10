@@ -496,7 +496,7 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
         return reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(tile_token[c]) * moe::wide::kA16XRowBytes);
     };
     ggml::tile::Accumulators<kGgmlTileThreads> acc;
-    ggml::tile::compute<GU, kGgmlTileThreads>(sm, row_of, kGgmlXSlices, limbs, 0, columns, acc);
+    ggml::tile::compute<GU, kGgmlTileThreads, 1, true>(sm, row_of, kGgmlXSlices, limbs, 0, columns, acc);
     const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
     const int lane = threadIdx.x % 32;
     std::uint16_t gate_y[ggml::tile::kNTiles][4];

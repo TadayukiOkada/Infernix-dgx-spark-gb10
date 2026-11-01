@@ -1822,3 +1822,143 @@ All six paired comparisons are negative, so the sign is consistent — but the m
 - **The embed spread heuristic is a constant, not a measured wave.** `kEmbedSpreadColumns = 48` / `kEmbedCtaTasks = 32` encode "≤ one CTA per SM while the work is tiny" for this device; they are not derived from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, and at 32 threads per CTA the kernel is launch-bound rather than occupancy-bound.
 - **The byte-load fallback in `load_packed_codes` is exercised only at tensor ends.** It is reachable and covered by the 1/37/64-column exact tests, but it is the path that would slow down if a future row layout made the 16-byte window illegal more often; a layout change should re-check the funnel-shift predicate rather than assume it.
 - **No CUDA-graph-level change.** The decode graph's node count drops by one because the op itself launches fewer kernels; no graph capture, workspace or slot-plumbing code was touched, and `forward.cpp` is deliberately unchanged (§3).
+
+---
+
+# GB10 changelog — 2026-11-01 (T10: the GGUF gate/up tile's register spills come out at its 128-register launch bound, and the four named target headers turn out to spill nothing)
+
+## 1. Accounting
+
+| | |
+|---|---|
+| Base commit (branch tip at start) | `712a0a043` — `perf(ple): vectorize NVFP4 embed, cache gate operands, and fuse decode conv state shift (T9)` |
+| HEAD after the task | `712a0a043` (uncommitted worktree, as instructed — no commit, no push) |
+| Files changed | 4 (2 source + 1 allowlist + this changelog) |
+| Insertions / deletions (code) | +20 / −11 across `src/ops/ggml/ggml_tile.cuh`, `src/ops/offloaded_sparse_moe/cuda/ggml_expert.cuh`, `tools/cuda_stack/cuda_stack_allowlist.json` |
+| Allowlist delta | 261 → 259 entries; 19 200 B → 19 152 B of allowed stack; two entries removed, one reduced 40 → 24 B, **zero added or raised** |
+| `cuda-kernel-toolkit/` | intentionally excluded — not touched |
+| Worktree at report time | `M src/ops/ggml/ggml_tile.cuh`, `M src/ops/offloaded_sparse_moe/cuda/ggml_expert.cuh`, `M tools/cuda_stack/cuda_stack_allowlist.json`; `git diff --check` clean |
+
+Task: `docs/tasks/20261101-performance-tasks.md` **T10 (P1)** — eliminate the remaining `STACK = 88–128 B` / `LOCAL = 208–272 B` spills in `gate_up_tile_kernel_a8` / `down_tile_kernel_a8` and the `LOCAL` spills in `ggml_bf16_tile.cuh` and `lossless_expert.cuh`, then ratchet `tools/cuda_stack/cuda_stack_allowlist.json` down.
+
+Rebuild discipline: 12 sequential `ninja -C build-native -j "$(nproc)"` invocations, never two on the same tree, always covering `infernix-serve` and the consumer targets together so the ~56 s `nvlink` device link ran once (one of the 12 aborted immediately on the task doc's nonexistent target names). Every edit to a `.cuh` was followed by `find src/ops/ggml src/ops/offloaded_sparse_moe -name '*.cu' -exec touch {} +` before Ninja — the CUDA depfiles in this configuration do not track headers. Spill numbers were read only from the device-linked `build-native/apps/infernix-serve`; the `-rdc=true` `.cu.o` objects under-report `STACK` to 0 (verified: `moe_layer.cu.o` reports `STACK:0` where the linked binary reports 40 for the same symbol).
+
+## 2. Task-premise corrections and architectural rationale
+
+### 2.1 None of the four named target files spills anything, and none of the named kernels exists
+
+The task's "Affected Files & Symbols" and "Root Cause" sections name kernels that are not in the tree. `grep -rn 'tile_kernel_a8|bf16_tc_kernel|down_lossless_kernel|gate_up_lossless_kernel|vq_ggml_tile_mma_kernel' src/` returns nothing, and none of them appears in `cuobjdump --dump-resource-usage build-native/apps/infernix-serve` (7 462 kernels). What the four headers actually compile, measured on the linked binary at the task's start:
+
+| doc claim | the file's real kernels | measured at HEAD |
+|---|---|---|
+| `gate_up_tile_kernel_a8` `STACK 88 B / LOCAL 208 B`, `down_tile_kernel_a8` `STACK 128 B / LOCAL 272 B` | no such symbols. `ggml_a8_tile.cuh` declares **no `__global__` at all** (it is `compute_plane`/`compute_decode` inlined by its consumers); `ggml_expert_a8.cuh`'s kernels are `ggml_a8_encode_x_kernel`, `gate_up_kernel_ggml_a8`, `down_kernel_ggml_a8`, `ggml_gate_up_a8_wide`, `ggml_down_a8_wide` | all `STACK 0, LOCAL 0` (max REG 255 on the two `_wide` pair, 90/54/39 on the rest) |
+| `down_bf16_tc_kernel` / `gate_up_bf16_tc_kernel` `LOCAL = 48 B` | `ggml_bf16_tile.cuh` declares one `__global__`, `tile_kernel` | `STACK ≤ 16, LOCAL 0` — and those 16 B are the pre-existing prologue-allocation spills of the generic `ggml_linear_wide_cu` family, not bf16-specific |
+| `down_lossless_kernel` `LOCAL = 480 B`, `gate_up_lossless_kernel` `LOCAL = 72 B` | `lossless_expert.cuh`'s kernels are `lossless_counts_kernel`, `lossless_tiles_kernel`, `lossless_up_rows_kernel`, `lossless_swiglu_kernel` | all four `STACK 0, LOCAL 0` (REG 14/28/24/52) |
+| `vq_ggml_tile_mma_kernel<2,1,1>` / `<2,2,1>` `LOCAL = 104 B` | no instances of that name in `infernix-serve` | n/a |
+
+`LOCAL` is **0 for all 7 462 kernels** in the binary, so every `LOCAL` figure in the task text is describing a state this tree has not had. The A8/BF16/lossless expert kernels reached `STACK 0` in the 2026-10-30 spill campaign; T10's remaining work is the one family in the affected translation unit that still spills.
+
+### 2.2 What actually spills in the affected TU, and what the fix had to be
+
+`moe_layer.cu` held three spilling kernels at HEAD, 72 B total — all in `ggml_expert.cuh`, which the task does not list:
+
+| kernel | REG | STACK at HEAD | STACK after | STL/LDL at HEAD | STL/LDL after |
+|---|---|---|---|---|---|
+| `gate_up_tile_ggml<GGML_IQ2_S>` | 128 | 40 B | **24 B** | 13 / 40 | 9 / 15 |
+| `gate_up_tile_ggml<GGML_IQ3_XXS>` | 128 | 16 B | **0 B** | 6 / 5 | 0 / 0 |
+| `gate_up_tile_ggml<GGML_IQ3_S>` | 128 | 16 B | **0 B** | 6 / 5 | 0 / 0 |
+| `gate_up_tile_ggml<GGML_IQ4_XS>` | 128 | 0 B | 0 B | 0 / 0 | 0 / 0 |
+| `down_resident_ggml<…>` (its `down` counterpart) | 128 | 0 B | 0 B | — | — |
+
+These are the production GGUF expert gate/up tiles: `QType` 14/15/16/17 are `GGML_IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_XS`, i.e. exactly the formats `--bank ggml --ggml-wide exact` and `tests/ops/test_offloaded_moe_ggml.cu` cover, and IQ3_S is the format of the delivered `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` artifact. So the task pointed at the right route by the wrong name.
+
+The root cause is *not* the one the task gives ("large per-thread accumulator and fragment arrays across dynamic/unrolled format switch branches … stage per-format decode temporaries in shared memory"). `gate_up_tile_ggml` already carries `__launch_bounds__(kGgmlTileThreads, 1)` with `kGgmlTileThreads = 512`, which is a **hard** 128-register cap (65 536 registers/SM ÷ 512 threads), so step 2's "add explicit `__launch_bounds__`" was already done and nothing can raise that ceiling. `cuobjdump -sass -fun <exact symbol>` puts the spilled values on `LimbCopies` — the five loop-invariant cp.async source pointers (`src[2]`, `xsum`) plus their word offsets, nine words — reloaded at fixed `[R1+0x8…0x18]` in every stage of the K loop. The decode temporaries are already in shared memory (`CodeStage`, `sm.b`, `sm.raw`).
+
+### 2.3 Three prescribed/reasonable register levers were tried and are recorded as failures
+
+Each row is one rebuild of `infernix-serve` and a full 7 462-kernel resource diff against the same baseline binary.
+
+| lever (hypothesis: free the nine pinned copy-set registers) | `gate_up_tile_ggml` | `ggml_linear_wide_cu` (neighbour) | verdict |
+|---|---|---|---|
+| Store the caller's `limbs` callable in `LimbCopies` and recompute each source per stage (2 `LDS` + 2 `IMAD` instead of 5 `LDL`) | 72 → 48 B, but `IQ4_XS` newly spilled 8 B | 240 → **576 B** | rejected — worse overall, and a new spilling kernel |
+| Keep the sources, drop the derivable `dst[]`/`xdst[]` words | 72 → **96 B** | 240 → **352 B** | rejected — ptxas had already chosen to spill exactly those; recomputing them at the loop's peak only added address math |
+| Roll the three-`ldmatrix.x4` gather loop as well as the stage-slice loop | 72 → **200 B** | unchanged | rejected — the four fragment registers of each `ldmatrix` are live into the MMAs anyway, so rolling only adds loop state |
+| **Roll the stage-slice MMA loop (`kStageSlices = 2`) for this tile only** | 72 → **24 B** | unchanged (240 B) | **shipped** |
+
+The last row is the one that works, and it is only safe because it is per-route: applied to every `compute` caller it raised `ggml_linear_wide_cu` from 240 B to 320 B (10 instances going 8 B → 16 B), which the ratchet forbids. That asymmetry is the reason the change is a template policy on the loop rather than a change to the loop — the tiles that have registers to spare schedule the unrolled stage better, the one tile pinned at its launch bound does not.
+
+## 3. Subsystem breakdown
+
+| File | Action | Mechanism |
+|---|---|---|
+| `src/ops/ggml/ggml_tile.cuh` | M | `compute_loop`, `dispatch_loop` and `compute` gain `bool RollSlices = false` (after `Stride`, ahead of the deduced class parameters, so every existing `compute<F, Threads, Stride>` call site is unchanged). The stage-slice loop becomes `#pragma unroll (RollSlices ? 1 : kStageSlices)`. With the default the instantiation is what the file already produced (`#pragma unroll 2` over a trip count of exactly 2), which is why the 7 462-kernel diff below shows no other kernel moving. |
+| `src/ops/offloaded_sparse_moe/cuda/ggml_expert.cuh` | M | `gate_up_tile_ggml` calls `ggml::tile::compute<GU, kGgmlTileThreads, 1, true>`. Its `down` counterpart (`down_resident_ggml`, `compute_resident`) is untouched — it already runs `STACK 0`, and `compute_plane`/`compute_resident` keep the unrolled default. |
+| `tools/cuda_stack/cuda_stack_allowlist.json` | M | Regenerated with `check_cuda_stack.py update` after the fix. Diff is two removals and one 40 → 24 reduction; no key added, no value raised. |
+| `docs/gb10/20261101-changelog.md` | M | This section. |
+
+The four files the task names as targets are unmodified, because §2.1 shows they had nothing to remove; editing them would have been churn against a measured `STACK 0 / LOCAL 0`.
+
+## 4. Verification
+
+### 4.1 The task's verification block, as actually runnable
+
+The block's `infernix_ops_moe_test` and `infernix_ops_ggml_test` are not ninja targets (`ninja: error: unknown target 'infernix_ops_moe_test'`, which is how the first of the 12 builds died). Op tests are members of the family binaries named by `infernix_add_family_op_test(... FAMILY …)`; the real gates are `infernix_ops_offloaded_moe_test` (family `offloaded_moe`) and `infernix_ops_projection_test` (family `projection`). Everything else in the block ran verbatim.
+
+### 4.2 CTest — 22/22 in the op families, plus 1/1 on the stack gate, none skipped
+
+`ctest --test-dir build-native -R "infernix_offloaded_moe_(ggml|ggml_a8|w4a8|a8_wide|cuda|team|wide|layer|plan|cpu|a16_cpu|a4r_cpu|ggml_cpu|ggml_a8_cpu|w4a8_cpu|layer_idle)_test|infernix_ggml_(linear|encode|linear_a8|linear_a8_wide)_test|infernix_sparse_moe(_wide)?_test" --output-on-failure` → `100% tests passed, 0 tests failed out of 22` in 262 s, run serially (this host's single GPU makes `--parallel` produce real numerical failures). The load-bearing ones: `infernix_offloaded_moe_ggml_test` 44.0 s, `infernix_ggml_linear_test` 14.4 s, `infernix_offloaded_moe_layer_test` 105.2 s, `infernix_offloaded_moe_a8_wide_test` 18.9 s, `infernix_ggml_linear_a8_wide_test` 8.2 s.
+
+`infernix_offloaded_moe_ggml_test` is the oracle gate for the changed kernel: `tests/ops/test_offloaded_moe_ggml.cu:782-799` runs the gate/up × down format pairs `{IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS} × {IQ4_NL, Q2_0}` against a CPU `dot<QType>` reference, i.e. every instantiation the change touches except the never-spilling `Q2_0` down half. `infernix_cuda_stack_check` passed before and after (`7462 kernels checked, 0 over their allowed stack or local memory`).
+
+### 4.3 Spill inventory — nothing moved except the three intended kernels
+
+Full per-kernel `STACK`/`LOCAL`/`REG` comparison of the 7 462 kernels in `build-native/apps/infernix-serve`, before vs after, keyed by `check_cuda_stack.stable_name` so the re-keyed file-static hashes do not masquerade as new symbols:
+
+```
+keys only in BEFORE: 0   only in AFTER: 0
+INCREASED (0):
+DECREASED (3):
+  stack: 16 -> 0   …gate_up_tile_ggmlILNS_5QTypeE15E…   (GGML_IQ3_XXS)
+  stack: 16 -> 0   …gate_up_tile_ggmlILNS_5QTypeE16E…   (GGML_IQ3_S)
+  stack: 40 -> 24  …gate_up_tile_ggmlILNS_5QTypeE14E…   (GGML_IQ2_S)
+```
+
+No kernel's register count rose either, which is the check that the policy really is route-local. Whole binary: 261 → 259 spilling kernels, 19 200 → 19 152 B.
+
+### 4.4 Performance — interleaved A/B against a HEAD-built binary
+
+`infernix_offloaded_moe_wide_bench --bank ggml --ggml-wide exact --formats iq3_s,iq4_nl --placement frames`, A = the HEAD binary saved aside before the change, B = the changed binary, run alternately in the same loop. Three passes at `--tokens 4096 --repeat 15 --seed 7`:
+
+| pass | A (HEAD) | B (rolled) | Δ |
+|---|---|---|---|
+| 1 | 33 288.7 µs | 32 652.6 µs | −1.9 % |
+| 2 | 33 152.0 µs | 32 120.2 µs | −3.1 % |
+| 3 | 33 410.2 µs | 32 764.2 µs | −1.9 % |
+
+Widened to four GGUF gate/up formats × `--tokens {1024, 4096}` (`--repeat 11 --seed 11`): the `exact` route is faster in **8/8** arms, by 0.8–2.9 %. Small shapes (`--tokens {64,256,1024}`, `--repeat 21 --seed 3`, where partial tiles take the narrow warp layouts) are 0.4–0.7 % faster in 3/3 arms.
+
+`--ggml-wide bf16` and `--ggml-wide a8` were run as controls — those routes do not launch `gate_up_tile_ggml` at all and their kernels' resources are bit-identical — and they scattered ±3.2 % in both directions (e.g. bf16/IQ2_S/T=1024: 15 896 → 16 402 µs, a8/IQ3_S/T=4096: 20 492 → 21 060 µs). That band is this host's run-to-run spread, so the 0.8–2.9 % above is only credible as a *direction* because it is consistent across all 14 `exact` pairs run (3 + 8 + 3 above), not because any single pair clears the noise.
+
+### 4.5 Numerical semantics — bit-exact, not merely within tolerance
+
+Every one of the 30 A/B pairs run for this task — the 24 of the sweep above (4 formats × {exact, bf16, a8} × 2 token counts), the three seed-7 passes and the three small-shape pairs — printed the same `output fnv1a` as its HEAD counterpart (e.g. IQ3_S/T=4096 `0c73caf5ecde95a1`, IQ2_S/T=4096 `b593e841917e2ade`, IQ3_XXS/T=4096 `8513fa23f9e8f806`, IQ4_XS/T=4096 `a5fc55c1cc178da2`). Rolling the slice loop changes only the order in which a thread issues its own `ldmatrix`s and MMAs for the two slices of a stage; each output element's K reduction still accumulates in the same sequence, so the int32 MMA sums and the `add_shifted` flushes are untouched. The oracle tests in §4.2 are the independent check.
+
+### 4.6 End-to-end health
+
+`build-native/apps/infernix …/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix --prompt "Explain in one sentence why a GPU kernel spills registers." --max-new 32 --greedy` → exit 0, 64 prompt tokens, 32 generated, prefill 327 tok/s, decode 36.6 tok/s, engine ready in 15.2 s, no warnings beyond the two pre-existing ones (experts-on-GPU miss-service off, chat-template role rendering). This is a smoke check, not a claimed E2E improvement — see §6.
+
+## 5. Regressions & adverse results
+
+- **`infernix_ops_moe_test` / `infernix_ops_ggml_test` do not exist**, so the task's verification block cannot run as written; §4.2 names what ran instead. Not a code regression, but the acceptance line "…`infernix_ops_moe_test`, `infernix_ops_ggml_test`… pass 100%" is literally unsatisfiable and was satisfied by their real family binaries.
+- **The acceptance bar "gate_up_tile_kernel_a8 and down_tile_kernel_a8 achieve 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads" is met for two of the three kernels that actually spill, not for all of them.** `gate_up_tile_ggml<GGML_IQ2_S>` keeps `STACK 24 B` with 9 `STL` / 15 `LDL` (down from 13/40). Its remaining local slots are single fixed-offset words, several outside the K loop — the signature of ptxas allocation at a hard register cap rather than a runtime-indexed local array. `down_resident_ggml`, its `down` counterpart, is already at 0 and was never a spiller. Disposition: **unresolved**, see §6.
+- **The three rejected levers in §2.3 each made some number worse** before being reverted: +336 B across `ggml_linear_wide_cu` (lazy copy set), +96 B on the gate/up family with +112 B wide (dropped `dst[]`), +128 B on the gate/up family (rolled `ldmatrix`). None is in the shipped tree; they are recorded because two of them looked promising on the target family alone and only the whole-binary diff exposed them.
+- **Applying the shipped lever globally is a regression** (240 → 320 B on `ggml_linear_wide_cu`) and was avoided only by making it a per-caller policy. If a future edit removes `RollSlices`' default, the wide linear routes start spilling again.
+- **Control-arm scatter of ±3.2 %** on routes whose kernels are provably unchanged (§4.4) bounds what the reported 0.8–2.9 % can be claimed to mean. No arm got slower beyond that band, and no arm's output hash changed.
+- Nothing in the allowlist grew: the ratchet diff is removals and one reduction only.
+
+## 6. Accepted gaps / follow-ups
+
+- **`gate_up_tile_ggml<GGML_IQ2_S>` still spills 24 B.** IQ2_S is the heaviest of the four formats (`kHalfSub` → two scaled `k16` MMAs per slice, 7 raw chunks per row unit), so it is the one that cannot be squeezed under the 128-register cap by loop scheduling alone. Getting it to zero needs one of: giving the tile a second CTA's worth of registers by cutting `kGgmlTileThreads` (which changes the warp layout, the accumulator shape and the tile decomposition of a numerically qualified route), staging the copy set in shared memory (+10 KiB dynamic shared against a ~99 KiB/SM budget that the Q6_K instantiation already uses most of), or splitting the decode out of the K loop. Each is a route redesign with its own A/B obligation, not a spill tweak, so none was attempted here.
+- **`RollSlices` is measured only for the one caller that needed it.** It is `true` for exactly one call site. The other 256/512-thread `compute`/`compute_plane`/`compute_resident` users keep the unrolled default because rolling made the wide family worse *as a whole*; an individual wide instance that would prefer the rolled form has not been identified, and the 240 B sitting in `ggml_linear_wide_cu` (26 kernels, 8–16 B each) is the obvious place to look next, one instance at a time and under the same whole-binary diff.
+- **No model-level performance claim.** The op-level bench isolates `moe_experts` on synthetic expert plans; the delivered artifact keeps its experts device-resident, so this task did not re-run `./bench/run_kv_matrix_bench.sh`. The E2E run in §4.6 is a health check. If a GGUF-expert prefill route is ever made the production configuration for these formats, the end-to-end arm belongs to that change.
+- **The `LOCAL` half of the task is vacuous today** (0 across all 7 462 kernels) and therefore untested as a guard: the ratchet would catch a regression only because `check` compares both fields. Nothing was added to keep `LOCAL` at zero beyond the existing gate.
