@@ -27,6 +27,22 @@ __device__ __forceinline__ std::int64_t nvfp4_tiled_scale_offset(int token, int 
            (group - group_tile * kGroupsPerTile);
 }
 
+// Four consecutive lanes (lane & 3 = 0..3) quantize four consecutive 16-element K-groups of the
+// same token and same 16-group scale tile while keeping 16-byte BF16 input loads and 8-byte FP4
+// code stores contiguous across the warp. In both RowMajor and Tiled128/Tiled256 layouts those
+// four scale bytes occupy a 4-byte-aligned word, so packing them across the four lanes via warp
+// shuffle emits a single coalesced uint32_t store per quad.
+__device__ __forceinline__ void store_nvfp4_scale_quad(std::uint8_t* scales,
+                                                       std::int64_t scale_offset,
+                                                       std::uint8_t scale, int tid) {
+    std::uint32_t word = static_cast<std::uint32_t>(scale);
+    word |= __shfl_down_sync(0xFFFFFFFFU, word, 1, 4) << 8;
+    word |= __shfl_down_sync(0xFFFFFFFFU, word, 2, 4) << 16;
+    if ((tid & 3) == 0) {
+        store_vec(scales + scale_offset, word);
+    }
+}
+
 template <class Geometry, int Threads, Nvfp4ScaleLayout Layout, bool Reciprocal = false>
 __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kernel(
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
@@ -36,12 +52,13 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     // is a programmatic dependent) before reading it.
     pdl::enter();
     static_assert(Threads == 128 || Threads == 256 || Threads == 512);
+    static_assert((Geometry::kInputRows / 16) % 4 == 0);
     static_assert(Layout == Nvfp4ScaleLayout::RowMajor ||
                   (Geometry::kInputRows / 16) % kNvfp4ScaleTileGroups == 0);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
-    const int task =
-        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
-    const int tasks = tokens * kGroupsPerRow;
+    const int tid               = static_cast<int>(threadIdx.x);
+    const int task              = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+    const int tasks             = tokens * kGroupsPerRow;
     if (task >= tasks) {
         // The tiled plane is addressed in whole tiles, so the launch covers the padding of the last
         // one. A padded token owns no input and no code byte, only the scale the consumer's tile
@@ -50,9 +67,10 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
         // tokens for the row-major layout, which stops at the real count.
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
             const int pad_token = task / kGroupsPerRow;
-            if (pad_token < written_tokens) {
+            if (pad_token < written_tokens && (tid & 3) == 0) {
                 const int pad_group = task - pad_token * kGroupsPerRow;
-                scales[nvfp4_tiled_scale_offset<Geometry, Layout>(pad_token, pad_group)] = 0;
+                store_vec(scales + nvfp4_tiled_scale_offset<Geometry, Layout>(pad_token, pad_group),
+                          std::uint32_t{0});
             }
         }
         return;
@@ -66,11 +84,11 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     auto* code_destination =
         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
     store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
+    std::int64_t scale_offset = static_cast<std::int64_t>(token) * kGroupsPerRow + group;
     if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
-        scales[nvfp4_tiled_scale_offset<Geometry, Layout>(token, group)] = quantized.scale;
-    } else {
-        scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
+        scale_offset = nvfp4_tiled_scale_offset<Geometry, Layout>(token, group);
     }
+    store_nvfp4_scale_quad(scales, scale_offset, quantized.scale, tid);
 }
 
 // The A4 residual profile's planes (quantize_nvfp4_terms_k16), each laid out like the A4 plane: codes
@@ -82,18 +100,20 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quan
     std::uint8_t* __restrict__ scales, std::int32_t tokens, std::int32_t written_tokens,
     float input_scale_divisor, std::int64_t code_plane, std::int64_t scale_plane) {
     pdl::enter();
+    static_assert((Geometry::kInputRows / 16) % 4 == 0);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
-    const int task =
-        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+    const int tid               = static_cast<int>(threadIdx.x);
+    const int task              = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
     if (task >= tokens * kGroupsPerRow) {
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
             const int pad_token = task / kGroupsPerRow;
-            if (pad_token < written_tokens) {
+            if (pad_token < written_tokens && (tid & 3) == 0) {
                 const int pad_group = task - pad_token * kGroupsPerRow;
+                const std::int64_t scale_offset =
+                    nvfp4_tiled_scale_offset<Geometry, Layout>(pad_token, pad_group);
 #pragma unroll
                 for (int term = 0; term < Terms; ++term) {
-                    scales[term * scale_plane +
-                           nvfp4_tiled_scale_offset<Geometry, Layout>(pad_token, pad_group)] = 0;
+                    store_vec(scales + term * scale_plane + scale_offset, std::uint32_t{0});
                 }
             }
         }
@@ -115,9 +135,15 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quan
     for (int term = 0; term < Terms; ++term) {
         store_vec(codes + term * code_plane + code_offset,
                   make_uint2(terms[term].codes_lo, terms[term].codes_hi));
-        scales[term * scale_plane + scale_offset] = terms[term].scale;
+        store_nvfp4_scale_quad(scales + term * scale_plane, scale_offset, terms[term].scale, tid);
     }
 }
+
+// Maximum 16-element groups per thread cached in registers between the amax pass and the quantize
+// pass of nvfp4_a4_row_scaled_residual_quantize_kernel. Five groups (10 uint4 = 40 registers) covers
+// K = 17408 (1,088 groups across 256 threads) within the 2-CTA/SM (128-register) budget so x is read
+// once from DRAM without spilling.
+inline constexpr int kNvfp4A4RowScaledCachedGroups = 5;
 
 // Per-token row-scaled A4 residual quantizer (1 CTA per token): reduces amax across the token's K
 // elements, sets row_scales[token] = amax / (6 * 448) so every 16-element group's first-term E4M3
@@ -133,9 +159,12 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
                                              std::int32_t tokens, std::int64_t code_plane,
                                              std::int64_t scale_plane) {
     static_assert(Threads % 32 == 0 && Threads <= 512);
+    static_assert((Geometry::kInputRows / 16) % 4 == 0);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
     constexpr int kWarps        = Threads / 32;
     constexpr bool kExactGroups = (kGroupsPerRow % Threads) == 0;
+    constexpr int kMaxGroups    = (kGroupsPerRow + Threads - 1) / Threads;
+    constexpr bool kCacheGroups = kMaxGroups <= kNvfp4A4RowScaledCachedGroups;
     __shared__ float warp_maxima[kWarps];
 
     pdl::enter();
@@ -143,12 +172,12 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
     const int tid   = static_cast<int>(threadIdx.x);
     if (token >= tokens) {
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
-            for (int group = tid; group < kGroupsPerRow; group += Threads) {
+            for (int group = tid * 4; group < kGroupsPerRow; group += Threads * 4) {
                 const std::int64_t scale_offset =
                     nvfp4_tiled_scale_offset<Geometry, Layout>(token, group);
 #pragma unroll
                 for (int term = 0; term < Terms; ++term) {
-                    scales[term * scale_plane + scale_offset] = 0;
+                    store_vec(scales + term * scale_plane + scale_offset, std::uint32_t{0});
                 }
             }
         }
@@ -156,9 +185,8 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
     }
 
     const __nv_bfloat16* row_in = input + static_cast<std::int64_t>(token) * Geometry::kInputRows;
-    constexpr int kMaxGroups    = (kGroupsPerRow + Threads - 1) / Threads;
-    uint4 cached_p0[kMaxGroups <= 2 ? kMaxGroups : 1];
-    uint4 cached_p1[kMaxGroups <= 2 ? kMaxGroups : 1];
+    uint4 cached_p0[kCacheGroups ? kMaxGroups : 1];
+    uint4 cached_p1[kCacheGroups ? kMaxGroups : 1];
     float amax = 0.0F;
 #pragma unroll
     for (int iter = 0; iter < kMaxGroups; ++iter) {
@@ -166,7 +194,7 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
         if (kExactGroups || group < kGroupsPerRow) {
             const uint4 p0 = load_vec<uint4>(row_in + group * 16);
             const uint4 p1 = load_vec<uint4>(row_in + group * 16 + 8);
-            if constexpr (kMaxGroups <= 2) {
+            if constexpr (kCacheGroups) {
                 cached_p0[iter] = p0;
                 cached_p1[iter] = p1;
             }
@@ -203,7 +231,7 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
         const int group = tid + iter * Threads;
         if (kExactGroups || group < kGroupsPerRow) {
             Nvfp4QuantizedK16 terms[Terms];
-            if constexpr (kMaxGroups <= 2) {
+            if constexpr (kCacheGroups) {
                 quantize_nvfp4_terms_k16_packed<Terms, true>(cached_p0[iter], cached_p1[iter],
                                                              divisor, terms);
             } else {
@@ -219,7 +247,8 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
             for (int term = 0; term < Terms; ++term) {
                 store_vec(codes + term * code_plane + code_offset,
                           make_uint2(terms[term].codes_lo, terms[term].codes_hi));
-                scales[term * scale_plane + scale_offset] = terms[term].scale;
+                store_nvfp4_scale_quad(scales + term * scale_plane, scale_offset,
+                                       terms[term].scale, tid);
             }
         }
     }

@@ -77,9 +77,12 @@ int run_nvfp4_a4() {
     for (int t : {33, 129, 257, 513, 1024}) {
         dense_a4_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
     }
-    for (auto [n, k, seed] : {std::tuple{16384, 2560, 823U}, std::tuple{13952, 2560, 827U},
-                              std::tuple{12800, 2560, 829U}, std::tuple{10240, 2560, 839U},
-                              std::tuple{6144, 2560, 853U}, std::tuple{2560, 6144, 857U}}) {
+    for (auto [n, k, seed] :
+         {std::tuple{16384, 2560, 823U}, std::tuple{13952, 2560, 827U},
+          std::tuple{12800, 2560, 829U}, std::tuple{10240, 2560, 839U},
+          std::tuple{6144, 2560, 853U}, std::tuple{2560, 6144, 857U},
+          std::tuple{2560, 2560, 859U}, std::tuple{2048, 2560, 863U},
+          std::tuple{512, 2560, 877U}, std::tuple{128, 2560, 881U}}) {
         failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                               {n, k, seed, Comparison::Sampled, true, dense_a4_invocations});
     }

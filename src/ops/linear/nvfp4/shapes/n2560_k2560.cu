@@ -17,8 +17,7 @@
 namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next PLE value projection [2560, 2560].
-// Same schedule family as [12800, 2560]; only the row count changes. A4 is not
-// enabled for these dense shapes.
+// Same schedule family as [12800, 2560]; only the row count changes.
 // GB10 2026-10-31 (T5): audited over T = 1..64 against 60 candidate tiles (cold 32 MiB L2, 25
 // repeats, minimum); the table already sits at the sweep argmin at every width, so nothing moved.
 // Two task premises did not survive measurement: the T = 2 SIMT C2 tile is the fastest thing
@@ -51,15 +50,29 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
     select_a16(x.ne[1])(x, w, y, stream);
 }
 
-[[noreturn]] void launch_a4(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
-    throw std::logic_error("nvfp4 A4 route is not enabled for the [2560, 2560] shape");
+// GB10 2026-11-01 (T1): the 1-term A4 ladder is registered for the prefill band, with the same
+// rung family as [6144, 2560] and the other K=2560 shapes. Its gate is the measured crossover
+// against the A16 table above, recorded in docs/gb10/20261101-changelog.md.
+using T16R64             = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 2, 2>;
+using T32R64             = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using T32R128            = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using T128R128Pipelined  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+
+Nvfp4A4Route select_a4(std::int32_t tokens) {
+    if (tokens >= 257) return nvfp4_a4_tma_route<>();
+    if (tokens >= 129) return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
+    if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
+    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
+    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R128>();
+    return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
 }
 
-bool uses_a4(std::int32_t, std::int32_t) { return false; }
+bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
 } // namespace
 
-// GB10 2026-10-31 (T5): pair gate 128 -> 65. This shape registers no 1-term A4 ladder, so the
-// 2-term row-scaled pair route is the only alternative its A16 table faces above the decode band,
+// GB10 2026-10-31 (T5): pair gate 128 -> 65, measured when this shape registered no 1-term A4
+// ladder, so the 2-term row-scaled pair route was the only alternative its A16 table faced above
+// the decode band,
 // and from T = 65 it wins by 18..25%: cold 32 MiB L2, 25 repeats, minimum, pair against the public
 // route at T = 65 / 72 / 80 / 88 / 96 / 112 / 127 is 26.34 / 26.62 / 26.72 / 27.55 / 28.32 / 28.32 /
 // 28.61us against 35.33 / 34.66 / 34.62 / 34.78 / 34.40 / 34.88 / 35.30us (62.0..64.2% against
@@ -70,5 +83,5 @@ bool uses_a4(std::int32_t, std::int32_t) { return false; }
 // A16Only/Exact artifacts keep the table above unchanged, and the route was already registered and
 // tested here at T = 65/96/127, so no new kernel enters any configuration.
 const Nvfp4LinearShape kNvfp4N2560K2560{
-    2560, 2560, launch_a16, launch_a4, uses_a4, launch_nvfp4_a4_pair, 65};
+    2560, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
 } // namespace infernix::ops::detail

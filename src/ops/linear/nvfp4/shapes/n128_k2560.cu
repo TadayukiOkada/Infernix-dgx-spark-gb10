@@ -17,8 +17,7 @@
 namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next QSA indexer key [128, 2560].
-// Same schedule family as [12800, 2560]; only the row count changes. A4 is not
-// enabled for these dense shapes.
+// Same schedule family as [12800, 2560]; only the row count changes.
 using Geometry = Nvfp4Geometry<128, 2560>;
 using Gemv =
     Nvfp4A16GemvSchedule<4, 1, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -44,12 +43,34 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
     select_a16(x.ne[1])(x, w, y, stream);
 }
 
-[[noreturn]] void launch_a4(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
-    throw std::logic_error("nvfp4 A4 route is not enabled for the [128, 2560] shape");
+// GB10 2026-11-01 (T1): the 1-term A4 ladder (`select_a4`) is registered and oracle-tested, with
+// Tiled128 (128x64, 2 CTAs/SM) at T >= 129. At N = 128, the entire NVFP4 weight matrix is only
+// 184 KiB (resident in L2), whereas quantizing x[T, 2560] adds an extra 13.1 MiB DRAM read + 7.4 MiB
+// write pass at T = 4096 (~35 us quantizer tax vs 108 us total GEMM) and 128x64 produces only 2 N-blocks.
+// Consequently A16 (32x32 / 64x96 MMA) beats 1-term A4 at T >= 512 (22.5 us vs 26.5 us at T = 512;
+// 108.4 us vs 116.6 us at T = 4096), while A4 matches/edges A16 at T <= 128 (16.2 us vs 18.2 us at T = 128).
+// Admitting A4 across the prefill band is only requested when the caller explicitly passes AllowA4 and
+// uses_a4 is true; to avoid regressing `--policy a4` at T = 512 and T = 4096 relative to A16, uses_a4
+// admits the A4 ladder only in the T <= 128 band (33..128) where A4 matches or beats A16.
+using T16R64             = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 2, 2>;
+using T32R64             = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using T32R128            = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using T128R128Pipelined  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+
+Nvfp4A4Route select_a4(std::int32_t tokens) {
+    // Tiled128 (128x64, 2 CTAs/SM) already beats T128R128Pipelined at T = 65..128 (16.2 us vs
+    // 22.4 us at T = 128).
+    if (tokens >= 65) return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
+    if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
+    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
+    return nvfp4_a4_mma_route<Geometry, T32R128>();
 }
 
-bool uses_a4(std::int32_t, std::int32_t) { return false; }
+bool uses_a4(std::int32_t min_tokens, std::int32_t max_tokens) {
+    return max_tokens >= 33 && min_tokens <= 128;
+}
 } // namespace
 
-const Nvfp4LinearShape kNvfp4N128K2560{128, 2560, launch_a16, launch_a4, uses_a4};
+const Nvfp4LinearShape kNvfp4N128K2560{128, 2560, launch_a16, launch_nvfp4_a4<select_a4>,
+                                       uses_a4};
 } // namespace infernix::ops::detail

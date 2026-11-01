@@ -100,10 +100,18 @@ template <class ActivationGeometry>
 void launch_residual(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
                      Nvfp4ScaleLayout layout, cudaStream_t stream) {
     constexpr int kTerms = kNvfp4A4ResidualTerms;
-    if (layout == Nvfp4ScaleLayout::Tiled128) {
+    if (layout == Nvfp4ScaleLayout::Tiled128 || layout == Nvfp4ScaleLayout::Tiled256) {
+        // The 128-token tile feeds the prefill band's residual GEMM and the 256-token tile its wide
+        // band; both address the plane in whole scale tiles, which a K must supply in whole.
+        const bool tiled_128 = layout == Nvfp4ScaleLayout::Tiled128;
         if constexpr (ActivationGeometry::kGroupsPerRow % kNvfp4ScaleTileGroups == 0) {
-            launch_residual_exact<ActivationGeometry, kTerms, Nvfp4ScaleLayout::Tiled128>(
-                x, weight, workspace, stream);
+            if (tiled_128) {
+                launch_residual_exact<ActivationGeometry, kTerms, Nvfp4ScaleLayout::Tiled128>(
+                    x, weight, workspace, stream);
+            } else {
+                launch_residual_exact<ActivationGeometry, kTerms, Nvfp4ScaleLayout::Tiled256>(
+                    x, weight, workspace, stream);
+            }
             return;
         }
         throw std::invalid_argument("nvfp4 A4 residual tiled scales need K groups in whole tiles");
@@ -112,13 +120,14 @@ void launch_residual(const Tensor& x, const Weight& weight, Nvfp4A4Workspace wor
                                                                                  workspace, stream);
 }
 
-// Row-major planes feed the MMA routes; 128-token tiled scale planes the TMA route.
+// Row-major planes feed the MMA routes; the token-tiled scale planes the TMA routes.
 void launch_nvfp4_a4_residual_quantize(const Tensor& x, const Weight& weight,
                                        Nvfp4A4Workspace workspace, Nvfp4ScaleLayout layout,
                                        cudaStream_t stream) {
-    if ((layout != Nvfp4ScaleLayout::RowMajor && layout != Nvfp4ScaleLayout::Tiled128) ||
+    if ((layout != Nvfp4ScaleLayout::RowMajor && layout != Nvfp4ScaleLayout::Tiled128 &&
+         layout != Nvfp4ScaleLayout::Tiled256) ||
         workspace.terms != kNvfp4A4ResidualTerms) {
-        throw std::invalid_argument("nvfp4 A4 residual: row-major or 128-token tiled planes");
+        throw std::invalid_argument("nvfp4 A4 residual: row-major or token-tiled planes");
     }
     const std::size_t tokens = static_cast<std::size_t>(x.ne[1]);
     const std::size_t scale_tokens =

@@ -376,15 +376,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 
 #pragma unroll
         for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
-            unsigned a_fragments[Schedule::kTerms][Schedule::kMmaTokens][4];
             unsigned b_fragments[Schedule::kMmaRows][2];
-            unsigned a_scales[Schedule::kTerms][Schedule::kMmaTokens];
             unsigned b_scales[Schedule::kMmaRows];
+            // Two A-fragment sets. The ldmatrix for the next m tile is issued before the current
+            // tile's OMMA.16864 block, so its shared-memory latency overlaps the tensor pipe rather
+            // than sitting in front of the whole block's worth of matrix multiplies.
+            unsigned a_fragments[2][Schedule::kTerms][4];
+            unsigned a_scales[2][Schedule::kTerms];
 
+            const auto load_a_fragment = [&](int mma_m, int slot) {
 #pragma unroll
-            for (int term = 0; term < Schedule::kTerms; ++term) {
-#pragma unroll
-                for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
+                for (int term = 0; term < Schedule::kTerms; ++term) {
                     // Each plane is its own box at a multiple of the swizzle period, so the row
                     // across planes keeps the box's swizzle phase.
                     const int plane_row = term * Schedule::kBlockTokens +
@@ -395,16 +397,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                         ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
                     const auto* address =
                         tensors.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                    ldmatrix_x4(a_fragments[term][mma_m][0], a_fragments[term][mma_m][1],
-                                a_fragments[term][mma_m][2], a_fragments[term][mma_m][3],
+                    ldmatrix_x4(a_fragments[slot][term][0], a_fragments[slot][term][1],
+                                a_fragments[slot][term][2], a_fragments[slot][term][3],
                                 smem_addr(address));
                     const int scale_row = plane_row + sfa_row;
-                    a_scales[term][mma_m] =
+                    a_scales[slot][term] =
                         tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots]
                                         [scale_row * Schedule::kScaleWordsPerRow +
                                          (k_tile & 1) * Schedule::kK64PerStage + local_k64];
                 }
-            }
+            };
 
 #pragma unroll
             for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
@@ -424,19 +426,23 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                                                          (scale_row >> 5) * 4);
             }
 
+            load_a_fragment(0, 0);
 #pragma unroll
             for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
+                if (mma_m + 1 < Schedule::kMmaTokens) {
+                    load_a_fragment(mma_m + 1, (mma_m + 1) & 1);
+                }
 #pragma unroll
                 for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
 #pragma unroll
                     for (int term = 0; term < Schedule::kTerms; ++term) {
-                        const unsigned(&a)[4] = a_fragments[term][mma_m];
+                        const unsigned(&a)[4] = a_fragments[mma_m & 1][term];
                         mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0],
                                        accumulators[mma_m][mma_n][1],
                                        accumulators[mma_m][mma_n][2],
                                        accumulators[mma_m][mma_n][3], a[0], a[1], a[2], a[3],
                                        b_fragments[mma_n][0], b_fragments[mma_n][1],
-                                       a_scales[term][mma_m], b_scales[mma_n]);
+                                       a_scales[mma_m & 1][term], b_scales[mma_n]);
                     }
                 }
             }

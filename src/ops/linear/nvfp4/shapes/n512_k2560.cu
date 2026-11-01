@@ -17,8 +17,7 @@
 namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next QSA key/value and indexer query [512, 2560].
-// Same schedule family as [12800, 2560]; only the row count changes. A4 is not
-// enabled for these dense shapes.
+// Same schedule family as [12800, 2560]; only the row count changes.
 using Geometry = Nvfp4Geometry<512, 2560>;
 using Gemv =
     Nvfp4A16GemvSchedule<4, 1, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
@@ -44,12 +43,28 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
     select_a16(x.ne[1])(x, w, y, stream);
 }
 
-[[noreturn]] void launch_a4(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
-    throw std::logic_error("nvfp4 A4 route is not enabled for the [512, 2560] shape");
+// GB10 2026-11-01 (T1): the 1-term A4 ladder is registered for the prefill band, with the same
+// rung family as the wider K=2560 shapes; the admission gate is the measured crossover against the
+// A16 table above.
+using T16R64             = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 2, 2>;
+using T32R64             = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using T32R128            = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using T128R128Pipelined  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+
+Nvfp4A4Route select_a4(std::int32_t tokens) {
+    // At N = 512, the 256x128 TMA tile has only 4 N-blocks (8 CTAs at T = 512, 64 CTAs = 1.33
+    // waves at T = 4096), whereas Tiled128 dispatches the 128x64 2-CTA/SM TMA tile (8 N-blocks:
+    // 32 CTAs at T = 512, 256 CTAs at T = 4096).
+    if (tokens >= 129) return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
+    if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
+    if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
+    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R128>();
+    return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
 }
 
-bool uses_a4(std::int32_t, std::int32_t) { return false; }
+bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 129; }
 } // namespace
 
-const Nvfp4LinearShape kNvfp4N512K2560{512, 2560, launch_a16, launch_a4, uses_a4};
+const Nvfp4LinearShape kNvfp4N512K2560{512, 2560, launch_a16, launch_nvfp4_a4<select_a4>,
+                                       uses_a4};
 } // namespace infernix::ops::detail

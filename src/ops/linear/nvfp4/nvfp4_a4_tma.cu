@@ -46,6 +46,15 @@ namespace {
 template <int K, Nvfp4A4TmaPromotions Promotions = kNvfp4A4TmaWeightCodeL2_128B>
 void launch_residual(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream) {
     const LinearBf16Output y{output, p.rows};
+    // Support explicit Tiled256 residual scale layout (2 stages, 64-row weight panel to fit GB10's
+    // 99 KiB shared memory and 168-register file with 2 activation planes per stage); the default
+    // Tiled128 path runs 3 stages at 128x128 (or 128x64 for small grids).
+    if (p.scale_layout == Nvfp4ScaleLayout::Tiled256) {
+        launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
+            Nvfp4A4TmaMmaSchedule<256, 2, 1, Promotions, kNvfp4A4ResidualTerms, 64>, K>>(
+            p, y, LinearIdentityEpilogue{}, stream);
+        return;
+    }
     // When 128-row tiles launch at most 24 CTAs (half of GB10's 48 SMs), 64-row tiles double
     // the CTA count while staying within a single 48-SM wave; when ctas_128 is 32..47, keeping
     // 128-row tiles finishes in 1 wave instead of spilling 64..94 CTAs into a 2nd wave.
