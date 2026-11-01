@@ -78,7 +78,8 @@ std::uint16_t bf16_rne(double value) {
 }
 
 void embed_exact() {
-    constexpr int kWidth = 160, kHeads = 16, kRowBytes = kWidth / 2 + kWidth / 16, kColumns = 37;
+    const auto one = [](const int kColumns) {
+    constexpr int kWidth = 160, kHeads = 16, kRowBytes = kWidth / 2 + kWidth / 16;
     std::vector<std::uint8_t> rows(static_cast<std::size_t>(kRowBytes) * kHeads * kColumns);
     std::uint32_t state = 2026U;
     for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -111,9 +112,14 @@ void embed_exact() {
                 }
             }
         }
-        check(bad == 0, "ple_embed_nvfp4 equals the exact product rounded once (multiplier " +
+        check(bad == 0, "ple_embed_nvfp4 T=" + std::to_string(kColumns) +
+                            " equals the exact product rounded once (multiplier " +
                             std::to_string(multiplier) + "): " + std::to_string(bad) + " differ");
     }
+    };
+    // Decode (one column, whose blocks split over warp-sized CTAs), a short chunk below one CTA per
+    // SM, and a chunk wide enough to keep one CTA per column.
+    for (const int columns : {1, 37, 64}) { one(columns); }
 }
 
 // The PLE gate's closed formula in FP64 (include/infernix/ops/ple.h).

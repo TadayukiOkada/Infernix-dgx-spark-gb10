@@ -1612,3 +1612,213 @@ per-arm within-arm spread: <= 1.5% on 13 of 15 points
 - **The partial plane is still sized from a compile-time ceiling.** Now that the ceiling equals the resident wave it can no longer over-reserve by more than a rounding of the occupancy query, but a plane sized from the measured wave at workspace-allocation time would remove the constant entirely and make §2.1's argument structural rather than a maintained invariant. Left as a follow-up; it touches every `partial_capacity_bytes` and its workspace tests.
 - **If a schedule ever does reach 2 CTAs/SM** (a body staging under ~50 KiB), `kGb10SplitWaveCtas` must become per-schedule again — the single constant is correct only because all five current split-K bodies stage 65 536 B or more, more than half of the 102 400 B per SM. The `static_assert(kSharedBytes <= 99 * 1024)` above `kSharedBytes` bounds the other end.
 - **`Wave48` is gone for good**: if a future port wants a genuine 96-CTA wave it must come with a schedule that can actually be resident twice per SM, not a second alias of an existing tile.
+
+# GB10 changelog — 2026-11-01 (T9: the Qwen4Exp PLE trio — vectorized NVFP4 n-gram embed, a single-pass register-cached gate, and the decode convolution that also shifts the history)
+
+## 1. Accounting
+
+| | |
+|---|---|
+| Base commit (branch tip at start) | `3c6313e34` — `perf(fp8,speculative): replace 170-CTA split-K ceiling with kGb10SplitWaveCtas and retune DFlash2 pair draft cost (T8)` |
+| HEAD after the task | `3c6313e34` (uncommitted worktree, as instructed — no commit, no push) |
+| Files changed | 4 (3 source/test + this changelog) |
+| Insertions / deletions (code) | +411 / −42 across 3 files |
+| `cuda-kernel-toolkit/` | intentionally excluded — not touched |
+| Worktree at report time | `M src/ops/ple/ple.cu`, `M tests/ops/test_ple.cpp`, `M tests/ops/test_ple_nvfp4.cpp`; `git diff --check` clean |
+
+Task: `docs/tasks/20261101-performance-tasks.md` **T9 (P1)** — fuse and vectorize the Qwen4Exp Per-Layer-Embedding path (`ops::ple_gate`, `ops::ple_conv_inject`, `ops::ple_embed_nvfp4`) on GB10, with three prescribed mechanisms: vectorized `embed_nvfp4_kernel` (`uint2` code loads, vectorized BF16 stores) plus (heads, columns) parallelism when `columns < 48`; register-cached `k`/`q`/`v` across the gate's norm reductions with a fused `block_sum2`, so key, residual and value come from memory once instead of twice; and folding the in-place `state_kernel` shift into `conv_kernel` when `update && width == 1`.
+
+Production shape (the only PLE layer in the model, layer id 2 of Qwen3.8-Flash-Next): `hidden_size` 2560, `hc_count` 4 → gate width 10 240; 16 heads × head width 160 → NVFP4 row 90 B (80 E2M1 code bytes + 10 E4M3FN block scales); conv taps 4, dilation 3, span 9; decode is `width == 1`, `columns == sequences`.
+
+Rebuild discipline: every round was one sequential `ninja -C build-native -j "$(nproc)"` invocation, never two on the same tree, and always covering the consumer targets together (`infernix-serve`, `infernix_bench`, the test binaries) so the ~55.8 s `nvlink` device link ran once. `src/ops/ple/ple.cu` was `touch`ed after every edit — the CUDA depfiles in this configuration do not track headers. The HEAD baseline used by the A/Bs was produced by a `git stash` → build → `git stash pop` round-trip; the three files were byte-compared against a copy taken before the stash after restoring (`restored OK` ×3), and the tree was then rebuilt in one unified invocation.
+
+## 2. Task-premise corrections and architectural rationale
+
+### 2.1 Two of the three named verification gates do not exist (and the doc's `infernix_ops_ple_test` is a near-miss on a real name)
+
+The task's verification block runs `ninja … infernix-serve infernix_ops_ple_test infernix_qwen4_exp_Execution_test` and then those two test binaries. Neither target exists in `build-native/build.ninja`. PLE's op tests are not per-family binaries; they are members of shared test executables, and the CTest ids differ from the ninja targets:
+
+| doc name | real CTest test | real ninja target containing it |
+|---|---|---|
+| `infernix_ops_ple_test` | `infernix_ple_test`, `infernix_ple_embed_test` | `infernix_ops_elementwise_test` (`tests/ops/test_ple.cpp`, `tests/ops/test_ple_embed.cu`) |
+| (not named) | `infernix_ple_nvfp4_test` | `infernix_ops_projection_test` (`tests/ops/test_ple_nvfp4.cpp`) |
+| (not named) | `infernix_speculative_state_ops_test` | `infernix_ops_sampling_test` (`tests/ops/test_speculative_state_ops.cu`) |
+| (not named) | `infernix_lossless_ops_test` | `infernix_ops_lossless_test` (`tests/ops/test_lossless_ops.cu`) |
+| `infernix_qwen4_exp_Execution_test` | does not exist; the nearest real model-level gate is `infernix_qwen4_exp_forward_real_test` | `infernix_qwen4_exp_forward_real_test` |
+
+`infernix_cuda_stack_check` does exist and was run as instructed. §4.2 lists what actually ran.
+
+### 2.2 "Per-layer" is per forward call — there is exactly one PLE layer
+
+`Qwen4ExpForCausalLM` builds PLE for a single layer id (2) and `Forward::ple` runs once per call, so "total PLE execution time per layer" is exactly "per forward call". The acceptance numbers in §4.5 are therefore per-call averages over 774 real PLE calls per profiled arm, not a sum over layers.
+
+### 2.3 The gate is 4 CTAs, not 40 — and its 14.2 µs was re-reads on four SMs, not arithmetic
+
+The task's framing ("the gate spreads over channels/256 = 40 CTAs") describes the convolutions. `gate_kernel`'s grid is `dim3(streams, columns)` = **4 CTAs of 256 threads** at decode (one CTA per hyper-connection stream), because the whole gate is one RMS-normalized dot product per (stream, column) and every reduction must complete inside one CTA. `conv_kernel`/`state_kernel` are the 40-CTA kernels.
+
+The cost came from the body, which walked `hidden` four times with a runtime-trip strided loop: pass 1 read `key`+`residual` for the two statistics, pass 2 read `key`+`residual` again for the dot, pass 3 read `value` and wrote `gated`, pass 4 read `value` again and wrote `normalized`. So each operand crossed memory twice and `block_sum` ran four times (four barrier pairs). The fix is the task's own idea, executed with the constraints in §2.5: one load of each operand into registers, `block_sum2` folding the two statistics into one barrier pair (3 barrier pairs total), and 8-element vector accesses — 14.23 µs → 3.67 µs (§4.5) with the CTA count unchanged at 4.
+
+### 2.4 `uint2` code loads are not sufficient: a 90-byte NVFP4 row is 16-byte aligned for one head in sixteen
+
+`row_bytes = 80 + 10 = 90`, so head *h*'s row starts at `90h` — congruent to 0 mod 16 only when `h ≡ 0 (mod 8)`. An 8-byte load per task is unaligned for 7 of the 8 residue classes it can land on, and a 16-byte load for 15 of 16. The kernel therefore gathers the 8 code bytes with **two aligned `uint2` loads plus a 64-bit funnel shift** (`(l >> shift) | (h << (64 - shift))`), which is alignment-free on the fast path, and falls back to eight byte loads when that 16-byte window would read past the end of the tensor (the last row of the last column). Stores are the vectorized part the task actually needed: eight BF16 per `uint4`, two `uint4` per 16-element block, dispatched on a host-side `aligned<16>(out)` test so an unaligned tensor view takes the scalar store path instead of faulting.
+
+### 2.5 "Cache k, q, v in registers" only works if the slice count is a compile-time constant, and that caps the (V, K) matrix
+
+A `float kf[K][V]` array indexed by a runtime loop trip count goes to local memory, which would have traded a 4-pass read pattern for a spill-heavy one. Both dimensions are therefore template parameters — `V` elements per access, up to `K` accesses per thread — with `#pragma unroll` on both loops and a `d >= hidden` break. Because the kernel carries `__launch_bounds__(kGateMaxThreads)` (1024 threads, so 64 registers), the dispatch is constrained to keep the cached operand set affordable: `V = 8` is only ever paired with `K = 1` (24 cached floats), `V = 1` with `K ≤ 8`, and anything larger takes `gate_kernel_scalar`. The measured result is REG 40…62, STACK 0, LOCAL 0 across all twelve vector instantiations (§4.4). Production decode takes `<Norm, 8, 1>` with a 320-thread block (2560 / 8 = 320 slices, one per thread).
+
+### 2.6 The fused conv+state needs the span as a template parameter, which is why it is capped at 16
+
+The fused kernel holds the whole history per thread (`bf16 past[SPAN]`) and must index it by `k` and by `k / dilation` inside the tap loop; with a runtime `span` that array becomes local memory and the fusion loses more than the saved launch. So `SPAN = (taps - 1) * dilation` is a template argument and `ple_conv_inject` dispatches over a switch of the sixteen instantiations it admits, `kFusedConvMaxSpan = 16`. Production is `taps = 4, dilation = 3 → SPAN = 9`, comfortably inside. Outside that window — or when `width != 1`, or `update` is false — the original `conv_kernel` + `state_kernel` pair still runs unchanged, so nothing regresses for an unusual checkpoint. The tap accumulation keeps the original add order (history taps in increasing `k`, then the current column's `latest` last), which is what lets the existing FP64 oracle bound hold exactly on the state shift and within one rounding on the residual.
+
+### 2.7 The embed kernel's stack frame was the E2M1 lookup table, not the vectorization
+
+The first vectorized `embed_nvfp4_kernel` came back `REG=48 STACK=64 LOCAL=0` where the baseline is `STACK=0`. `ckt static` flagged the symbol; `cuobjdump -sass -fun <exact stored symbol>` (verified nonzero: 4 × `STL.128`, many `LDL`) put the frame on the dynamically indexed `constexpr float kE2m1[16]` — a 64 B table ptxas could not keep in constants once the index came from a nibble. Replacing the table with arithmetic (`sign = (code & 8) << 28`, `exponent = (code >> 1) & 3`, `mantissa = code & 1`, subnormals as `0x3F000000`, normals as `((exponent + 126) << 23) | (mantissa << 22)`) removed it: both instantiations are `STACK=0 LOCAL=0` (REG 47 / 48) and the bit-exact NVFP4 oracle test still passes, which is the check that matters — the decode must still be the exact product rounded once.
+
+### 2.8 The gate's fast-route bits move; the lossless route does not
+
+Caching each thread's whole slice changes the *intra-thread* summation order of `key_sq`, `query_sq`, `dot` and `gated_sq`, so the fast route's `gated`/`normalized` bits are not the previous ones. That is permitted here and was checked rather than assumed: the oracle for this Op is the FP64 closed formula with a one-BF16-rounding criterion (`kOneRounding`) plus exactness on the state shift, both of which pass at the production geometry and at fallback geometries (§4.2); the reduction stays FP32, and every per-element FP expression is character-for-character the earlier one (including `normalized` recomputing `gate * value` rather than reading `gated` back). `--reproducible` determinism is unaffected — the kernel is a pure function of its inputs. The `--lossless` route is untouched: its PLE is a separate set of kernels in `src/ops/lossless/lossless_flash.cu` (`ple_gated_kernel`, `ple_history_kernel`, `ple_conv_inject_kernel`, `ple_scores_kernel`), which this change does not edit, and `infernix_lossless_ops_test` passes.
+
+### 2.9 The fusion is decode-only, so prefill still launches four kernels — and the profiled decode route never enters the prefill conv
+
+`update && width == 1` is the fused condition, so a prefill chunk (`width` = chunk tokens) still runs `conv_kernel` and `state_kernel` separately: the "4 → 3 launches" acceptance is a decode statement, and it is met. It also means the profiled route exercises only the fused conv — the tg256 bench config is `n_prompt 0`, `max_context=257`, so all 774 PLE calls per arm have `width == 1` (the two unfused kernels are entirely absent from the candidate traces, §4.5). The wide-`width` conv path is covered by unit tests only (`test_conv` at widths 1, 3, 4, 5, 9 and 40, including a `SPAN = 20` case past the fused cap), not by an end-to-end measurement.
+
+### 2.10 The E2E half of the acceptance bar cannot be a decode-throughput claim
+
+PLE is 24.76 µs of a decode step that takes 27.1 ms at the measured 36.9 t/s (iq3s) or 22.4 ms at 44.6 t/s (nvfp4) — **0.09 % / 0.11 % of the step**. The whole 15.6 µs saving is bounded at +0.06 % / +0.07 % end to end, which is below the ±0.1 % resolution of the harness. Both routes were still measured (§4.6, §4.7), and their deltas (−0.18 % to +0.31 %) are larger in magnitude than the entire theoretical effect, so they are reported as "unchanged within resolution" rather than as a win — see §5.2 for the sign disagreement between the two routes.
+
+## 3. Subsystem breakdown (mechanism)
+
+| File | Action | Mechanism |
+|---|---|---|
+| `src/ops/ple/ple.cu` | M | New constants `kGateMaxThreads` (1024), `kFusedConvMaxSpan` (16), `kEmbedSpreadColumns` (48), `kEmbedCtaTasks` (32); host `aligned<Alignment>()`. `block_sum2` (two values per barrier pair, `float2` scratch). `embed_nvfp4_kernel` becomes `template <bool VectorStore>` with a task loop, `load_packed_codes` (2 × `uint2` + funnel shift + byte fallback), arithmetic `e2m1_value`, `uint32_t words[8]` staging and two `uint4` stores; `launch_embed_nvfp4` computes `tasks = heads × width/16`, spreads across ≤ 48 SMs at `columns < 48`, grid `(⌈tasks/tasks_per_cta⌉, columns)`. `gate_kernel` becomes `template <class Norm, int V, int K>` with `kf/qf/vf[K][V]` register slices, `load_bf16x`/`store_bf16x`/`load_normx` helpers, one `block_sum2` + two `block_sum`; `gate_kernel_scalar` keeps the old strided walk (with `block_sum2`) for unaligned or oversized geometries; `ple_gate` dispatches on 16-byte alignment, `%8` divisibility of `hidden`/`width`/strides and `hidden ≤ 8192`. New `template <int SPAN> conv_state_kernel` reads the history once, injects the residual and rewrites the shifted slot; `ple_conv_inject` takes it when `update && width == 1 && 1 ≤ span ≤ 16`. `embed_kernel`, `conv_kernel`, `state_kernel`, `commit_kernel`, every `require()` validation and all four public entry points are unchanged. |
+| `tests/ops/test_ple.cpp` | M | +8 lines: production gate geometry (4 streams × 2560 at `T = 1` and 33 — the 8-element vector path), `hidden = 9000` (past the cached-slice limit → scalar walk), and two conv cases pinned at `width = 1`: `SPAN = 8` fused and `SPAN = 20` past the cap (unfused pair), the latter with distinct source/destination slots. |
+| `tests/ops/test_ple_nvfp4.cpp` | M | `embed_exact()` parameterized over `kColumns` and run at 1, 37 and 64 columns (block-split decode, a chunk below one CTA per SM, a chunk at one CTA per column); failure messages now carry `T=`. |
+| `src/models/qwen4_exp/execution/forward.cpp` | **unchanged** | The task lists it as a target file, but no op signature, workspace or slot-plumbing change was needed: `Forward::ple` already calls `ple_embedding → project → ple_gate → ple_conv_inject` with the same `batch.slots` for source and destination, and the fusion lives entirely behind `ple_conv_inject`. Editing it would have been churn. |
+| `tools/cuda_stack/cuda_stack_allowlist.json` | **unchanged** | Spill inventory identical to baseline (§4.3); `check_cuda_stack.py update` was never run. |
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`, 20-core host)
+
+### 4.1 Build
+
+One unified invocation produced the final binaries: `ninja -C build-native -j 20 infernix-serve infernix_bench infernix_ops_elementwise_test infernix_ops_projection_test infernix_ops_lossless_test infernix_ops_sampling_test infernix_qwen4_exp_forward_real_test` → 13/13 edges, exit 0, one shared device link. `ple.cu` touched before every round.
+
+### 4.2 Gates — 6/6 passed (11.85 s, serial CTest; no `--parallel` on this single-GPU host)
+
+| Test | Time | Covers |
+|---|---|---|
+| `infernix_ple_test` | 2.11 s | `ple_embed` exactness, `ple_gate` vs the FP64 formula at eight gate geometries incl. the new production `4 × 2560` and the scalar-walk `2 × 9000`, `ple_conv_inject` residual + exact state shift incl. the new `width = 1` fused (`SPAN = 8`) and unfused (`SPAN = 20`) cases |
+| `infernix_ple_nvfp4_test` | 2.05 s | bit-exact NVFP4 decode (every code and scale word, 4 multipliers incl. the tie-producing `1 + 2^-7`) at `T = 1, 37, 64`; FP32/BF16-norm gate within its bound |
+| `infernix_ple_embed_test` | 1.91 s | the FP8 `ple_embed` route (untouched code path, kept as a regression guard) |
+| `infernix_speculative_state_ops_test` | 2.14 s | the state-slot machinery the fused conv now owns for `width == 1`, incl. in-place vs distinct slots |
+| `infernix_lossless_ops_test` | (in the 6/6) | the separate lossless PLE kernels, to confirm `--lossless` is untouched |
+| `infernix_cuda_stack_check` | 1.43 s | the zero-spill ratchet gate |
+
+### 4.3 The stack gate and the spill inventory (no allowlist movement)
+
+`ctest -R infernix_cuda_stack_check` → **Passed** (1.43 s). Independently, the spilling-function inventory is identical between the HEAD-built and candidate binaries:
+
+```text
+/tmp/ple9/base/infernix_bench              261 functions with STACK>0 or LOCAL>0
+build-native/bench/infernix_bench          261
+build-native/apps/infernix-serve           261   (= allowlist entry count)
+```
+
+`git status` shows only the three code files, so `tools/cuda_stack/cuda_stack_allowlist.json` is untouched and `check_cuda_stack.py update` was never run — there was nothing to ratchet down. The allowlist's 261 keys contain exactly two `ple_*` symbols (`ple_scores_kernel`, `ple_conv_inject_kernel`), and both are file-static kernels of `src/ops/lossless/lossless_flash.cu`, not of the file this task edits, so no `src/ops/ple/ple.cu` kernel was ever on the ratchet.
+
+### 4.4 Kernel resources (all 34 `ple.cu` functions, from the linked bench binary)
+
+| Kernel | Instances | REG | STACK | LOCAL | SHARED |
+|---|---|---|---|---|---|
+| `embed_nvfp4_kernel<bool>` | 2 | 47 / 48 | 0 | 0 | 0 |
+| `gate_kernel<Norm, 8, 1>` | 2 | 62 | 0 | 0 | 1280 |
+| `gate_kernel<Norm, 1, K>`, K = 1…8 | 8 | 40 / 44 / 50 / 62 | 0 | 0 | 1280 |
+| `gate_kernel_scalar<Norm>` | 2 | 38 | 0 | 0 | 1088 |
+| `conv_state_kernel<SPAN>`, SPAN = 1…16 | 16 | 27…56 | 0 | 0 | 0 |
+| `conv_kernel` / `state_kernel` / `commit_kernel` / `embed_kernel` | 4 | 38 / 34 / 34 / 12 | 0 | 0 | 0 |
+
+Production decode is `gate_kernel<bf16, 8, 1>` (62 REG), `conv_state_kernel<9>` (40 REG) and `embed_nvfp4_kernel<true>` (47 REG) — all three at `STACK:0 LOCAL:0`, matching the baseline kernels they replace or subsume.
+
+Decode launch geometry, before → after:
+
+| Op | baseline grid × block | candidate grid × block |
+|---|---|---|
+| `embed_nvfp4` | `(1, 1) × 256` (one CTA runs all 160 head-block tasks) | `(5, 1) × 32` |
+| `gate` | `(4, 1) × 256`, 4 strided passes | `(4, 1) × 320`, 1 pass |
+| `conv` | `(40, 1) × 256` | — |
+| `state` | `(40, 1) × 256` | — |
+| `conv_state` | — | `(40, 1) × 256` |
+
+Per call this also removes 250 880 B (245 KiB) of memory traffic at the production shape: one fewer read of `key` + `residual` + `value` (46 080 B), one fewer read of `normalized` (20 480 B) and one fewer read of the 9-column history (184 320 B).
+
+### 4.5 PLE kernel time — the acceptance measurement
+
+`nsys profile --cuda-graph-trace=node` around the real route (`Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` + its `.ngram` volume, `INFERNIX_EXPERTS_ON_GPU=1`, `-n 256 -r 2 --warmup 1 --kv-dtype bf16`), durations from `CUPTI_ACTIVITY_KIND_KERNEL` joined on demangled names. **774 PLE calls per arm.** Baseline = the HEAD-built binary; two baseline and three candidate rounds. Averages per call, µs:
+
+| kernel | base | base2 | cand1 | cand2 | cand3 |
+|---|---|---|---|---|---|
+| `embed_nvfp4_kernel` | 3.13 | 3.14 | 2.30 | 1.97 | 1.90 |
+| `gate_kernel` | 14.23 | 14.48 | 3.74 | 3.67 | 3.66 |
+| `conv_kernel` | 2.96 | 2.88 | — | — | — |
+| `state_kernel` | 4.45 | 4.60 | — | — | — |
+| `conv_state_kernel` | — | — | 3.48 | 3.52 | 3.48 |
+| **PLE total / call** | **24.76** | **25.09** | **9.52** | **9.16** | **9.05** |
+| launches / call | 4 | 4 | 3 | 3 | 3 |
+
+```text
+base2 vs base   +1.3%     (baseline-to-baseline drift, for scale)
+cand1 vs base  −61.6%
+cand2 vs base  −63.0%
+cand3 vs base  −63.4%
+```
+
+**Both acceptance criteria are met**: launches per call 4 → 3 with `state_kernel` gone (and `conv_kernel` too, since the fused kernel replaces the pair), and PLE time per call −61.6 % … −63.4 % against a ≥ 30 % bar, with a 1.3 % baseline spread. Per mechanism: embed −37 % (3.13 → 1.97), gate −74 % (14.23 → 3.67), the conv+state pair 7.41 → 3.52 µs (−53 %, one launch instead of two).
+
+### 4.6 End-to-end, the NVFP4 route that PLE actually gates
+
+Same command as §4.5 without `nsys`, tg256, `decode out t/s`:
+
+| arm | binary | t/s |
+|---|---|---|
+| base | HEAD | 44.56 ± 0.03 |
+| base2 | HEAD | 44.70 ± 0.15 |
+| cand1 | T9 | 44.61 ± 0.08 |
+| cand2 | T9 | 44.73 ± 0.06 |
+| cand3 | T9 | 44.96 ± 0.08 |
+
+Means 44.63 (HEAD) → 44.77 (T9), **+0.31 %**, with overlapping spreads. This route is dominated by reading the 29 GB n-gram volume, so the PLE saving is a rounding error here (§2.10).
+
+### 4.7 End-to-end, the IQ3_S route (prefill + decode, n-gram table in RAM)
+
+`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix` with `--ngram-residency ram`, `-p 4096 -n 128,256 -r 3 --warmup 1 --kv-dtype bf16`, two order-alternating rounds per arm, both from real binaries:
+
+| metric | HEAD r1 | HEAD r2 | T9 r1 | T9 r2 | Δ (mean) |
+|---|---|---|---|---|---|
+| pp4096 prefill t/s | 1440.53 ± 2.47 | 1439.49 ± 1.52 | 1437.17 ± 1.98 | 1438.94 ± 2.69 | **−0.14 %** |
+| tg128 decode t/s | 36.92 ± 0.09 | 36.97 ± 0.04 | 36.87 ± 0.08 | 36.89 ± 0.04 | **−0.18 %** |
+| tg256 decode t/s | 36.96 ± 0.04 | 36.92 ± 0.02 | 36.92 ± 0.05 | 36.85 ± 0.00 | **−0.15 %** |
+
+All six paired comparisons are negative, so the sign is consistent — but the magnitude (≈ 0.15 %) is more than twice the entire theoretical effect of the change on this route (§2.10), and the sign is the opposite of §4.6's. Both are reported as unchanged-within-resolution, and the adverse sign is disclosed rather than dismissed (§5.2).
+
+### 4.8 Real-model substitute for the doc's non-existent `infernix_qwen4_exp_Execution_test`
+
+`infernix_qwen4_exp_forward_real_test @tokens --decode-widths` (96 tokens, the W4Dense artifact + n-gram volume, `INFERNIX_EXPERTS_ON_GPU=1`) compares a width-*w* batched decode step against *w* solo width-1 calls, per block and on the logits. It **fails on both arms identically** — 35 differing rows, every width 2…8, first difference always at `block 0 residual`, `FAIL: a decode width changes a row's bits` on HEAD and on T9 (the two logs are identical in structure). Block 0 precedes the PLE layer, so this is a pre-existing width-dependence of the batched decode schedules on this artifact, not a T9 regression; it is disclosed as an unmet check rather than a pass (§5.6).
+
+## 5. Regressions and adverse results
+
+1. **A 64-byte stack frame was introduced and then eliminated.** The first vectorized `embed_nvfp4_kernel` measured `STACK=64`; root cause and the arithmetic-decode fix are in §2.7. The shipped kernel is `STACK:0 LOCAL:0` and the spill inventory is unchanged (§4.3), but the intermediate state was a real ratchet violation on this tree and it is part of the record.
+2. **The IQ3_S route is consistently ~0.15 % slower** on all three metrics in both rounds (−0.14 % / −0.18 % / −0.15 %, §4.7), while the NVFP4 route is ~0.3 % faster (§4.6). The two routes disagree in sign and the whole PLE change can move either route by at most ~0.06 %, so neither delta is attributable to this work — but neither was dismissed: no cause was found for the iq3s sign, GPU clock/host state was not isolated, and a third round of each arm was not run because the effect cannot exceed the measurement's resolution. If a future change touches PLE again, the iq3s arm should be measured before concluding anything about its sign.
+3. **The fast route's gate output bits change** (§2.8). The reduction is still FP32 and still within the one-rounding criterion against the FP64 oracle at the production and fallback geometries, and the lossless route is a different set of kernels — but anything that compares `gated`/`normalized` bits against a pre-T9 capture will see differences.
+4. **Prefill gets nothing.** The fusion is `width == 1` only, so a prefill chunk still pays four launches and two passes over the history. The task's acceptance is a decode criterion, so this is in scope as shipped, but a wide-chunk PLE profile was never taken and no prefill PLE improvement is claimed.
+5. **The embed kernel's wide-column configuration is correctness-tested, not timed.** `columns = 37` and `64` are covered by the bit-exact NVFP4 oracle, but the profiled route only has `columns = 1`, so the `tasks_per_cta = 256` branch (one CTA per column) has no timing evidence either way.
+6. **`infernix_qwen4_exp_forward_real_test --decode-widths` does not pass** — on HEAD either (§4.8). It is the only model-level gate the task named that could be run at all, and it fails before and after, so PLE's contribution to a real end-to-end forward is verified indirectly (the route runs in §4.6/§4.7) rather than by a passing model test.
+7. **The gate is still 4 CTAs on a 48-SM device.** Removing the re-reads took it from 14.23 µs to 3.67 µs, but four CTAs of 320 threads occupy 4 SMs and the remaining time is launch and reduction latency, not work. Splitting each stream across CTAs would need a second kernel or a device-wide sync, which was not attempted at this scope.
+8. **Not measured at all**: `conv_state_kernel` with distinct source/destination slots in production (only unit-tested), the FP32-norm gate route's timing (the profiled artifact uses BF16 norms), and any artifact whose PLE geometry differs from 160 × 16 heads / taps 4 / dilation 3.
+
+## 6. Accepted gaps and follow-ups
+
+- **`kFusedConvMaxSpan = 16` is a compile-time window, not a semantic limit** (§2.6). A checkpoint whose `(taps − 1) × dilation` exceeds 16 silently falls back to the two-kernel path; correct but slower. Raising it costs 16 more instantiations and register pressure (`conv_state_kernel<16>` is already 56 REG), so it should move only against a real artifact that needs it.
+- **The gate and the convolution are still two kernels.** `gated` (20 KiB per decode column) is written by the gate and read back by the conv. Fusing them needs either a persistent CTA per channel column (which re-imports the cross-CTA reduction problem of §2.3) or a cooperative launch; at 3.5 µs the conv is no longer where the remaining PLE time is, so the 3.67 µs gate is the better next target.
+- **`V ∈ {1, 8}` only.** The `%8` and alignment predicates (§2.5) send anything else to `gate_kernel_scalar`, which keeps the old strided walk and gains only the shared barrier pair. A `V = 4` instantiation is cheap to add if a real artifact lands in that gap; none does today (`hidden = 2560`, head width 160).
+- **The embed spread heuristic is a constant, not a measured wave.** `kEmbedSpreadColumns = 48` / `kEmbedCtaTasks = 32` encode "≤ one CTA per SM while the work is tiny" for this device; they are not derived from `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, and at 32 threads per CTA the kernel is launch-bound rather than occupancy-bound.
+- **The byte-load fallback in `load_packed_codes` is exercised only at tensor ends.** It is reachable and covered by the 1/37/64-column exact tests, but it is the path that would slow down if a future row layout made the 16-byte window illegal more often; a layout change should re-check the funnel-shift predicate rather than assume it.
+- **No CUDA-graph-level change.** The decode graph's node count drops by one because the op itself launches fewer kernels; no graph capture, workspace or slot-plumbing code was touched, and `forward.cpp` is deliberately unchanged (§3).

@@ -298,6 +298,10 @@ INFERNIX_OP_TEST(ple) {
         for (const int columns : {1, 4, 33}) { test_gate(4, 2048, columns, 100U + columns); }
         test_gate(2, 300, 5, 150);
         test_gate(3, 1000, 2, 151);
+        // Qwen3.8-Flash-Next's gate geometry (four streams of 2,560: the 8-element vector path at
+        // decode and at a chunk) and a hidden past the cached-slice limit (the scalar walk).
+        for (const int columns : {1, 33}) { test_gate(4, 2560, columns, 160U + columns); }
+        test_gate(2, 9000, 1, 165);
         // Dilation is the n-gram size (3); widths shorter and longer than the span, a sequence per
         // row, the in-place, moved and verification (no destination) state updates.
         for (const bool distinct : {false, true}) {
@@ -308,6 +312,10 @@ INFERNIX_OP_TEST(ple) {
         test_conv(4 * 2048, 4, 3, 3, 4, false, false, 230U);
         test_conv(300, 2, 2, 2, 3, true, false, 240U);
         test_conv(300, 5, 1, 1, 9, true, true, 241U);
+        // A decode column (width 1) folds the history shift into the convolution; a history past
+        // the folded limit keeps the separate shift, and another dilation checks the tap mapping.
+        test_conv(300, 3, 4, 2, 1, true, false, 242U);
+        test_conv(300, 6, 4, 2, 1, true, true, 243U);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

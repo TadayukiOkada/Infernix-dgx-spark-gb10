@@ -4,6 +4,7 @@
 #include <cuda_fp8.h>
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -13,6 +14,17 @@ namespace {
 using bf16 = __nv_bfloat16;
 
 constexpr int kThreads = 256;
+// The widest block a gate CTA uses: one V-wide slice per thread up to 32 warps, then K slices
+// per thread.
+constexpr int kGateMaxThreads = 1024;
+// A decode convolution folds its state shift into conv_kernel only up to this history length, so
+// the shift stays a compile-time-indexed register array (a runtime index would spill it to local
+// memory). Longer histories keep the separate state_kernel.
+constexpr int kFusedConvMaxSpan = 16;
+// Below one CTA per SM, an NVFP4 embedding column is split into warp-sized CTAs so a short chunk
+// occupies several SMs instead of one.
+constexpr int kEmbedSpreadColumns = 48;
+constexpr int kEmbedCtaTasks      = 32;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("ple: ") + message); }
@@ -36,15 +48,39 @@ bool column_strided_2d(const Tensor& t, DType dtype) {
            t.nb[1] % t.nb[0] == 0;
 }
 
+template <std::size_t Alignment>
+bool aligned(const void* p) {
+    return reinterpret_cast<std::uintptr_t>(p) % Alignment == 0;
+}
+
 __device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
 
-__device__ __forceinline__ float block_sum(float value, float* scratch) {
+// One block reduction per barrier pair. The two operands of the gate's key/query statistics share
+// a pair, which is why the gate needs three barrier pairs rather than four.
+__device__ __forceinline__ float block_sum(float value, float2* scratch) {
     for (int offset = 16; offset > 0; offset >>= 1) { value += __shfl_xor_sync(0xFFFFFFFFU, value, offset); }
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (lane == 0) { scratch[warp] = value; }
+    if (lane == 0) { scratch[warp].x = value; }
     __syncthreads();
     float total = 0.0F;
-    for (int w = 0; w < blockDim.x / 32; ++w) { total += scratch[w]; }
+    for (int w = 0; w < blockDim.x / 32; ++w) { total += scratch[w].x; }
+    __syncthreads();
+    return total;
+}
+
+__device__ __forceinline__ float2 block_sum2(float a, float b, float2* scratch) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        a += __shfl_xor_sync(0xFFFFFFFFU, a, offset);
+        b += __shfl_xor_sync(0xFFFFFFFFU, b, offset);
+    }
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (lane == 0) { scratch[warp] = make_float2(a, b); }
+    __syncthreads();
+    float2 total = make_float2(0.0F, 0.0F);
+    for (int w = 0; w < blockDim.x / 32; ++w) {
+        total.x += scratch[w].x;
+        total.y += scratch[w].y;
+    }
     __syncthreads();
     return total;
 }
@@ -76,27 +112,81 @@ __device__ __forceinline__ std::uint16_t bf16_rn_product(float p, float m) {
     return static_cast<std::uint16_t>((b >> 16) + up);
 }
 
-// One CTA per column; each task decodes one 16-element block of one head's row.
+// The eight packed E2M1 codes of one 16-element block. An NVFP4 row is nine bytes per 16 elements,
+// so a block's codes are generally not 8-byte aligned; two aligned 8-byte loads and a 64-bit
+// funnel shift replace eight single-byte loads. The out-of-range ends fall back to byte loads
+// rather than reading past the tensor.
+__device__ __forceinline__ std::uint64_t load_packed_codes(const std::uint8_t* p, const std::uint8_t* first,
+                                                           const std::uint8_t* last) {
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(p);
+    const std::uintptr_t base    = address & ~std::uintptr_t(7U);
+    if (base >= reinterpret_cast<std::uintptr_t>(first) && base + 16 <= reinterpret_cast<std::uintptr_t>(last)) {
+        const uint2 low  = *reinterpret_cast<const uint2*>(base);
+        const uint2 high = *reinterpret_cast<const uint2*>(base + 8);
+        const std::uint64_t l = static_cast<std::uint64_t>(low.x) | (static_cast<std::uint64_t>(low.y) << 32);
+        const std::uint64_t h = static_cast<std::uint64_t>(high.x) | (static_cast<std::uint64_t>(high.y) << 32);
+        const unsigned shift  = static_cast<unsigned>(address & 7U) * 8U;
+        return shift == 0U ? l : ((l >> shift) | (h << (64U - shift)));
+    }
+    std::uint64_t words = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { words |= static_cast<std::uint64_t>(p[i]) << (8 * i); }
+    return words;
+}
+
+// E2M1 is a four-bit float: sign, a two-bit exponent with bias one, and one mantissa bit, whose
+// subnormal is 0.5 — so the eight magnitudes are {0, 1/2, 1, 3/2, 2, 3, 4, 6}. Decoding it with
+// integer arithmetic (rather than a sixteen-entry table indexed by the code nibble) keeps the
+// table out of local memory, which a dynamically indexed array would cost a 64-byte stack frame.
+__device__ __forceinline__ float e2m1_value(unsigned code) {
+    const unsigned sign     = (code & 8U) << 28;
+    const unsigned exponent = (code >> 1) & 3U, mantissa = code & 1U;
+    const unsigned bits = exponent == 0U ? mantissa * 0x3F000000U : ((exponent + 126U) << 23) | (mantissa << 22);
+    return __uint_as_float(bits | sign);
+}
+
+// One CTA per (task group, column); each task decodes one 16-element block of one head's row.
+// A task's 16 outputs stay two-per-word in eight registers, and the store width follows the
+// output tensor's alignment: every block's output starts at (h * width + 16 * b) elements, so a
+// 16-byte-aligned tensor keeps every one of them 16-byte aligned.
+template <bool VectorStore>
 __global__ void __launch_bounds__(kThreads)
     embed_nvfp4_kernel(const std::uint8_t* __restrict__ rows, const float* __restrict__ multiplier, int row_bytes,
-                       int heads, int width, std::uint16_t* __restrict__ out) {
-    constexpr float kE2m1[16] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
-                                 -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
-    const int t      = blockIdx.x;
+                       int heads, int width, int columns, int tasks_per_cta, std::uint16_t* __restrict__ out) {
+    const int t      = blockIdx.y;
     const int blocks = width / 16;
+    const int tasks  = heads * blocks;
     const float m    = multiplier[0];
-    for (int task = threadIdx.x; task < heads * blocks; task += blockDim.x) {
+    const std::uint8_t* const first = rows;
+    const std::uint8_t* const last  = rows + static_cast<std::size_t>(columns) * heads * row_bytes;
+    const int begin = blockIdx.x * tasks_per_cta;
+    const int end   = begin + tasks_per_cta < tasks ? begin + tasks_per_cta : tasks;
+    for (int task = begin + threadIdx.x; task < end; task += blockDim.x) {
         const int h = task / blocks, b = task % blocks;
         const std::uint8_t* row = rows + (static_cast<std::size_t>(t) * heads + h) * row_bytes;
         __nv_fp8_e4m3 code;
-        code.__x       = row[width / 2 + b];
-        const float s  = static_cast<float>(code);
-        std::uint16_t* o = out + static_cast<std::size_t>(t) * heads * width + static_cast<std::size_t>(h) * width + 16 * b;
+        code.__x = row[width / 2 + b];
+        const float s           = static_cast<float>(code);
+        const std::uint64_t codes = load_packed_codes(row + 8 * b, first, last);
+        std::uint32_t words[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const std::uint8_t pair = row[8 * b + i];
-            o[2 * i]     = bf16_rn_product(kE2m1[pair & 15U] * s, m); // E2M1 times E4M3: exact in FP32
-            o[2 * i + 1] = bf16_rn_product(kE2m1[pair >> 4U] * s, m);
+            const std::uint8_t pair = static_cast<std::uint8_t>(codes >> (8 * i));
+            const std::uint32_t low  = bf16_rn_product(e2m1_value(pair & 15U) * s, m); // E2M1 times E4M3: exact in FP32
+            const std::uint32_t high = bf16_rn_product(e2m1_value(pair >> 4U) * s, m);
+            words[i]                 = low | (high << 16);
+        }
+        std::uint16_t* o =
+            out + static_cast<std::size_t>(t) * heads * width + static_cast<std::size_t>(h) * width + 16 * b;
+        if constexpr (VectorStore) {
+            *reinterpret_cast<uint4*>(o)     = make_uint4(words[0], words[1], words[2], words[3]);
+            *reinterpret_cast<uint4*>(o + 8) = make_uint4(words[4], words[5], words[6], words[7]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                o[2 * i]     = static_cast<std::uint16_t>(words[i] & 0xFFFFU);
+                o[2 * i + 1] = static_cast<std::uint16_t>(words[i] >> 16);
+            }
         }
     }
 }
@@ -104,15 +194,149 @@ __global__ void __launch_bounds__(kThreads)
 __device__ __forceinline__ float norm_value(bf16 w) { return __bfloat162float(w); }
 __device__ __forceinline__ float norm_value(float w) { return w; }
 
-// One CTA per (stream, column). The norm weights are BF16, or FP32 (NVIDIA FP4-Local's).
-template <class Norm>
-__global__ void __launch_bounds__(kThreads)
+// V consecutive BF16 as floats: one 16-byte load when V is 8, which the launcher only selects for
+// an aligned operand whose whole geometry is a multiple of 8 elements.
+template <int V>
+__device__ __forceinline__ void load_bf16x(const bf16* __restrict__ p, float* out) {
+    static_assert(V == 1 || V == 8, "unsupported vector width");
+    if constexpr (V == 8) {
+        union { uint4 bits; __nv_bfloat162 half[4]; } raw;
+        raw.bits = *reinterpret_cast<const uint4*>(p);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 pair = __bfloat1622float2(raw.half[j]);
+            out[2 * j]        = pair.x;
+            out[2 * j + 1]    = pair.y;
+        }
+    } else {
+        out[0] = __bfloat162float(p[0]);
+    }
+}
+
+template <int V>
+__device__ __forceinline__ void store_bf16x(bf16* __restrict__ p, const float* in) {
+    static_assert(V == 1 || V == 8, "unsupported vector width");
+    if constexpr (V == 8) {
+        union { uint4 bits; __nv_bfloat162 half[4]; } raw;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            raw.half[j] = __floats2bfloat162_rn(in[2 * j], in[2 * j + 1]);
+        }
+        *reinterpret_cast<uint4*>(p) = raw.bits;
+    } else {
+        p[0] = __float2bfloat16_rn(in[0]);
+    }
+}
+
+template <class Norm, int V>
+__device__ __forceinline__ void load_normx(const Norm* __restrict__ p, float* out) {
+    static_assert(V == 1 || V == 8, "unsupported vector width");
+    if constexpr (V == 8 && sizeof(Norm) == 4) {
+        const float4* const f = reinterpret_cast<const float4*>(p);
+        const float4 low      = f[0];
+        const float4 high     = f[1];
+        out[0]                = low.x;
+        out[1]                = low.y;
+        out[2]                = low.z;
+        out[3]                = low.w;
+        out[4]                = high.x;
+        out[5]                = high.y;
+        out[6]                = high.z;
+        out[7]                = high.w;
+    } else if constexpr (V == 8) {
+        load_bf16x<8>(reinterpret_cast<const bf16*>(p), out);
+    } else {
+        out[0] = norm_value(p[0]);
+    }
+}
+
+// One CTA per (stream, column). Each thread holds its whole slice of key, residual and value in
+// registers, so every operand is read from memory once; the two statistics reductions share a
+// barrier pair. V is the elements per access and K the maximum number of accesses per thread.
+template <class Norm, int V, int K>
+__global__ void __launch_bounds__(kGateMaxThreads)
     gate_kernel(const bf16* __restrict__ key, const bf16* __restrict__ value,
                 const bf16* __restrict__ residual, const Norm* __restrict__ key_norm,
                 const Norm* __restrict__ query_norm, const Norm* __restrict__ conv_norm, int hidden,
                 int width, int key_stride, int value_stride, float eps, bf16* __restrict__ gated,
                 bf16* __restrict__ normalized) {
-    __shared__ float scratch[kThreads / 32];
+    __shared__ float2 scratch[kGateMaxThreads / 32];
+    const int s = blockIdx.x, t = blockIdx.y;
+    const std::size_t base     = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
+    const std::size_t key_base = static_cast<std::size_t>(t) * key_stride + static_cast<std::size_t>(s) * hidden;
+    const std::size_t val_base = static_cast<std::size_t>(t) * value_stride;
+    float kf[K][V], qf[K][V], vf[K][V];
+    float key_sq = 0.0F, query_sq = 0.0F;
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        const int d = (i * blockDim.x + threadIdx.x) * V;
+        if (d >= hidden) { break; }
+        load_bf16x<V>(key + key_base + d, &kf[i][0]);
+        load_bf16x<V>(residual + base + d, &qf[i][0]);
+        load_bf16x<V>(value + val_base + d, &vf[i][0]);
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+            key_sq += kf[i][j] * kf[i][j];
+            query_sq += qf[i][j] * qf[i][j];
+        }
+    }
+    const float2 squares = block_sum2(key_sq, query_sq, scratch);
+    const float key_inv   = rsqrtf(squares.x / static_cast<float>(hidden) + eps);
+    const float query_inv = rsqrtf(squares.y / static_cast<float>(hidden) + eps);
+    float dot = 0.0F;
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        const int d = (i * blockDim.x + threadIdx.x) * V;
+        if (d >= hidden) { break; }
+        const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+        float kn[V], qn[V];
+        load_normx<Norm, V>(key_norm + c, kn);
+        load_normx<Norm, V>(query_norm + c, qn);
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+            dot += (kf[i][j] * key_inv * (1.0F + kn[j])) * (qf[i][j] * query_inv * (1.0F + qn[j]));
+        }
+    }
+    float g = block_sum(dot, scratch) / sqrtf(static_cast<float>(hidden));
+    g       = copysignf(sqrtf(fmaxf(fabsf(g), 1.0e-6F)), g);
+    const float gate = sigmoidf(g);
+    float gated_sq   = 0.0F;
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        const int d = (i * blockDim.x + threadIdx.x) * V;
+        if (d >= hidden) { break; }
+        float scaled[V];
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+            scaled[j] = gate * vf[i][j];
+            gated_sq += scaled[j] * scaled[j];
+        }
+        store_bf16x<V>(gated + base + d, scaled);
+    }
+    const float gated_inv = rsqrtf(block_sum(gated_sq, scratch) / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int i = 0; i < K; ++i) {
+        const int d = (i * blockDim.x + threadIdx.x) * V;
+        if (d >= hidden) { break; }
+        const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+        float cn[V], out[V];
+        load_normx<Norm, V>(conv_norm + c, cn);
+#pragma unroll
+        for (int j = 0; j < V; ++j) { out[j] = (gate * vf[i][j]) * gated_inv * (1.0F + cn[j]); }
+        store_bf16x<V>(normalized + base + d, out);
+    }
+}
+
+// The gate for a geometry or alignment the vectorized kernel does not cover: the strided scalar
+// walk, still with the shared statistics barrier pair.
+template <class Norm>
+__global__ void __launch_bounds__(kThreads)
+    gate_kernel_scalar(const bf16* __restrict__ key, const bf16* __restrict__ value,
+                       const bf16* __restrict__ residual, const Norm* __restrict__ key_norm,
+                       const Norm* __restrict__ query_norm, const Norm* __restrict__ conv_norm, int hidden,
+                       int width, int key_stride, int value_stride, float eps, bf16* __restrict__ gated,
+                       bf16* __restrict__ normalized) {
+    __shared__ float2 scratch[kThreads / 32];
     const int s = blockIdx.x, t = blockIdx.y;
     const std::size_t base     = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
     const std::size_t key_base = static_cast<std::size_t>(t) * key_stride + static_cast<std::size_t>(s) * hidden;
@@ -124,8 +348,9 @@ __global__ void __launch_bounds__(kThreads)
         key_sq += k * k;
         query_sq += q * q;
     }
-    const float key_inv   = rsqrtf(block_sum(key_sq, scratch) / static_cast<float>(hidden) + eps);
-    const float query_inv = rsqrtf(block_sum(query_sq, scratch) / static_cast<float>(hidden) + eps);
+    const float2 squares  = block_sum2(key_sq, query_sq, scratch);
+    const float key_inv   = rsqrtf(squares.x / static_cast<float>(hidden) + eps);
+    const float query_inv = rsqrtf(squares.y / static_cast<float>(hidden) + eps);
     float dot = 0.0F;
     for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
         const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
@@ -177,6 +402,46 @@ __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restri
     residual[i]         = __float2bfloat16_rn(__bfloat162float(residual[i]) + out);
 }
 
+// The decode convolution: one column per sequence, so every tap but the last reads the history and
+// the shift moves it forward by exactly one column. One thread per (channel, sequence) reads the
+// span once, injects the residual and rewrites the slot, which is what conv_kernel and a separate
+// state_kernel used to do in two passes over the history. SPAN is (taps - 1) * dilation, so the
+// history taps are the multiples of `dilation` below it and the register array stays indexed by
+// compile-time constants. As in state_kernel, a sequence's threads own their source and
+// destination slot, so an in-place update (source == destination) is safe.
+template <int SPAN>
+__global__ void __launch_bounds__(kThreads)
+    conv_state_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
+                      const bf16* __restrict__ weight, int taps, int dilation, int channels,
+                      bf16* __restrict__ states, const std::int32_t* __restrict__ source_slots,
+                      const std::int32_t* __restrict__ destination_slots, bf16* __restrict__ residual) {
+    const int c        = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sequence = blockIdx.y;
+    if (c >= channels) { return; }
+    const int src = source_slots[sequence], dst = destination_slots[sequence];
+    const std::size_t column = static_cast<std::size_t>(sequence) * channels; // width == 1: t == sequence
+    const bf16* const history = states + static_cast<std::size_t>(src) * SPAN * channels + c;
+    bf16* const shifted       = states + static_cast<std::size_t>(dst) * SPAN * channels + c;
+    bf16 past[SPAN];
+#pragma unroll
+    for (int k = 0; k < SPAN; ++k) { past[k] = history[static_cast<std::size_t>(k) * channels]; }
+    const bf16 latest = normalized[column + c];
+    float acc         = 0.0F;
+#pragma unroll
+    for (int k = 0; k < SPAN; ++k) {
+        const int tap = k / dilation;
+        if (tap * dilation == k && tap + 1 < taps) {
+            acc += __bfloat162float(weight[static_cast<std::size_t>(tap) * channels + c]) * __bfloat162float(past[k]);
+        }
+    }
+    acc += __bfloat162float(weight[static_cast<std::size_t>(taps - 1) * channels + c]) * __bfloat162float(latest);
+    const float out = __bfloat162float(gated[column + c]) + acc * sigmoidf(acc);
+    residual[column + c] = __float2bfloat16_rn(__bfloat162float(residual[column + c]) + out);
+#pragma unroll
+    for (int k = 0; k + 1 < SPAN; ++k) { shifted[static_cast<std::size_t>(k) * channels] = past[k + 1]; }
+    if (SPAN > 0) { shifted[static_cast<std::size_t>(SPAN - 1) * channels] = latest; }
+}
+
 // One thread per (channel, sequence) shifts the history in increasing order, so an in-place
 // update (source == destination slot) never reads an element it already overwrote.
 __global__ void state_kernel(const bf16* __restrict__ normalized, int span, int channels, int width,
@@ -222,6 +487,21 @@ __global__ void commit_kernel(const bf16* __restrict__ normalized, int span, int
     }
 }
 
+void launch_embed_nvfp4(const std::uint8_t* rows, const float* multiplier, int row_bytes, int heads, int width,
+                        int columns, std::uint16_t* out, cudaStream_t stream) {
+    const int tasks = heads * (width / 16);
+    int tasks_per_cta = tasks < kThreads ? tasks : kThreads;
+    if (columns < kEmbedSpreadColumns && tasks > kEmbedCtaTasks) { tasks_per_cta = kEmbedCtaTasks; }
+    const dim3 grid((tasks + tasks_per_cta - 1) / tasks_per_cta, columns);
+    if (aligned<16>(out)) {
+        embed_nvfp4_kernel<true><<<grid, tasks_per_cta, 0, stream>>>(rows, multiplier, row_bytes, heads, width,
+                                                                     columns, tasks_per_cta, out);
+    } else {
+        embed_nvfp4_kernel<false><<<grid, tasks_per_cta, 0, stream>>>(rows, multiplier, row_bytes, heads, width,
+                                                                      columns, tasks_per_cta, out);
+    }
+}
+
 } // namespace
 
 void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_t stream) {
@@ -239,9 +519,8 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
         const int head_width = embed_dim / heads;
         require(head_width % 16 == 0 && row_bytes == head_width / 2 + head_width / 16,
                 "NVFP4 row bytes disagree with the head width");
-        embed_nvfp4_kernel<<<columns, kThreads, 0, stream>>>(
-            static_cast<const std::uint8_t*>(rows.data), static_cast<const float*>(scale.data), row_bytes,
-            heads, head_width, static_cast<std::uint16_t*>(out.data));
+        launch_embed_nvfp4(static_cast<const std::uint8_t*>(rows.data), static_cast<const float*>(scale.data),
+                           row_bytes, heads, head_width, columns, static_cast<std::uint16_t*>(out.data), stream);
         check_launch("embed");
         return;
     }
@@ -263,9 +542,8 @@ void ple_embed_nvfp4(const Tensor& rows, const Tensor& multiplier, Tensor& out, 
             "NVFP4 rows must be whole 16-element blocks (8 code bytes and a scale each)");
     const int width = row_bytes / 9 * 16;
     require(out.ne[0] == heads * width && out.ne[1] == columns, "NVFP4 embed shapes disagree");
-    embed_nvfp4_kernel<<<columns, kThreads, 0, stream>>>(static_cast<const std::uint8_t*>(rows.data),
-                                                         static_cast<const float*>(multiplier.data), row_bytes, heads,
-                                                         width, static_cast<std::uint16_t*>(out.data));
+    launch_embed_nvfp4(static_cast<const std::uint8_t*>(rows.data), static_cast<const float*>(multiplier.data),
+                       row_bytes, heads, width, columns, static_cast<std::uint16_t*>(out.data), stream);
     check_launch("embed nvfp4");
 }
 
@@ -293,12 +571,53 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
     const int key_stride   = static_cast<int>(key.nb[1] / static_cast<std::int64_t>(sizeof(bf16)));
     const int value_stride = static_cast<int>(value.nb[1] / static_cast<std::int64_t>(sizeof(bf16)));
     const auto launch = [&]<class Norm>() {
-        gate_kernel<Norm><<<dim3(streams, columns), kThreads, 0, stream>>>(
-            static_cast<const bf16*>(key.data), static_cast<const bf16*>(value.data),
-            static_cast<const bf16*>(residual.data), static_cast<const Norm*>(key_norm.data),
-            static_cast<const Norm*>(query_norm.data), static_cast<const Norm*>(conv_norm.data), hidden,
-            width, key_stride, value_stride, eps, static_cast<bf16*>(gated.data),
-            static_cast<bf16*>(normalized.data));
+        const auto* key_p   = static_cast<const bf16*>(key.data);
+        const auto* value_p = static_cast<const bf16*>(value.data);
+        const auto* residual_p = static_cast<const bf16*>(residual.data);
+        const auto* key_norm_p  = static_cast<const Norm*>(key_norm.data);
+        const auto* query_norm_p = static_cast<const Norm*>(query_norm.data);
+        const auto* conv_norm_p  = static_cast<const Norm*>(conv_norm.data);
+        auto* gated_p      = static_cast<bf16*>(gated.data);
+        auto* normalized_p = static_cast<bf16*>(normalized.data);
+        const dim3 grid(streams, columns);
+        // Eight elements per access needs every operand 16-byte aligned and every index multiple
+        // of 8. A cached slice is at most one access per thread at that width and at most eight at
+        // the scalar width, which keeps the three cached operands inside the 64 registers a
+        // 1,024-thread block allows; anything larger takes the scalar walk, which caches nothing.
+        const bool vector8 =
+            hidden % 8 == 0 && width % 8 == 0 && key_stride % 8 == 0 && value_stride % 8 == 0 &&
+            aligned<16>(key_p) && aligned<16>(value_p) && aligned<16>(residual_p) && aligned<16>(gated_p) &&
+            aligned<16>(normalized_p) && aligned<16>(key_norm_p) && aligned<16>(query_norm_p) &&
+            aligned<16>(conv_norm_p) && hidden <= kGateMaxThreads * 8;
+        const int vector     = vector8 ? 8 : 1;
+        const int slices     = hidden / vector;
+        int block            = ((slices + 31) / 32) * 32;
+        if (block > kGateMaxThreads) { block = kGateMaxThreads; }
+        const int per_thread = (slices + block - 1) / block;
+        const auto run = [&]<int V, int K>() {
+            gate_kernel<Norm, V, K><<<grid, block, 0, stream>>>(key_p, value_p, residual_p, key_norm_p,
+                                                                query_norm_p, conv_norm_p, hidden, width, key_stride,
+                                                                value_stride, eps, gated_p, normalized_p);
+        };
+        const auto run_scalar = [&]() {
+            gate_kernel_scalar<Norm><<<grid, kThreads, 0, stream>>>(key_p, value_p, residual_p, key_norm_p,
+                                                                    query_norm_p, conv_norm_p, hidden, width,
+                                                                    key_stride, value_stride, eps, gated_p,
+                                                                    normalized_p);
+        };
+        if (vector8) {
+            run.template operator()<8, 1>();
+        } else if (per_thread <= 1) {
+            run.template operator()<1, 1>();
+        } else if (per_thread <= 2) {
+            run.template operator()<1, 2>();
+        } else if (per_thread <= 4) {
+            run.template operator()<1, 4>();
+        } else if (per_thread <= 8) {
+            run.template operator()<1, 8>();
+        } else {
+            run_scalar();
+        }
     };
     if (norm == DType::FP32) {
         launch.template operator()<float>();
@@ -326,17 +645,53 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
     const int span = (taps - 1) * dilation;
     require(states.ne[0] == channels && states.ne[1] == span, "conv state must be [C, span, slots]");
     const int width = columns / sequences;
+    const auto* gated_p      = static_cast<const bf16*>(gated.data);
+    const auto* normalized_p = static_cast<const bf16*>(normalized.data);
+    const auto* weight_p     = static_cast<const bf16*>(weight.data);
+    const auto* source_p     = static_cast<const std::int32_t*>(source_slots.data);
+    const auto* destination_p = static_cast<const std::int32_t*>(destination_slots.data);
+    auto* states_p   = static_cast<bf16*>(states.data);
+    auto* residual_p = static_cast<bf16*>(residual.data);
+    if (update && width == 1 && span >= 1 && span <= kFusedConvMaxSpan) {
+        const dim3 grid((channels + kThreads - 1) / kThreads, sequences);
+        const auto run = [&]<int SPAN>() {
+            conv_state_kernel<SPAN><<<grid, kThreads, 0, stream>>>(gated_p, normalized_p, weight_p, taps, dilation,
+                                                                  channels, states_p, source_p, destination_p,
+                                                                  residual_p);
+        };
+        switch (span) {
+#define INFERNIX_PLE_FUSED_STATE(n)                                                                        \
+    case n:                                                                                                \
+        run.template operator()<n>();                                                                      \
+        break;
+            INFERNIX_PLE_FUSED_STATE(1)
+            INFERNIX_PLE_FUSED_STATE(2)
+            INFERNIX_PLE_FUSED_STATE(3)
+            INFERNIX_PLE_FUSED_STATE(4)
+            INFERNIX_PLE_FUSED_STATE(5)
+            INFERNIX_PLE_FUSED_STATE(6)
+            INFERNIX_PLE_FUSED_STATE(7)
+            INFERNIX_PLE_FUSED_STATE(8)
+            INFERNIX_PLE_FUSED_STATE(9)
+            INFERNIX_PLE_FUSED_STATE(10)
+            INFERNIX_PLE_FUSED_STATE(11)
+            INFERNIX_PLE_FUSED_STATE(12)
+            INFERNIX_PLE_FUSED_STATE(13)
+            INFERNIX_PLE_FUSED_STATE(14)
+            INFERNIX_PLE_FUSED_STATE(15)
+            INFERNIX_PLE_FUSED_STATE(16)
+#undef INFERNIX_PLE_FUSED_STATE
+        }
+        check_launch("conv state");
+        return;
+    }
     conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(gated.data), static_cast<const bf16*>(normalized.data),
-        static_cast<const bf16*>(weight.data), taps, dilation, span, channels, width,
-        static_cast<const bf16*>(states.data), static_cast<const std::int32_t*>(source_slots.data),
-        columns, static_cast<bf16*>(residual.data));
+        gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, columns,
+        residual_p);
     check_launch("conv");
     if (!update) { return; }
     state_kernel<<<dim3((channels + kThreads - 1) / kThreads, sequences), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(normalized.data), span, channels, width, sequences,
-        static_cast<bf16*>(states.data), static_cast<const std::int32_t*>(source_slots.data),
-        static_cast<const std::int32_t*>(destination_slots.data));
+        normalized_p, span, channels, width, sequences, states_p, source_p, destination_p);
     check_launch("state");
 }
 
