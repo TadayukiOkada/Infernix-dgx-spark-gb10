@@ -10,6 +10,7 @@
 // selects behind its token bands, exposed so each can be timed independently on this device.
 #include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
@@ -69,6 +70,33 @@ void bench_a4_tma(const Weight& weight, Tensor& out, d::Nvfp4A4Workspace workspa
     d::launch_nvfp4_linear_swiglu_a4_tma(
         d::nvfp4_a4_operands(weight, workspace, tokens, d::Nvfp4ScaleLayout::Tiled256),
         static_cast<__nv_bfloat16*>(out.data), stream);
+}
+
+// The 2-term (FusedA4Residual) lanes with an explicit schedule, so the TMA tile that replaces the
+// RTX 5090 non-TMA `ResidualM64N128` band is chosen against its neighbours in one process.
+template <class Schedule>
+void bench_a4r_gemm(const Weight& weight, Tensor& out, d::Nvfp4A4Workspace workspace, int tokens,
+                    cudaStream_t stream) {
+    using S = d::Nvfp4ScheduleInstance<Schedule, kHidden>;
+    d::launch_nvfp4_a4_mma<S>(
+        d::nvfp4_a4_operands(weight, workspace, tokens, d::Nvfp4ScaleLayout::RowMajor),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+        d::SwiGluTokenMajorMmaEpilogue{}, stream, d::SwiGluTokenMajorMmaRows<S>{},
+        pdl::Dependency::Programmatic);
+}
+
+template <int BlockTokens, int Stages, int MinBlocksPerSm, int BlockRows>
+void bench_a4r_tma(const Weight& weight, Tensor& out, d::Nvfp4A4Workspace workspace, int tokens,
+                   cudaStream_t stream) {
+    using S = d::Nvfp4ScheduleInstance<
+        d::Nvfp4A4TmaMmaSchedule<BlockTokens, Stages, MinBlocksPerSm,
+                                 d::kNvfp4A4TmaWeightCodeL2_128B, d::kNvfp4A4ResidualTerms,
+                                 BlockRows>,
+        kHidden>;
+    d::launch_nvfp4_a4_tma_mma<S>(
+        d::nvfp4_a4_operands(weight, workspace, tokens, S::kScaleLayout),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+        d::SwiGluTokenMajorMmaEpilogue{}, stream, d::SwiGluTokenMajorMmaRows<S>{});
 }
 
 template <int Tokens, int Warps, int Stages>
@@ -218,11 +246,14 @@ int main(int argc, char** argv) {
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t, 101U);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(kGateUpRows, kHidden);
+        const std::size_t one_term = d::nvfp4_a4_workspace_capacity_bytes(max_t, kHidden);
+        const std::size_t two_term =
+            d::nvfp4_a4_workspace_capacity_bytes(max_t, kHidden, d::kNvfp4A4ResidualTerms);
         const std::size_t workspace_capacity = options.variants
             ? std::max(ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, kGateUpRows, kHidden,
                                                                    ops::LinearPolicy::AllowA4, min_t,
                                                                    max_t),
-                       d::nvfp4_a4_workspace_capacity_bytes(max_t, kHidden))
+                       one_term + two_term)
             : ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, kGateUpRows, kHidden,
                                                           options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
@@ -311,6 +342,70 @@ int main(int argc, char** argv) {
                                                 s);
                     bench_a4_tma(packed.weight, out, scratch, tokens, s);
                 }});
+                // T4: the 2-term FusedA4Residual lanes the production plan hides behind its token
+                // bands (quantize included), so the TMA / non-TMA crossover is read in one process.
+                const d::Nvfp4A4Workspace residual_scratch = d::allocate_nvfp4_a4_workspace(
+                    workspace, tokens, kHidden, d::kNvfp4A4ResidualTerms);
+                using A4RLaunch = void (*)(const Weight&, Tensor&, d::Nvfp4A4Workspace, int,
+                                           cudaStream_t);
+                const auto a4r = [&](const char* name, A4RLaunch gemm,
+                                     d::Nvfp4ScaleLayout layout) {
+                    return Cand{name, [=, &x, &packed, &out](cudaStream_t s) {
+                                   d::launch_nvfp4_a4_quantize(x, packed.weight, residual_scratch,
+                                                               layout, s);
+                                   gemm(packed.weight, out, residual_scratch, tokens, s);
+                               }};
+                };
+                cands.push_back(a4r(
+                    "a4r_m16n64",
+                    [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4r_gemm<d::Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 3, 2, ops::Cache::cg,
+                                                             ops::Cache::cg,
+                                                             d::kNvfp4A4ResidualTerms>>(w, o, ws, t, s);
+                    },
+                    d::Nvfp4ScaleLayout::RowMajor));
+                cands.push_back(a4r(
+                    "a4r_m32n64",
+                    [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4r_gemm<d::Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2, ops::Cache::cg,
+                                                             ops::Cache::cg,
+                                                             d::kNvfp4A4ResidualTerms>>(w, o, ws, t, s);
+                    },
+                    d::Nvfp4ScaleLayout::RowMajor));
+                cands.push_back(a4r(
+                    "a4r_m64n128",
+                    [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4r_gemm<d::Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1, ops::Cache::cg,
+                                                             ops::Cache::cg,
+                                                             d::kNvfp4A4ResidualTerms>>(w, o, ws, t, s);
+                    },
+                    d::Nvfp4ScaleLayout::RowMajor));
+                cands.push_back(a4r(
+                    "a4r_m96n128",
+                    [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4r_gemm<d::Nvfp4A4MmaSchedule<96, 128, 256, 3, 4, 2, 1, ops::Cache::cg,
+                                                             ops::Cache::cg,
+                                                             d::kNvfp4A4ResidualTerms>>(w, o, ws, t, s);
+                    },
+                    d::Nvfp4ScaleLayout::RowMajor));
+                cands.push_back(a4r(
+                    "a4r_tma128_r128_s3",
+                    [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4r_tma<128, 3, 1, 128>(w, o, ws, t, s);
+                    },
+                    d::Nvfp4ScaleLayout::Tiled128));
+                cands.push_back(a4r(
+                    "a4r_tma128_r64_s3",
+                    [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4r_tma<128, 3, 1, 64>(w, o, ws, t, s);
+                    },
+                    d::Nvfp4ScaleLayout::Tiled128));
+                cands.push_back(a4r(
+                    "a4r_tma256_r64_s2",
+                    [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t, cudaStream_t s) {
+                        bench_a4r_tma<256, 2, 1, 64>(w, o, ws, t, s);
+                    },
+                    d::Nvfp4ScaleLayout::Tiled256));
                 for (const Cand& cand : cands) {
                     const bench::ColdTiming timing =
                         bench::measure_cold_launch(cand.launch, flush, stream, options.warmup,

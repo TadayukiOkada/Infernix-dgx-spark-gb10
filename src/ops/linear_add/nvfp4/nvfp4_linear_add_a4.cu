@@ -80,15 +80,17 @@ template <int Terms>
 using ResidualM16N64 = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
 template <int Terms>
 using ResidualM32N64 = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
-template <int Terms>
-using ResidualM64N64 = Nvfp4A4MmaSchedule<64, 64, 256, 4, 2, 2, 2, Cache::cg, Cache::cg, Terms>;
-template <int Terms>
-using ResidualM64N128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1, Cache::cg, Cache::cg, Terms>;
+
+// From 65 columns the 2-term TMA lane owns the band on GB10, quantize included: 103 against
+// 126-129 us at 65 and 111 against 133-137 at 128 for K=6144, and 290 against 440-487 at 65 and
+// 5.2 against 14.1 ms at 4,096 for K=17408. The cp.async tiles only stay ahead inside one
+// 16-token tile, where their extra planes cost no staging; the RTX 5090 fit kept 64x64 to 128 and
+// 64x128 above it, which left the whole prefill band 2.7x behind the standalone pair route.
+constexpr bool uses_residual_tma(std::int32_t tokens) { return tokens >= 65; }
 
 // The 5,120 outputs give 64-row tiles only 80 CTAs per token tile: 32-token tiles keep 160 CTAs
-// to 64 columns (44-46 against 59-63 us at 40-64 for 64-token tiles), 64x64 tiles to 128 (67-71
-// against 94-120 us for 64x128 or 128x64), and 64x128 above (98-108 against 128-141 us at 160-256;
-// K=17408, RTX 5090).
+// to 64 columns (44-46 against 59-63 us at 40-64 for 64-token tiles; GB10, this file's candidate
+// sweep).
 template <class Geometry, int Terms>
 void launch_residual_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
                              std::int32_t tokens, cudaStream_t stream) {
@@ -100,12 +102,8 @@ void launch_residual_problem(const Weight& weight, Tensor& residual, Nvfp4A4Work
             launch_gemm<Geometry, ResidualM16N64<Terms>>(weight, residual, workspace, tokens,
                                                          stream);
         }
-    } else if (tokens <= 64) {
-        launch_gemm<Geometry, ResidualM32N64<Terms>>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 128) {
-        launch_gemm<Geometry, ResidualM64N64<Terms>>(weight, residual, workspace, tokens, stream);
     } else {
-        launch_gemm<Geometry, ResidualM64N128<Terms>>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, ResidualM32N64<Terms>>(weight, residual, workspace, tokens, stream);
     }
 }
 
@@ -114,6 +112,12 @@ void launch_residual_terms(const Weight& weight, Tensor& residual, Nvfp4A4Worksp
                            std::int32_t tokens, cudaStream_t stream) {
     if (workspace.terms != kNvfp4A4ResidualTerms) {
         throw std::invalid_argument("nvfp4 linear_add A4 residual: unexpected activation planes");
+    }
+    if (uses_residual_tma(tokens)) {
+        launch_nvfp4_a4_tma_linear_add_residual(
+            nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::Tiled128),
+            static_cast<__nv_bfloat16*>(residual.data), stream);
+        return;
     }
     launch_residual_problem<Geometry, kNvfp4A4ResidualTerms>(weight, residual, workspace, tokens,
                                                              stream);
@@ -124,7 +128,10 @@ void launch_residual_terms(const Weight& weight, Tensor& residual, Nvfp4A4Worksp
 void nvfp4_linear_add_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                          Nvfp4A4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
-    launch_nvfp4_a4_quantize(x, weight, workspace, Nvfp4ScaleLayout::RowMajor, stream);
+    // The quantizer writes the plane the GEMM below reads, so both come from `uses_residual_tma`.
+    const auto layout = uses_residual_tma(tokens) ? Nvfp4ScaleLayout::Tiled128
+                                                  : Nvfp4ScaleLayout::RowMajor;
+    launch_nvfp4_a4_quantize(x, weight, workspace, layout, stream);
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
         launch_residual_terms<Nvfp4N5120K6144>(weight, residual, workspace, tokens, stream);

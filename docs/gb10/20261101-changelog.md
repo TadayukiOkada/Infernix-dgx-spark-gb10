@@ -667,3 +667,262 @@ remains implemented, FP64-oracle qualified and runnable under `--fast-path gdn-c
   cool and warm states and the plain-projection control moves by `1.3 µs`, so the fused-minus-plain
   residual computed from two non-alternating runs ranges over `1.1 … 4.1 µs` for the *same* binaries.
   Judge this route only on alternating base/candidate rounds in one session, as §4 does.
+
+---
+
+# GB10 changelog — 2026-11-01 (T4: the fused NVFP4 `linear_swiglu` / `linear_add` residual routes take the 2-term TMA lane above the cp.async cliff, and the RTX 5090 routing caps come out)
+
+## 1. Accounting
+
+- Base commit: `3bedb4e4c` (`dev-rebased-20261028`, T1–T3 shipped, tree clean). No commit created
+  (task instruction 7 — the reviewer commits).
+- Files changed (9 tracked, 0 added, 0 deleted):
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4.cu` | M | the residual dispatch's `x.ne[1] > 96 && x.ne[1] <= 128` TMA gate becomes `x.ne[1] >= kResidualTmaTokens` (`97`) — the 128-column cap that sent the whole prefill band back to `ResidualM64N128` is gone; the now-unreachable `ResidualM64N64` alias is deleted and the ladder's `tokens <= 64 \|\| tokens > 128` becomes `tokens <= 64`; the two RTX 5090 tile-choice comments carry GB10 numbers |
+| `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma.cu` | M | comment only — records that the `--variants` harness ranks the 64-row panel ahead below 97 while the shipped route does not, so the entry was set from the route binary |
+| `src/ops/linear_add/nvfp4/nvfp4_linear_add_a4.cu` | M | `uses_residual_tma(tokens) = tokens >= 65` routes the residual GEMM and its quantizer plane together (`Tiled128` / `RowMajor`); the superseded `ResidualM64N64` (65..128) and `ResidualM64N128` (>128) tiles and their branches are removed, leaving the 16/32-token cp.async tiles that still win inside one tile |
+| `src/ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma.cu` | M | `launch_nvfp4_a4_tma_linear_add_residual` — the 2-term TMA lane (`Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 128>`) with the in-place `LinearResidualAddEpilogue`, baked at `K = 6144` / `17408` |
+| `src/ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h` | M | its declaration (the task named `launch_nvfp4_linear_add_a4_residual_tma`, which is swiglu's naming; this file's existing `launch_nvfp4_a4_tma_*` convention is kept) |
+| `bench/ops/nvfp4_linear_swiglu_bench.cu` | M | `--variants` gains the residual candidates the production plan hides: `a4r_m16n64/m32n64/m64n128/m96n128` and `a4r_tma128_r128_s3/r64_s3`, `a4r_tma256_r64_s2`, over a terms-2 scratch sized `one_term + two_term` |
+| `bench/ops/nvfp4_linear_add_bench.cu` | M | same for the add lane: `bench_a4_tma_residual<BlockTokens, Stages, MinBlocksPerSm, BlockRows, K>` plus `a4r_m32n64/m64n64/m64n128` and the TMA variants |
+| `tests/ops/linear_swiglu/test_nvfp4.cpp` | M | `A4_RESIDUAL` walks the new bands (`65, 96, 97, 112, 128, 129, 130, 192, 255, 256, 257, 512, 768, 1024`) and replays `8, 33, 65, 97, 129, 257` under a CUDA Graph |
+| `tests/ops/linear_add/test_nvfp4.cpp` | M | `AllowA4Residual` gains `130, 255, 256, 257, 512, 1024, 2048`; `257` also replays under a graph |
+
+- CUDA stack allowlist: **unchanged** — zero new `STACK`/`LOCAL` symbols, so `infernix_cuda_stack_check`
+  passes as registered and `check_cuda_stack.py update` was not run (§4). The route that changed
+  instantiates one TMA kernel that the 1-term lane already carried plus the existing residual
+  quantizer; the deleted cp.async residual tiles were not allowlist entries.
+- Rebuilds: 6 single-invocation `ninja -C build-native -j "$(nproc)"` builds (the last one
+  `infernix-serve infernix_nvfp4_linear_swiglu_bench infernix_nvfp4_linear_add_bench
+  infernix_ops_linear_fused_test infernix_ops_attention_test infernix_ops_recurrent_test`, preceded by
+  `find … -name '*.cu' -exec touch {} +` over the four nvfp4 directories because `build-native` CUDA
+  depfiles do not track headers), plus two builds of the bench pair from a clean `git stash` of exactly
+  the five `src/ops` files to put the HEAD binaries on disk for the alternating A/B.
+
+## 2. Task-premise corrections and architectural rationale (`20261101-performance-tasks.md` T4)
+
+**What held.** `nvfp4_linear_swiglu_a4.cu` really did carry an RTX 5090 (`sm_120a`) dispatch cap that
+had never been re-measured on GB10, and it really did cost the prefill band a factor of 3.6: with the
+cap, `T = 129` costs `1367.9 µs` against `555.9 µs` without it and `T = 4096` costs `29333 µs` against
+`8078 µs` (§4). `linear_add` had no TMA residual lane at all — the 2-term profile ran entirely on
+cp.async tiles above its 16-token band.
+
+**Premise corrections from measurement.**
+
+1. *The swiglu guard is `x.ne[1] > 96 && x.ne[1] <= 128`, not `<= 128`.* The task describes a route
+   that "restricted 2-term TMA to `x.ne[1] <= 128`"; the lower bound already existed, so 97..128 was
+   TMA at HEAD and only the *upper* cap needed removing. This matters because the first candidate read
+   the guard as `<= 128`, concluded that HEAD's decode band was TMA, measured the cp.async ladder to be
+   a tie against a TMA that HEAD never ran there, and shipped "TMA everywhere" — which costs
+   **+10.3 … +12.2 % over `T = 5..96`** (498.6 against 445.3 µs at 5, 523.1 against 470.8 at 96). That
+   candidate was reverted; §5 carries the numbers.
+2. *The two lanes do not share a crossover.* `linear_add`'s TMA entry is `T ≥ 65` (measured
+   −19 … −20 % at 65..128 and −24 … −38 % above), `linear_swiglu`'s stays at `T ≥ 97` (the ladder is
+   11 % ahead below it, and 97..128 is level). The single `T > 64` the task specifies for the fused
+   projections is right for one of them and 33 columns too low for the other.
+3. *`launch_nvfp4_linear_add_a4_residual_tma` does not exist.* The add lane's TMA file exports
+   `launch_nvfp4_a4_tma_linear_add_residual`; the name in the task is swiglu's
+   (`launch_nvfp4_linear_swiglu_a4_residual_tma`) with the operands swapped. The declaration went into
+   the existing `nvfp4_linear_add_a4_tma_launch.h` rather than creating a second spelling.
+4. *`nvfp4_linear_add_a16.cu` has no 5090 guard left and no `launch_n5120_k6144` /
+   `launch_n5120_k17408` symbols* — those names appear only in the task document; the file's own
+   dispatcher is `launch_matrix<K>` and it was GB10-retuned in T7 (runtime-K sliced-K tiles,
+   `RowTiles = 2`, the 2 K-warp tiles dropped). Nothing in it is a 5090 leftover, so T4 leaves it
+   alone; the residual band the task points at lives in `nvfp4_linear_add_a4.cu`.
+5. *The gdn/attn projections inherit T1's quantizer and promotion work already.* Both files are
+   1-term, hold no token-count guard, and call the shared `launch_nvfp4_a4_quantize` and
+   `launch_nvfp4_a4_tma_mma` with the shipped `kNvfp4A4TmaWeightCodeL2_128B` promotions, so "propagate
+   T1/T2" is not an edit there — it is automatic through the shared launchers. `nvfp4_gdn_input_a4.cu`
+   has no 128-token Tiled128 lane where attn has one, which is a real lever but not this task's
+   (§6).
+6. *The `--variants` candidate harness misranks this family.* It puts the 2-term TMA lane ahead of the
+   ladder below 97 columns for swiglu, where the shipped route says the opposite by 11 %, and its
+   absolute numbers (`a4r_m64n128` 95 µs at `[5120,6144] T = 64`) sit 15 % under what that tile costs on
+   the route. Every band boundary in this task was therefore set from alternating HEAD/candidate rounds
+   of the route binaries, exactly as T2's raster lesson said; the harness remains useful for *within*
+   one schedule family (the 64- vs 128-row panel comparison it does support is what §3 records).
+7. *"90 %+ roofline efficiency with standalone `ops::linear`" has to be read per activation plane.*
+   The 2-term residual profile multiplies the same weight tile by two activation code+scale planes, so
+   at equal `N, K, T` it performs 2× the MACs of a 1-term standalone `ops::linear`. Normalised that way
+   the fused routes run at **102 … 145 %** of the standalone pair route measured in the same session
+   (§4.4): `swiglu [34816,5120] T = 4096` does `2 × 1.4603e12` FLOP in `8078 µs` = 361.5 TF/s against
+   the standalone's 353.6 TF/s. The raw single-plane `useful_tflops` the bench prints (180.8) is not
+   comparable to a 1-term kernel's number and is not what the bar means.
+8. *The TMA and MMA residual lanes are not bit-identical.* They are the same two-plane arithmetic with
+   the same quantizer output, but the TMA lane accumulates `BlockK = 128` in three stages where the
+   ladder's tiles use their own K order, so the FP32 accumulation order per output differs. Both stay
+   inside the unchanged `kA4ResidualTolerance{2.5e-2, kBf16UnitRoundoff, 5.0e-2}` FP64-oracle criterion;
+   1:1 FP32 Tensor Core accumulation is untouched (no FP16 accumulate anywhere on the route).
+
+## 3. Subsystem breakdown
+
+- `linear_swiglu/nvfp4` (M): `launch_residual<Terms>` now asks one question — `Terms == 2 && tokens >=
+  97` → Tiled128 quantize + `launch_nvfp4_linear_swiglu_a4_residual_tma`, otherwise RowMajor quantize +
+  the `16 / 32 / 64x128 / 96x128` ladder. The `ResidualM64N64` alias is deleted because no branch
+  reaches it once the cap is gone; the four remaining residual tiles are unchanged schedules, so the
+  decode band's bits are unchanged. `SwiGluTokenMajorMmaRows<S>` still requires `kWarpRows % 16 == 0`,
+  which the 128-row panel satisfies.
+- `linear_add/nvfp4` (M): one `uses_residual_tma(tokens)` predicate drives both the quantizer layout
+  and the GEMM, which is what keeps the plane the quantizer writes and the plane the GEMM's descriptor
+  reads in step — the pairing is the reason the layout is not a parameter of the launcher. The TMA
+  instantiation is the one the standalone pair route's grid heuristic also picks for 5,120 rows
+  (`ctas_128 = (5120/128) × ceil(T/128) ≥ 40 > 24` CTAs, so 128-row panel, 3 stages, 1 CTA per SM), and
+  it writes in place through `LinearResidualAddEpilogue` exactly as the 1-term TMA lane does.
+  `nvfp4_a4_padded_tokens` pads the planes to 256 tokens, which already satisfies the Tiled128
+  descriptor's coverage check for both `terms = 2` planes.
+- `linear_add/nvfp4` TMA lane (M): baked at `K = 6144` and `K = 17408`; any other `K` throws
+  `std::invalid_argument` naming the route, rather than falling back to the lane the task replaces.
+- `bench/ops` (M): the residual candidates exist so a future retune can see the ladder and the TMA lane
+  side by side; they are sweep instrumentation, and §2.6 records that their *ordering across* the two
+  families must not be read as route evidence.
+- `tests/ops` (M): the residual token lists now cross both entries (65 and 97), the first ragged call
+  past each 128-token tile (129/130, 255/256/257), and the prefill widths the TMA lane owns (512, 1024,
+  2048); graph capture at 257 regenerates every plane inside a capture, which is the case that would
+  break if the Tiled128 plane were sized from the unpadded token count.
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+**4.1 Tests** — run serially; `--parallel` produces real numerical failures on this single-GPU host.
+
+```
+35/35 ctest -R "linear_add|linear_swiglu|attn_input_proj|gdn_input_proj|
+                column_invariant_projections|softmax_attention|gdn_gating|infernix_cuda_stack_check"
+      -> 100% tests passed, 0 tests failed out of 35   (1331.01 s, incl. #28 cuda_stack_check 1.52 s)
+ 8/8 ctest -R "linear_add_nvfp4|linear_swiglu_nvfp4|attn_input_proj|gdn_input_proj|
+               infernix_cuda_stack_check"               -> 100% on the final binaries (92.61 s)
+     ctest -R infernix_cuda_stack_check                 -> 100%, 1.55 s (final `infernix-serve`)
+```
+
+The task's `infernix_ops_quant_mlp_test` is not a target on this tree; the two Op tests the task means
+are CTest members of `build-native/tests/infernix_ops_linear_fused_test`
+(`infernix_linear_add_nvfp4_test`, `infernix_linear_swiglu_nvfp4_test`), both re-run directly on the
+final binaries (`OK NVFP4 linear_add`, `OK LinearSwiGLU NVFP4 correctness`), together with
+`infernix_ops_attention_test` and `infernix_ops_recurrent_test`'s members.
+
+**4.2 Production route, `--policy a4r`, cold L2, quantizer included — min of two alternating rounds
+of the HEAD and T4 binaries in one session** (µs; `×2 TF/s` is the T4 route's real MAC rate, since the
+2-term profile does two planes):
+
+| shape | T | HEAD | T4 | Δ | T4 ×2 TF/s |
+|---|---|---|---|---|---|
+| swiglu `[34816,5120]` | 5 / 16 / 32 / 64 / 96 | 444.3 / 451.6 / 450.4 / 460.8 / 470.8 | 443.4 / 450.5 / 450.6 / 461.7 / 472.0 | −0.2 … +0.3 % | 8.0 / 25.3 / 50.6 / 98.9 / 145.0 |
+| swiglu | 97 / 128 | 524.3 / 525.2 | 525.1 / 525.1 | +0.2 / −0.0 % | 131.7 / 173.8 |
+| swiglu | **129** | **1367.9** | **555.9** | **−59.4 %** | 165.5 |
+| swiglu | 256 / 512 / 1024 | 1840.0 / 3819.5 / 7337.8 | 571.2 / 967.4 / 1919.8 | −69.0 / −74.7 / −73.8 % | 319.6 / 377.4 / 380.3 |
+| swiglu | **4096** | **29333.3** | **8078.1** | **−72.5 %** | **361.5** |
+| add `[5120,6144]` | 5 / 16 / 32 | 85.0 / 88.1 / 89.1 | 85.0 / 88.1 / 90.0 | 0.0 / 0.0 / +1.1 % | 7.4 / 22.9 / 44.7 |
+| add `[5120,6144]` | 48 / 64 | 112.6 / 114.7 | 111.6 / 113.7 | −0.9 / −0.9 % | 54.1 / 70.9 |
+| add `[5120,6144]` | **65 / 96 / 128** | 128.0 / 131.1 / 135.2 | **102.4 / 105.5 / 109.6** | **−20.0 / −19.5 / −18.9 %** | 79.9 / 114.5 / 147.0 |
+| add `[5120,6144]` | **512 / 4096** | 353.0 / 2393.1 | **248.8 / 1819.7** | **−29.5 / −24.0 %** | 258.9 / 283.2 |
+| add `[5120,17408]` | 5 / 16 / 32 | 227.3 / 230.4 / 240.6 | 227.3 / 230.4 / 241.7 | 0.0 / −0.1 / +0.4 % | 7.8 / 24.8 / 47.2 |
+| add `[5120,17408]` | 48 / 64 | 470.0 / 476.2 | 475.4 / 509.9 | +1.1 / +7.1 % † | 36.0 / 44.8 |
+| add `[5120,17408]` | **65 / 96 / 128** | 486.4 / 500.7 / 518.1 | **295.9 / 300.0 / 310.3** | **−39.2 / −40.1 / −40.1 %** | 78.3 / 114.1 / 147.1 |
+| add `[5120,17408]` | **512 / 4096** | 1904.9 / 14004.2 | **651.3 / 5175.3** | **−65.8 / −63.0 %** | 280.3 / 282.2 |
+
+The `T = 512` and `T = 4096` rows are the task's acceptance points: both Op shapes improve by 24 … 75 %,
+far above the 25 % bar, and every `T ≥ 129` point does too. † is discussed in §5.
+
+**4.3 The TMA kernel really runs on the route** — `nsys profile --capture-range=cudaProfilerApi` on
+`--policy a4r --profile` (synthetic bench inputs), kernel summary from the exported SQLite:
+
+| trace | kernels on the route |
+|---|---|
+| swiglu `[34816,5120] T=4096` | `nvfp4_a4_tma_kernel` (96.5 %), `nvfp4_a4_residual_quantize_kernel` |
+| add `[5120,17408] T=4096` | `nvfp4_a4_tma_kernel` (81.3 %), `nvfp4_a4_residual_quantize_kernel` |
+| add `[5120,6144] T=512` | `nvfp4_a4_tma_kernel` (86.9 %), `nvfp4_a4_residual_quantize_kernel` |
+
+No cp.async residual GEMM appears in any trace. At `[5120,17408] T = 4096` the quantizer is 19 % of the
+route, which is the known serialized-quantizer limit on this family (§6).
+
+**4.4 Against standalone `ops::linear`** — `infernix_linear_bench --qtype NVFP4 --policy a4 --routes
+fast`, same session, cold L2, median µs; "equal-work standalone" doubles the 1-term time because the
+fused Op computes two activation planes:
+
+| shape | T | standalone | equal-work | fused T4 | fused / equal-work |
+|---|---|---|---|---|---|
+| `[34816,5120]` | 512 | 698.2 | 1396.4 | 967.4 | 144 % |
+| `[34816,5120]` | 4096 | 4129.6 | 8259.3 | 8078.1 | 102 % |
+| `[5120,6144]` | 512 | 145.5 | 291.1 | 248.8 | 117 % |
+| `[5120,6144]` | 4096 | 1013.5 | 2027.0 | 1819.7 | 111 % |
+| `[5120,17408]` | 512 | 420.8 | 841.7 | 651.3 | 129 % |
+| `[5120,17408]` | 4096 | 2954.1 | 5908.1 | 5175.3 | 114 % |
+
+Every fused route is at or above 100 % of the equal-work standalone rate, so the 90 %+ bar is met at
+both acceptance widths for all three shapes; the fused Op also carries the residual read-modify-write
+(`add`) and the SwiGLU epilogue (`swiglu`) inside that time.
+
+## 5. Regressions and adverse results
+
+Compared: every token count the changed dispatch can route, `T = 5, 8, 16, 32, 48, 64, 65, 96, 97,
+128, 129, 256, 512, 1024, 2048, 4096`, for all three shapes, HEAD binary vs T4 binary, alternating
+rounds in one session (the tables in §4.2), plus the neighbouring `attn_input_proj`, `gdn_input_proj`
+and column-invariant tests, the spill ratchet, and the FP64-oracle tolerances.
+
+1. **Fixed — the "TMA everywhere" candidate cost +10.3 … +12.2 % over `T = 5..96` for swiglu.**
+   Reading the guard as `<= 128` made the decode band look like a tie with TMA, so the first candidate
+   deleted the ladder; measured against HEAD it was 498.6 against 445.3 µs at 5, 505.6 against 448.2 at
+   16, 517.0 against 461.7 at 64 and 523.1 against 470.8 at 96 (rounds 3/4 of the small-band sweep).
+   Cause: one 128-token TMA tile streams the 89 MiB gate/up panel worse than a cp.async tile whose
+   column is split across two CTAs per SM, and the `--variants` harness that recommended it does not
+   reproduce the route. Disposition: **fixed** — the ladder is restored and the TMA entry stays at 97;
+   the harness's misordering is recorded at the site (§2.6).
+2. **`[5120,17408]` at `T = 64` reads +7.1 % (476.2 → 509.9 µs) in one round; it is not a code change.**
+   HEAD and T4 run *the same kernel* there (`ResidualM32N64` over a RowMajor plane — the deleted tiles
+   only covered `65..128` and `> 128`), so four further alternating rounds were run: HEAD
+   `473.9 / 476.0 / 476.2 / 477.0`, T4 `475.1 / 477.1 / 478.0 / 478.0` µs, i.e. medians `476.1` against
+   `477.6` (+0.3 %) with a within-binary spread of 0.6 %. The `509.9` sample did not reproduce. Same
+   reading for the `+1.1 %` at `T = 48` and `+1.1 %` / `+0.4 %` at `T = 32`: identical code paths, and
+   the four-round medians agree within 0.4 %. Disposition: **accepted as session variance, with the
+   identical-kernel argument as the evidence** rather than a dismissal — the band's route did not change.
+3. **No regression in the bands the change actually owns.** swiglu `5..128` is within ±0.3 % of HEAD
+   (it runs HEAD's own kernels), `linear_add 5..64` within 0.4 % as above, and `infernix_cuda_stack_check`
+   plus the 35-test and 8-test CTest selections pass 100 %. The `linear_add` `65..128` and all `T ≥ 129`
+   rows improve; nothing in the sweep got worse by more than the 1.3 % single-run spread.
+4. **Adverse result on method, not on the route:** the candidate harness's absolute numbers are 15 %
+   below the route's for the same nominal tile (`a4r_m64n128` 95 µs vs 111.6 µs measured on the route at
+   `[5120,6144] T = 64`), which is what made an unreproducible 44 % "win" look available at
+   `[5120,17408] T = 64` early in the task. Chasing it would have re-instantiated a tile the route
+   already shows no need for; it was dropped once the route binary said the band is level. Disclosed so
+   the harness numbers in §3 are not read as route evidence.
+5. **Deleted schedules were live, not dead.** `ResidualM64N64` (`65..128`) and `ResidualM64N128`
+   (`> 128`) in `linear_add` and `ResidualM64N64` in swiglu ran at HEAD and are removed *because* the TMA
+   lane replaces them at those widths (−18.9 … −40.1 %), not as cleanup; the `65..128` removal is a
+   measured improvement, and no width loses its kernel.
+6. **Memory/workspace:** the residual lane now sizes its scratch for a `terms = 2`, 256-token-padded
+   Tiled128 pair of planes above its entry. The Op tests' `workspace.peak_used() == capacity` assertion
+   holds at every token count, including the graph replays, so query and execution agree; no route
+   allocates outside its queried high-water.
+
+## 6. Accepted gaps and follow-ups
+
+- **swiglu `97..128` is a coin flip** — TMA 527.2/527.6 against the ladder 528.2/529.3 µs. HEAD already
+  had TMA there and the difference is inside any protocol's resolution, so it was left rather than
+  re-litigated; a future pass that needs the last 0.2 % should decide it on more rounds, not on
+  `--variants`.
+- **The residual ladder's 96-token tile now exists for `65..96` alone.** With the TMA entry at 97,
+  `ResidualM96N128` is reachable on the 2-term route only in `65..96` (`ResidualM64N128` covers
+  `33..64`), and on the 1-term route above 64 columns. Both tiles are live for that 1-term profile, so
+  nothing here is dead code — but if a quantizer change moved the TMA entry below 97, `ResidualM96N128`
+  would lose its only 2-term band and should be re-swept rather than kept by default.
+- **`linear_add` below 65 keeps the cp.async tiles on sweep evidence, not route A/B.** The candidate
+  harness favours them there and the route binary shows no gap to close (0.4 % against HEAD, which runs
+  the same tile), so nothing was changed; a route-level TMA-vs-ladder A/B at `T = 33..64` would settle
+  whether the entry should drop further.
+- **`nvfp4_gdn_input_a4.cu` still has no 128-token Tiled128 lane** where `nvfp4_attn_input_a4.cu`
+  instantiates `Nvfp4A4TmaMmaSchedule<128, 3, 2, …, 1, 64>`. That asymmetry is the remaining unexploited
+  lever in the fused NVFP4 projections and is a separate change with its own `gdn_input_proj` oracle run.
+- **The quantizer is 19 % of the `[5120,17408] T = 4096` residual route** (nsys, §4.3) and the prefill
+  rate sits at 283 TF/s of real math against the 498.2 TF/s `ckt env` nvfp4 ceiling. Per the stored
+  finding that this family's prefill gap is the serialized quantizer rather than tile/promotion/raster
+  knobs, closing it is a quantizer-overlap task, not a schedule retune.
+- **No end-to-end run.** The acceptance criteria and every measurement here are Op-level on the fused
+  routes; `./bench/run_kv_matrix_bench.sh` was not run, because no model route, plan gate, or kernel
+  outside the two fused Ops changed. If the reviewer wants E2E evidence, the A/B to run is that script
+  against `3bedb4e4c`, and the `--fast-path`/`a4r` configuration it exercises is the one these bands
+  feed.
+- **`nvfp4_linear_add_a16.cu` was left as T7 shipped it** (§2.4). Its `T = 2..32` bands were re-read,
+  not re-measured: the task's premise for that file (5090 K-baked tiles named
+  `launch_n5120_k*`) does not exist in the tree, and T7's record already carries the GB10 sweep and the
+  two bars it could not meet.

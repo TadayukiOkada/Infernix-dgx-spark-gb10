@@ -139,7 +139,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
         // The A4 residual profile: A16 below 5 columns, then each residual tile and a ragged
-        // last tile; 128 also replays under a CUDA Graph.
+        // last tile; 128 also replays under a CUDA Graph. From 65 columns the 2-term TMA lane owns
+        // the band, so its first ragged call past a 128-token tile and the prefill widths it serves
+        // are covered here too (257 also replays under a graph).
         Invocation{4, ops::LinearPolicy::AllowA4Residual},
         Invocation{5, ops::LinearPolicy::AllowA4Residual},
         Invocation{7, ops::LinearPolicy::AllowA4Residual},
@@ -154,6 +156,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{65, ops::LinearPolicy::AllowA4Residual},
         Invocation{128, ops::LinearPolicy::AllowA4Residual},
         Invocation{129, ops::LinearPolicy::AllowA4Residual},
+        Invocation{130, ops::LinearPolicy::AllowA4Residual},
+        Invocation{255, ops::LinearPolicy::AllowA4Residual},
+        Invocation{256, ops::LinearPolicy::AllowA4Residual},
+        Invocation{257, ops::LinearPolicy::AllowA4Residual},
+        Invocation{512, ops::LinearPolicy::AllowA4Residual},
+        Invocation{1024, ops::LinearPolicy::AllowA4Residual},
+        Invocation{2048, ops::LinearPolicy::AllowA4Residual},
         // batched-decode's down tiles (8 K-warps at K=17408, 5-16 columns): the A16 criterion.
         Invocation{5, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
         Invocation{8, ops::LinearPolicy::A16Only, ops::LinearRoutes::WideDownTile},
@@ -198,7 +207,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr, invocation.routes);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
-        if (invocation.tokens == 128) {
+        if (invocation.tokens == 128 ||
+            (invocation.policy == ops::LinearPolicy::AllowA4Residual &&
+             invocation.tokens == 257)) {
             cudaStream_t stream;
             cudaGraph_t graph;
             cudaGraphExec_t executable;

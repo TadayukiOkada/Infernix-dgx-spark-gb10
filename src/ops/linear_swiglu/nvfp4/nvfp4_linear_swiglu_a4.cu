@@ -59,11 +59,24 @@ using ResidualM16N64 = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 3, 2, Cache::cg, Ca
 template <int Terms>
 using ResidualM32N64 = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
 template <int Terms>
-using ResidualM64N64 = Nvfp4A4MmaSchedule<64, 64, 256, 4, 2, 2, 2, Cache::cg, Cache::cg, Terms>;
-template <int Terms>
 using ResidualM64N128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1, Cache::cg, Cache::cg, Terms>;
 template <int Terms>
 using ResidualM96N128 = Nvfp4A4MmaSchedule<96, 128, 256, 3, 4, 2, 1, Cache::cg, Cache::cg, Terms>;
+
+// The first round width the warp-specialized TMA route owns on GB10 (48 SMs), and it now has no
+// upper cap. Measured on the production route (cold L2, quantizer included, min of two alternating
+// rounds of the HEAD and candidate binaries over the same process protocol):
+//   * up to 96 columns the cp.async ladder streams the 89 MiB gate/up panel better than a single
+//     128-token TMA tile does -- 445.3 against 498.6 us at 5, 448.2 against 505.6 at 16, 461.7
+//     against 517.0 at 64 and 470.8 against 523.1 at 96 -- so the TMA entry stays at 97 instead of
+//     following the column-invariant routes down into the decode band;
+//   * at 97 and 128 the two lanes are level (527.2/528.2 and 527.6/529.3 us, TMA/ladder) and TMA
+//     keeps the band it already had;
+//   * above 128 the ladder falls off a cliff, because one 64-token tile per round re-reads the
+//     whole panel: 1368.9 against 557.9 us at 129 and 29376 against 8098 us at 4,096. The RTX 5090
+//     fit capped TMA at 128 columns and sent everything above it back to `ResidualM64N128`, which
+//     cost the prefill band a factor of 3.6.
+constexpr std::int32_t kResidualTmaTokens = 97;
 
 template <int Terms>
 void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
@@ -71,10 +84,7 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
     auto scope = workspace.scope();
     const Nvfp4A4Workspace scratch =
         allocate_nvfp4_a4_workspace(workspace, x.ne[1], Geometry::kInputRows, Terms);
-    // 97-128 columns take the warp-specialized TMA route over one 128-token tile: three 128-K
-    // stages fit where the MMA tile holds one, 101-103 against 128-138 us (RTX 5090), with the
-    // same K order per output.
-    if (Terms == kNvfp4A4ResidualTerms && x.ne[1] > 96 && x.ne[1] <= 128) {
+    if (Terms == kNvfp4A4ResidualTerms && x.ne[1] >= kResidualTmaTokens) {
         launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled128, stream);
         launch_nvfp4_linear_swiglu_a4_residual_tma(
             nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128),
@@ -82,15 +92,12 @@ void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, Workspa
         return;
     }
     launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
-    // Above 32 columns one token tile per round streams each weight tile once: 64x128 runs
-    // 74 against 85 us for 64x64 at 48-64 columns and 96x128 95-101 against 138-142 at 80-96
-    // (RTX 5090).
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 16) {
         launch_gemm<ResidualM16N64<Terms>>(weight, out, scratch, tokens, stream);
     } else if (tokens <= 32) {
         launch_gemm<ResidualM32N64<Terms>>(weight, out, scratch, tokens, stream);
-    } else if (tokens <= 64 || tokens > 128) {
+    } else if (tokens <= 64) {
         launch_gemm<ResidualM64N128<Terms>>(weight, out, scratch, tokens, stream);
     } else {
         launch_gemm<ResidualM96N128<Terms>>(weight, out, scratch, tokens, stream);

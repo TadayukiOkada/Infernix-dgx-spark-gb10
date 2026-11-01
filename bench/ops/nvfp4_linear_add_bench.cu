@@ -127,6 +127,22 @@ template <int BlockTokens>
 inline constexpr d::Nvfp4ScaleLayout kBenchTmaScaleLayout =
     BlockTokens == 128 ? d::Nvfp4ScaleLayout::Tiled128 : d::Nvfp4ScaleLayout::Tiled256;
 
+// The 2-term (FusedA4Residual) TMA lane with an explicit schedule: the route that replaces the RTX
+// 5090 RowMajor ResidualM64N128 band above T = 64.
+template <int BlockTokens, int Stages, int MinBlocksPerSm, int BlockRows, int K>
+void bench_a4_tma_residual(const Weight& weight, Tensor& out, d::Nvfp4A4Workspace workspace,
+                           int tokens, cudaStream_t stream) {
+    using S = d::Nvfp4ScheduleInstance<
+        d::Nvfp4A4TmaMmaSchedule<BlockTokens, Stages, MinBlocksPerSm,
+                                 d::kNvfp4A4TmaWeightCodeL2_128B, d::kNvfp4A4ResidualTerms,
+                                 BlockRows>,
+        K>;
+    d::launch_nvfp4_a4_tma_mma<S>(
+        d::nvfp4_a4_operands(weight, workspace, tokens, S::kScaleLayout),
+        d::LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
+        d::LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(out.data), weight.n}}, stream);
+}
+
 template <class Schedule, int K>
 void bench_a16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     d::launch_nvfp4_a16_mma<d::Nvfp4ScheduleInstance<Schedule, K>>(
@@ -274,11 +290,14 @@ int main(int argc, char** argv) {
         bench::SavedBuffer residual_initial(residual);
         const auto restore                   = [&](cudaStream_t s) { residual_initial.restore(s); };
         bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(options.n, options.k);
+        const std::size_t one_term = d::nvfp4_a4_workspace_capacity_bytes(max_t, options.k);
+        const std::size_t two_term =
+            d::nvfp4_a4_workspace_capacity_bytes(max_t, options.k, d::kNvfp4A4ResidualTerms);
         const std::size_t workspace_capacity = options.variants
             ? std::max(ops::linear_add_workspace_capacity_bytes(QType::NVFP4, options.n, options.k,
                                                                 ops::LinearPolicy::AllowA4, min_t,
                                                                 max_t),
-                       d::nvfp4_a4_workspace_capacity_bytes(max_t, options.k))
+                       one_term + two_term)
             : ops::linear_add_workspace_capacity_bytes(QType::NVFP4, options.n, options.k,
                                                        options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
@@ -566,6 +585,59 @@ int main(int argc, char** argv) {
                             bench_a4_tma_schedule<256, 3, 1, 64, K>(w, o, ws, t, s);
                         },
                         kBenchTmaScaleLayout<256>);
+                    // T4: the 2-term FusedA4Residual lanes (quantize included) that the production
+                    // plan hides behind its token bands, so the TMA lane that replaces the RTX 5090
+                    // RowMajor ResidualM64N128 band above T = 64 is picked against its neighbours.
+                    const d::Nvfp4A4Workspace rscratch = d::allocate_nvfp4_a4_workspace(
+                        workspace, tokens, K, d::kNvfp4A4ResidualTerms);
+                    const auto a4r = [&](const char* name, d::Nvfp4ScaleLayout layout,
+                                         void (*gemm)(const Weight&, Tensor&, d::Nvfp4A4Workspace,
+                                                      int, cudaStream_t)) {
+                        cands.push_back(Cand{name, [=, &x, &packed, &out](cudaStream_t s) {
+                                               d::launch_nvfp4_a4_quantize(x, packed.weight,
+                                                                           rscratch, layout, s);
+                                               gemm(packed.weight, out, rscratch, tokens, s);
+                                           }});
+                    };
+                    a4r("a4r_m32n64", d::Nvfp4ScaleLayout::RowMajor,
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_gemm<d::Nvfp4A4MmaSchedule<
+                                              32, 64, 256, 2, 4, 3, 2, ops::Cache::cg, ops::Cache::cg,
+                                              d::kNvfp4A4ResidualTerms>,
+                                          K>(w, o, ws, t, s);
+                        });
+                    a4r("a4r_m64n64", d::Nvfp4ScaleLayout::RowMajor,
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_gemm<d::Nvfp4A4MmaSchedule<
+                                              64, 64, 256, 4, 2, 2, 2, ops::Cache::cg, ops::Cache::cg,
+                                              d::kNvfp4A4ResidualTerms>,
+                                          K>(w, o, ws, t, s);
+                        });
+                    a4r("a4r_m64n128", d::Nvfp4ScaleLayout::RowMajor,
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_gemm<d::Nvfp4A4MmaSchedule<
+                                              64, 128, 256, 4, 2, 2, 1, ops::Cache::cg, ops::Cache::cg,
+                                              d::kNvfp4A4ResidualTerms>,
+                                          K>(w, o, ws, t, s);
+                        });
+                    a4r("a4r_tma128_r128_s3", kBenchTmaScaleLayout<128>,
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_tma_residual<128, 3, 1, 128, K>(w, o, ws, t, s);
+                        });
+                    a4r("a4r_tma128_r64_s3", kBenchTmaScaleLayout<128>,
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_tma_residual<128, 3, 1, 64, K>(w, o, ws, t, s);
+                        });
+                    a4r("a4r_tma256_r64_s2", kBenchTmaScaleLayout<256>,
+                        [](const Weight& w, Tensor& o, d::Nvfp4A4Workspace ws, int t,
+                           cudaStream_t s) {
+                            bench_a4_tma_residual<256, 2, 1, 64, K>(w, o, ws, t, s);
+                        });
                 };
                 if (k6144)
                     add_t7(std::integral_constant<int, 6144>{});

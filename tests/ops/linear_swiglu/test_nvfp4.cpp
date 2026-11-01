@@ -96,13 +96,16 @@ INFERNIX_OP_TEST(linear_swiglu_nvfp4) {
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});
-        // The residual tiles (16, 32, 64, 96 and 128 columns), their ragged edges, and token
-        // slices past the widest; graph replays regenerate every plane.
+        // The residual tiles (16, 32, 64, 96 and 128 columns), their ragged edges, and the TMA
+        // prefill band the route owns from 97 columns up, including the first ragged call past a
+        // 128-token tile; graph replays regenerate every plane.
         failures += run_profile(
             "LinearSwiGLU NVFP4_A4_RESIDUAL",
             {QType::NVFP4, 34816, 5120, 17408, 1807U, ActivationCompute::A4Residual},
-            std::array{4, 5, 8, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 96, 97, 112, 128, 129},
-            std::array<std::int32_t, 4>{8, 33, 65, 97});
+            std::array{4,   5,   8,   15,  16,  17,  31,  32,  33,  48,  63,
+                       64,  65,  96,  97,  112, 128, 129, 130, 192, 255, 256,
+                       257, 512, 768, 1024},
+            std::array<std::int32_t, 6>{8, 33, 65, 97, 129, 257});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
