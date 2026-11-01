@@ -1403,6 +1403,22 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
                                 work_.alloc(DType::FP32, {T})};
         Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
         const DeviceSpan expert_ws = work_.alloc_bytes(ops::resident_moe_workspace_bytes(K * T, I));
+        const std::int32_t SI      = dim(m.shared_intermediate);
+        // Allocated before the fork, so the shared expert's own scoped workspace lies past every
+        // buffer the routed experts use, and this stream allocates nothing until the join.
+        Tensor product = work_.alloc(DType::BF16, {SI, T});
+        Tensor shared  = work_.alloc(DType::BF16, {H, T});
+        // The shared expert reads only xm, so it runs on the experts' side stream beside the routed
+        // ones: both stream whole weight banks from LPDDR5X and neither reaches the read roofline
+        // alone, so the shared expert's two projections cost nothing but their own bytes. Eager
+        // prefill chunks keep the serial order, as in Forward::moe.
+        const bool side = !eager_chunk_ && experts_.shared_stream != nullptr;
+        cudaStream_t shared_s = s;
+        if (side) {
+            CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
+            CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
+            shared_s = experts_.shared_stream;
+        }
         if (experts_.drafter_slots > 0) { // the drafter pool: among the pooled experts, by their slots
             ops::moe_route_pooled(logits, K, experts_.drafter_slot_of, experts_.drafter_demand, routing, s);
             ops::resident_moe_experts(xm, routing.ids, experts_.drafter_gate_up, experts_.drafter_down,
@@ -1412,11 +1428,12 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
             ops::resident_moe_experts(xm, routing.ids, p.experts_gate_up, p.experts_down, E, I, expert_ws.data,
                                       expert_ws.bytes, outputs, s);
         }
-        const std::int32_t SI = dim(m.shared_intermediate);
-        Tensor product = work_.alloc(DType::BF16, {SI, T});
-        shared_swiglu(xm, p.shared_gate_up, product, work_, s, dense_routes());
-        Tensor shared = work_.alloc(DType::BF16, {H, T});
-        project(product, p.shared_down, shared, work_, s, dense_routes());
+        shared_swiglu(xm, p.shared_gate_up, product, work_, shared_s, dense_routes());
+        project(product, p.shared_down, shared, work_, shared_s, dense_routes());
+        if (side) {
+            CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], shared_s));
+            CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0));
+        }
         ops::moe_combine_inject(outputs, routing, shared, inject, residual, s);
         if (call.residual_out.data != nullptr && call.residual_out.data != residual.data) {
             CUDA_CHECK(

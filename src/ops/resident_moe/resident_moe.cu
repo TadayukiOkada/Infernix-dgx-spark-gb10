@@ -3,6 +3,18 @@
 // shared memory as FP32 (swizzled, so lanes on different chunks read different banks), applies each
 // chunk's FP16 group scale once, and reduces by a fixed butterfly, so an output's bits depend only
 // on the shapes, never on the batch or placement.
+//
+// The gate and up rows of one intermediate row are a pair: both dots walk the staged activation in
+// one pass, so it is read from shared memory once per pair and both weight streams are in flight at
+// once. The staged activation is dynamic shared memory sized to the bank's padded row, which is
+// what a CTA of the bank's own width needs rather than the largest bank the Op serves.
+//
+// Both dots are FP32 on purpose. The kernels read every weight byte of every routed entry once, so
+// a top-10 decode call of the drafter's shape (H 2560 / I 640, Q4) moves 26.11 MB for 98.3 MFLOP:
+// arithmetic intensity 3.76 FLOP/B, a 108.3 us DRAM floor at the measured 241.2 GB/s against 126.8
+// us measured, and only 3.5 us of work for the whole FP32 pipe (2.66% busy; ckt roofline, GB10). An
+// integer dot therefore buys at most what it costs to be wrong, and quantizing the activation to
+// int8 would also put the result outside the FP64 oracle's bound.
 #include "infernix/ops/resident_moe.h"
 
 #include "core/device.h"
@@ -19,11 +31,13 @@ namespace {
 
 using bf16 = __nv_bfloat16;
 
-constexpr int kThreads       = 256;
-constexpr int kWarps         = kThreads / 32;
-constexpr int kGateRowsPerCta = kWarps * 2; // intermediate rows (each a gate and an up row)
-constexpr int kDownRowsPerCta = kWarps * 4;
-constexpr int kMaxHidden      = 4096;
+constexpr int kThreads         = 256;
+constexpr int kWarps           = kThreads / 32;
+constexpr int kGateRowsPerWarp = 1; // intermediate rows, each a gate and an up row
+constexpr int kDownRowsPerWarp = 4;
+constexpr int kGateRowsPerCta  = kWarps * kGateRowsPerWarp;
+constexpr int kDownRowsPerCta  = kWarps * kDownRowsPerWarp;
+constexpr int kMaxHidden       = 4096;
 constexpr int kMaxIntermediate = 2048;
 
 void require(bool condition, const char* message) {
@@ -126,13 +140,46 @@ __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int
     return sum;
 }
 
-// The two kernels launch serialized. Programmatic dependents with the down rows prefetched into L2
-// before the wait (candidates §2.3 W5) measured within chance (6 blocks, removed 2026-10-28).
+// The gate and up rows of one intermediate row, in one pass over the staged activation: a lane
+// holds both chunks of its position live, so `x` is read from shared memory once per pair and both
+// weight streams are in flight at once. Each row's products, their order and the butterfly are
+// row_dot's, so the pair gives the bits row_dot gives twice.
 template <class Codec>
-__global__ void __launch_bounds__(kThreads)
+__device__ void row_dot_pair(const Bank& bank, std::int64_t gate_row, std::int64_t up_row, const float* x, int lane,
+                             float& gate, float& up) {
+    const int chunks        = bank.padded_k / Codec::kCodes;
+    const int groups        = bank.padded_k / Codec::kGroup;
+    const auto* gate_chunks = reinterpret_cast<const uint4*>(bank.codes) + gate_row * chunks;
+    const auto* up_chunks   = reinterpret_cast<const uint4*>(bank.codes) + up_row * chunks;
+    const __half* gate_scale = bank.scales + gate_row * groups;
+    const __half* up_scale   = bank.scales + up_row * groups;
+    float gs = 0.0F, us = 0.0F;
+    for (int c = lane; c < chunks; c += 32) {
+        const uint4 wg        = __ldcs(gate_chunks + c);
+        const uint4 wu        = __ldcs(up_chunks + c);
+        const float* xs       = x + c * Codec::kCodes;
+        const float g         = __half2float(__ldg(gate_scale + c * Codec::kCodes / Codec::kGroup));
+        const float u         = __half2float(__ldg(up_scale + c * Codec::kCodes / Codec::kGroup));
+        gs = fmaf(Codec::chunk_dot(wg, reinterpret_cast<const float4*>(xs), c), g, gs);
+        us = fmaf(Codec::chunk_dot(wu, reinterpret_cast<const float4*>(xs), c), u, us);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gs += __shfl_xor_sync(0xFFFFFFFFU, gs, offset);
+        us += __shfl_xor_sync(0xFFFFFFFFU, us, offset);
+    }
+    gate = gs;
+    up   = us;
+}
+
+// The pair's two live weight streams let ptxas take 56 registers per thread, which costs a CTA per
+// SM (5 -> 4, and 83% -> 67% occupancy) for arithmetic the memory system never asks for. The clamp
+// asks for the baseline's 5 CTAs; ptxas meets it at 42 registers with no stack or local traffic
+// (cuobjdump, GB10), and the call's latency is unchanged within the noise band.
+template <class Codec>
+__global__ void __launch_bounds__(kThreads, 5)
     gate_up_kernel(const bf16* __restrict__ x, const std::int32_t* __restrict__ ids, int top_k, int hidden,
                    int intermediate, Bank bank, float* __restrict__ h) {
-    __shared__ __align__(16) float xs[kMaxHidden];
+    extern __shared__ __align__(16) float xs[]; // bank.padded_k floats, swizzled
     const int entry = static_cast<int>(blockIdx.y);
     const int t     = entry / top_k;
     const int e     = ids[entry];
@@ -141,12 +188,12 @@ __global__ void __launch_bounds__(kThreads)
     }
     __syncthreads();
     const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
-    for (int i = 0; i < 2; ++i) {
-        const int r = static_cast<int>(blockIdx.x) * kGateRowsPerCta + warp * 2 + i;
+    const std::int64_t base = static_cast<std::int64_t>(e) * 2 * intermediate;
+    for (int i = 0; i < kGateRowsPerWarp; ++i) {
+        const int r = static_cast<int>(blockIdx.x) * kGateRowsPerCta + warp * kGateRowsPerWarp + i;
         if (r >= intermediate) { break; }
-        const std::int64_t base = static_cast<std::int64_t>(e) * 2 * intermediate;
-        const float g = row_dot<Codec>(bank, base + r, xs, lane);
-        const float u = row_dot<Codec>(bank, base + intermediate + r, xs, lane);
+        float g, u;
+        row_dot_pair<Codec>(bank, base + r, base + intermediate + r, xs, lane, g, u);
         if (lane == 0) { h[static_cast<std::int64_t>(entry) * intermediate + r] = g / (1.0F + __expf(-g)) * u; }
     }
 }
@@ -155,7 +202,7 @@ template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int top_k, int hidden,
                 int intermediate, Bank bank, bf16* __restrict__ out) {
-    __shared__ __align__(16) float hs[kMaxIntermediate];
+    extern __shared__ __align__(16) float hs[]; // bank.padded_k floats, swizzled
     const int entry = static_cast<int>(blockIdx.y);
     const int e     = ids[entry];
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
@@ -163,8 +210,8 @@ __global__ void __launch_bounds__(kThreads)
     }
     __syncthreads();
     const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
-    for (int i = 0; i < kDownRowsPerCta / kWarps; ++i) {
-        const int r = static_cast<int>(blockIdx.x) * kDownRowsPerCta + warp * (kDownRowsPerCta / kWarps) + i;
+    for (int i = 0; i < kDownRowsPerWarp; ++i) {
+        const int r = static_cast<int>(blockIdx.x) * kDownRowsPerCta + warp * kDownRowsPerWarp + i;
         if (r >= hidden) { break; }
         const float y = row_dot<Codec>(bank, static_cast<std::int64_t>(e) * hidden + r, hs, lane);
         if (lane == 0) { out[static_cast<std::int64_t>(entry) * hidden + r] = __float2bfloat16_rn(y); }
@@ -175,17 +222,31 @@ Bank bank_of(const Weight& w) {
     return {static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales), w.padded_shape[1]};
 }
 
+// Dynamic shared memory is the staged activation alone; the base is 16-byte aligned, and the size
+// rounds up to the launch's own granularity.
+std::size_t stage_bytes(std::int32_t padded_k) {
+    return (static_cast<std::size_t>(padded_k) * sizeof(float) + 255) / 256 * 256;
+}
+
 template <class Codec>
 void launch(const Tensor& x, const Tensor& ids, const Weight& gate_up, const Weight& down, int top_k, int hidden,
             int intermediate, float* h, Tensor& outputs, cudaStream_t stream) {
     const int entries = ids.ne[0] * ids.ne[1];
-    gate_up_kernel<Codec><<<dim3((intermediate + kGateRowsPerCta - 1) / kGateRowsPerCta, entries), kThreads, 0,
-                            stream>>>(static_cast<const bf16*>(x.data), static_cast<const std::int32_t*>(ids.data),
-                                      top_k, hidden, intermediate, bank_of(gate_up), h);
+    const std::int32_t* route = static_cast<const std::int32_t*>(ids.data);
+    gate_up_kernel<Codec><<<dim3((intermediate + kGateRowsPerCta - 1) / kGateRowsPerCta, entries), kThreads,
+                            stage_bytes(gate_up.padded_shape[1]), stream>>>(static_cast<const bf16*>(x.data), route,
+                                                                            top_k, hidden, intermediate,
+                                                                            bank_of(gate_up), h);
     CUDA_CHECK(cudaGetLastError());
-    down_kernel<Codec><<<dim3((hidden + kDownRowsPerCta - 1) / kDownRowsPerCta, entries), kThreads, 0, stream>>>(
-        h, static_cast<const std::int32_t*>(ids.data), top_k, hidden, intermediate, bank_of(down),
-        static_cast<bf16*>(outputs.data));
+    // The two grids stay stream-ordered. Programmatic dependents were measured twice on GB10 and
+    // never paid: the down grid is 20 CTAs per entry behind a gate/up grid that already holds most
+    // of the machine, so it gets the SMs gate/up retires rather than a launch slot it does not need
+    // (candidates §2.3 W5, 2026-10-28; re-measured on the captured MTP decode graph 2026-11-01, T7:
+    // 54.58/60.02 -> 54.45/59.96 tok/s, i.e. within the noise band and never ahead).
+    down_kernel<Codec><<<dim3((hidden + kDownRowsPerCta - 1) / kDownRowsPerCta, entries), kThreads,
+                         stage_bytes(down.padded_shape[1]), stream>>>(h, route, top_k, hidden, intermediate,
+                                                                      bank_of(down),
+                                                                      static_cast<bf16*>(outputs.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

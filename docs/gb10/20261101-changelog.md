@@ -1260,3 +1260,163 @@ passes (`AB / BA / AB`).
     `last_round_steps_` on GB10 without new hardware/model evidence overturning §2.1–2.2.
   - Preserve pre-drafter `copy_beats_chain` competition for all non-empty matches, post-cut fallback
     via `ngram_proposal_`, and multi-row `mtp_confident_` truncation in `program_impl.h`.
+
+
+# GB10 changelog — 2026-11-01 (T7: Qwen4Exp MTP drafter block — shared expert beside the routed experts, resident-MoE gate/up pair fusion with bank-sized dynamic shared memory, and the falsified `split_attention_projection` / `__dp4a` / PDL premises)
+
+## 1. Accounting
+
+- Branch `dev-rebased-20261028`; task base commit `9c58c0a45` (T6). `git diff --check` clean; `.tandem/` untouched; no commit or push made.
+- Files changed (T7): 3 (2 modified sources, 1 modified document), `+106 / -28` in `src/`
+  (`forward.cpp` `+22 / -5`, `resident_moe.cu` `+84 / -23`; `git diff --numstat`, final tree).
+  `cuda-kernel-toolkit/` intentionally excluded (integrated toolkit, untouched).
+
+| File | Action | Change |
+|---|---|---|
+| `src/models/qwen4_exp/execution/forward.cpp` | M | `Forward::mtp_block`: fork the drafter's shared expert (`shared_swiglu` + `project(shared_down)`) onto `experts_.shared_stream` beside `ops::resident_moe_experts` on `device_.stream`, with `experts_.shared_events[0]` as the fork and `[1]` as the join before `ops::moe_combine_inject`; `product`/`shared` allocated before the fork so the shared expert's scoped workspace cannot alias a routed-expert buffer; serial order kept on eager prefill chunks (`!eager_chunk_`), exactly as `Forward::moe` (line 1157) does |
+| `src/ops/resident_moe/resident_moe.cu` | M | `row_dot_pair<Codec>`: gate and up rows of one intermediate row in a single pass over the staged activation; staged `xs`/`hs` moved from fixed `kMaxHidden`/`kMaxIntermediate` static shared memory to dynamic shared memory sized by `stage_bytes(bank.padded_shape[1])`; `kGateRowsPerCta` expressed as `kWarps * kGateRowsPerWarp` with `kGateRowsPerWarp = 1` (the pair doubles the live weight streams per warp); `__launch_bounds__(kThreads, 5)` on `gate_up_kernel` to keep the baseline's 5 CTAs/SM |
+| `docs/gb10/20261101-changelog.md` | M | This section |
+
+- **Not touched although the task lists it**: `src/ops/linear/nvfp4/shapes/n13952_k2560.cu` — its step-3 premise is falsified (§2.3); no edit is the correct outcome.
+- Allowlist delta: **none**. `resident_moe` contributes no entry to `tools/cuda_stack/cuda_stack_allowlist.json` before or after; both builds report `STACK:0 LOCAL:0` for all six kernels, so `check_cuda_stack.py update` was deliberately not run (nothing to ratchet down, and it must not be used to mask anything).
+- Ninja invocations: 6 (initial candidate, baseline benches, candidate benches + `infernix-serve`, PDL-switch bench, launch-bounds probe, final ship build). Baseline and candidate benches were compared as two binaries alternating per measurement round.
+
+## 2. Task-premise corrections and architectural rationale
+
+### 2.1 Shared expert serialized with the routed experts — premise held, win is bandwidth-limited
+
+`Forward::mtp_block` really did run `ops::resident_moe_experts` and the shared expert's two projections serially on `device_.stream`, unlike `Forward::moe`, which already forks them. The fork is now the same shape as the main model's. The claimed reason ("neither reaches the read roofline alone") is only partly true: the routed pass alone measures 208–228 GB/s against the 241.2 GB/s `ckt env` read ceiling (§4.4), so it reaches 86–95% by itself, and the shared expert adds bytes rather than hiding them. End-to-end the overlap is worth +0.18% on the captured MTP decode graph (§4.6) — kept because the sign is consistent across rounds and workloads and the pattern is the one the main model already ships, not because it moved the step time out of the noise band.
+
+### 2.2 `__dp4a` on an int8 activation — falsified twice over (no headroom, and outside the oracle)
+
+`ckt math roofline` for one top-10 decode call of the drafter's shape (`H 2560`, `I 640`, `E` routed 10, Q4 codes + FP16 group scales = 26.112 MB, 98.304 MFLOP, arithmetic intensity 3.76 FLOP/B):
+
+- memory-bound latency **108.26 us** at the measured 241.2 GB/s, against **125.8–126.8 us** measured for the shipped baseline;
+- compute-bound latency **3.54 us** even on the FP32 SIMT pipe (**2.66%** utilised) and **0.40 us** on int8.
+
+So removing *all* FP32 arithmetic could recover at most 3.5 us of a 126 us kernel, and the task's `>= 25%` decode-latency bar would need 95 us — **275 GB/s, above GB10's 273.0 GB/s theoretical and 14% above its measured sustained read ceiling**. The bar is unreachable by any kernel change; only fewer bytes per draft step could approach it. Separately, the Op's oracle (`tests/ops/linear/test_resident_moe.cpp`) exact-decodes the bank and accumulates in FP64, allowing only the FP32 accumulation bound `sum |D h| * (I + H) * 2^-23`; quantizing `xs`/`hs` to int8 is an activation-encoding change outside that bound and would need model-level fast-path qualification for a 3 us best case. Not implemented; the reason is recorded in the file header.
+
+### 2.3 `split_attention_projection` at `T == 1` — falsified: the kernel and the extra launch do not exist
+
+The task states that `Forward::attention` at `T == 1` pays "a separate `ops::split_attention_projection` kernel launch that reads all 13,952 BF16 outputs back". In this tree:
+
+- `split_attention_projection` appears **nowhere** in `src/` (`grep -rn` over `.cpp/.cu/.cuh/.h`: zero hits), and the file the task cites, `nvfp4_attn_input_small_t.cu`, does not exist;
+- the live `T == 1` branch (`forward.cpp:829`) allocates one packed `[13952, 1]` tensor, calls `project()` once, and hands `q/gate/k/v/iq/ik` downstream as **contiguous slices** — one GEMV launch, no scatter and no extra global round-trip;
+- `launch_nvfp4_n13952_k2560_split` at `T == 1` falls through `launch_routes` to `launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Gemv, kInputRows>>` with the very same `Gemv = Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>` that `select_a16(1)` selects for the packed route, differing only in the output object (`LinearBf16SegmentedOutput<6144,6144,512,512,512,128>` vs `LinearBf16Output`). Same schedule, same weight bytes, same launch count — there is nothing to eliminate.
+
+The `RowsPerWarp 1` vs `2` mismatch the task attributes the bypass to is likewise absent: both sites use the same `Gemv` alias. The `T == 1` route was therefore left untouched, and `n13952_k2560.cu` was not modified. The `attn_input_proj` Op bench (`infernix_attn_input_proj_bench`) registers no `[13952, 2560]` six-output profile, so no op-level bench exists for the alternative; the code-identity argument above plus the unchanged E2E decode rate (§4.5/4.6) is the evidence.
+
+### 2.4 PDL between `gate_up_kernel` and `down_kernel` — re-measured on the production route, removed
+
+`pdl::launch_with(Programmatic, …)` sets the attribute only while the stream captures a graph (`pdl::graph_dependent`), so the eager op-level bench is insensitive to it; the decision therefore had to come from the captured decode graph. One binary with an env switch, `--draft-tokens 4`, 3 interleaved rounds (§4.7): PDL-off 54.58 / 60.02 tok/s vs PDL-on 54.45 / 59.96 — never ahead, `tg128` `−0.24%`. That reproduces the removal recorded in the file's own comment (`candidates §2.3 W5, removed 2026-10-28`): the down grid is 20 CTAs per entry behind a gate/up grid that already holds the machine, so it is handed freed SMs rather than needing an early launch slot. PDL was removed and the reason left in the launch comment.
+
+### 2.5 Register cost of the pair — an occupancy regression found and fixed in-task
+
+Fusing the pair leaves both `uint4` weight streams live, and ptxas took 56 registers per thread for `gate_up_kernel<Q4>` (baseline 45), which `ckt math occupancy` puts at **4 CTAs/SM (66.7%)** against the baseline's **5 (83.3%)** — the dynamic-shared-memory change alone would have allowed 9, so registers became the only limiter. `__launch_bounds__(kThreads, 5)` recovers the baseline's 5 CTAs/SM at **42 registers with `STACK:0 LOCAL:0`** (no spill), and measures within the noise band (§4.4). The clamp is shipped.
+
+### 2.6 The task's named test gates do not exist
+
+`infernix_ops_moe_test`, `infernix_qwen4_exp_Execution_test` and `infernix_qwen4_exp_Speculative_test` are not registered in any `tests/**/tests.cmake` (verified with `ninja -t targets all`). The real gates used: `infernix_resident_moe_test` (the FP64-oracle MoE test, a member of the unified `infernix_ops_linear_test`), `infernix_qwen4_exp_speculative_test` (the T6 host gating test), the attention family of the unified `infernix_ops_attention_test`, and `infernix_cuda_stack_check`.
+
+## 3. Subsystem breakdown (mechanism)
+
+- **`src/models/qwen4_exp/execution/forward.cpp` — `Forward::mtp_block`.** `cudaEventRecord(shared_events[0], s)` → `cudaStreamWaitEvent(shared_stream, …)` publishes `xm` to the side stream; the routed experts stay on `s`; `cudaEventRecord(shared_events[1], side)` → `cudaStreamWaitEvent(s, …)` joins before `ops::moe_combine_inject`, which is the only consumer of `product`/`shared`. `product` and `shared` are allocated before the fork so the arena cannot hand the shared expert's internal scratch an address the routed experts are still using. `side` is gated on `!eager_chunk_ && experts_.shared_stream != nullptr`, identical to `Forward::moe`; `experts_.shared_stream` is created unconditionally at program setup (`program_impl.h:1182`), so the MTP decode path takes the fork. Under capture the event pair becomes graph edges, as in the main model's decode graphs.
+- **`src/ops/resident_moe/resident_moe.cu` — `row_dot_pair`.** Per lane, chunk `c` of the gate row and of the up row are fetched with `__ldcs` side by side and both `Codec::chunk_dot` results accumulate into separate FP32 scalars against their own FP16 group scale, then one butterfly reduces both. Each row's products, their order, and the butterfly are exactly `row_dot`'s, so the pair yields the bits `row_dot` yields twice — confirmed by the bench's FNV-1a output hash matching the baseline at every codec and width (§4.4).
+- **Dynamic shared memory.** `xs`/`hs` were `kMaxHidden`/`kMaxIntermediate` static arrays (17,408 B and 9,216 B per CTA, sized for the widest bank the Op serves) and are now `extern __shared__` sized `stage_bytes(bank.padded_shape[1])` — 10,240 B for the gate/up bank of a `K = 2560` drafter and 2,560 B for the down bank of `I = 640`. The launch's own bank width is what a CTA of that bank reads, so a `Q4` gate/up CTA no longer pays 1.7x the shared memory it touches.
+- **`kGateRowsPerWarp`.** With the pair, one warp per intermediate row already keeps two weight streams in flight; the previous two rows per warp made four. The grid doubles (`intermediate / 8` instead of `/ 16` blocks in `x`), which on 48 SMs is still many waves at `entries = top_k * T`.
+
+## 4. Verification
+
+### 4.1 Tests (all on the shipped binary, serial CTest — no `--parallel` on this single-GPU host)
+
+| Gate | Result |
+|---|---|
+| `infernix_resident_moe_test` (FP64 oracle over exact-decoded Q2/Q4/Q8 banks, drafter and 122B shapes) | Passed |
+| `infernix_qwen4_exp_speculative_test` (MTP draft gating, T6) | Passed |
+| `infernix_cuda_stack_check` | Passed (1.44 s) |
+| attention family — `infernix_softmax_attention_{,_bf16,_int8,_fp8,_nvfp4,_k8v4,_extended}`, `_wide_{bf16,int8,fp8,nvfp4,k8v4}`, `infernix_sliding_window_attention_test`, `infernix_vq_attention_test`, `infernix_kimi_delta_attention_test` | **15/15 Passed** |
+
+The 15-test attention family was run against the candidate build; the only later source change was removing PDL from `resident_moe.cu`, which that binary does not exercise, and `infernix_softmax_attention_test` was re-run on the final binary (Passed).
+
+### 4.2 Per-symbol resources (`cuobjdump --dump-resource-usage` on the bench executable)
+
+| Kernel | baseline `REG/STACK/SHARED` | shipped `REG/STACK/SHARED` (dynamic) | CTAs/SM (`ckt math occupancy`) |
+|---|---|---|---|
+| `gate_up_kernel<Q4>` | 45 / 0 / 17408 | 42 / 0 / 0 (10240) | 5 → 5 |
+| `gate_up_kernel<Q8>` | 84 / 0 / 17408 | 48 / 0 / 0 (10240) | 5 → 5 |
+| `gate_up_kernel<Q2>` | 44 / 0 / 17408 | 40 / 0 / 0 (10240) | 5 → 5 |
+| `down_kernel<Q4>` | 45 / 0 / 9216 | 45 / 0 / 0 (2560) | 5 → 5 |
+| `down_kernel<Q8>` | 83 / 0 / 9216 | 83 / 0 / 0 (2560) | 5 → 5 |
+| `down_kernel<Q2>` | 44 / 0 / 9216 | 44 / 0 / 0 (2560) | 5 → 5 |
+
+Zero `STACK` and zero `LOCAL` everywhere, in both builds; the pair's register demand is held at or below the baseline by the clamp of §2.5. The shipped column was re-read on the product binary
+(`cuobjdump --dump-resource-usage build-native/apps/infernix-serve`, filtered on `resident_moe_cu`) and gives the same `REG` for all six symbols — 42/48/40 for `gate_up_kernel` and 45/83/44 for `down_kernel`, each with `STACK:0 LOCAL:0` — so the table describes what ships, not only what the bench measures.
+
+### 4.3 Roofline (`ckt math roofline`, `--bytes 26112000 --flops 98304000`)
+
+Memory-bound at every dtype: 108.259 us floor at the measured 241.2 GB/s; `fp32` compute bound 3.535 us (2.66% util), `int8` 0.400 us; ridge 115 FLOP/B for `fp32`. Max theoretical speedup from the measured 133 us point 1.2285x, and 1.16x from the 125.8 us the baseline actually measures.
+
+### 4.4 `ops::resident_moe_experts` — interleaved two-binary A/B (`infernix_resident_moe_bench`, L2 flushed before each call, medians)
+
+First 4-round pass (pair + dynamic smem, before the clamp), and the shipped kernel's 3-round confirmations:
+
+| codec | T | baseline us | candidate us | delta | shipped us | delta |
+|---|---|---:|---:|---:|---:|---:|
+| `q4` | 1 | 126.8 | 125.3 | **`−1.2%`** | 125.8 / 126.3 | `0.0%` / `+0.4%` |
+| `q4` | 2 | 240.6 | 239.1 | **`−0.6%`** | — | (242.6 → 238.4, `−1.7%`) |
+| `q4` | 4 | 466.2 | 462.8 | **`−0.8%`** | 471.9 → 467.0 | `−1.0%` |
+| `q8` | 1 | 243.1 | 238.9 | **`−1.7%`** | 240.4 → 239.6 | `−0.3%` |
+| `q8` | 2 | 468.4 | 465.9 | **`−0.5%`** | 465.2 → 469.9 | `+1.0%` |
+| `q8` | 4 | 917.3 | 915.8 | **`−0.2%`** | 916.5 → 921.4 | `+0.5%` / `+0.7%` |
+
+The output FNV-1a hash is identical between arms at every codec and width, so the pair is bit-exact. Reported bandwidth is 206–228 GB/s in both arms (86–95% of the 241.2 GB/s measured ceiling). **The `>= 25%` acceptance bar is not met: the change is worth 0.2–1.7% with mixed sign across passes, i.e. inside the `|Δ| <= ~3.5%` band this host shows for identical dispatch, and §2.2 shows it cannot be met at all.**
+
+### 4.5 End-to-end, adaptive draft length (the shipped gate shape)
+
+`Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix`, `INFERNIX_EXPERTS_ON_GPU=1`, `--kv-dtype fp8`, `--concurrency 1`, `-p 4096 -n 128,256 -r 2 --warmup 1`, 2 interleaved rounds per arm:
+
+| mode / test | baseline | shipped | delta |
+|---|---:|---:|---:|
+| `mtp` `tg128` (`--spec mtp --draft-tokens auto --lm-head-draft`) | 64.04 | 64.34 | **`+0.47%`** |
+| `mtp` `tg256` | 72.11 | 71.69 | **`−0.57%`** |
+| `plain` `tg128` | 46.08 | 46.11 | `+0.07%` |
+| `plain` `tg256` | 46.00 | 46.03 | `+0.07%` |
+| `mtp` `pp4096` prefill | 3276.2 | 3267.6 | `−0.26%` |
+| `plain` `pp4096` prefill | 3291.6 | 3289.0 | `−0.08%` |
+
+### 4.6 End-to-end with a fixed draft length (removes the round-timer confounder)
+
+Same artifact and flags, `--spec mtp --draft-tokens 4 --lm-head-draft`, 3 interleaved rounds:
+
+| test | baseline | shipped | delta | acceptance (base / shipped) |
+|---|---:|---:|---:|---|
+| `tg128` | 54.34 | 54.44 | **`+0.18%`** | `0.3524 / 0.3524` |
+| `tg256` | 59.84 | 59.95 | **`+0.18%`** | `0.4271 / 0.4271` |
+
+Acceptance is equal to four decimals in every individual round, which is the bit-identity check for the drafter: the drafts the target verifies are the same tokens, so neither the pair fusion nor the stream overlap altered a single draft.
+
+### 4.7 PDL on/off, one binary, fixed draft length, 3 interleaved rounds
+
+| test | PDL off (serialized) | PDL on (programmatic under capture) | PDL on minus off |
+|---|---:|---:|---:|
+| `tg128` | 54.58 | 54.45 | `−0.24%` |
+| `tg256` | 60.02 | 59.96 | `−0.10%` |
+
+## 5. Regressions and adverse results
+
+Every comparison in this section is against the HEAD baseline binary of the same tree, on the same artifact and flags, interleaved per round; the workloads compared are the six op points of §4.4 (both codecs, `T = 1, 2, 4`), the four decode and two prefill arms of §4.5, the two fixed-draft arms of §4.6, the two PDL arms of §4.7, the six kernel symbols of §4.2, and the four test gates of §4.1.
+
+1. **Occupancy regression in `gate_up_kernel`, found and fixed.** The pair alone raised registers 45 → 56 and dropped CTAs/SM 5 → 4 (83.3% → 66.7%, `ckt math occupancy`). Cause: two live `uint4` weight streams plus two FP32 accumulators per lane. Disposition: **fixed** by `__launch_bounds__(kThreads, 5)`; 42 registers, `STACK:0 LOCAL:0`, 5 CTAs/SM, latency unchanged within noise.
+2. **PDL measured slower, not faster** (`−0.24%` / `−0.10%` on the captured MTP decode graph, §4.7). Disposition: **removed** (also matches the 2026-10-28 measurement the file recorded).
+3. **`q8` `T = 4` reads slower in two of three passes** (`916.5 → 921.4` `+0.5%`, `914.8 → 921.0` `+0.7%`) while the first pass read it faster (`917.3 → 915.8`, `−0.2%`); `q8` `T = 2` likewise (`+1.0%` in the clamped pass, `−0.5%` in the first). Cause not established — the sign flips between passes of identical dispatch, which is the host's known drift band rather than a mechanism; it is disclosed rather than dismissed. Disposition: **unresolved within the noise band**, no measurable cost claimed either way.
+4. **`mtp` `tg256` with adaptive draft length read `−0.57%`** while the fixed-draft form of the same workload reads `+0.18%`. Cause: `--draft-tokens auto` fits `round_cost_` from wall-clock round timing, so the two arms drafted different numbers of tokens (`acceptance 0.775 → 0.793`, and `0.688 → 0.703` on `tg128`) — a policy-trajectory difference, not a bits difference, exactly as T6 §5.2 documents for the same artifact. Disposition: **explained**; the fixed-draft arms of §4.6 are the comparable numbers.
+5. **Prefill `pp4096` `−0.26%` (`mtp` arm) and `−0.08%` (`plain` arm)** — both inside one timer tick of the baseline; `pp4096` does not enter `mtp_block`'s resident-expert path at these shapes. Disposition: **noise, disclosed**.
+6. **No test or numerical regression**: all four gates pass; the MoE oracle is bit-exact (identical FNV-1a per point); the stack gate passes with no allowlist entry added or needed.
+
+## 6. Accepted gaps and follow-ups
+
+- **The task's `>= 25%` `resident_moe_experts` bar is unmet and is not reachable on GB10.** The shipped Op is at 86–95% of the measured LPDDR5X read ceiling; its floor is 108.3 us against 125.8 us measured (§2.2/§4.3). Remaining headroom is 1.16x, and it is bytes, not arithmetic: fewer bytes per draft step (fewer experts per draft, or reusing expert pages the target model already made resident) is the lever, not a faster dot.
+- **No demonstrated end-to-end `mtp_block` step-time win.** The overlap and the pair together are worth `+0.18%` on the captured decode graph with a fixed draft length (§4.6) — consistently signed, never negative in any arm, but inside the host's noise band. Both are shipped as structural improvements (one pass over the staged activation, per-bank shared memory, the shared expert off the critical stream) rather than as a measured speedup, and neither may be reported as a step-time win.
+- **`T == 1` attention projection route left as-is** (§2.3): the packed single GEMV plus contiguous slices stays, because the alternative dispatches the identical `nvfp4_a16_gemv` instantiation and the split kernel the task assumed does not exist. `infernix_attn_input_proj_bench` has no `[13952, 2560]` profile, so an op-level A/B of the two epilogues would need a new fixture — left undone as out of scope.
+- **Artifact-gated model tests not run.** `infernix_qwen4_exp_forward_real_test`, `..._score_real_test`, `..._lossless_generation_real_test` and the other `*_real_test` entries skip without `INFERNIX_QWEN4_ARTIFACT`; they were not executed, so they are *not run*, not passed. The real-artifact evidence here is the W4Dense decode/prefill A/B of §4.5–4.6 plus the bit-identical acceptance rates.
+- **PDL was measured only on the MTP decode graph of one artifact.** If a future drafter widens the down grid past one wave, §2.4's conclusion should be re-tested rather than assumed.
