@@ -92,8 +92,11 @@ struct Schedule {
         kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4 + kRowGroups * kUnitRunBytes;
     static constexpr std::uint32_t kHalfStageBytes =
         kWarpTokens * kCodeRowBytes + kWarpTokens * kScaleWordsPerRow * 4 + kRowGroups * kUnitRunBytes;
-    // Consumer warps compute every 16-column MMA tile of the 64-column token tile, valid or not.
-    static constexpr bool kSkipIdleColumns = false;
+    // Consumer warps compute only the 16-column MMA tiles of the 64-column token tile that hold a
+    // valid column (the epilogues never write a column past the tile's count, so a skipped tile's
+    // zeroed accumulators are unobservable and every output bit is unchanged). An expert sees about
+    // 20 columns per 1K-token chunk and 80 per 4K chunk, so most tiles' upper MMA tiles are padding.
+    static constexpr bool kSkipIdleColumns = true;
     static_assert(kWarpRows == 32, "a warp's rows are one A4 block of h");
     static_assert(kUnitRunBytes % 16 == 0, "bulk copies move multiples of 16 bytes");
 };
@@ -109,10 +112,9 @@ struct Schedule {
 //     token tiles would compute mostly padding, and a 64-column warp tile (twice the weight fragment
 //     reuse) needs about 140 registers a thread, past the 112 that two CTAs of 288 threads allow;
 //   - a third stage would cost the second CTA (58 KB a CTA at two terms).
-// Its consumer warps skip the 16-column MMA tiles past the tile's valid columns (kSkipIdleColumns): at
-// 1K-token chunks about half of the tiles' columns are padding, which the outputs never read, so the
-// skip removes that tensor work and its fragment loads without changing any output bit. Flash-Next's
-// instances keep their qualified and timed code.
+// Its consumer warps inherit Schedule's kSkipIdleColumns: at 1K-token chunks about half of the
+// tiles' columns are padding, which the outputs never read, so the skip removes that tensor work and
+// its fragment loads without changing any output bit.
 template <int Terms, class G = FlashNextExperts>
 struct ScheduleResidual : Schedule {
     static_assert(Terms >= 2 && Terms <= kMaxResidualTerms);
@@ -122,7 +124,6 @@ struct ScheduleResidual : Schedule {
         kTerms * (kBlockTokens * kCodeRowBytes + kBlockTokens * kScaleWordsPerRow * 4) + kRowGroups * kUnitRunBytes;
     static constexpr std::uint32_t kHalfStageBytes =
         kTerms * (kWarpTokens * kCodeRowBytes + kWarpTokens * kScaleWordsPerRow * 4) + kRowGroups * kUnitRunBytes;
-    static constexpr bool kSkipIdleColumns = !(G::kHidden == kHidden && G::kIntermediate == kIntermediate);
 };
 
 // Schedule Base with a 64-token warp tile (Basalt ebf6928), for calls of kWarpTile64MinColumns columns per

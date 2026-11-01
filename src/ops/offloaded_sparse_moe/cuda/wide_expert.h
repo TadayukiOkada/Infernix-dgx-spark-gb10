@@ -243,7 +243,20 @@ struct ExpertsWorkspace {
     std::uint32_t* ring_done;
     std::uint32_t* ring_ready;
     std::uint32_t* ring_counters;
+    // Multi-column W4A4 decode and verification calls of 2..kNarrowQuantColumns columns (else
+    // null): [entries][2][shape.gate_up_blocks()] blocks of kNarrowActBytes — every entry's x
+    // column quantized to A4 codes once per call, once per input scale (gate, then up), which the
+    // narrow gate/up kernels read instead of re-quantizing the column in all of the job's CTAs.
+    std::uint8_t* narrow_acts;
 };
+
+// Bytes of one pre-quantized activation block (moe_layer.cu's ActCodes: four doubled-code words
+// and that parity's scaled E4M3 scale in `scale').
+inline constexpr int kNarrowActBytes = 24;
+// A multi-column W4A4 call of at most this many columns (decode and verification widths)
+// pre-quantizes its x in the workspace's narrow_acts plane; one-column calls (whose quantization
+// overlaps their stage) and wider calls keep quantizing inside the narrow gate/up kernels.
+inline constexpr std::int32_t kNarrowQuantColumns = 64;
 
 // The 8-bit activation route of NVFP4 W4A16 banks (NarrowA16::kA8; ops/offloaded_sparse_moe/nvfp4_a8.h): its calls
 // (at most 128 columns) take neither the wide route nor the narrow ring, so its encoded x reuses their x region:

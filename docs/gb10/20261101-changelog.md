@@ -926,3 +926,146 @@ and column-invariant tests, the spill ratchet, and the FP64-oracle tolerances.
   not re-measured: the task's premise for that file (5090 K-baked tiles named
   `launch_n5120_k*`) does not exist in the tree, and T7's record already carries the GB10 sweep and the
   two bars it could not meet.
+
+---
+
+# GB10 changelog — 2026-11-01 (T5: the multi-column W4A4 narrow decode/verify pass pre-quantizes x once per entry; the wide schedules skip the idle 16-column MMA tiles)
+
+## 1. Accounting
+
+- Base commit: `a71c6ca7a` (`dev-rebased-20261028`, T1–T4 shipped, tree clean). No commit created
+  (task instruction — the reviewer commits).
+- Files changed (4 tracked, 0 added, 0 deleted): +161 / −24 lines. `cuda-kernel-toolkit/` untouched.
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | M | `gate_up_kernel` gains a `const ActCodes* narrow_acts` parameter; its column-pair loop takes the new `unit_sums_pair_cols` (two pre-quantized columns' per-column `dup` words are exactly the packed pair's unpacked halves) and its single-column loop reads the plane instead of calling `quantize_column_codes`; new `quantize_narrow_x_kernel` (one CTA per job, `gate_up_kernel`'s guards, writes `[entry][parity][block]` of the workspace plane); `launch_expert_pass` gains `columns` and `narrow_acts` and launches the quantizer before the gate/up pass when `columns > 1` |
+| `src/ops/offloaded_sparse_moe/cuda/wide_expert.h` | M | `ExpertsWorkspace::narrow_acts` plus `kNarrowActBytes = 24` (`static_assert`-tied to `ActCodes`) and `kNarrowQuantColumns = 64` |
+| `src/ops/offloaded_sparse_moe/cuda/wide_expert.cu` | M | `offsets()` sizes the plane (`entries × 2 × kGateUpBlocks × 24`) for multi-column W4A4 calls of 2..64 columns; `carve_experts_workspace` hands it out (null otherwise) |
+| `src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh` | M | `Schedule::kSkipIdleColumns = true` (was the integration default `false`, commit `69b3da534`, never a measurement); `ScheduleResidual`'s geometry-conditional override deleted — it inherits the base |
+
+- Task: `docs/tasks/20261101-performance-tasks.md` T5 (P0).
+
+## 2. Task-premise corrections and architectural rationale
+
+1. **The bench flag and target names in the task do not exist.** The decode bench has no
+   `--ColdL2` flag — it always prints a warm and a cold row per (T, split). There is no
+   `infernix_ops_moe_test` and no `infernix_offloaded_moe_prefill_bench`: the checks used were
+   `ctest -R "infernix_offloaded_moe|infernix_cuda_stack_check"` (20 tests, unified binary
+   `build-native/tests/infernix_ops_offloaded_moe_test`) and
+   `build-native/bench/infernix_offloaded_moe_wide_bench --tokens 512,1024,2048,4096`.
+2. **`stage_nmma16_units` (spec item 2) does not exist.** `narrow_a16_mma.cuh`'s ring already
+   distributes its `cp.async16` fills across all 32 lanes, and the A16 nmma route is not what the
+   kA4 decode bench exercises. No change; the spec item is a documentation artifact.
+3. **The T=4/8 baseline is 164.6/299.1 µs cold (task said 142–150).** The per-column pass cost
+   scales with the job's count, so the ≤132 µs bar at T=8 is arithmetically out of reach of this
+   op (gate/up alone is 2× the T=1 traffic). Disclosed with measurements in §5.
+4. **`kSkipIdleColumns = false` was never justified by a measurement** — commit `69b3da534`
+   introduced it as the integration default. The skip is bit-exact by construction:
+   `live_mma = min(⌈columns − warp_m·kWarpTokens + 15⌉/16, kMmaTokens)` and every epilogue guards
+   `column >= ctx.columns`, so a skipped tile's zeroed accumulators are never read. All wide
+   hashes are unchanged (§4).
+5. **The wide-prefill gain the task predicted (15–25 %) did not materialize: measured neutral**
+   (−0.9 % … +0.3 % at T = 512…4096, both placements, §5). The wide A4 route is bound by the
+   serialized x-quantizer and the weight stream, not by padding MMAs — consistent with the stored
+   GB10 finding for this family's prefill gap. The flag stays on (it removes real tensor work at
+   tail tiles and costs nothing), but it is not a measured win here.
+6. **The NCU premise is confirmed and its prescribed fix is falsified at T=1.** `gate_up_kernel`
+   is latency-bound (3.73 active warps/scheduler, 59.5 % long_scoreboard, Mem 15 %, Compute 20 %).
+   But streaming the slice to registers is *worse* than the full-slice `stage_wait`: at two CTAs
+   per SM the unrolled per-warp `__ldg` stride keeps ~1–1.5 KB in flight per warp against
+   cp.async's whole-slice 46 KB per CTA — ~4.6× less MLP — and a separate pre-quantizing launch
+   serializes ~16 µs ahead of the captured graph. Both variants were implemented, measured, found
+   slower at T=1 (warm +26 %/+21 %), and removed; the staged pass keeps its inline quantization
+   there, which overlaps the fetch. The pre-quantization wins only where the duplication is worst:
+   multi-column calls (spec item 1's other half, kept).
+
+## 3. Subsystem breakdown
+
+- `src/ops/offloaded_sparse_moe/cuda/` (M): as §1. Bit-exactness rests on two identities, both
+  verified against the CPU oracle (`exact=yes`, all 12 decode rows): the pair packing
+  `(a0.dup[q] & 0x0F0F0F0F) | (a1.dup[q] & 0xF0F0F0F0)` reproduces `quantize_pair_codes`' word, and
+  `unit_sums`' lane mapping (q = lane>>3, i = lane&7) reads the per-column `dup` words unchanged.
+  The plane layout `[entries][2 parities][160 blocks]` mirrors the gate/up kernel's parity loop;
+  the quantizer kernel's skip predicates (`job_count`, `cpu_flags`, `pass_record`, `wide_route`)
+  are the gate/up kernel's, so a skipped job's CTAs never read unwritten plane bytes.
+- No plan, converter, model, serving, or documentation contract changed. The workspace plane is
+  sized and carved from the same `offsets()` arguments (the caller's token count), the
+  `x_acts`-ring precedent; one-column and >64-column calls leave it null and run the untouched
+  inline path.
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+- **Tests:** `ctest -R "infernix_offloaded_moe|infernix_cuda_stack_check"` — 20/20 passed
+  (layer, plan, wide, cuda, ggml, ggml_a8, w4a8, a8_wide, fp8, 122b, a4_residual_122b, team,
+  the five cpu tests, layer_idle, stack ratchet). Run serially per the stored single-GPU finding.
+- **Spill ratchet:** no allowlist update was run or needed (`git diff` touches no file under
+  `tools/cuda_stack/`). Per-symbol `cuobjdump -res-usage`: `quantize_narrow_x_kernel` REG:72
+  STACK:0 LOCAL:0; `gate_up_kernel` REG:101 STACK:0 — identical to the baseline binary's symbol.
+  (The first compile put the two by-value `ActCodes` loads on the stack, STACK:48/24; taking
+  references like the original `unit_sums` eliminated both before any gate failure shipped.)
+- **Bit-exactness:** decode bench `exact=yes` on all 12 rows (every T × split × warm/cold). Wide
+  bench `output fnv1a` identical to the saved baseline on a4 (T = 512…4096, both placements:
+  `44a3d026d330a364`/`505681a3f4ee4fc1`/`33d2ef52f688991e`/`90cb5930998d3eeb`) and on every
+  regression variant: `--activation a16x2`/`a16x3` (the residual schedule now inherits the skip),
+  `--split-scales` narrow multi-column calls (the plane's parity path), `--geometry 122b`
+  `--activation a16`/`a16x2`, `--bank ggml --ggml-wide bf16`.
+- **A/B protocol:** absolute µs on this host drifts with thermal state (a non-interleaved
+  comparison showed a phantom +17 µs T=1 warm "regression" that interleaving erased), so all
+  claims below are from two alternating base/candidate passes over separately built binaries in
+  one session.
+
+## 5. Results — wins, parity, and every adverse number
+
+Decode bench medians (µs; base → new, second value = second pass):
+
+| Row | warm base → new | cold base → new |
+|---|---|---|
+| T=1 split=0 | 94.8 / 92.5 → 94.1 / 87.7 (parity) | 134.0 / 132.8 → 135.9 / 132.8 (parity) |
+| T=1 split=1 | 98.5 / 98.9 → 97.9 / 95.8 (parity) | 123.6 / 123.6 → 122.5 / 122.9 (parity) |
+| T=4 split=0 | 146.9 / 147.8 → 135.7 / 139.7 (**−6 %**) | 158.5 / 167.0 → 166.8 / 165.6 (flat) |
+| T=4 split=1 | 278.8 / 278.7 → 264.7 / 236.0 (**−5…−15 %**) | 295.6 / 297.7 → 258.1 / 253.7 (**−14 %**) |
+| T=8 split=0 | 274.7 / 273.0 → 239.9 / 243.3 (**−12 %**) | 286.4 / 286.7 → 263.1 / 264.1 (**−8 %**) |
+| T=8 split=1 | 531.2 / 532.9 → 443.9 / 446.0 (**−16 %**) | 543.6 / 542.4 → 455.4 / 456.4 (**−16 %**) |
+
+- **No regression shipped.** Every row is parity or a win under interleaving. The T=4 split=0 cold
+  row is flat, not a win (base itself measured 158.5 then 167.0 across passes; candidate 165.6–166.8).
+- **Wide prefill:** T = 512…4096, frames and staged: medians move by −0.9 % … +0.3 % — neutral
+  (§2.5). The task's ≥15–25 % bar is **not met**; the premise that tail padding MMAs bound the
+  wide route is falsified by this measurement.
+- **Removed attempts (both bit-exact, both slower at T=1, disclosed rather than kept):**
+  (a) `gate_up_single_kernel` reading pre-quantized codes from the plane — T=1 warm 103.8 vs 82.4
+  (the separate quantize launch serializes ~16–21 µs ahead of the 3-node graph); (b) the same
+  kernel with the quantization moved inside (no launch) — T=1 warm 98.8, because the codes'
+  `__syncthreads` puts the weight loads behind the column's barrier, losing the cp.async overlap.
+  The T=1 path is therefore the untouched baseline; the per-symbol trace evidence is
+  `/tmp/t5_dec_after.sqlite` (quantize kernel min 3.7 µs, single kernel avg 82.1 vs staged 85.0 —
+  the per-kernel averages hide exactly the launch-serialization the whole-graph rows show).
+- **Acceptance bars:** T=1 cold ≤124 µs **not met** (~133 µs, unchanged — 82 % of the 246 GB/s
+  reference; 27.6 MB/expert-call at that size is 112 µs of DRAM floor and the pass is already
+  within ~20 % of it). T=4 ≤132 µs **not met** (166 µs); T=8 ≤132 µs **not met** (264 µs, but
+  −16 % from the pre-quantization). Wide ≥15 % **not met** (neutral).
+
+## 6. Accepted gaps and follow-ups
+
+- **The T=1 narrow decode bar needs a different lever than this task named.** At 2 CTAs/SM the
+  staged pass's remaining latency is the whole-slice `stage_wait` join; the two register/
+  pre-quantization alternatives are measured slower (§5). The untried shape is the task's
+  "compact cp.async ring": warp-owned chunked staging (each warp waits only its own commit
+  group, or a two-group half-slice pipeline) at unchanged 2 CTAs/SM — a rewrite of the hot
+  kernel's staging contract, worth a follow-up task with the same interleaved protocol.
+- **Cold T=1 is near the DRAM floor** (82 % READ_%): 27.6 MB per call at 246 GB/s is 112 µs, so
+  the ≤124 µs bar leaves ~12 µs of non-DRAM budget for stage+dispatch+down; the down kernel's
+  PDL overlap already absorbs most of its own staging. Reaching 90 %+ likely requires cutting
+  bytes (e.g., a resident-frame L2 pin of the 24 MiB working set) rather than latency work.
+- **Zero-copy host records are untested for the new plane path:** the benches use device-resident
+  frames; a forked call whose `job_records` point at pinned host memory exercises the same code
+  with PCIe latency in the quantizer's x reads. The guards are the gate/up kernel's, so the
+  correctness contract is unchanged, but no measurement covers it.
+- **`run_kv_matrix_bench.sh` was not run:** every change is inside the W4A4 narrow op and the wide
+  schedule constants, exercised op-level by the two benches and the 20-test family; no model
+  route, plan gate, or artifact format changed. If the reviewer wants E2E evidence, A/B that
+  script against `a71c6ca7a`.
+- **`kNarrowQuantColumns = 64` is a contract constant, not a tuned one:** above it the plane's
+  quantizer serializes more x-traffic than the duplication it removes; the 64 boundary follows
+  `kMaxColumns` (the narrow/wide planning split) rather than a sweep at intermediate widths.

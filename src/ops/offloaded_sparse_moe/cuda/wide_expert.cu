@@ -198,7 +198,7 @@ namespace {
 // Byte offsets of the workspace's regions; `end` is its size.
 struct Offsets {
     std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
-    std::size_t h_blocks, x_plane;                      // W4A4
+    std::size_t h_blocks, x_plane, narrow_acts;         // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax, job_ctas; // W4A16
     std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
     std::size_t lossless;                              // kLossless
@@ -265,6 +265,12 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
+        // A multi-column decode or verification call quantizes every entry's x column once per
+        // input scale (its gate and up scales' A4 codes) instead of in every gate/up CTA of its
+        // job; a one-column call's quantization overlaps its stage and stays inline.
+        if (columns > 1 && columns <= kNarrowQuantColumns) {
+            o.narrow_acts = take(e * 2 * static_cast<std::size_t>(kGateUpBlocks) * kNarrowActBytes);
+        }
     }
     if (ring_call(shape, activation, wide_a16, columns)) {
         o.x_acts        = take(t * static_cast<std::size_t>(shape.gate_up_blocks()) * kA16ActBytes);
@@ -656,6 +662,8 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
+        w.narrow_acts =
+            o.narrow_acts != 0 ? reinterpret_cast<std::uint8_t*>(p + o.narrow_acts) : nullptr;
     }
     if (o.has_ring) {
         w.x_acts        = reinterpret_cast<std::uint8_t*>(p + o.x_acts);
