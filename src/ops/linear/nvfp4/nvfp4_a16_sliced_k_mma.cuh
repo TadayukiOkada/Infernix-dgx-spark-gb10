@@ -80,9 +80,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 
     if constexpr (kPrefetchWords != 0) {
         // One thread fills one row's whole line before the copies go out; the mainloop's first
-        // barrier publishes them, so the fill costs no extra synchronization here. The line covers
-        // the CTA's contraction columns by their absolute index, which is what the row consumer
-        // below names when it reads a column's window back.
+        // barrier publishes them, so the fill costs no extra synchronization here. Measured (GB10,
+        // 2026-11-01, T3): issuing it after the prologue instead - so the async copies are already in
+        // flight when the fill stalls on its read - is 1.3 .. 2.4 us slower at every B = 3..8 the route
+        // serves, because the fill then delays the mainloop's first group while the copies it was
+        // supposed to overlap were already covered by the pipeline. The line covers the CTA's
+        // contraction columns by their absolute index, which is what the row consumer below names when
+        // it reads a column's window back.
         for (int local = tid; local < kBlockRows; local += Schedule::kThreads) {
             output.prefetch_row(row_prefetch + local * kPrefetchWords,
                                 row_policy.weight_row(row0, local, operands.rows),

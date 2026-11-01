@@ -78,6 +78,16 @@ struct GdnConvSnapshotColumnsOutput {
         }
     }
 
+    // The line of a contraction that covers one column: the taps and column zero's window, and no
+    // slot for the columns a single-column call cannot name. A contraction whose rows each have one
+    // owner keeps this in that thread's registers, so its loads go out before the contraction and
+    // are read back by the same thread without ever touching shared memory.
+    static constexpr int kPrefetchLiveWords = 4 * 2;
+    __device__ __forceinline__ void prefetch_single_row(std::uint32_t* words, int row) const {
+        prefetch_unit(words, row, 0, 1);
+        prefetch_unit(words, row, 1, 1);
+    }
+
     // One fully reduced row over contraction columns [column_begin, column_begin + active). Every
     // history the row needs is loaded before the row publishes any window, so a sequence's
     // snapshot slot may be its own initial slot (the decode configuration). Distinct sequences

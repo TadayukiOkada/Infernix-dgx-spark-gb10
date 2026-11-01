@@ -697,10 +697,12 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Nvfp4A4Pair: return configuration.dense == DenseKernels::Nvfp4;
     // W4Dense's NVFP4 projections carry their own fused decode convolution ([16384,2560]) - an
     // implemented candidate: its epilogue form runs the shared A16 GEMV schedule, and after the T6
-    // row-scratch prefetch it costs 3.6 us more than the unfused projection at B = 1 (its own state
-    // traffic is ~1.1 us of that) against the composed route's ~4.1 us convolution kernel, i.e. a tie
-    // at the Op level and -0.2 .. -0.4 % on the artifact's plain decode (2026-10-31, W4Dense; -3.3 %
-    // before T6), so it registers nowhere (its Q8 route is the faster fusion).
+    // row-scratch and T3 register prefetches it costs 1.1 us more than the unfused projection at
+    // B = 1, of which ~0.9 us is its own state traffic (conv_weight, the three history taps and the
+    // published window, ~202 KB); it beats the composed route's 106.2 us (projection plus a 4.1 us
+    // convolution kernel) by 3.0 us per call, which is a tie on the artifact's plain decode (+0.02 ..
+    // +0.03 tok/s over six alternating rounds, 2026-11-01, W4Dense; -0.2 .. -0.4 % before T3), so it
+    // registers nowhere (its Q8 route is the faster fusion).
     // W4Dense's Q8 weights (the shared expert, hyper-connections, MTP drafters, LM head) take the
     // sliced-K decode routes the flag serves; the dispatch ignores the flag on NVFP4 problems.
     case FastPath::Q8SlicedK:

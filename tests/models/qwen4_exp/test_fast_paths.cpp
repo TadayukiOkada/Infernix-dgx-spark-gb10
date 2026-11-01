@@ -341,8 +341,11 @@ int main() {
     // the artifact's Q8 weights (its NVFP4 problems ignore the flag) and dflash2-pairs joins the
     // owner's every-configuration registration; both are registered. gdn-conv-fused's [16384,2560]
     // NVFP4 route is implemented (it applies, so --fast-path can run it) but measured no faster than
-    // the composed decode route on GB10 - a tie at the Op level and -0.2 .. -0.4 % on the artifact's
-    // plain decode after the T6 epilogue prefetch (2026-10-31), so it registers nowhere. The fused
+    // the composed decode route on GB10 - after the T6 row-scratch and T3 register prefetches (the
+    // latter drops the GEMV's shared line and its barrier for a further 0.4 .. 1.2 us at B = 1) it is
+    // 3.0 us per call ahead of the composed route at the Op level and +0.02 .. +0.03 tok/s, a tie, on
+    // the artifact's plain decode over six alternating rounds (2026-11-01), so it registers nowhere.
+    // The fused
     // convolution is per column and keeps a request invariant;
     // q8-sliced-k and dflash2-pairs couple a request to its round, which the reproducible route
     // therefore excludes.
@@ -353,7 +356,7 @@ int main() {
             const FastPathConfiguration w4dense{DenseKernels::Nvfp4, a4, kv};
             failures += check(q::fast_path_applies(FastPath::GdnConvFused, w4dense, options) &&
                                   !q::fast_path_qualified(FastPath::GdnConvFused, w4dense),
-                              "gdn-conv-fused's NVFP4 route is an unqualified candidate (measured slower)");
+                              "gdn-conv-fused's NVFP4 route is an unqualified candidate (measured a tie)");
             failures += check(q::fast_path_applies(FastPath::Q8SlicedK, w4dense, options) &&
                                   q::fast_path_qualified(FastPath::Q8SlicedK, w4dense),
                               "q8-sliced-k applies and is registered on W4Dense (its Q8 weights)");

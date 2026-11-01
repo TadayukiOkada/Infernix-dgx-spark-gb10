@@ -38,6 +38,21 @@ struct LinearRowPrefetch<Output, std::void_t<decltype(Output::kPrefetchWords),
     static constexpr int units = Output::kPrefetchUnits;
 };
 
+// The register-resident form of the line above, for a contraction that covers a single column: the
+// thread that owns the row is the line's only reader, so it can hold the `words` live words itself
+// and its loads need neither shared memory nor the barrier that publishes a shared fill. Zero for an
+// output that declares no single-column form, which leaves that contraction reading the row's scratch
+// in its tail. See `prefetch_single_row` on the output.
+template <class Output, class = void>
+struct LinearRowPrefetchSingle {
+    static constexpr int words = 0;
+};
+
+template <class Output>
+struct LinearRowPrefetchSingle<Output, std::void_t<decltype(Output::kPrefetchLiveWords)>> {
+    static constexpr int words = Output::kPrefetchLiveWords;
+};
+
 // Row consumers run in the single thread owning the fully reduced row. They
 // may publish fused Op state, but do not introduce warp/CTA synchronization.
 // `row_prefetch` is the row's preloaded scratch line (see the NVFP4 GEMV's row prefetch): a line of
