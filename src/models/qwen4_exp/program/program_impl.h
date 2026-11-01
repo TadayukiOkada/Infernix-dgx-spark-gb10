@@ -30,6 +30,7 @@
 #include "runtime/expert_offload/placement.h"
 #include "models/qwen4_exp/program/calibrated_order.h"
 #include "runtime/expert_offload/drafter_pool.h"
+#include "models/qwen4_exp/program/mtp_gating.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
@@ -397,43 +398,8 @@ inline ops::SamplingConfig translate(const ResolvedSamplingParameters& s) {
     return out;
 }
 
-// The cumulative cut of an argmax MTP chain (candidates §7 D8; Basalt draft_cum.hpp): the chain keeps
-// draft j while the product over i <= j of the observed acceptance rate of draft i's probability bin
-// stays at or above the request's threshold. The bins are Basalt's, as log-probability edges (the
-// drafter's stored values, compared without exp, so host and device classify alike:
-// core/decode_graph.h). The threshold starts at kMtpCumulativeBase and falls toward 0.25 as the
-// request's drafts are accepted more often than the table predicts (observed / expected accepted,
-// decayed 0.97 per round, mapped linearly over 0.9..1.1). Draft-only: verification and outputs are
-// unchanged. It is the cut of `--draft-tokens auto` (Dense8 MTP auto, ABBA x5: conv 1.0529x, 5/5, worst 1.0296;
-// struct 1.0009x); a fixed draft length keeps the --spec-min-p cut (MTP-3 under this cut: conv 1.0423x, struct
-// 0.9919x, worse in every pair; 2026-10-28).
-inline constexpr GraphGateBins kMtpCumulativeBins{
-    {-1.20397280F, -0.693147181F, -0.356674944F, -0.223143551F, -0.105360516F, -0.0512932944F, -0.0100503359F},
-    {0.12F, 0.26F, 0.43F, 0.51F, 0.59F, 0.66F, 0.79F, 0.96F}};
-inline constexpr float kMtpCumulativeBase = 0.35F;
-
-struct MtpCumulative {
-    float threshold = kMtpCumulativeBase;
-    double observed = 0.0, expected = 0.0;
-
-    void reset() { *this = MtpCumulative{}; }
-    // One verified chain: `offered` drafts with these log-probabilities, `accepted` of them taken.
-    void observe(const float* logprobs, std::int32_t offered, std::int32_t accepted) {
-        if (offered <= 0) { return; }
-        constexpr double kDecay = 0.97, kLowRatio = 0.9, kHighRatio = 1.1;
-        constexpr float kFloor  = 0.25F;
-        double chance = 1.0, sum = 0.0;
-        for (std::int32_t j = 0; j < offered; ++j) {
-            chance *= static_cast<double>(graph_gate_rate(logprobs[j], kMtpCumulativeBins));
-            sum += chance;
-        }
-        observed = observed * kDecay + static_cast<double>(accepted);
-        expected = expected * kDecay + sum;
-        if (expected < 0.5) { return; }
-        const double t = std::clamp((observed / expected - kLowRatio) / (kHighRatio - kLowRatio), 0.0, 1.0);
-        threshold      = kMtpCumulativeBase + static_cast<float>(t) * (kFloor - kMtpCumulativeBase);
-    }
-};
+// The cumulative cut of an argmax MTP chain and its threshold adaptation live with the rest of the
+// round's host policy: models/qwen4_exp/program/mtp_gating.h.
 
 // A paused request (design §19.3.13): what its lane held besides model state. The pause published
 // the state at `target` to the prefix cache (a request the cache publishes); a resume binds the
@@ -2582,6 +2548,8 @@ public:
             Lane& lane = lanes_[lanes[b]];
             drafts_[b].clear();
             from_ngram_[b] = false;
+            ngram_proposal_[b].clear();
+            ngram_proposal_bucket_[b] = -1;
             const std::uint32_t remaining =
                 static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
             if (remaining < 2) { continue; }
@@ -2605,32 +2573,26 @@ public:
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
                 auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
                 const int bucket = ngram_bucket(match.matched);
-                // A longer copy proposal replaces the row's MTP drafts; a round with active MTP drafts
-                // takes it when its expected tokens per round time (using kNgramWidthCost for zero-draft-step
-                // copy verification) beat the MTP drafts' (Strata's DraftPolicy).
-                bool take = match.tokens.size() > static_cast<std::size_t>(extents[b]);
+                // Any non-empty copy proposal competes with the row's MTP drafts on expected tokens per
+                // round time (kNgramWidthCost for a zero-draft-step copy verification; Strata's
+                // DraftPolicy) — not only a longer one: a short copy of a well-accepted match beats a
+                // long chain the round's cut will truncate. A proposal the chain wins is still kept for
+                // after the cut, which may leave the row fewer drafts than the copy.
+                bool take = !match.tokens.empty();
                 if (take && extents[b] > 0) {
-                    const double mtp_cost   = batch == 1 ? width_cost() : kPairWidthCost;
-                    const double ngram_cost = batch == 1 ? kNgramWidthCost : kPairWidthCost;
-                    double reach = 1.0, mtp_tokens = 1.0;
-                    for (std::int32_t k = 0; k < extents[b]; ++k) {
-                        reach *= lane.mtp_accept[static_cast<std::size_t>(k)];
-                        mtp_tokens += reach;
-                    }
-                    const double p = lane.ngram_accept[static_cast<std::size_t>(bucket)];
-                    double copy_reach = 1.0, copy_tokens = 1.0;
-                    for (std::size_t k = 0; k < match.tokens.size(); ++k) {
-                        copy_reach *= p;
-                        copy_tokens += copy_reach;
-                    }
-                    take = copy_tokens / (1.0 + ngram_cost * static_cast<double>(match.tokens.size())) >
-                           mtp_tokens / (1.0 + mtp_cost * extents[b]);
+                    take = copy_beats_chain(static_cast<std::int32_t>(match.tokens.size()),
+                                            lane.ngram_accept[static_cast<std::size_t>(bucket)],
+                                            batch == 1 ? kNgramWidthCost : kPairWidthCost, lane.mtp_accept, extents[b],
+                                            batch == 1 ? width_cost() : kPairWidthCost);
                 }
                 if (take) {
                     drafts_[b]       = std::move(match.tokens);
                     from_ngram_[b]   = true;
                     ngram_bucket_[b] = bucket;
                     extents[b]       = static_cast<std::int32_t>(drafts_[b].size());
+                } else if (!match.tokens.empty()) {
+                    ngram_proposal_[b]        = std::move(match.tokens);
+                    ngram_proposal_bucket_[b] = bucket;
                 }
             }
             width = std::max(width, 1 + extents[b]);
@@ -2654,20 +2616,53 @@ public:
                     stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
                 }
             });
+            // Every row verifies only its confident drafts: those its cumulative cut keeps
+            // (read_mtp_drafts; every draft of a sampled row with sampled-mtp-drafts). A row the cut
+            // leaves shorter than a copy proposal it declined takes the copy instead: the draft steps
+            // are already paid for and a copy costs no draft step, so a truncated round still verifies
+            // a wide row rather than decaying to a narrow one. The
+            // round's width is the longest row's, so a cut can narrow it; the drafter staged each row's
+            // n-gram columns at the width it knew, and rows 1.. are read again at the round's width
+            // (row 0's columns sit at offset 0 whatever the width, as in the DFlash2 pair path).
+            const std::int32_t staged_width = width;
             for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
-                if (!from_ngram_[b] && extents[b] > 0) {
-                    drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
+                if (from_ngram_[b] || extents[b] <= 0) { continue; }
+                drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
+                extents[b] = std::min(extents[b], mtp_confident_[b]);
+                drafts_[b].resize(static_cast<std::size_t>(extents[b]));
+                const auto copies = static_cast<std::int32_t>(ngram_proposal_[b].size());
+                if (copies > extents[b] &&
+                    copy_beats_chain(
+                        copies,
+                        lanes_[lanes[b]].ngram_accept[static_cast<std::size_t>(ngram_proposal_bucket_[b])],
+                        batch == 1 ? kNgramWidthCost : kPairWidthCost, lanes_[lanes[b]].mtp_accept, extents[b],
+                        batch == 1 ? width_cost() : kPairWidthCost)) {
+                    drafts_[b]              = ngram_proposal_[b];
+                    from_ngram_[b]          = true;
+                    ngram_bucket_[b]        = ngram_proposal_bucket_[b];
+                    extents[b]              = copies;
+                    ngram_proposal_[b].clear();
+                    ngram_proposal_bucket_[b] = -1;
                 }
             }
-            // A one-row round verifies only its confident drafts: those its cumulative cut keeps
-            // (read_mtp_drafts; every draft of a sampled row with sampled-mtp-drafts). Its width may
-            // still shrink, as the drafter staged only column 0's n-gram rows; a pair round's
-            // columns are staged at their offsets, so it keeps its length.
-            if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
-                extents[0] = std::min(extents[0], mtp_confident_[0]);
-                drafts_[0].resize(static_cast<std::size_t>(extents[0]));
-                width = 1 + extents[0];
-                if (extents[0] != wanted[0]) { last_round_steps_ = -1; }
+            if (max_width_ > 1) {
+                std::int32_t widest = 1;
+                for (std::int32_t b = 0; b < batch; ++b) { widest = std::max(widest, 1 + extents[b]); }
+                width = widest;
+                if (batch == 1 && last_round_steps_ >= 0 && steps > 0 &&
+                    (from_ngram_[0] || extents[0] != wanted[0])) {
+                    // The cost fit models complete drafted rounds only: a gated chain's graph time
+                    // follows its drafted steps — the conditional bodies past the cut are still
+                    // replayed, just skipped — so pairing a truncated round's time with the
+                    // executed count (mtp_executed_) inflated the slope and over-pruned the draft
+                    // length (measured: tg256 rounds 181 -> 198, decode -5.6%, 2026-11-01). An
+                    // n-gram round's width does not follow the drafter's steps either. Both stay
+                    // out of the fit, as before the executed count existed.
+                    last_round_steps_ = -1;
+                }
+                if (width != staged_width) {
+                    for (std::int32_t b = 1; b < batch; ++b) { staged[b] = 0; }
+                }
             }
         } else if (dflash2_ && width > 1) {
             // One proposal for every row that takes the drafter's tokens (none when every speculating
@@ -5789,11 +5784,13 @@ private:
         }
     }
 
-    // A draft round's readout once its copies have landed: each row's first `steps` drafts and its
-    // confident count, and with `unwritten` its pending cell written.
+    // A draft round's readout once its copies have landed: each row's first `steps` drafts, its
+    // confident count and the draft steps the device actually ran, and with `unwritten` its pending
+    // cell written.
     void read_mtp_drafts(std::span<const std::uint32_t> lanes, std::int32_t steps, bool unwritten, bool sampled) {
         const auto batch         = static_cast<std::int32_t>(lanes.size());
         const bool need_logprobs = need_mtp_logprobs(batch, sampled);
+        const bool gated         = mtp_draft_gated(batch, steps, sampled);
         for (std::int32_t b = 0; b < batch; ++b) {
             Lane& lane = lanes_[lanes[b]];
             if (unwritten && lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
@@ -5806,20 +5803,21 @@ private:
             // with sampled-mtp-drafts (a sampled proposal's acceptance does not follow the head's top
             // probability, and its rounds were measured faster without a cut).
             mtp_confident_[b] = steps;
+            mtp_executed_[b]  = steps;
             if (!need_logprobs || (sampled && lane.sampling.temperature > 0.0F)) { continue; }
             const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
             auto& kept           = mtp_draft_logprobs_[static_cast<std::size_t>(b)];
             for (std::int32_t j = 0; j < steps; ++j) { kept[static_cast<std::size_t>(j)] = logprobs[j * batch + b]; }
-            for (std::int32_t j = 0; j < steps; ++j) {
-                const bool cut = options_.auto_draft_length
-                                     ? graph_gate_product(logprobs + b, batch, j, kMtpCumulativeBins) <
-                                           mtp_cumulative_threshold_[static_cast<std::size_t>(b)]
-                                     : logprobs[j * batch + b] < draft_min_logprob_;
-                if (cut) {
-                    mtp_confident_[b] = j;
-                    break;
-                }
-            }
+            // The gated chain ran steps 0..its cut, so the drafts beyond mtp_executed_[b] are stale
+            // words a skipped gated step left behind and must not be read; the round's cost fit stays
+            // fed the drafted count of uncut rounds only (decode, where the fit is described).
+            const auto cut = options_.auto_draft_length
+                                 ? mtp_cumulative_cut(logprobs + b, batch, steps,
+                                                      mtp_cumulative_threshold_[static_cast<std::size_t>(b)],
+                                                      kMtpCumulativeBins, gated)
+                                 : mtp_min_logprob_cut(logprobs + b, batch, steps, draft_min_logprob_, gated);
+            mtp_confident_[b] = cut.kept;
+            mtp_executed_[b]  = cut.executed;
         }
     }
 
@@ -6647,6 +6645,10 @@ private:
     MtpIo mtp_io_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
     std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts kept by the cumulative cut
+    // Per row: the draft steps the device ran (mtp_gating.h); the drafts at or past it are stale
+    // words a skipped gated step left behind. The round's cost fit does not use it: a gated chain's
+    // graph time follows its drafted steps, not the executed ones (see decode's fit reset).
+    std::array<std::int32_t, kMaximumConcurrency> mtp_executed_{};
     std::array<bool, kMaximumConcurrency> from_ngram_{};
     // Copy proposals are chosen against the MTP drafts by expected tokens per round time, their
     // acceptance learned per match-length bucket (4-7, 8-11, 12-15, 16+ tokens; Strata's priors).
@@ -6654,6 +6656,11 @@ private:
     static int ngram_bucket(std::uint32_t matched) { return matched < 8 ? 0 : matched < 12 ? 1 : matched < 16 ? 2 : 3; }
     static constexpr std::array<double, 4> kNgramAcceptancePriors{0.75, 0.88, 0.93, 0.96};
     std::array<int, kMaximumConcurrency> ngram_bucket_{};
+    // A copy proposal the neural chain won before the round was drafted, kept for the round's cut: when
+    // the cut leaves the row fewer drafts than this copy, the round verifies the copy instead of
+    // decaying to a narrow round (the draft steps' cost is already spent, a copy costs no draft step).
+    std::array<std::vector<std::int32_t>, kMaximumConcurrency> ngram_proposal_;
+    std::array<int, kMaximumConcurrency> ngram_proposal_bucket_{};
     // DFlash2's acceptance per probability decile learned across the process's requests with the
     // requests' own EWMA (candidates VS-2 / D11's draft half): a new request starts from it rather than
     // from the deciles' face values, which a short request otherwise spends its rounds unlearning.

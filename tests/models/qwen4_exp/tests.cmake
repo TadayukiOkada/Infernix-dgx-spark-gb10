@@ -174,6 +174,13 @@ infernix_add_test(infernix_qwen4_exp_preemption_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# The MTP draft round's host policy (program/mtp_gating.h): the cumulative cut and the executed-draft-
+# step count the round's cost fit is fed, and the copy-versus-chain choice that lets a truncated MTP
+# round still verify the n-gram proposal it declined before the drafter ran. Host only.
+infernix_add_test(infernix_qwen4_exp_speculative_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative.cpp"
+  LIBRARIES infernix_core)
+
 # MTP drafts (one-hot and sampled-mtp-drafts) and a DFlash2 companion drafter (--draft-model) against
 # one plain-decoding reference: the sampler's output distribution, greedy tokens, concurrency and the
 # drafter's ring through a prefix resume.

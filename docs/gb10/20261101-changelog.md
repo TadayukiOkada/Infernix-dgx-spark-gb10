@@ -1069,3 +1069,194 @@ Decode bench medians (µs; base → new, second value = second pass):
 - **`kNarrowQuantColumns = 64` is a contract constant, not a tuned one:** above it the plane's
   quantizer serializes more x-traffic than the duplication it removes; the 64 boundary follows
   `kMaxColumns` (the narrow/wide planning split) rather than a sweep at intermediate widths.
+
+---
+
+# GB10 changelog — 2026-11-01 (T6: Qwen4Exp MTP & n-gram speculative decoding gating, post-cut copy fallback, multi-row cut application, and falsified terminal-retention / cost-fit premises)
+
+Task: `docs/tasks/20261101-performance-tasks.md` T6 (P0), "Smart MTP & N-Gram Speculative Decoding
+Acceptance & Verification Gating (`Qwen4Exp`)".
+
+## 1. Accounting
+
+- Branch `dev-rebased-20261028`; task base commit `d4dee8c0a`. `git diff --check` clean; `.tandem/`
+  and `task_orchestrator.py` untouched.
+- Files changed (T6): 4 code/test files (2 modified, 2 added), `+502 / -79` lines (excluding this
+  changelog). `cuda-kernel-toolkit/` intentionally excluded from the enumeration (integrated
+  toolkit, untouched).
+- Allowlist delta: none (`tools/cuda_stack/cuda_stack_allowlist.json` untouched; host-only policy
+  changes, `infernix_cuda_stack_check` passes with zero new `STACK > 0` or `LOCAL > 0` symbols).
+
+| File | Action | Change |
+|---|---|---|
+| `src/models/qwen4_exp/program/mtp_gating.h` | A | Host policy for a Qwen4Exp MTP draft round: `kMtpCumulativeBins`, `kMtpCumulativeBase`, `MtpCumulative`, `MtpDraftCut { kept, executed }`, `mtp_cumulative_cut`, `mtp_min_logprob_cut`, `expected_copy_tokens`, `expected_chain_tokens`, and `copy_beats_chain` |
+| `src/models/qwen4_exp/program/program_impl.h` | M | Delegate cumulative/fixed-floor cuts to `mtp_gating.h` and record `mtp_executed_[b]`; relax pre-drafter copy filter from `match.tokens.size() > extents[b]` to `!match.tokens.empty()` via `copy_beats_chain`; retain declined copy proposals in `ngram_proposal_[b]` / `ngram_proposal_bucket_[b]` and fall back to them post-cut when `copies > extents[b]` and `copy_beats_chain` holds over the kept prefix; apply `mtp_confident_[b]` across all rows `b < batch` (`batch >= 2`), recompute `width`, and reset `staged[b] = 0` (`b >= 1`) when `width != staged_width` |
+| `tests/models/qwen4_exp/test_speculative.cpp` | A | Host unit test verifying `mtp_cumulative_cut` and `mtp_min_logprob_cut` (`kept` vs `executed` across gated/ungated and strided multi-row rounds against a direct simulation of `launch_graph_gate_product`), `expected_copy_tokens`, `expected_chain_tokens`, and `copy_beats_chain` pre-drafter and post-cut copy fallback |
+| `tests/models/qwen4_exp/tests.cmake` | M | Register `infernix_qwen4_exp_speculative_test` |
+
+## 2. Task-premise corrections and architectural rationale
+
+1. **Terminal draft token retention (`kMtpTerminalMinRate = 0.12F`, `kMtpTerminalMinProduct = 0.08F`)
+   — falsified on GB10 and reverted.**
+   - *Task premise*: When the device continuation gate (`launch_graph_gate_product`) stops the draft
+     chain after step `j` because `product(0..j) < threshold`, draft step `j` has already run and its
+     cost is sunk, so retaining token `j` for verification whenever `rate(j) >= 0.12` and
+     `product(0..j) >= 0.08` should increase accepted tokens per round at near-zero verify cost.
+   - *Measured reality on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix`*:
+     - **Variant A (retention on, terminal token observed in `mtp_accept` / `mtp_cumulative`)**:
+       2-pass order-swapped A/B showed `tg256` decode throughput dropped **`-9.11%`** (`70.94 -> 64.48
+       tok/s`, acceptance `0.763 -> 0.646`, rounds `187 -> 228.5`) and `tg128` dropped **`-2.83%`**
+       (`63.84 -> 62.04 tok/s`, acceptance `0.699 -> 0.592`).
+     - **Variant B (`final` and `iso` arm `C`: retention on, retained cut token excluded from
+       `mtp_accept` and `mtp_cumulative` learners)**: Even with learner poisoning eliminated, the
+       3-pass order-swapped `final` campaign regressed **every** workload: `pp4096+tg128` **`-1.65%`**
+       (`94.50 -> 92.94 tok/s`), `pp4096+tg256` **`-2.82%`** (`95.19 -> 92.51 tok/s`), `tg128`
+       **`-2.06%`** (`64.66 -> 63.33 tok/s`), and `tg256` **`-3.63%`** (`70.45 -> 67.89 tok/s`). In
+       the 3-pass 4-arm isolation campaign (`iso` arm `C`, retention isolated alone), `tg128`
+       regressed **`-6.9%`** (`64.62 -> 60.15 tok/s`, acceptance `0.70 -> 0.53`) and `tg256` regressed
+       **`-7.2%`** (`69.52 -> 64.53 tok/s`, acceptance `0.75 -> 0.63`).
+     - *Root cause*: The table's `0.12..0.26` bin rates are unconditional averages, whereas the
+       continuation gate stops the chain on step `j` conditioned on the product falling below
+       `0.35..0.25`. On those cut steps, the extra `35..44` retained tokens per `tg128`/`tg256` run
+       yielded **`~1–2%` empirical acceptance** (and net fewer accepted tokens across the run due to
+       altered round boundaries). Worse, whenever the gate cuts at `j = 0`, retaining token `0` stops
+       the round from taking the fast `width = 1` plain decode path (`plain_round_ = true`), forcing a
+       full `W = 2` verification + GDN replay fold + MTP catch-up round for a token that rejects
+       `~98%` of the time.
+     - *Disposition*: `mtp_cumulative_cut` and `mtp_min_logprob_cut` drop the step `j` that tripped
+       the cut (`cut.kept = j`) while recording `cut.executed = gated ? j + 1 : steps`. Both the
+       header comment in `mtp_gating.h` and `test_speculative.cpp` lock `cut.kept == j` as an explicit
+       regression guard.
+
+2. **Feeding `mtp_executed_` into `last_round_steps_` (`round_cost_` OLS fitter) — falsified on GB10
+   and reverted.**
+   - *Task premise*: Setting `last_round_steps_ = mtp_executed_[0]` instead of `-1` when a round is
+     truncated by `mtp_confident_` feeds the online `round_cost_` linear regression more data points
+     with the actual number of executed device draft steps.
+   - *Measured reality (`final2` and `iso` arm `D`: retention off, `last_round_steps_ =
+     mtp_executed_[0]`)*: In the 3-pass `final2` campaign, `pp4096+tg256` regressed **`-3.89%`**
+     (`95.56 -> 91.85 tok/s`, rounds `102 -> 111`, `acc-len 5.02 -> 4.59`) and `tg256` regressed
+     **`-5.61%`** (`72.94 -> 68.85 tok/s`, rounds `181 -> 198`, `acc-len 2.68 -> 2.45`). In `iso` arm
+     `D`, `pp4096+tg128` regressed **`-2.9%`** and `pp4096+tg256` regressed **`-3.3%`**.
+   - *Root cause*: A gated one-row draft round replays `mtp_gated_graphs_[steps - 1]`, whose CUDA
+     Graph topology and conditional-node dispatch still depend on the drafted `steps`, and whose
+     subsequent verify round is narrower than an uncut round's. Pairing a truncated round's total wall
+     time with a smaller `x = mtp_executed_[0]` in the 2-parameter OLS fit `Time(x) = a + b * x`
+     biases the estimated slope `width_cost() = b / a` upward, causing `mtp_draft_round_steps` to
+     under-select draft lengths on subsequent rounds (`acc-len` drops from `5.02 -> 4.59` and
+     `2.68 -> 2.45`).
+   - *Disposition*: `mtp_executed_[b]` is computed and stored on each row (`cut.executed`, documenting
+     which draft slots in `mtp_io_.drafts` were actually written by the device chain vs stale past a
+     skipped conditional node), while `decode()` keeps `last_round_steps_ = -1` whenever
+     `from_ngram_[0] || extents[0] != wanted[0]` so `round_cost_` fits only complete neural rounds.
+
+3. **Pre-drafter copy competition, post-cut n-gram copy fallback, and multi-row (`batch >= 2`) cut
+   application — shipped.**
+   - Before `mtp_draft`, any non-empty n-gram proposal (`!match.tokens.empty()`, removing the strict
+     `match.tokens.size() > extents[b]` gate) competes against the planned MTP chain via
+     `copy_beats_chain(...)`. If the neural chain wins before drafting, the copy proposal and its
+     match-length bucket are saved in `ngram_proposal_[b]` and `ngram_proposal_bucket_[b]`.
+   - After `mtp_draft` and `read_mtp_drafts`, `extents[b] = std::min(extents[b], mtp_confident_[b])`
+     is applied across all `b < batch` (including `batch >= 2`). If the cut leaves row `b` with fewer
+     drafts than `ngram_proposal_[b]` (`copies > extents[b]`) and `copy_beats_chain(...)` holds
+     against the truncated prefix `extents[b]`, row `b` falls back to `ngram_proposal_[b]` (`from_ngram_[b] = true`)
+     instead of decaying to a narrow or plain round.
+   - `width` is recomputed across all rows (`max_b(1 + extents[b])`), and when `width != staged_width`
+     on a multi-row round, `staged[b] = 0` is reset for `b >= 1` so `verify()` re-stages their n-gram
+     columns at the new row stride `b * width`.
+
+## 3. Subsystem breakdown
+
+- **Model / Qwen4Exp MTP gating (`src/models/qwen4_exp/program/mtp_gating.h`)**:
+  - Centralizes `kMtpCumulativeBins`, `kMtpCumulativeBase`, `MtpCumulative`, `MtpDraftCut`,
+    `mtp_cumulative_cut`, `mtp_min_logprob_cut`, `expected_copy_tokens`, `expected_chain_tokens`, and
+    `copy_beats_chain` in a self-contained header testable without loading a model artifact.
+- **Model / Qwen4Exp Program (`src/models/qwen4_exp/program/program_impl.h`)**:
+  - `decode()` and `read_mtp_drafts()` use `mtp_gating.h`, track `mtp_executed_`, retain declined
+    n-gram proposals in `ngram_proposal_` / `ngram_proposal_bucket_` for post-cut fallback, and apply
+    `mtp_confident_` across all `batch` rows.
+- **Tests (`tests/models/qwen4_exp/test_speculative.cpp`, `tests/models/qwen4_exp/tests.cmake`)**:
+  - Adds `infernix_qwen4_exp_speculative_test` covering bin rates, cumulative and `--spec-min-p` cuts,
+    strided multi-row readout, 20,000 random chains against `simulated_device_steps`, and pre-/post-cut
+    `copy_beats_chain` decisions.
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`)
+
+- **Host & stack CTest suite (13/13 passed, 6.36 s)**:
+  - `infernix_cuda_stack_check`: **Passed** (1.52 s; zero new `STACK > 0` or `LOCAL > 0` symbols in
+    `infernix-serve`).
+  - `infernix_qwen4_exp_speculative_test`: **Passed** (0.01 s).
+  - `infernix_qwen4_exp_fast_paths_test`, `call_plan_test`, `rope_positions_test`, `memory_plan_test`,
+    `prefix_state_test`, `ngram_hash_test`, `ngram_volume_test`, `expert_cache_test`,
+    `host_expert_tier_test`, `host_tier_test`, `expert_activations_test`: **All Passed**.
+- **Real-artifact Qwen4Exp speculative verification tests (`Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix`)**:
+  - `infernix_qwen4_exp_speculative_sampling_real_test`: **Passed** (`1,845.3 s`; 2,000 requests per
+    arm across plain `T = 0.8`, one-hot MTP-4 `7,886` rounds / `1.62` tok/round, sampled MTP-4 `8,277`
+    rounds / `1.54` tok/round, and greedy parity).
+  - `infernix_qwen4_exp_resume_width_real_test`: **Passed** (`88.00 s`).
+  - `infernix_qwen4_exp_decide_real_test`: **Passed** (`61.54 s`).
+
+## 5. Benchmarks, regressions, and adverse results
+
+All end-to-end benchmarks ran on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`INFERNIX_EXPERTS_ON_GPU=1`,
+`--ngram-residency volume`, `--corpus bench/fixtures/bench_corpus.ids`, `--kv-dtype fp8`, `--spec mtp`,
+`--draft-tokens auto`, `--lm-head-draft`, `--concurrency 1`, `-r 2 --warmup 1`) using order-swapped
+passes (`AB / BA / AB`).
+
+### 5.1 Rejected candidates (falsified task premises)
+
+| Campaign / Variant | `pp4096+tg128` base -> cand | `pp4096+tg256` base -> cand | `tg128` base -> cand | `tg256` base -> cand | Disposition |
+|---|---|---|---|---|---|
+| Initial (`retention + fit + learner obs`, 2 passes) | `90.07 -> 93.98` (`+4.35%`) | `93.59 -> 92.50` (`-1.17%`) | `63.84 -> 62.04` (`-2.83%`, acc `0.699 -> 0.592`) | `70.94 -> 64.48` (**`-9.11%`**, acc `0.763 -> 0.646`) | **Reverted** (cut-token learner poisoning + retention overhead) |
+| `final` (`retention + fit, learner excluded`, 3 passes) | `94.50 -> 92.94` (`-1.65%`) | `95.19 -> 92.51` (`-2.82%`) | `64.66 -> 63.33` (`-2.06%`, acc `0.706 -> 0.581`) | `70.45 -> 67.89` (**`-3.63%`**, acc `0.758 -> 0.648`) | **Reverted** |
+| `iso` arm `C` (`retention only`, 3 passes) | `92.89 -> 90.19` (`-2.9%`) | `90.70 -> 90.74` (`+0.0%`) | `64.62 -> 60.15` (**`-6.9%`**, acc `0.70 -> 0.53`) | `69.52 -> 64.53` (**`-7.2%`**, acc `0.75 -> 0.63`) | **Reverted** (terminal retention alone is net-negative) |
+| `iso` arm `D` (`cost-fit executed only`, 3 passes) | `92.89 -> 90.21` (`-2.9%`) | `90.70 -> 87.68` (**`-3.3%`**) | `64.62 -> 65.33` (`+1.1%`) | `69.52 -> 69.12` (`-0.6%`, `r185 -> r200`) | **Reverted** |
+| `final2` (`cost-fit executed only`, 3 passes) | `91.05 -> 90.93` (`-0.14%`) | `95.56 -> 91.85` (**`-3.89%`**, `r102 -> r111`) | `63.95 -> 65.23` (`+2.00%`) | `72.94 -> 68.85` (**`-5.61%`**, `r181 -> r198`) | **Reverted** (truncated-round fit inflates slope and over-prunes width) |
+
+### 5.2 Shipped tree (`final3`, `--ngram-draft-tokens 0` default, 3 order-swapped passes) and null control (`final4`, identical `base` binary vs `base` binary, 3 passes)
+
+| Workload | `final3` (`base -> new` median `tok/s`) | `final3` Δ | `final3` accept (`base -> new`) | `final3` rounds (`base -> new`) | `final4` null control (`base -> base`) |
+|---|---|---:|---|---|---:|
+| `pp4096+tg128` | `92.56 -> 93.48` | **`+0.99%`** | `0.948 -> 0.948` | `56 -> 56` (`acc-len 4.55 -> 4.57`) | `-3.84%` (`93.79 -> 90.19`) |
+| `pp4096+tg256` | `91.18 -> 94.88` | **`+4.06%`** | `0.882 -> 0.897` | `105 -> 98` (`acc-len 4.83 -> 5.21`) | `+5.14%` (`91.18 -> 95.87`) |
+| `tg128` | `63.69 -> 64.59` | **`+1.42%`** | `0.705 -> 0.717` | `105 -> 104` (`acc-len 2.22 -> 2.24`) | `-0.24%` (`64.77 -> 64.61`) |
+| `tg256` | `71.35 -> 69.47` | **`-2.64%`** | `0.785 -> 0.773` | `188 -> 189` (`acc-len 2.61 -> 2.54`) | `-0.59%` (`69.88 -> 69.47`) |
+
+- **Note on `final3` vs `final4` at concurrency 1 with `--ngram-draft-tokens 0`**: When
+  `batch == 1` and `ngram_draft_tokens == 0`, the shipped code executes the exact same host cut
+  predicate and `round_cost_` update as `base`. Yet because `--draft-tokens auto` uses wall-clock
+  round timing (`observe_round`) to fit `round_cost_`, micro-second thermal/OS jitter shifts the very
+  first draft-length transition by 1 round, which cascades into different drafted/accepted token
+  trajectories (`final4` identical-binary control spans `-3.84%` to `+5.14%`, and `base` itself on
+  `tg256` moved from `71.35` in `final3` to `69.88` in `final4` while `new` was `69.47` in both). The
+  `-2.64%` on `tg256` in `final3` is therefore an adaptive-timer trajectory fluctuation between two
+  mathematically identical `batch == 1, ngram == 0` policies, proven by the `final4` null test.
+
+### 5.3 Shipped tree with n-gram copy proposals active (`ng`, `--ngram-draft-tokens 16`, 2 order-swapped passes)
+
+| Workload | `base` -> `new` median `tok/s` | Δ vs `base` | `base` -> `new` accept | `base` -> `new` rounds | `base` -> `new` `acc-len` |
+|---|---|---:|---|---|---|
+| `pp4096+tg128` | `185.26 -> 185.47` | **`+0.11%`** | `1.000 -> 1.000` | `16 -> 16` (`ng_rnd 16 -> 16`) | `16.00 -> 16.00` |
+| `pp4096+tg256` | `186.55 -> 186.98` | **`+0.23%`** | `1.000 -> 1.000` | `30 -> 30` (`ng_rnd 30 -> 30`) | `17.00 -> 17.00` |
+| `tg128` | `64.78 -> 65.33` | **`+0.85%`** | `0.721 -> 0.718` | `102 -> 101` | `2.29 -> 2.31` |
+| `tg256` | `68.88 -> 70.18` | **`+1.88%`** | `0.733 -> 0.715` | `193 -> 184` (`ng_rnd 2 -> 3`, pass 2 `2 -> 4`) | `2.53 -> 2.65` |
+
+- With `--ngram-draft-tokens 16`, all four workloads are positive (`+0.11%` to `+1.88%`), and on
+  `tg256` the post-cut copy fallback converts truncated neural rounds into n-gram copy verification
+  rounds (`ng_rnd` `2 -> 4` in pass 2, `22/64` n-gram tokens accepted vs `15/32`, cutting total rounds
+  from `193` to `184` and raising `acc-len` from `2.53` to `2.65`).
+
+## 6. Accepted gaps and rebase conflict resolution policy
+
+- **The `+3–8%` MTP speculative decode `tok/s` target bar is not met across all arms**: the two levers
+  expected to provide the bulk of the single-request MTP gain (terminal draft token retention and
+  feeding `mtp_executed_` into `round_cost_`) were both empirically falsified on GB10 (`-3.6%` to
+  `-9.1%` and `-3.9%` to `-5.6%`, §5.1). Reaching `+3–8%` on single-request MTP without n-gram hits
+  requires reducing the GPU time of `run_mtp_draft_steps` / `verify` or improving the drafter's
+  calibration table rather than retaining low-confidence cut tokens.
+- **Rebase conflict resolution policy**:
+  - Preserve `src/models/qwen4_exp/program/mtp_gating.h` and `tests/models/qwen4_exp/test_speculative.cpp`.
+  - Do not re-enable terminal draft token retention on cut steps or feed `mtp_executed_` into
+    `last_round_steps_` on GB10 without new hardware/model evidence overturning §2.1–2.2.
+  - Preserve pre-drafter `copy_beats_chain` competition for all non-empty matches, post-cut fallback
+    via `ngram_proposal_`, and multi-row `mtp_confident_` truncation in `program_impl.h`.
