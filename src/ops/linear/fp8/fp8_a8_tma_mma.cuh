@@ -73,12 +73,13 @@ inline int fp8_a8_tma_wave(Kernel kernel, int threads, int shared, int ceiling) 
 }
 
 // Splits any underfilled final wave of `wave` CTAs. `wave` is one resident wave of this shape on the
-// running device: `Schedule::kSplitWaveCtas` is the ceiling the partials buffer was sized for when
-// the schedule was fitted to the RTX 5090's 170 SMs, and taking it as the wave itself made the
-// planner skip every tail between half and one GB10 wave (48 SMs). With the wave correct, a tail is
-// worth splitting at any size: the old `tail <= wave / 2` cut, also fitted on 170, still refused
-// tails of two thirds and five sixths of a wave, and splitting those measured 8-15 % faster at
-// T=1024, 1792, 2560 and 4096 (n34816_k5120). `wave == 0` disables splitting (no partial plane).
+// running device; `Schedule::kSplitWaveCtas` (kGb10SplitWaveCtas) is only the ceiling the partials
+// buffer was sized for. Taking the constant as the wave itself — it was the RTX 5090's 170 SMs
+// before this port — made the planner skip every tail between half and one GB10 wave (48 SMs). With
+// the wave measured, a tail is worth splitting at any size: the old `tail <= wave / 2` cut, also
+// fitted on 170, still refused tails of two thirds and five sixths of a wave, and splitting those
+// measured 8-15 % faster at T=1024, 1792, 2560 and 4096 (n34816_k5120). `wave == 0` disables
+// splitting (no partial plane).
 template <class Schedule>
 inline Fp8TmaSplitKPlan fp8_tma_split_k_plan(int tiles, int k, int wave) {
     Fp8TmaSplitKPlan plan{tiles, 0, 0};

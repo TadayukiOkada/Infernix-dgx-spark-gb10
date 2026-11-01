@@ -20,8 +20,9 @@ namespace infernix::models::qwen3_5::detail {
 // where a(q) is the learned acceptance of a draft of drafter probability q (given its prefix was
 // accepted) and c the cost of one verified draft column relative to a round without drafts. The
 // verification round masks the columns past each row's extent (ops::MoeColumnMask), so with experts
-// held outside device memory an unverified draft costs no expert traffic: there c is large (a
-// column's misses, about 0.7 of a plain round on the 5090) and only confident drafts pay.
+// held outside the cache an unverified draft costs no expert traffic: there c is large (the caller's
+// `prior_column_cost` is the one measured number for that configuration) and only confident drafts
+// pay. A resident model's c is its own measured per-column cost, an order of magnitude smaller.
 //
 // a(q) is learned per probability bucket from the verified drafts (decayed counts, each bucket's
 // prior its midpoint, as if the drafter were calibrated); c from the start-to-start time of

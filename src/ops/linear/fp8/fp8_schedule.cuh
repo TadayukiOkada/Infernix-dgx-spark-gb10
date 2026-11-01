@@ -200,6 +200,15 @@ struct Fp8A8TmaMmaSchedule
 
 // Split only an underfilled final wave. Earlier CTAs keep the full K loop and
 // write their final outputs directly. WaveCtas describes the tuned resident grid.
+//
+// `kGb10SplitWaveCtas` is that resident grid on GB10 (`sm_121a`, 48 SMs, 102 400 B shared per SM).
+// Every split-K schedule below stages at least 64 KiB per CTA, so one CTA per SM fits and the wave
+// is 48 CTAs; the planner takes the wave from `cudaOccupancyMaxActiveBlocksPerMultiprocessor` at
+// run time and uses this only as the ceiling the partial plane was sized for, so it must be at
+// least the true resident wave and no more (the 170 it replaces was the RTX 5090's SM count, which
+// reserved 3.5 waves of partials this engine's plan can never address).
+inline constexpr int kGb10SplitWaveCtas = 48;
+
 template <class TmaSchedule, int WaveCtas, int MaxParts, int ReductionBlocks>
 struct Fp8A8TmaSplitKSchedule : TmaSchedule {
     static constexpr int kSplitWaveCtas   = WaveCtas;

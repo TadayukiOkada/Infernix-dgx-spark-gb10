@@ -86,9 +86,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
     if (execution_schedule.mtp_draft_confidence && parameters.model.offloaded_experts()) {
-        // A verified draft column's prior cost against a round without drafts: with experts held
-        // outside device memory its misses, Qwen3.5-122B design §0: ~10 ms a column against 13.8 ms
-        // a plain token on the 5090. The fit replaces it.
+        // A verified draft column's prior cost against a round without drafts, for a model whose
+        // experts sit outside the VRAM cache: each extra column brings its own expert traffic.
+        // Qwen3.5-122B design §0 measured ~10 ms a column against 13.8 ms a plain token (0.7); that
+        // is the only measurement of this quantity available, and it is a prior only — the round
+        // timer's fit replaces it once it has the rounds and spread. On GB10 the offloaded experts
+        // live in the same LPDDR5X as the resident weights (no PCIe hop), so the fit, not this
+        // number, is what serves the device. The resident route below never reads it: it pays the
+        // configuration's own measured cost.
         mtp_confidence.emplace(0.7);
     } else if (execution_schedule.mtp_calibrated_extent) {
         // Resident targets (one-row calibrated extents): the configuration's measured cost of a

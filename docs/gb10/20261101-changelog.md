@@ -1420,3 +1420,195 @@ Every comparison in this section is against the HEAD baseline binary of the same
 - **`T == 1` attention projection route left as-is** (§2.3): the packed single GEMV plus contiguous slices stays, because the alternative dispatches the identical `nvfp4_a16_gemv` instantiation and the split kernel the task assumed does not exist. `infernix_attn_input_proj_bench` has no `[13952, 2560]` profile, so an op-level A/B of the two epilogues would need a new fixture — left undone as out of scope.
 - **Artifact-gated model tests not run.** `infernix_qwen4_exp_forward_real_test`, `..._score_real_test`, `..._lossless_generation_real_test` and the other `*_real_test` entries skip without `INFERNIX_QWEN4_ARTIFACT`; they were not executed, so they are *not run*, not passed. The real-artifact evidence here is the W4Dense decode/prefill A/B of §4.5–4.6 plus the bit-identical acceptance rates.
 - **PDL was measured only on the MTP decode graph of one artifact.** If a future drafter widens the down grid past one wave, §2.4's conclusion should be re-tested rather than assumed.
+
+# GB10 changelog — 2026-11-01 (T8: the RTX 5090's 170-CTA split-K wave becomes one named GB10 constant, the duplicate `Wave48` arms come out, and the DFlash2 pair draft cost is fitted on the device)
+
+## 1. Accounting
+
+- Branch `dev-rebased-20261028`; task base commit `a9d19c87e` (T7). `git diff --check` clean; `.tandem/` and `task_orchestrator.py` untouched; no commit or push made.
+- Files changed (T8): 24, `+133 / -147` (`git diff --numstat`, final tree) — `src/` 20 files `+85 / -88`, `bench/ops/` 3 files `+4 / -8`, `tools/cuda_stack/cuda_stack_allowlist.json` `+44 / -51`. `cuda-kernel-toolkit/` intentionally excluded (integrated toolkit, untouched).
+- The FP8 change converts **37** `Fp8A8TmaSplitKSchedule<…, 170, 4, 8>` instantiations across **12** `.cu` files (the task says 25; `git grep -o ', 170, 4, 8>' HEAD -- 'src/ops/**.cu' | wc -l` = 37) into one named constant, and deletes the three pre-existing duplicate `Wave48` candidate arms that differed from their twin only in that integer.
+- Allowlist delta: **268 → 261** entries (`261 of 7435 kernels use stack or local memory`). This is a *re-key*, not a spill reduction or an increase — proved in §4.3. `check_cuda_stack.py update` was run only after that proof, and the diff it produced is part of this change.
+- Ninja invocations: 5 (candidate ship build; HEAD-baseline bench; candidate bench; final full build; the earlier gate build). Every invocation that linked a consumer target was a single call so `nvlink` ran once. The two bench binaries used by the decisive A/B were built from the same tree one `git stash` apart, minutes apart (§4.6).
+
+| File | Action | Change |
+|---|---|---|
+| `src/ops/linear/fp8/fp8_schedule.cuh` | M | Adds `inline constexpr int kGb10SplitWaveCtas = 48;` with the derivation of why 48 is both the floor and the ceiling of the resident split-K wave, as the single source of truth for all 37 sites |
+| `src/ops/linear/fp8/shapes/{n34816_k5120,n5120_k17408,n5120_k6144,n14336_k5120,n16384_k5120}.cu` | M | 14 `170` → `kGb10SplitWaveCtas` positional template arguments (2/5/3/2/2) |
+| `src/ops/linear_add/fp8/fp8_linear_add_a8.cu` | M | 8 template arguments |
+| `src/ops/linear_add/fp8/fp8_linear_add_n3072_k8192.cu` | M | 5 template arguments; the `Wave48` alias, its switch arm, its name string and its enum entry removed; two "170-wave" comments de-provenanced |
+| `src/ops/linear_add/fp8/fp8_linear_add_plan.h` | M | `Wave48` enum entry deleted (10 → 8 ids) |
+| `src/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu` | M | 2 template arguments |
+| `src/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu` | M | 1 template argument |
+| `src/ops/attn_input_proj/fp8/fp8_attn_input_n17408_k3072.cu` | M | 2 template arguments; `Wave48` alias/arm/name/enum deleted |
+| `src/ops/attn_input_proj/fp8/fp8_attn_input_plan.h` | M | `Wave48` enum entry deleted (12 → 11 ids) |
+| `src/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu` | M | 2 template arguments |
+| `src/ops/gdn_input_proj/fp8/fp8_gdn_input_n20480_k3072.cu` | M | 3 template arguments; `Wave48` alias/arm/name/enum deleted |
+| `src/ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h` | M | `Wave48` enum entry deleted (12 → 11 ids) |
+| `src/ops/linear/fp8/fp8_a8_tma_mma.cuh` | M | The comment above `fp8_tma_split_k_plan` now states that `Schedule::kSplitWaveCtas` is only the ceiling the partials buffer was sized for, and that the wave itself is measured at run time |
+| `src/models/qwen4_exp/program/program_impl.h` | M | `kDFlashPairDraftCost` becomes `policy_double("INFERNIX_PAIR_DRAFT_COST", 0.30)` beside the existing `INFERNIX_PAIR_WIDTH_COST`, so one binary A/Bs both values; comment records that `0.47` was the 5090's |
+| `src/models/qwen3_5/program/program_impl.cpp` | M | Comment only: `mtp_confidence.emplace(0.7)` kept, and documented as the **offloaded-experts** prior with the reason it is not the resident number (§2.5) |
+| `src/models/qwen3_5/program/speculative/mtp_confidence_policy.h` | M | Comment only: the `c` explanation no longer reads as a 5090 fact — a large `c` belongs to experts-outside-the-cache, a resident model's `c` is its own measured per-column cost |
+| `bench/ops/{attn_input_proj_bench,fp8_linear_add_bench,gdn_input_proj_bench}.cu` | M | Candidate arrays and their `results.reserve` bounds shrunk with the deleted ids (12→11, 10→8, 12→11) |
+| `tools/cuda_stack/cuda_stack_allowlist.json` | M | Regenerated: 268 → 261 entries (§4.3) |
+| `docs/gb10/20261101-changelog.md` | M | This section |
+
+## 2. Task-premise corrections and architectural rationale
+
+### 2.1 The constant no longer chooses anything — it sizes a buffer (falsifies the headline mechanism)
+
+The task's root cause is that `kSplitWaveCtas` decides *when split-K activates* (`base_ctas * SplitK <= WaveCtas`), so on 48 SMs GB10 "launches up to 170 split-K CTAs (3.54 waves)". That was true before the runtime-wave port and is not true now. `fp8_a8_tma_wave` takes the wave from `cudaOccupancyMaxActiveBlocksPerMultiprocessor() * device_sm_count()` and clamps it by the template value:
+
+```cpp
+const int wave = std::min(ceiling, per_sm * device_sm_count());   // min(170, 1 * 48) == min(48, 1 * 48)
+```
+
+`fp8_tma_split_k_plan` then derives `tail = tiles % wave` and `parts <= min(wave, tail * kMaxParts)` from that measured wave. For every schedule in this change `per_sm == 1` (§2.3), so **the plan is bit-identical before and after** and a 170-CTA wave was already unreachable. What the stale constant actually cost was memory: `kPartialBytes = WaveCtas * kBlockTokens * kBlockRows * sizeof(float)`, so each split-K schedule reserved a partial plane 3.54× larger than any plan can address. The change is therefore a resource fix with a neutral latency effect, which is exactly what §4.6 measures — and it is why the task's "split-K latency improves" bar cannot be met by this edit.
+
+### 2.2 37 sites, not 25; and no `WaveCtas = 170` text to grep for
+
+The literal string `WaveCtas = 170` appears nowhere. The constant is the third positional argument of `Fp8A8TmaSplitKSchedule<TmaSchedule, WaveCtas, MaxParts, ReductionBlocks>`, written `…, 170, 4, 8>`. Counting it gives 37 sites in 12 files (per-file counts in §1), 12 more than the task enumerates, and `fp8_gdn_input_n20480_k3072.cu` has 3 rather than 2. All 37 now read `kGb10SplitWaveCtas`; the per-file counts match HEAD exactly.
+
+### 2.3 The "96 for 2-CTA/SM 64-row schedules" rule is arithmetically impossible here
+
+The task prescribes 96 where `BlockRows == 64` and 48 where `BlockRows == 128`. Neither half holds:
+
+- **No split-K schedule in the tree has `BlockRows == 64.`** The five distinct TMA bodies under a split-K wrapper are `<64 tok, 128 rows>×3st` (Small), `<128, 128>×3st` (Mid), `<128, 128>×2st`, `<192, 128>×2st` (Wide) and `<128, 256>×2st` (Bulk), counting the `Grouped, 8` raster twins once each; the 64-row tiles (`<32, 64>` and the `Fp8A8MmaSchedule` residual tiles) exist only in routes with no `WaveCtas` at all.
+- **Every one of the five is 1 CTA/SM, and shared memory alone forbids a second.** `kSharedBytes` (`fp8_schedule.cuh:158`) evaluates to 65 536 / 73 728 / 81 920 / 98 304 B across those five (the `<128, 128>` body is 98 304 B at 3 stages and 65 536 B at 2); with the driver's 1 KiB per-block reserve, GB10's 102 400 B per SM holds one CTA of even the smallest (2 × 66 560 B = 133 120 B). `ckt math occupancy --threads 288 --regs 168 --smem <bytes>` reports **1 active block/SM for all four distinct sizes** (§4.5).
+
+So the resident wave is 48 for all 37 sites and one constant is the correct shape. A per-schedule 96 would have *raised* the ceiling above the resident wave, which is the one thing the ceiling must not do: the planner would then size partials for CTAs that can never run.
+
+### 2.4 `fp8_linear_add_n3072_k8192.cu:183` (`base_ctas >= 2 * 170`) does not exist
+
+Step 1's second edit targets a comparison that is not in the file — `grep -n 'base_ctas\|2 \* 170\|2 \* 48'` over `src/ops/linear_add/fp8/` returns nothing. Line 183 is the comment `// Largest partial plane any forced candidate may need: Bulk's 170-wave 128x256 split-K tiles.`, which was reworded. No routing threshold changed.
+
+### 2.5 The three `Wave48` arms were duplicates, not an unported tuning
+
+`fp8_linear_add_n3072_k8192.cu`, `fp8_attn_input_n17408_k3072.cu` and `fp8_gdn_input_n20480_k3072.cu` each carried a `Wave48` alias identical to its `Bulk` twin except for the wave integer. Since the wave is measured (§2.1) and both arms took `min(ceiling, 48)`, they instantiated different template symbols that computed the same plan and the same kernel — they were never a second data point, and after this change they would have been *the same instantiation twice*. They are removed with their enum ids, switch arms, name strings and bench arrays rather than kept as aliases. History agrees: `df1e62a72` (the runtime-wave port) landed alongside the `Wave48` arms, and the earlier `WaveCtas 170→48` probe measured ≤ 0.2%.
+
+### 2.6 `prior_column_cost = 0.7` is the offloaded-experts prior, not a resident 5090 prior — value kept, documentation fixed
+
+The task reads `program_impl.cpp:92` as a resident-model warmup prior that GB10 UMA makes "4.6× too pessimistic", and prescribes 0.18. The guard around it is
+
+```cpp
+if (execution_schedule.mtp_draft_confidence && parameters.model.offloaded_experts()) { … mtp_confidence.emplace(0.7); }
+else if (execution_schedule.mtp_calibrated_extent) { /* measured plan.dflash_width_costs.per_draft */ }
+```
+
+so the 0.7 is reached **only** when the experts are offloaded, where a column really does drag its own expert traffic — and the resident route the task is describing already pays its own measured `per_draft` (0.02 / 0.15; 0.72 in the offloaded fast-path fit). Replacing it with 0.18 would make the offloaded prior optimistic on the one configuration it applies to, on a host with **no Qwen3.5-122B `.infernix` artifact** to measure it against. The value stays; both the call site and `mtp_confidence_policy.h`'s header now say plainly that a large `c` belongs to experts-outside-the-cache and that a resident model's `c` is its own measured cost, so the number can no longer be mistaken for a device constant. Disclosed as unverified in §6.
+
+### 2.7 `kDFlashPairDraftCost` 0.47 → 0.30, fitted on the device behind an env switch
+
+The pair route maximizes `(t_a + t_b) / (1 + proposal + per_draft * k)`. Making the draft cost `policy_double("INFERNIX_PAIR_DRAFT_COST", 0.30)` beside the width cost means one binary measures both values with no rebuild and no provenance confounder. Three interleaved passes on the real W4Dense artifact (§4.7) give `+8.32%` tg256 and `+1.45%` tg128 decode for 0.30, with the policy decision deterministic (identical round/fallback counts in every pass). The task's "~0.30" is confirmed rather than assumed.
+
+## 3. Subsystem breakdown (mechanism)
+
+- **`include/` & core runtime**: untouched.
+- **Ops — FP8 split-K sizing** (`src/ops/linear/fp8/fp8_schedule.cuh` + 12 `.cu` files): one `constexpr` replaces 37 magic integers; `kPartialBytes` shrinks 3.54× at identical plans (§4.4). No kernel body, tile shape, stage count, raster, epilogue, launch bound or route table changed.
+- **Ops — candidate catalogs** (3 `*_plan.h` + 3 `bench/ops/*.cu`): the duplicate `Wave48` ids leave the enum, the forced-candidate switch, the schedule-name table, the sweep array and its `reserve` bound together, so no orphan id can be selected.
+- **Model & MoE offload** (`qwen4_exp/program/program_impl.h`): the pair cost model's two priors are both env-overridable policy constants. `qwen3_5` (`program_impl.cpp`, `mtp_confidence_policy.h`): documentation only, no value change.
+- **Converter & tools**: `tools/cuda_stack/cuda_stack_allowlist.json` regenerated (§4.3).
+- **Tests & benchmarks**: no test edited; the three bench files' candidate arrays follow their plan headers.
+
+## 4. Verification (GB10 `sm_121a`, CUDA 13, `build-native`, 20-core host)
+
+### 4.1 Build
+
+`ninja -C build-native -j 20` — 229/229 targets, exit 0, in one invocation (shared `nvlink`). The only diagnostics are pre-existing `ptxas warning: Value of threads per SM … .minnctapersm will be ignored` on `q8_a16_mma_kernel` instantiations, unrelated to this change. All `.cu` files under the five FP8 op directories were touched after every `.cuh` edit (the CUDA depfiles in this tree are dead).
+
+### 4.2 Gates — 17/17 passed (207.04 s, serial CTest; no `--parallel` on this single-GPU host)
+
+| Test | Result | Test | Result |
+|---|---|---|---|
+| `infernix_cuda_stack_check` | Passed 1.46 s | `infernix_linear_fp8_a16_test` | Passed 9.30 s |
+| `infernix_qwen3_5_mtp_confidence_policy_test` | Passed 0.00 s | `infernix_linear_fp8_a8_test` | Passed 6.61 s |
+| `infernix_qwen4_exp_speculative_test` | Passed 0.01 s | `infernix_fp8_a8_pair_repeat_test` | Passed 48.42 s |
+| `infernix_offloaded_moe_fp8_test` | Passed 4.10 s | `infernix_linear_add_fp8_test` | Passed 3.60 s |
+| `infernix_fp8_row_f32_test` | Passed 12.99 s | `infernix_linear_add_fp8_wide_test` | Passed 2.59 s |
+| `infernix_attn_input_proj_test` | Passed 24.89 s | `infernix_linear_swiglu_fp8_test` | Passed 14.95 s |
+| `infernix_attn_input_proj_fused_rmsnorm_test` | Passed 7.69 s | `infernix_qsa_fp8_test` | Passed 24.24 s |
+| `infernix_gdn_input_proj_test` | Passed 10.38 s | | |
+| `infernix_gdn_input_proj_conv_snapshot_test` | Passed 27.73 s | | |
+| `infernix_gdn_input_proj_conv_record_test` | Passed 8.07 s | | |
+
+The task's named targets `infernix_linear_fp8_e4m3_a16_test`, `infernix_ops_quant_mlp_test`, `infernix_ops_attention_test`, `infernix_ops_recurrent_test`, `infernix_qwen3_5_Speculative_test` and `infernix_qwen4_exp_Speculative_test` do not exist (nor do its bench flags `--qtype fp8_e4m3 --t … --cold-l2-mb`); the table lists the real tests that cover the same ground, and the real bench form is `--qtype FP8 --policy a8 --n N --k K --sweep A:B:step --flush-mib 32`.
+
+Earlier, on the first candidate build, the same set plus `infernix_linear_mxfp8_a16_test` and `infernix_mxfp8_moe_overlap_test` ran 19/20 with only `infernix_cuda_stack_check` failing — for the reason in §4.3.
+
+### 4.3 The stack gate: a re-key, proved before the allowlist moved
+
+After the constant change the gate failed with ~34 lines of the form `…Fp8A8TmaSplitKSchedule<…Li48ELi4ELi8EE…>: STACK 16 bytes > allowed 0`. The allowlist is keyed by **mangled symbol**, and the mangled name embeds the template integer, so `Li170E → Li48E` re-keys every FP8 split-K symbol and each one looks like a new spill. Before touching the allowlist, HEAD's list was diffed against the regenerated one with `Li170E → Li48E` normalization:
+
+```text
+before entries 268   after entries 261
+increased_or_changed = 0      newly_listed = 0      dropped = 7
+dropped: 6 × vq_kv_grouped_kernel<…>   1 × __nv_static__moe_layer_cu__…ggml_gate_up_bf16<…>
+```
+
+No symbol's allowed `stack`/`local` budget grew and nothing new appeared; the 7 drops are stale entries for kernels no longer in the binary (6 `vq_kv_grouped_kernel`, 1 `ggml_gate_up_bf16`), which the ratchet is allowed to ratchet **down**. Only then was `check_cuda_stack.py update` run, and the gate passes (§4.2). The FP8 kernels' own `STACK` values are unchanged by a template integer; per memory, a nonzero `STACK` on these tiles is the measured speed tradeoff of the 128×256 schedule, not a defect.
+
+### 4.4 Split-K partial-plane footprint (`kPartialBytes = WaveCtas × kBlockTokens × kBlockRows × 4 B`)
+
+| Schedule (tokens × rows, stages) | dynamic smem/CTA | blocks/SM | HEAD plane | T8 plane | Δ |
+|---|---|---|---|---|---|
+| Small `<64,128>` 3st | 73 728 B | 1 | 5.31 MiB | 1.50 MiB | **−71.76%** |
+| Mid `<128,128>` 3st | 98 304 B | 1 | 10.62 MiB | 3.00 MiB | **−71.76%** |
+| Wide `<192,128>` 2st | 81 920 B | 1 | 15.94 MiB | 4.50 MiB | **−71.76%** |
+| Bulk `<128,256>` 2st | 98 304 B | 1 | 21.25 MiB | 6.00 MiB | **−71.76%** |
+
+Every schedule drops by exactly 48/170, uniformly beyond the task's 43.5–71.8% band. The largest single plane falls from 21.25 MiB (22 282 240 B — above GB10's entire 24 MiB L2) to 6.00 MiB; per shape the production plane is sized by the route that actually runs (`partial_capacity_bytes`), and the candidate path reserves the largest, so the workspace saving is largest on the `Bulk` shapes (`> 768` tokens) and on `linear_add`, whose candidate capacity is `max(Mid, Bulk)`. The four rows cover the five bodies because `kPartialBytes` depends only on `tokens × rows`, and the two `<128, 128>` forms share a plane.
+
+### 4.5 Independent occupancy evidence
+
+`ckt math occupancy --threads 288 --regs 168 --smem {65536, 73728, 81920, 98304}` — the four distinct `kSharedBytes` of the five split-K bodies — returns **1 active block/SM (9/48 warps, 18.75% occupancy) in all four cases**, with `by_regs = 1` and `by_smem = 1` (the register budget and the shared-memory budget each independently cap the grid at one CTA; allocated 48 384 regs and 66 560/74 752/82 944/99 328 B per block). This confirms §2.3 and that a 96-CTA ceiling would name CTAs the device cannot host.
+
+### 4.6 Op-level latency A/B — candidate vs a **true HEAD-built** baseline
+
+`infernix_linear_bench --qtype FP8 --policy a8 --flush-mib 32`, two binaries, 3 interleaved rounds, 5 shapes × the widths the task and the split-K bands cover: `n5120_k17408` T=256…512, `n14336_k5120` T=448…640, `n34816_k5120` T=320…448 and 768, `n5120_k6144` T=320…384. The baseline binary is `infernix_linear_bench` built from HEAD by `git stash` → build → copy → `git stash pop` (tree verified identical afterwards: 24 files, `+133 / -147`).
+
+```text
+points = 15    mean delta = -0.00%    median delta = +0.01%
+worst 3 slower: +0.31% (n5120_k17408 T=512), +0.41% (n14336_k5120 T=512), +1.11% (n5120_k6144 T=320)
+best 3 faster : -0.86% (n34816_k5120 T=448), -0.55% (n14336_k5120 T=640), -0.43% (n34816_k5120 T=320)
+per-arm within-arm spread: <= 1.5% on 13 of 15 points
+```
+
+**Latency is unchanged**, within the measurement's resolution, at every width including the acceptance band T = 64…256 (`n5120_k17408` T=256: 535.4 → 534.4 us, −0.19%). That is the expected result for a constant that only sizes a buffer, and it is what §2.1 predicted from the plan being bit-identical.
+
+### 4.7 End-to-end DFlash2 pair-cost A/B (the task's second half)
+
+`infernix_bench --weights Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix -p 4096 -n 128,256 -r 3 --warmup 1 --spec dflash2 --draft-tokens auto --lm-head-draft --concurrency 2 --kv-dtype fp8`, `INFERNIX_EXPERTS_ON_GPU=1`, **one binary** with `INFERNIX_PAIR_DRAFT_COST` alternating 0.47 / 0.30, 3 order-alternating passes. `dflash2-pairs` confirmed in the report's `fast_paths`. The policy decision is deterministic (identical `spec round/fb` in all three passes per arm); the `±` is timing spread only.
+
+| test | metric | 0.47 (HEAD) | 0.30 (T8) | Δ |
+|---|---|---|---|---|
+| pp4096 | prefill t/s | 3268.58 ± 11.14 | 3272.97 ± 1.40 | +0.13% |
+| tg128 | decode t/s | 36.36 ± 0.05 | **36.89 ± 0.05** | **+1.45%** |
+| tg128 | batch out t/s | 70.73 ± 0.11 | 71.83 ± 0.11 | +1.56% |
+| tg128 | spec acc | 0.586 | 0.528 | −9.77% |
+| tg128 | round/fallback | 340/168 | 360/110 | −34.5% fallbacks |
+| tg256 | decode t/s | 37.80 ± 0.09 | **40.94 ± 0.04** | **+8.32%** |
+| tg256 | batch out t/s | 74.15 ± 0.17 | 74.48 ± 0.07 | +0.45% |
+| tg256 | spec acc | 0.619 | 0.550 | −11.10% |
+| tg256 | round/fallback | 690/254 | 676/133 | −47.6% fallbacks |
+
+`0.30` is kept as the default. The acceptance-rate fall is the intended semantics of the change, not a defect: a cheaper column prior makes `pair_draft_width` propose wider rounds, so each draft is right less often while the round commits more tokens per second and half-rate falls back to the copy path. The claim is throughput at this artifact, concurrency and KV dtype (§6).
+
+## 5. Regressions and adverse results
+
+1. **The task's "FP8 T = 64..256 split-K latency improves" acceptance criterion is not met.** Measured effect is ±1.11% with mean −0.00% (§4.6). The workspace-footprint half of the criterion is met (−71.76%, §4.4). No latency win was available from this edit, because the constant stopped driving selection when the wave became a measured quantity (§2.1).
+2. **The first A/B campaign produced large false wins and a false regression; both came from baseline provenance, and both are disclosed.** The initial baseline was the `infernix_linear_bench` binary on disk (built 07:23 today), while HEAD's tip (`a9d19c87e`, T7) was committed at 16:47 — the "baseline" predated ~9 h of merged work. Against it, 80 points gave mean −0.85% with three points that survived round-to-round agreement (within-arm spread ≤ 1.2%) and looked systematic: `n5120_k17408` T=320 −7.06% (591.7/597.1 → 551.8/553.1), T=384 −13.63% (674.4/673.2 → 578.4/585.6), T=448 −17.41% (761.6/768.0 → 629.6/633.7), plus an apparent +14.81% at `n14336_k5120` T=640. Against a **HEAD-built** baseline all of them vanish (T=320 551.8 vs 549.7, T=384 583.5 vs 582.5, T=448 634.7 vs 633.6, T=640 −0.55%): the stale binary was simply slower at those widths. The earlier "wins" must not be carried forward, and the corrected comparison in §4.6 supersedes them.
+3. **Two single-round outliers of 23.7% and 28.9% appeared in the HEAD arm** (`n34816_k5120` T=448 round 3 = 1335.4 us against 1078–1084 us; T=768 round 3 = 1774.0 us against 1376–1377 us). They are host/device events, not a schedule property — the same arm's other two rounds are tight, and no comparable outlier sits on the candidate side systematically. Medians were used; the raw rounds are in `/tmp/t8/ab2/`.
+4. **The stack gate failed on the first candidate build** (§4.3). Root-caused to allowlist re-keying before any allowlist edit, verified as `increased_or_changed = 0`, and resolved by regeneration; it now passes. Nothing was masked: no budget grew and 7 stale entries came out.
+5. **Speculative acceptance rate falls** with the shipped pair cost (0.586 → 0.528 tg128, 0.619 → 0.550 tg256, §4.7). Throughput rises and fallbacks roughly halve, so this is the policy working as designed on this device, but it is a real change in what the model does per round and it was not measured on any other artifact, concurrency or KV dtype.
+6. **The attention and recurrent families were not run to completion on the final binary.** A 37-test sweep covering them was killed to bound wall clock after the attention tests alone consumed ~80 min (`softmax_attention_bf16` 269.77 s, `_nvfp4` 177.71 s, `_int8` 121.33 s, `_fp8` 106.98 s each). Five of them — `infernix_softmax_attention_test`, `_bf16`, `_int8`, `_fp8`, `_nvfp4` — did pass on the candidate binary before the kill. No FP8 split-K source is reachable from those tests, so the risk is a link-time one only; still, they are *partially run*, not passed.
+7. **The `prior_column_cost` path is unverified end-to-end** — see §2.6 and §6. The value was deliberately left at 0.7 against the task's instruction, which is a disclosed deviation, not an oversight.
+8. **Checks that could not run**: the task's six named test binaries and its bench flag form do not exist (§4.2), so its verification script cannot be executed as written; `infernix_linear_bench` has no `T ≤ 64` split-K coverage to report because `resolve_route` floors the A8 route at 17 tokens and T ≤ 64 on `n5120_k17408` runs the non-split-K `Tma32x64` tile.
+
+## 6. Accepted gaps and follow-ups
+
+- **Three literal `170` strings remain in `src/ops/*/fp8/`**, all in comments (`fp8_a8_tma_mma.cuh:77,80`, `fp8_schedule.cuh:208`) that record *why* the constant is 48 by naming what it replaced. Deleting them would remove the guard against re-introducing it, so the task's literal "zero occurrences of `170`" is satisfied for constants and deliberately not for prose. Separately, `src/ops/ggml/ggml_tables_device.cuh:18` contains `170` as a raster-permutation value, not an SM count — out of scope, unchanged.
+- **`prior_column_cost = 0.7` stays** (§2.6). It applies only to `offloaded_experts()`, there is no Qwen3.5-122B `.infernix` artifact on this host to measure the GB10 value against, and the resident route the task describes already uses its measured `per_draft`. A future 122B artifact should fit it and retire the prior.
+- **`INFERNIX_PAIR_DRAFT_COST = 0.30` is fitted on one configuration**: W4Dense, `--concurrency 2`, fp8 KV, `--draft-tokens auto`, experts on GPU. `dflash2_rows_ = 2` was left untouched — the task lists it but the pair route's row count is a separate measured quantity and no evidence here bears on it. The resident `c = 4` MTP shape and the offloaded-expert shape were not swept.
+- **The partial plane is still sized from a compile-time ceiling.** Now that the ceiling equals the resident wave it can no longer over-reserve by more than a rounding of the occupancy query, but a plane sized from the measured wave at workspace-allocation time would remove the constant entirely and make §2.1's argument structural rather than a maintained invariant. Left as a follow-up; it touches every `partial_capacity_bytes` and its workspace tests.
+- **If a schedule ever does reach 2 CTAs/SM** (a body staging under ~50 KiB), `kGb10SplitWaveCtas` must become per-schedule again — the single constant is correct only because all five current split-K bodies stage 65 536 B or more, more than half of the 102 400 B per SM. The `static_assert(kSharedBytes <= 99 * 1024)` above `kSharedBytes` bounds the other end.
+- **`Wave48` is gone for good**: if a future port wants a genuine 96-CTA wave it must come with a schedule that can actually be resident twice per SM, not a second alias of an existing tile.

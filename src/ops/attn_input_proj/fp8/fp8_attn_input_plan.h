@@ -94,8 +94,7 @@ void fp8_attn_input_n17408_dispatch(const Tensor& x, const Weight& weight, Tenso
                                     WorkspaceArena* workspace, cudaStream_t stream);
 
 // A8 GEMM schedules reachable for the 122B [17408,3072] shape, exposed as opaque ids so the bench
-// can drive every legal schedule directly (candidate sweep) instead of the production route. The
-// Wave48 split-K ids carry the GB10-resident-grid wave model (48 SMs) instead of the [170]-SM one.
+// can drive every legal schedule directly (candidate sweep) instead of the production route.
 enum class Fp8AttnInputN17408ScheduleId {
     A8T32R32K128,
     A8T32R128K128,
@@ -108,7 +107,6 @@ enum class Fp8AttnInputN17408ScheduleId {
     A8Tma128x128G8,
     A8Bulk,
     A8BulkG8,
-    A8BulkG8Wave48,
 };
 
 const char* fp8_attn_input_n17408_schedule_name(Fp8AttnInputN17408ScheduleId schedule) noexcept;

@@ -40,19 +40,16 @@ void fp8_linear_add_n3072_a8_launch(const Tensor& x, const Weight& weight, Tenso
                                     WorkspaceArena& workspace, cudaStream_t stream);
 
 // A8 GEMM schedules reachable for the 122B [3072,8192] shape, exposed as opaque ids so the bench
-// can drive every legal schedule directly (candidate sweep) instead of the production route. The
-// Wave48 ids carry the GB10-resident-grid wave model (48 SMs) instead of the [170]-SM one.
+// can drive every legal schedule directly (candidate sweep) instead of the production route.
 enum class Fp8LinearAddN3072ScheduleId {
     A8Tma32x64,
     A8Small,
-    A8SmallWave48,
     A8Mid,
     A8Wide,
     A8Tma128x128G8,
     A8Tma192x128G8,
     A8Bulk,
     A8BulkG8,
-    A8BulkG8Wave48,
 };
 
 const char* fp8_linear_add_n3072_schedule_name(Fp8LinearAddN3072ScheduleId schedule) noexcept;

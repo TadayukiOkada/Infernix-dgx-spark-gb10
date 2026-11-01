@@ -24,8 +24,8 @@ using Tma64x128       = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma192x128      = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
 using Tma192x128G8    = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1, Fp8MmaRaster::Grouped, 8>;
 using Tma128x128G8    = Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1, Fp8MmaRaster::Grouped, 8>;
-using MidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 170, 4, 8>;
-using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+using MidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, kGb10SplitWaveCtas, 4, 8>;
+using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, kGb10SplitWaveCtas, 4, 8>;
 
 Output output_of(Tensor& qkv, Tensor& z) {
     return {static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
@@ -151,8 +151,7 @@ namespace {
 
 using Tma64x128G8  = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1, Fp8MmaRaster::Grouped, 8>;
 using Tma64x256G8  = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1, Fp8MmaRaster::Grouped, 8>;
-using BulkG8       = Fp8A8TmaSplitKSchedule<Tma128x128G8, 170, 4, 8>;
-using BulkG8Wave48 = Fp8A8TmaSplitKSchedule<Tma128x128G8, 48, 4, 8>;
+using BulkG8       = Fp8A8TmaSplitKSchedule<Tma128x128G8, kGb10SplitWaveCtas, 4, 8>;
 
 void launch_n20480_a8_schedule(Fp8GdnInputN20480ScheduleId schedule, const Tensor& x,
                                const Weight& weight, Tensor& qkv, Tensor& z,
@@ -191,8 +190,6 @@ void launch_n20480_a8_schedule(Fp8GdnInputN20480ScheduleId schedule, const Tenso
         return launch.template operator()<Bulk>();
     case Fp8GdnInputN20480ScheduleId::A8BulkG8:
         return launch.template operator()<BulkG8>();
-    case Fp8GdnInputN20480ScheduleId::A8BulkG8Wave48:
-        return launch.template operator()<BulkG8Wave48>();
     }
     throw std::logic_error("fp8 A8 gdn_input_proj n20480: unknown schedule");
 }
@@ -200,7 +197,7 @@ void launch_n20480_a8_schedule(Fp8GdnInputN20480ScheduleId schedule, const Tenso
 } // namespace
 
 std::size_t fp8_gdn_input_n20480_candidate_partial_capacity_bytes() {
-    // Largest partial plane any forced candidate may need: Bulk's 170-wave 128x256 split-K tiles.
+    // Largest partial plane any forced candidate may need: Bulk's full-wave 128x256 split-K tiles.
     return Bulk::kPartialBytes;
 }
 
@@ -228,8 +225,6 @@ const char* fp8_gdn_input_n20480_schedule_name(Fp8GdnInputN20480ScheduleId sched
         return "gdn_input_proj.fp8.n20480.a8.bulk";
     case Fp8GdnInputN20480ScheduleId::A8BulkG8:
         return "gdn_input_proj.fp8.n20480.a8.bulk.g8";
-    case Fp8GdnInputN20480ScheduleId::A8BulkG8Wave48:
-        return "gdn_input_proj.fp8.n20480.a8.bulk.g8.w48";
     }
     return "gdn_input_proj.fp8.n20480.a8.unknown";
 }

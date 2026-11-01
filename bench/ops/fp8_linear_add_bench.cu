@@ -232,22 +232,20 @@ int main(int argc, char** argv) {
         }
 
         std::vector<Result> results;
-        results.reserve(options.t_sweep.size() * (options.candidates ? 10 : 1));
+        results.reserve(options.t_sweep.size() * (options.candidates ? 8 : 1));
         std::printf("# mxfp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n",
                     kMxFp8Fp32AccumulatePeak);
         std::printf("%-40s %8s %8s %6s %11s %11s %11s %10s %10s %8s\n", "pol", "N", "K", "T",
                     "median_us", "min_us", "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
-        constexpr std::array<ops::detail::Fp8LinearAddN3072ScheduleId, 10> kSchedules{{
+        constexpr std::array<ops::detail::Fp8LinearAddN3072ScheduleId, 8> kSchedules{{
             ops::detail::Fp8LinearAddN3072ScheduleId::A8Tma32x64,
             ops::detail::Fp8LinearAddN3072ScheduleId::A8Small,
-            ops::detail::Fp8LinearAddN3072ScheduleId::A8SmallWave48,
             ops::detail::Fp8LinearAddN3072ScheduleId::A8Mid,
             ops::detail::Fp8LinearAddN3072ScheduleId::A8Wide,
             ops::detail::Fp8LinearAddN3072ScheduleId::A8Tma128x128G8,
             ops::detail::Fp8LinearAddN3072ScheduleId::A8Tma192x128G8,
             ops::detail::Fp8LinearAddN3072ScheduleId::A8Bulk,
             ops::detail::Fp8LinearAddN3072ScheduleId::A8BulkG8,
-            ops::detail::Fp8LinearAddN3072ScheduleId::A8BulkG8Wave48,
         }};
         for (const std::int32_t tokens : options.t_sweep) {
             const double flops = 2.0 * static_cast<double>(options.n) * options.k * tokens;

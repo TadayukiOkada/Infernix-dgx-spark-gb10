@@ -16,8 +16,8 @@ using Tma64x128    = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma64x256    = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
 using Tma128x256   = Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>;
 using Tma128x128G8 = Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1, Fp8MmaRaster::Grouped, 8>;
-using Bulk         = Fp8A8TmaSplitKSchedule<Tma128x256, 170, 4, 8>;
-using BulkG8       = Fp8A8TmaSplitKSchedule<Tma128x128G8, 170, 4, 8>;
+using Bulk         = Fp8A8TmaSplitKSchedule<Tma128x256, kGb10SplitWaveCtas, 4, 8>;
+using BulkG8       = Fp8A8TmaSplitKSchedule<Tma128x128G8, kGb10SplitWaveCtas, 4, 8>;
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const int tokens = x.ne[1];

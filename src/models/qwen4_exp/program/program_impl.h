@@ -6726,11 +6726,13 @@ private:
         return static_cast<std::uint32_t>(std::max(chunk_, static_cast<std::int32_t>(kGdnGrid)));
     }
     // dflash2-pairs' width with --draft-tokens auto (dflash2_pair_width): a draft per row and the
-    // two-row proposal in plain two-row rounds, fixed priors as for one row. GB10 retune: the pair
-    // width cost is a policy constant (INFERNIX_PAIR_WIDTH_COST, 0.15), decoupled from the DFlash2
-    // pair draft cost (0.47, the 5090-fitted value the pair kernels' cost model still pays).
-    static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.15);
-    static constexpr double kDFlashPairDraftCost     = 0.47;
+    // two-row proposal in plain two-row rounds, fixed priors as for one row. GB10 retune: both
+    // costs of the pair's cost model are policy constants (INFERNIX_PAIR_WIDTH_COST 0.15 for the
+    // pair width, INFERNIX_PAIR_DRAFT_COST below for one verified column of the round), each fitted
+    // on this device; the draft cost replaced the 0.47 the 5090's cost model paid.
+    static inline const double kPairWidthCost       = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.15);
+    static inline const double kDFlashPairDraftCost =
+        policy_double("INFERNIX_PAIR_DRAFT_COST", 0.30);
     static constexpr double kDFlashPairProposalCost  = 0.1;
     // The cumulative cut's per-row thresholds and draft log-probabilities (the device gate's for row 0
     // of a one-row round, the host cut's for every row; MtpCumulative is always on).

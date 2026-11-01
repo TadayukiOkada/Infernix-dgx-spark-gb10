@@ -693,7 +693,7 @@ void run_fp8_122b_candidates(const Options& options, bench::L2FlushBuffer& flush
     DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
 
-    constexpr std::array<ops::detail::Fp8GdnInputN20480ScheduleId, 12> kSchedules{{
+    constexpr std::array<ops::detail::Fp8GdnInputN20480ScheduleId, 11> kSchedules{{
         ops::detail::Fp8GdnInputN20480ScheduleId::A8T32R32K128,
         ops::detail::Fp8GdnInputN20480ScheduleId::A8T64R128K256,
         ops::detail::Fp8GdnInputN20480ScheduleId::A8Tma64x128,
@@ -705,7 +705,6 @@ void run_fp8_122b_candidates(const Options& options, bench::L2FlushBuffer& flush
         ops::detail::Fp8GdnInputN20480ScheduleId::A8MidBulk,
         ops::detail::Fp8GdnInputN20480ScheduleId::A8Bulk,
         ops::detail::Fp8GdnInputN20480ScheduleId::A8BulkG8,
-        ops::detail::Fp8GdnInputN20480ScheduleId::A8BulkG8Wave48,
     }};
 
     for (const std::int32_t tokens : options.tokens) {

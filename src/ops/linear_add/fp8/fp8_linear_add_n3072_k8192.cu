@@ -32,10 +32,10 @@ struct ResidualPairEpilogue : LinearResidualAddEpilogue {
 
 using Tma32x64 = Fp8A8TmaMmaSchedule<32, 64, 128, 1, 2, 3, 2>;
 using Tma192x128G8 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1, Fp8MmaRaster::Grouped, 8>;
-using Small    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>, 170, 4, 8>;
-using Mid      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1>, 170, 4, 8>;
-using Wide     = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>, 170, 4, 8>;
-using Bulk     = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+using Small    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>, kGb10SplitWaveCtas, 4, 8>;
+using Mid      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1>, kGb10SplitWaveCtas, 4, 8>;
+using Wide     = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>, kGb10SplitWaveCtas, 4, 8>;
+using Bulk     = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, kGb10SplitWaveCtas, 4, 8>;
 
 struct Destination {
     LinearBf16Output output;
@@ -128,17 +128,14 @@ void fp8_linear_add_n3072_a8_launch(const Tensor& x, const Weight& weight, Tenso
     if (tokens <= 2560) return launch.template operator()<Bulk>();
     // 2561+: the Grouped-8 192x128 full tile replaces split-K Bulk: sweep -22.3% vs Bulk at 4096
     // (1623 us vs 2088 us) and argmin at 3072/6144. The G8 raster keeps the K=8192 activation slab
-    // L2-resident across the 24 row tiles, which the 170-wave split-K ordering cannot.
+    // L2-resident across the 24 row tiles, which the split-K ordering cannot.
     launch.template operator()<Tma192x128G8>();
 }
 
 namespace {
 
 using Tma128x128G8   = Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1, Fp8MmaRaster::Grouped, 8>;
-using SmallWave48    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>, 48, 4,
-                                              8>;
-using BulkG8         = Fp8A8TmaSplitKSchedule<Tma128x128G8, 170, 4, 8>;
-using BulkG8Wave48   = Fp8A8TmaSplitKSchedule<Tma128x128G8, 48, 4, 8>;
+using BulkG8         = Fp8A8TmaSplitKSchedule<Tma128x128G8, kGb10SplitWaveCtas, 4, 8>;
 
 void launch_n3072_a8_schedule(Fp8LinearAddN3072ScheduleId schedule, const Tensor& x,
                               const Weight& weight, Tensor& residual, Fp8A8Workspace scratch,
@@ -157,8 +154,6 @@ void launch_n3072_a8_schedule(Fp8LinearAddN3072ScheduleId schedule, const Tensor
         return launch.template operator()<Tma32x64>();
     case Fp8LinearAddN3072ScheduleId::A8Small:
         return launch.template operator()<Small>();
-    case Fp8LinearAddN3072ScheduleId::A8SmallWave48:
-        return launch.template operator()<SmallWave48>();
     case Fp8LinearAddN3072ScheduleId::A8Mid:
         return launch.template operator()<Mid>();
     case Fp8LinearAddN3072ScheduleId::A8Wide:
@@ -171,8 +166,6 @@ void launch_n3072_a8_schedule(Fp8LinearAddN3072ScheduleId schedule, const Tensor
         return launch.template operator()<Bulk>();
     case Fp8LinearAddN3072ScheduleId::A8BulkG8:
         return launch.template operator()<BulkG8>();
-    case Fp8LinearAddN3072ScheduleId::A8BulkG8Wave48:
-        return launch.template operator()<BulkG8Wave48>();
     }
     throw std::logic_error("fp8 A8 linear_add n3072: unknown schedule");
 }
@@ -180,7 +173,7 @@ void launch_n3072_a8_schedule(Fp8LinearAddN3072ScheduleId schedule, const Tensor
 } // namespace
 
 std::size_t fp8_linear_add_n3072_candidate_partial_capacity_bytes() {
-    // Largest partial plane any forced candidate may need: Bulk's 170-wave 128x256 split-K tiles.
+    // Largest partial plane any forced candidate may need: Bulk's full-wave 128x256 split-K tiles.
     return Bulk::kPartialBytes;
 }
 
@@ -190,8 +183,6 @@ const char* fp8_linear_add_n3072_schedule_name(Fp8LinearAddN3072ScheduleId sched
         return "linear_add.fp8.n3072.a8.tma32x64";
     case Fp8LinearAddN3072ScheduleId::A8Small:
         return "linear_add.fp8.n3072.a8.small";
-    case Fp8LinearAddN3072ScheduleId::A8SmallWave48:
-        return "linear_add.fp8.n3072.a8.small.w48";
     case Fp8LinearAddN3072ScheduleId::A8Mid:
         return "linear_add.fp8.n3072.a8.mid";
     case Fp8LinearAddN3072ScheduleId::A8Wide:
@@ -204,8 +195,6 @@ const char* fp8_linear_add_n3072_schedule_name(Fp8LinearAddN3072ScheduleId sched
         return "linear_add.fp8.n3072.a8.bulk";
     case Fp8LinearAddN3072ScheduleId::A8BulkG8:
         return "linear_add.fp8.n3072.a8.bulk.g8";
-    case Fp8LinearAddN3072ScheduleId::A8BulkG8Wave48:
-        return "linear_add.fp8.n3072.a8.bulk.g8.w48";
     }
     return "linear_add.fp8.n3072.a8.unknown";
 }
