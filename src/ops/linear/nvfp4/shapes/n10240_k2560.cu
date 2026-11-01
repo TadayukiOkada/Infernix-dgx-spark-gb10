@@ -56,6 +56,12 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
 } // namespace
 
+// GB10 2026-11-01 (T2): pair gate 128 -> 56. Measured against the A16 table the public route runs
+// in the same process (cold 32 MiB L2, 15 repeats, minimum over 2 passes) the pair's 128-row panel
+// is level with A16 at T = 40/47 (82.3/82.4 us against 84.0/82.8 us) and ahead from T = 56:
+// 82.5/82.2/82.8/83.1 us at T = 56/64/96/128 against 84.5/88.3/108.6/124.5 us -- a 24..33% gain at
+// the top of the band, where the A16 HMMA tile is compute-bound. The 64-row panel is faster still
+// from T = 56 but 2x behind below it, so the shape keeps the grid-heuristic panel.
 const Nvfp4LinearShape kNvfp4N10240K2560{
-    10240, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 128};
+    10240, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 56};
 } // namespace infernix::ops::detail

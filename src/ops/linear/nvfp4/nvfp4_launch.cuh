@@ -110,4 +110,23 @@ inline void launch_nvfp4_a4_pair(const Tensor& x, const Weight& weight, Tensor& 
         nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128),
         static_cast<__nv_bfloat16*>(out.data), stream);
 }
+
+// The same 2-term residual pair with the 64-row weight panel a shape table measured ahead of the
+// grid-size heuristic's choice, over the widths that measurement covers. The panel halves the
+// weight tile each CTA owns and doubles the grid, which pays while the grid is small enough to
+// leave SMs idle in its last wave. From the prefill width up, thousands of CTAs run and the halved
+// panel reads its weight tile twice as often, where it measures 10..30% behind on every shape;
+// those widths are delegated to the public heuristic, which is the route they ran before.
+inline void launch_nvfp4_a4_pair_r64(const Tensor& x, const Weight& weight, Tensor& out,
+                                     Nvfp4A4Workspace scratch, cudaStream_t stream) {
+    launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled128, stream);
+    const Nvfp4A4Operands operands =
+        nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128);
+    __nv_bfloat16* y = static_cast<__nv_bfloat16*>(out.data);
+    if (x.ne[1] <= 128) {
+        launch_nvfp4_a4_residual_tma_linear_r64(operands, y, stream);
+        return;
+    }
+    launch_nvfp4_a4_residual_tma_linear(operands, y, stream);
+}
 } // namespace infernix::ops::detail

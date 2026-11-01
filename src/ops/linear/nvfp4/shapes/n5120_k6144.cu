@@ -59,6 +59,10 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
 } // namespace
 
+// GB10 2026-11-01 (T2): pair gate 65 -> 33, measured against the A16 table the public route runs
+// in the same process (cold 32 MiB L2, 15 repeats, minimum over 2 passes). The pair leads the
+// whole band: T = 33/40/47/56 is 97.5/98.7/100.1/100.3 us against 107.8/109.8/110.1/111.7 us, and
+// T = 96/128 is 102.0/103.5 us against 126.0/148.9 us.
 const Nvfp4LinearShape kNvfp4N5120K6144{
-    5120, 6144, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
+    5120, 6144, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 33};
 } // namespace infernix::ops::detail

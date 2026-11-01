@@ -68,6 +68,13 @@ bool uses_a4(std::int32_t, std::int32_t) { return true; }
 
 } // namespace
 
+// GB10 2026-11-01 (T2): pair gate 65 -> 48 and the 64-row pair tile. Measured against the A16
+// table the public route runs in the same process (cold 32 MiB L2, 15 repeats, minimum over 2
+// passes) the 64-row panel is ahead across the band: 496.0/495.1/499.9/502.4 us at
+// T = 33/40/47/56 against 506.0/508.8/510.4/510.8 us for A16, and 518.4/527.3 us at T = 96/128
+// against 657.4/696.6 us. The 128-row panel is 2..3% behind it throughout. The A16 table still
+// wins at T = 2..32, where its GEMV and sliced-K tiles read the weights once per CTA.
 const Nvfp4LinearShape kNvfp4N34816K5120{
-    34816, 5120, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
+    34816, 5120, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4,
+    launch_nvfp4_a4_pair_r64, 33};
 } // namespace infernix::ops::detail

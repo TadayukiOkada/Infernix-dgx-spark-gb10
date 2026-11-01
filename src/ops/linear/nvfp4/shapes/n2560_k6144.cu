@@ -68,6 +68,11 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
 } // namespace
 
+// GB10 2026-11-01 (T2): pair gate 65 -> 33. Measured in one process against the A16 table the
+// public route runs (cold 32 MiB L2, 15 repeats, per-pass minimum over 2 passes), the 2-term pair
+// is ahead across the whole 33..128 band here -- at T = 33/40/47/56 it is 55.7/57.9/56.5/57.0 us
+// against 62.7/63.1/62.8/63.1 us for A16 -- so the gate sits at the bottom of the band the sweep
+// covered rather than at the verification width it had been parked at.
 const Nvfp4LinearShape kNvfp4N2560K6144{
-    2560, 6144, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
+    2560, 6144, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 33};
 } // namespace infernix::ops::detail

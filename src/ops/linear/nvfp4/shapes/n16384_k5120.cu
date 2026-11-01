@@ -66,6 +66,12 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t) { return true; }
 } // namespace
 
+// GB10 2026-11-01 (T2): pair gate 65 -> 48 and the 64-row pair tile. Measured against the A16
+// table the public route runs in the same process (cold 32 MiB L2, 15 repeats, minimum over 2
+// passes) the 64-row panel is level with A16 at T = 33..47 (239.4/238.4/239.7 us against
+// 238.4/239.4/241.4 us) and ahead from T = 56: 241.1/242.1/248.5/251.1 us at T = 56/64/96/128
+// against 247.5/254.2/313.1/347.8 us. The 128-row panel is 0.5..1.5% behind it above T = 64.
 const Nvfp4LinearShape kNvfp4N16384K5120{
-    16384, 5120, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
+    16384, 5120, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4,
+    launch_nvfp4_a4_pair_r64, 48};
 } // namespace infernix::ops::detail

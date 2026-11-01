@@ -56,6 +56,12 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
 } // namespace
 
+// GB10 2026-11-01 (T2): the 64-row pair tile. This shape's 128-row grid is 100 CTAs, so 4 of the
+// 48 SMs carry a 3rd wave; the 64-row panel doubles the grid to 200 and measures ahead from
+// T = 64 (99.1/100.6/101.3 us at T = 64/96/128 against 108.7/109.1/110.1 us for the 128-row panel
+// and 104.3/133.2/150.8 us for the A16 table). Its 128-row panel still wins at T = 48 (109.7 us
+// against 119.1 us), which the gate at 65 leaves to A16 (100.3 us) anyway.
 const Nvfp4LinearShape kNvfp4N12800K2560{
-    12800, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
+    12800, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4,
+    launch_nvfp4_a4_pair_r64, 65};
 } // namespace infernix::ops::detail

@@ -236,6 +236,12 @@ const RouteCandidate kCandidates[] = {
     INFER_NX_SLICED_STATIC("r32_t48_w4_s2", 1, 48, Nvfp4SlicedInstance<48, 4, 2, 2>)
     INFER_NX_SLICED_STATIC("r32_t64_w4_s2", 1, 64, Nvfp4SlicedInstance<64, 4, 2, 2>)
 
+    // GB10 2026-11-01 (T2): the wide-token RowTiles=1 sliced-K forms the task asks for at
+    // T = 33..64. Both measure 2..3x behind the shipped MMA band (activation staging forces
+    // 1 CTA/SM), so they stay candidates and nothing in a shape table selects them.
+    INFER_NX_SLICED_STATIC("r16_t48_w4_s2", 32, 64, Nvfp4SlicedInstance<48, 4, 2, 1>)
+    INFER_NX_SLICED_STATIC("r16_t64_w4_s2", 32, 64, Nvfp4SlicedInstance<64, 4, 2, 1>)
+
     INFER_NX_MMA_STATIC("r32_t64_k128_s1", 16, 0, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>)
     INFER_NX_MMA_STATIC("r64_t64_k128_s1", 16, 0, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>)
     INFER_NX_MMA_STATIC("r64_t64_k128_s2", 16, 0, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>)
@@ -313,7 +319,16 @@ struct A4RouteCandidate {
     // workspace layout (terms = kNvfp4A4ResidualTerms, row-scaled) rather than the 1-term one the
     // other A4 candidates share; handing it the latter fails the plane-vs-call check.
     bool residual = false;
+    // The A16 table is the shipped, oracle-qualified reference, and it is a different
+    // approximation from the A4 planes this list otherwise checks against. Marking it unchecked
+    // lets the pair-vs-A16 admission gate be measured in one process instead of two passes.
+    bool unchecked = false;
 };
+
+void launch_a4_a16_ref(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A4Workspace,
+                       cudaStream_t stream) {
+    ops::linear(x, w, out, stream);
+}
 
 void launch_a4_production(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A4Workspace ws,
                           cudaStream_t stream) {
@@ -370,6 +385,10 @@ using A4PrefillSchedule = Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCode
 
 const A4RouteCandidate kA4Candidates[] = {
     {"production", launch_a4_production, 1, 0},
+
+    // The A16 table the same shape runs when no A4 route is admitted: the real competitor of both
+    // A4 routes under --routes fast, and the baseline the pair_min_tokens gate is set against.
+    {"a16_ref", launch_a4_a16_ref, 1, 0, false, true},
 
     // The 2-term residual TMA route the shape tables register as their pair entry. The engine admits
     // it only at or above pair_min_tokens, so this candidate is the evidence for that gate: a shape
@@ -438,6 +457,13 @@ const A4RouteCandidate kA4Candidates[] = {
     {"a4_split_1q1g",            launch_a4_tma_repeats<A4PrefillSchedule, 1, 1>, 128, 0},
     {"a4_split_2q1g",            launch_a4_tma_repeats<A4PrefillSchedule, 2, 1>, 128, 0},
     {"a4_split_1q2g",            launch_a4_tma_repeats<A4PrefillSchedule, 1, 2>, 128, 0},
+
+    // GB10 2026-11-01 (T2): the 2-term residual TMA GEMM at an explicit weight-panel height, so the
+    // pair route's wave fit on 48 SMs is measured rather than inherited from the ctas_128 gate.
+    {"a4_pair_r128_s3_m1", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 128>>, 32, 0, true},
+    {"a4_pair_r64_s3_m1",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 64>>, 32, 0, true},
+    {"a4_pair_r64_s2_m2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 2, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 64>>, 32, 0, true},
+    {"a4_pair_r64_s4_m1",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 64>>, 32, 0, true},
 };
 
 std::vector<int> parse_tokens(const std::string& spec) {
@@ -479,6 +505,24 @@ bool check_numeric_agreement(const std::vector<__nv_bfloat16>& got,
         if (diff > tol) return false;
     }
     return true;
+}
+
+// Comma-separated substring filter. "production" always survives so the report keeps its anchor
+// even when the argmin candidate is filtered out.
+bool filter_matches(const std::string& filter, const char* name) {
+    if (filter.empty()) return true;
+    if (std::strcmp(name, "production") == 0) return true;
+    const std::string view(name);
+    std::size_t begin = 0;
+    while (begin <= filter.size()) {
+        const std::size_t comma = filter.find(',', begin);
+        const std::string token =
+            filter.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
+        if (!token.empty() && view.find(token) != std::string::npos) return true;
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    }
+    return false;
 }
 
 } // namespace
@@ -629,9 +673,7 @@ int main(int argc, char** argv) {
                 for (const auto& cand : kA4Candidates) {
                     if (t < cand.min_t) continue;
                     if (cand.max_t > 0 && t > cand.max_t) continue;
-                    if (!filter.empty() && std::string(cand.name).find(filter) == std::string::npos &&
-                        std::string(cand.name) != "production")
-                        continue;
+                    if (!filter_matches(filter, cand.name)) continue;
 
                     const bool is_prod = (std::strcmp(cand.name, "production") == 0);
                     Nvfp4A4Workspace run_ws = cand.residual ? pair_ws : a4_ws;
@@ -657,7 +699,7 @@ int main(int argc, char** argv) {
 
                     CUDA_CHECK(cudaMemcpy(got.data(), ys.data, out_bytes, cudaMemcpyDeviceToHost));
                     const bool numeric_ok =
-                        is_prod ||
+                        is_prod || cand.unchecked ||
                         check_numeric_agreement(got, cand.residual ? exact_host : ref_host);
                     if (!numeric_ok) {
                         report_skip("numeric", cand.name, t, "disagrees with the reference output");
@@ -714,9 +756,7 @@ int main(int argc, char** argv) {
                 if (t < cand.min_t) continue;
                 if (cand.max_t > 0 && t > cand.max_t) continue;
                 if (cand.static_k > 0 && k != cand.static_k) continue;
-                if (!filter.empty() && std::string(cand.name).find(filter) == std::string::npos &&
-                    std::string(cand.name) != "production")
-                    continue;
+                if (!filter_matches(filter, cand.name)) continue;
 
                 bool ok = true;
                 try {

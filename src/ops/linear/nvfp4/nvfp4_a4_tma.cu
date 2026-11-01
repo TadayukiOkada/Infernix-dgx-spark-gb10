@@ -69,6 +69,17 @@ void launch_residual(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream
         Nvfp4A4TmaMmaSchedule<128, 3, 1, Promotions, kNvfp4A4ResidualTerms, 128>, K>>(
         p, y, LinearIdentityEpilogue{}, stream);
 }
+
+// The shape table's 64-row pair panel, over the same K set the public pair route serves. The
+// stage/occupancy pair is the one that fits the 99 KiB shared-memory limit with two activation
+// planes per stage and won the A/B recorded in the shape tables.
+template <int K, Nvfp4A4TmaPromotions Promotions = kNvfp4A4TmaWeightCodeL2_128B>
+void launch_residual_r64(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream) {
+    const LinearBf16Output y{output, p.rows};
+    launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
+        Nvfp4A4TmaMmaSchedule<128, 3, 1, Promotions, kNvfp4A4ResidualTerms, 64>, K>>(
+        p, y, LinearIdentityEpilogue{}, stream);
+}
 } // namespace
 
 void launch_nvfp4_a4_residual_tma_linear(const Nvfp4A4Operands& p, __nv_bfloat16* output,
@@ -85,6 +96,25 @@ void launch_nvfp4_a4_residual_tma_linear(const Nvfp4A4Operands& p, __nv_bfloat16
         return;
     case 17408:
         launch_residual<17408>(p, output, stream);
+        return;
+    }
+    throw std::invalid_argument("NVFP4 residual TMA linear: unsupported K");
+}
+
+void launch_nvfp4_a4_residual_tma_linear_r64(const Nvfp4A4Operands& p, __nv_bfloat16* output,
+                                             cudaStream_t stream) {
+    switch (p.k) {
+    case 2560:
+        launch_residual_r64<2560>(p, output, stream);
+        return;
+    case 5120:
+        launch_residual_r64<5120>(p, output, stream);
+        return;
+    case 6144:
+        launch_residual_r64<6144>(p, output, stream);
+        return;
+    case 17408:
+        launch_residual_r64<17408>(p, output, stream);
         return;
     }
     throw std::invalid_argument("NVFP4 residual TMA linear: unsupported K");

@@ -46,8 +46,16 @@ int run_nvfp4_a4() {
                           {5120, 6144, 723U, Comparison::Sampled, true, invocations});
     failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                           {5120, 17408, 725U, Comparison::Sampled, true, invocations});
-    // Two-term row-scaled A4 TMA route (Nvfp4A4Pair) on Qwen3.8-Flash-Next W4Dense shapes.
+    // Two-term row-scaled A4 TMA route (Nvfp4A4Pair) on Qwen3.8-Flash-Next W4Dense shapes. The
+    // widths below 65 are the bands the 2026-11-01 retune admitted the pair to (gates at 33, 48
+    // and 56), so they are covered against the oracle at the widths the shape table now selects
+    // it at, not only where it ran before.
     const std::vector<Invocation> pair_invocations{
+        {33, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {34, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {48, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {56, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {64, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
         {65, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
         {96, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
         {127, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},

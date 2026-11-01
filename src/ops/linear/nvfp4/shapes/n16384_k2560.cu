@@ -129,8 +129,14 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 65; }
 } // namespace
 
+// GB10 2026-11-01 (T2): the 64-row pair tile. The 128-row grid is 128 CTAs (2.67 waves of 48);
+// the 64-row panel is ahead from T = 64 at 123.7/123.7/125.8 us at T = 64/96/128 against
+// 124.4/126.3/126.8 us for the 128-row panel and 125.3/149.9/180.7 us for the A16 table. Below the
+// gate the 128-row panel wins (125.3 us against 143.9 us at T = 48) and A16 wins over both, so the
+// gate stays at 65.
 const Nvfp4LinearShape kNvfp4N16384K2560{
-    16384, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4, launch_nvfp4_a4_pair, 65};
+    16384, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4,
+    launch_nvfp4_a4_pair_r64, 65};
 
 void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                      cudaStream_t stream, LinearPolicy policy, LinearRoutes routes,
