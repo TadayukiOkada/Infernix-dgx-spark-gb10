@@ -25,8 +25,6 @@
 #include <string>
 #include <type_traits>
 
-#include "core/temporary_switches.h"
-
 namespace infernix::ops::detail {
 namespace {
 
@@ -619,14 +617,18 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         }
         l0 = __fmaf_rn(l0, alpha0, bl0);
         l1 = __fmaf_rn(l1, alpha1, bl1);
+        // The 128 output rescales are pure scaling: when no row's max moved this tile every alpha is
+        // exp2_approx(0) = 1 exactly and the whole loop can be skipped (warp-uniform, bits unchanged).
+        if (!__all_sync(FullMask, alpha0 == 1.0f && alpha1 == 1.0f)) {
 #pragma unroll
-        for (int b = 0; b < 16; ++b) {
+            for (int b = 0; b < 16; ++b) {
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                o[b][h][0] *= alpha0;
-                o[b][h][1] *= alpha0;
-                o[b][h][2] *= alpha1;
-                o[b][h][3] *= alpha1;
+                for (int h = 0; h < 2; ++h) {
+                    o[b][h][0] *= alpha0;
+                    o[b][h][1] *= alpha0;
+                    o[b][h][2] *= alpha1;
+                    o[b][h][3] *= alpha1;
+                }
             }
         }
 

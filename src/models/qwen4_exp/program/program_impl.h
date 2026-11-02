@@ -2568,7 +2568,9 @@ public:
                                : std::min<std::uint32_t>(
                                      ngram_max,
                                      static_cast<std::uint32_t>(std::max<std::int32_t>(
-                                         pair_k, batch == 2 ? kPairMaxDrafts : kMultiRowMaxDrafts)));
+                                         pair_k,
+                                         batch == 2 ? kPairMaxDrafts
+                                                    : (kMultiRowDrafts > 0.5 ? kMultiRowMaxDrafts : 0))));
                 const auto tail = std::span<const std::int32_t>(lane.history)
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
                 auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
@@ -2616,33 +2618,33 @@ public:
                     stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
                 }
             });
-            // Every row verifies only its confident drafts: those its cumulative cut keeps
-            // (read_mtp_drafts; every draft of a sampled row with sampled-mtp-drafts). A row the cut
-            // leaves shorter than a copy proposal it declined takes the copy instead: the draft steps
-            // are already paid for and a copy costs no draft step, so a truncated round still verifies
-            // a wide row rather than decaying to a narrow one. The
-            // round's width is the longest row's, so a cut can narrow it; the drafter staged each row's
-            // n-gram columns at the width it knew, and rows 1.. are read again at the round's width
-            // (row 0's columns sit at offset 0 whatever the width, as in the DFlash2 pair path).
+            // A one-row round verifies only its confident drafts: those its cumulative cut keeps
+            // (read_mtp_drafts; every draft of a sampled row with sampled-mtp-drafts). Multi-row
+            // rounds run an ungated draft chain and verify their full shared width, except when a row
+            // the cut leaves shorter than a copy proposal it declined takes the copy instead.
             const std::int32_t staged_width = width;
             for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
                 if (from_ngram_[b] || extents[b] <= 0) { continue; }
-                drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
-                extents[b] = std::min(extents[b], mtp_confident_[b]);
-                drafts_[b].resize(static_cast<std::size_t>(extents[b]));
-                const auto copies = static_cast<std::int32_t>(ngram_proposal_[b].size());
-                if (copies > extents[b] &&
+                const std::int32_t chain_ext = std::min(extents[b], mtp_confident_[b]);
+                const auto copies            = static_cast<std::int32_t>(ngram_proposal_[b].size());
+                if (copies > chain_ext &&
                     copy_beats_chain(
                         copies,
                         lanes_[lanes[b]].ngram_accept[static_cast<std::size_t>(ngram_proposal_bucket_[b])],
-                        batch == 1 ? kNgramWidthCost : kPairWidthCost, lanes_[lanes[b]].mtp_accept, extents[b],
+                        batch == 1 ? kNgramWidthCost : kPairWidthCost, lanes_[lanes[b]].mtp_accept, chain_ext,
                         batch == 1 ? width_cost() : kPairWidthCost)) {
-                    drafts_[b]              = ngram_proposal_[b];
-                    from_ngram_[b]          = true;
-                    ngram_bucket_[b]        = ngram_proposal_bucket_[b];
-                    extents[b]              = copies;
+                    drafts_[b]                = ngram_proposal_[b];
+                    from_ngram_[b]            = true;
+                    ngram_bucket_[b]          = ngram_proposal_bucket_[b];
+                    extents[b]                = copies;
                     ngram_proposal_[b].clear();
                     ngram_proposal_bucket_[b] = -1;
+                    continue;
+                }
+                drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
+                if (batch == 1) {
+                    extents[b] = chain_ext;
+                    drafts_[b].resize(static_cast<std::size_t>(extents[b]));
                 }
             }
             if (max_width_ > 1) {
@@ -5520,10 +5522,8 @@ private:
     // choose_pair_draft_length's choice as pair policy round `round` (1-based), without counting it.
     std::int32_t pair_draft_length_at(const Lane& a, const Lane& b, std::uint64_t round) const {
         if (!drafter_live(a) || !drafter_live(b)) { return 0; }
-        const std::int32_t pair_max =
-            (dflash2_ || options_.fast_paths.dense_routes == ops::LinearRoutes::Exact) ? kDFlashPairMaxDrafts
-                                                                                       : kPairMaxDrafts;
-        const std::int32_t most = std::min(pair_max, neural_k());
+        const std::int32_t pair_max = dflash2_ ? kDFlashPairMaxDrafts : kPairMaxDrafts;
+        const std::int32_t most     = std::min(pair_max, neural_k());
         if (!options_.auto_draft_length || dflash2_) { return most; }
         std::int32_t best = 0;
         double best_score = 2.0;
@@ -5552,7 +5552,7 @@ private:
             if (!lanes_[lanes[b]].mtp_live) { return 0; }
         }
         const std::int32_t most = std::min(kMultiRowMaxDrafts, mtp_k_);
-        if (!options_.auto_draft_length) { return most; }
+        if (!options_.auto_draft_length || most <= 0) { return std::max(0, most); }
         std::int32_t best         = 0;
         double best_score         = static_cast<double>(batch);
         double tokens             = static_cast<double>(batch);
@@ -5565,7 +5565,7 @@ private:
                 add += reach[b];
             }
             tokens += add;
-            const double score = tokens / (1.0 + kPairWidthCost * k);
+            const double score = tokens / (1.0 + kMultiRowWidthCost * k);
             if (score > best_score) {
                 best_score = score;
                 best       = k;
@@ -6730,7 +6730,8 @@ private:
     // costs of the pair's cost model are policy constants (INFERNIX_PAIR_WIDTH_COST 0.15 for the
     // pair width, INFERNIX_PAIR_DRAFT_COST below for one verified column of the round), each fitted
     // on this device; the draft cost replaced the 0.47 the 5090's cost model paid.
-    static inline const double kPairWidthCost       = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.15);
+    static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.25);
+    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.35);
     static inline const double kDFlashPairDraftCost =
         policy_double("INFERNIX_PAIR_DRAFT_COST", 0.30);
     static constexpr double kDFlashPairProposalCost  = 0.1;

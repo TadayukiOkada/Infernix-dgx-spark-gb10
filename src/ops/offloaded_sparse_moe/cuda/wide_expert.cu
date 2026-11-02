@@ -118,6 +118,91 @@ __global__ void __launch_bounds__(kQuantizeThreads)
     }
 }
 
+// One CTA per job: for each routed entry of the job's expert, its plane row (its dispatch index) and
+// the expert, indexed by the entry's token * top_k + slot.
+__global__ void __launch_bounds__(kQuantizeThreads)
+    map_entries_kernel(MoeDispatch dispatch, std::int32_t* __restrict__ map) {
+    const int job = static_cast<int>(blockIdx.x);
+    if (job >= *dispatch.job_count) { return; }
+    const int expert = dispatch.jobs[job];
+    const int end    = dispatch.offsets[expert + 1];
+    for (int p = dispatch.offsets[expert] + static_cast<int>(threadIdx.x); p < end; p += static_cast<int>(blockDim.x)) {
+        const int entry   = dispatch.entries[p];
+        map[2 * entry]     = p;
+        map[2 * entry + 1] = expert;
+    }
+}
+
+// quantize_kernel with the loops exchanged: a warp reads one token's x row once and writes its A4(x)
+// for each of the token's top_k entries that takes the wide route (each with its expert's gate/up input
+// scale), instead of every entry's warp reading the row again. Every code and scale is the entry-major
+// kernel's. Requires a dispatch without a shared job (entries == tokens * top_k).
+__global__ void __launch_bounds__(kQuantizeThreads, 3)
+    quantize_token_kernel(const std::uint16_t* __restrict__ x, int top_k, int tokens, MoeDispatch dispatch,
+                          const ExpertScales* __restrict__ scales, const std::int32_t* __restrict__ map,
+                          std::uint8_t* __restrict__ plane) {
+    static_assert(kGateUpBlocks % 32 == 0);
+    constexpr int kWarps     = kQuantizeThreads / 32;
+    constexpr int kPerLane   = kGateUpBlocks / 32;
+    const int lane           = static_cast<int>(threadIdx.x) & 31;
+    const int warp           = static_cast<int>(threadIdx.x) >> 5;
+    for (int t = static_cast<int>(blockIdx.x) * kWarps + warp; t < tokens; t += static_cast<int>(gridDim.x) * kWarps) {
+        const auto* token_x = x + static_cast<std::size_t>(t) * kHidden;
+        // One 16-element block per lane at a time keeps the registers low enough for three CTAs per SM
+        // (the row is read once from memory; its repeats for the other slots hit the L1).
+#pragma unroll 1
+        for (int m = 0; m < kPerLane; ++m) {
+            const int b        = m * 32 + lane;
+            const auto* source = reinterpret_cast<const uint4*>(token_x + 16 * b);
+            const uint4 v0 = source[0], v1 = source[1];
+            const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            const int position = plane_block(b);
+#pragma unroll 1
+            for (int slot = 0; slot < top_k; ++slot) {
+                const int entry  = t * top_k + slot;
+                const int p      = map[2 * entry];
+                const int expert = map[2 * entry + 1];
+                if (!wide_route(dispatch.offsets[expert + 1] - dispatch.offsets[expert], scales[expert])) { continue; }
+                // Rebuilt from the registers per slot so every index of v is static (no local memory).
+                std::uint16_t v[16];
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
+                    v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
+                }
+                // canon::quantize_a4_codes with its loops unrolled explicitly (the same operations in the same
+                // order), so the sixteen codes stay in registers inside this non-unrolled loop.
+                const float input_scale = scales[expert].input_gate;
+                float amax              = 0.0F;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const float a = canon::f32_from_bits(canon::f32_bits(canon::bf16_to_f32(v[j])) & 0x7FFFFFFFU);
+                    amax          = a > amax ? a : amax;
+                }
+                const std::uint8_t scale_word = canon::a4_scale_word(amax, input_scale);
+                unsigned code[16];
+#pragma unroll
+                for (int j = 0; j < 16; ++j) { code[j] = 0; }
+                if (canon::e4m3_scaled(scale_word) != 0) {
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        code[j] = canon::a4_code(canon::bf16_to_f32(v[j]), scale_word, input_scale);
+                    }
+                }
+                unsigned low = 0, high = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    low |= (code[j] | (code[4 + j] << 4)) << (8 * j);
+                    high |= (code[8 + j] | (code[12 + j] << 4)) << (8 * j);
+                }
+                std::uint8_t* const row = plane + static_cast<std::size_t>(p) * kXRowBytes;
+                *reinterpret_cast<uint2*>(row + 8 * position) = make_uint2(low, high);
+                row[kXCodeBytes + position]                   = scale_word;
+            }
+        }
+    }
+}
+
 Descriptors make_descriptors(const std::uint8_t* x_plane, const std::uint8_t* h_plane, int entries) {
     const auto rows = static_cast<std::uint64_t>(entries);
     auto* x = const_cast<std::uint8_t*>(x_plane);
@@ -198,7 +283,7 @@ namespace {
 // Byte offsets of the workspace's regions; `end` is its size.
 struct Offsets {
     std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
-    std::size_t h_blocks, x_plane, narrow_acts;         // W4A4
+    std::size_t h_blocks, x_plane, narrow_acts, entry_map; // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax, job_ctas; // W4A16
     std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
     std::size_t lossless;                              // kLossless
@@ -265,6 +350,7 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
+        o.entry_map = take(e * 2 * sizeof(std::int32_t));
         // A multi-column decode or verification call quantizes every entry's x column once per
         // input scale (its gate and up scales' A4 codes) instead of in every gate/up CTA of its
         // job; a one-column call's quantization overlaps its stage and stays inline.
@@ -662,6 +748,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
+        w.entry_map = reinterpret_cast<std::int32_t*>(p + o.entry_map);
         w.narrow_acts =
             o.narrow_acts != 0 ? reinterpret_cast<std::uint8_t*>(p + o.narrow_acts) : nullptr;
     }
@@ -768,9 +855,16 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         check_launch("encode x");
         return call;
     }
-    quantize_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
-        static_cast<const std::uint16_t*>(x.data), top_k, dispatch, source.scales, workspace.tiles,
-        workspace.pass_tiles, call.passes, workspace.x_plane);
+    if (entries == static_cast<int>(x.ne[1]) * top_k && workspace.entry_map != nullptr) {
+        map_entries_kernel<<<max_jobs, kQuantizeThreads, 0, stream>>>(dispatch, workspace.entry_map);
+        quantize_token_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
+            static_cast<const std::uint16_t*>(x.data), top_k, static_cast<int>(x.ne[1]), dispatch, source.scales,
+            workspace.entry_map, workspace.x_plane);
+    } else {
+        quantize_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
+            static_cast<const std::uint16_t*>(x.data), top_k, dispatch, source.scales, workspace.tiles,
+            workspace.pass_tiles, call.passes, workspace.x_plane);
+    }
     check_launch("quantize");
 #ifdef _WIN32
     const Descriptors descriptors = make_descriptors(workspace.x_plane, call.h_plane, entries);

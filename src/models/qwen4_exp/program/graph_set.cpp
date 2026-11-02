@@ -87,14 +87,15 @@ void ProgramImpl::capture_graph_set() {
     std::vector<std::pair<std::int32_t, std::int32_t>> verified;
     if (max_width_ > 1) {
         verified.emplace_back(1, max_width_);
-        const std::int32_t pair_max =
-            (dflash2_ || options_.fast_paths.dense_routes == ops::LinearRoutes::Exact) ? kDFlashPairMaxDrafts
-                                                                                       : kPairMaxDrafts;
+        const std::int32_t pair_max   = dflash2_ ? kDFlashPairMaxDrafts : kPairMaxDrafts;
         const std::int32_t pair_width = 1 + std::min(pair_max, neural_k());
-        if (options_.pair_speculation && pair_width > 1) {
+        if (options_.pair_speculation) {
             for (std::int32_t rows = 2; rows <= lanes; ++rows) {
                 if (rows == 2 ? (mtp_ || dflash2_) : (dflash2_ && rows <= dflash2_rows_)) {
-                    verified.emplace_back(rows, pair_width);
+                    if (pair_width > 1) { verified.emplace_back(rows, pair_width); }
+                } else if (mtp_ && rows >= 3 && kMultiRowDrafts > 0.5) {
+                    const std::int32_t multi_width = 1 + std::min(kMultiRowMaxDrafts, neural_k());
+                    if (multi_width > 1) { verified.emplace_back(rows, multi_width); }
                 }
             }
         }
@@ -143,7 +144,8 @@ void ProgramImpl::capture_graph_set() {
         for (const auto& shape : verified) {
             const std::int32_t batch = shape.first;
             if (mtp_) {
-                const std::int32_t longest = batch == 1 ? mtp_k_ : std::min(kPairMaxDrafts, mtp_k_);
+                const std::int32_t longest =
+                    batch == 1 ? mtp_k_ : std::min(batch == 2 ? kPairMaxDrafts : kMultiRowMaxDrafts, mtp_k_);
                 for (std::int32_t steps = 1; steps <= longest; ++steps) {
                     for (const bool sampled : {false, true}) {
                         if (sampled && !sampled_drafts_) { continue; }

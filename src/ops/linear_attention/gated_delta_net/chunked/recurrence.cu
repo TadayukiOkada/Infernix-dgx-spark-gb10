@@ -510,26 +510,16 @@ void dispatch(const Arguments& args, const QkChunk* qk, const ControlChunk* cont
 } // namespace
 
 int value_tile(int value_heads, int multiprocessor_count) {
-    // Small grids need the narrowest stripe. Otherwise use fixed relative tile costs
-    // to weight the SM-wave count (verified on GB10 sm_121a, 48 SMs: picks tile=32 at Hv=32
-    // where tile=64 underfills wave 2, and tile=64 at Hv=48/64 where full waves avoid 2x packet reads).
-    // Wider stripes reduce replicated packet reads but retain more state per CTA.
+    // Small grids need the narrowest stripe. Otherwise the launch is value_heads * (kStateDim / tile)
+    // CTAs and the widest stripe that still fills two SM waves wins: wider stripes quarter the
+    // per-chunk Qk/Control packet re-reads each slice pays (measured on GB10 sm_121a, 48 SMs,
+    // Hv=48: tile 64 is 13-19% faster than tile 16 at T=512..8192; tile 32 fills wave 2 at Hv=32
+    // where tile 64 underfills it).
     if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
-    int best               = 64;
-    double best_efficiency = 0.0;
-    for (int tile : {64, 32, 16}) {
-        const int blocks = (value_heads + tile - 1) / tile;
-        const double waves =
-            static_cast<double>(blocks) / static_cast<double>(multiprocessor_count);
-        const double efficiency = waves / std::ceil(waves);
-        constexpr double kTileRelativeCost[] = {1.0, 1.0, 1.0, 1.0, 1.0};
-        const double score = efficiency / kTileRelativeCost[tile / 16];
-        if (score > best_efficiency) {
-            best_efficiency = score;
-            best            = tile;
-        }
+    for (const int tile : {64, 32}) {
+        if (static_cast<std::int64_t>(value_heads) * (kStateDim / tile) >= 2 * multiprocessor_count) return tile;
     }
-    return best;
+    return 16;
 }
 
 void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,

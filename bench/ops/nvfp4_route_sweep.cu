@@ -464,6 +464,20 @@ const A4RouteCandidate kA4Candidates[] = {
     {"a4_pair_r64_s3_m1",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 64>>, 32, 0, true},
     {"a4_pair_r64_s2_m2",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 2, 2, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 64>>, 32, 0, true},
     {"a4_pair_r64_s4_m1",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 64>>, 32, 0, true},
+    // GB10 2026-11-02 (T7 ext): the 2-term pair route is also the live prefill GEMM (split fused
+    // launchers at T >= 65, public pair gate 33/65), where only the WeightCodeL2 panel has ever
+    // been measured. The promotion variants are cache hints (bits unchanged), so a prefill win is
+    // adoptable under the same rule the 1-term ladder follows.
+    {"a4_pair_r128_s3_m1_ws",  launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightL2_128B, kNvfp4A4ResidualTerms, 128>>, 32, 0, true},
+    {"a4_pair_r128_s3_m1_all", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaL2_128B, kNvfp4A4ResidualTerms, 128>>, 32, 0, true},
+    {"a4_pair_r128_s3_m1_none", launch_a4_tma_cand<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaNoPromotions, kNvfp4A4ResidualTerms, 128>>, 32, 0, true},
+    // The exact instance the model runs (baked K, WeightCodeL2): the pair route's launchers bake K
+    // (launch_residual<K> / the split fused launchers' Nvfp4ScheduleInstance), while every other
+    // pair candidate above reads K from the operands. The 1-term ladder showed baked K costs the
+    // wide-token bands; this arm measures whether the 2-term GEMM pays the same. A mismatch with
+    // --k throws in validate_nvfp4_operands and skips.
+    {"a4_pair_r128_s3_m1_baked2560", launch_a4_tma_cand<Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 128>, 2560>>, 32, 0, true},
+    {"a4_pair_r128_s3_m1_baked6144", launch_a4_tma_cand<Nvfp4ScheduleInstance<Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, kNvfp4A4ResidualTerms, 128>, 6144>>, 32, 0, true},
 };
 
 std::vector<int> parse_tokens(const std::string& spec) {

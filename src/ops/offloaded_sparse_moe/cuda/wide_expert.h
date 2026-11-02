@@ -248,6 +248,9 @@ struct ExpertsWorkspace {
     // column quantized to A4 codes once per call, once per input scale (gate, then up), which the
     // narrow gate/up kernels read instead of re-quantizing the column in all of the job's CTAs.
     std::uint8_t* narrow_acts;
+    // W4A4: [entries][2] (plane row, expert) of each routed entry t * top_k + slot, so the wide route's
+    // x quantization can walk tokens once instead of reading a token's row once per routed entry.
+    std::int32_t* entry_map;
 };
 
 // Bytes of one pre-quantized activation block (moe_layer.cu's ActCodes: four doubled-code words
