@@ -168,12 +168,14 @@ export INFERNIX_EXPERTS_ON_GPU=1
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency volume \
-    --kv-dtype fp8 \
+    --kv-dtype int8 \
     --spec mtp \
     --draft-tokens auto \
+    --temperature 1.0 \
+    --top-p 0.9 \
+    --min-p 0.1 \
+    --top-k 20 \
     --lm-head-draft \
-    --ngram-draft-tokens 31 \
-    --ngram-min-match 4 \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --host "${HOST}" \
