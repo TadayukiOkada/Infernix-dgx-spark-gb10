@@ -33,12 +33,12 @@ for arg in "$@"; do
 done
 if [ "$FULL" = 1 ]; then
     DEFAULT_KV='bf16 int8 fp8 nvfp4 k8v4 vq2 k4v2'
-    DEFAULT_MODES='plain mtp'
-    DEFAULT_MODELS='iq3s dense8 nvfp4'
-else
-    DEFAULT_KV='fp8'
     DEFAULT_MODES='mtp'
-    DEFAULT_MODELS='iq3s dense8 nvfp4'
+    DEFAULT_MODELS='nvfp4'
+else
+    DEFAULT_KV='int8'
+    DEFAULT_MODES='mtp'
+    DEFAULT_MODELS='nvfp4'
 fi
 KV_DTYPES="${KV_DTYPES:-$DEFAULT_KV}"
 MODES="${MODES:-$DEFAULT_MODES}"
@@ -71,7 +71,7 @@ run() { # run <model-tag> <weights> <ngram> <residency> <kv> <mode>
     INFERNIX_EXPERTS_ON_GPU=1 "$BENCH" \
         --weights "$weights" --ngram-volume "$ngram" --ngram-residency "$residency" \
         --corpus bench/fixtures/bench_corpus.ids \
-        -p 4096 -n 128,256 -pg '4096,128;4096,256' \
+        -p 8192 -n 512 -pg '8192,512' \
         -r 2 --warmup 1 --concurrency 1 \
         --kv-dtype "$kv" "${spec[@]}" \
         -o json --output-file "$OUT/m_${name}.json" > "$OUT/m_${name}.log" 2>&1
