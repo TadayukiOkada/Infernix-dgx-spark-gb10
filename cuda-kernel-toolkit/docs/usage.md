@@ -333,3 +333,31 @@ PYTHONPATH=cuda-kernel-toolkit /opt/etc/Infernix/.venv-convert/bin/python3 -m ck
     --results results/autotune_nvfp4_n128_k2560.json \
     -o results/autotune_nvfp4_n128_k2560.md
 ```
+
+---
+
+## Step 9: In-Process Kernel Tuner Qualification (`ckt kt`)
+
+Sweeps the *template space of a production kernel* with [Kernel Tuner](https://kerneltuner.github.io/kernel_tuner/)
+(NVRTC + driver API, no product rebuild) and verifies every candidate against a float64 decode of the stored NVFP4
+operands. Requires `kernel_tuner` in `.venv-convert`.
+
+```bash
+PYTHONPATH=cuda-kernel-toolkit .venv-convert/bin/python3 -m ckt kt list
+PYTHONPATH=cuda-kernel-toolkit .venv-convert/bin/python3 -m ckt kt doctor     # shim still mirrors src/?
+PYTHONPATH=cuda-kernel-toolkit .venv-convert/bin/python3 -m ckt kt tune nvfp4_a16_mma \
+    --n 2560 --k 2560 --tokens 1024 --baseline 64,128,64,64,16,2,2 --md profiles/kt/out.md
+# decode: nvfp4_a16_sliced_k --baseline KW,TT,ROWTILES,STAGES,MINB ; --wide adds cache hints/staging modes;
+# --strategy genetic_algorithm --max-fevals 300 for budgeted search; --compiler nvcc for product SASS.
+```
+
+What to know before trusting a row:
+- **Timing protocol.** KT's default loop (sync, record, launch) adds ~7 us of host launch latency to a ~20 us kernel.
+  The bridge queues the cold-L2 flush *ahead of* the start event instead (the `bench::measure_cold_launch` order);
+  with it the harness reproduced `infernix_linear_bench` (20.27 vs 20.29 us, [2048,2560] T=24).
+- **Always pass `--baseline`**, and keep the GPU otherwise idle; re-time any claimed win with a repeat run.
+- **Not modelled:** PDL overlap inside the decode graph, eager vs graph launch gaps, the A4/TMA routes.
+- NVRTC compiles PTX that the driver JIT-assembles (`--compiler nvcc` gives the product's SASS; register counts differ,
+  timing matched in the one case checked). `ckt/kt/shim/` replaces only host-only headers; `ckt kt doctor` guards drift.
+- A sweep ranks schedules; it does not change the product. Moving a winner into `shapes/*.cu` needs the normal
+  `ckt shapes bench` / test gates, and a reproducible-route bit check where the reduction order could change.

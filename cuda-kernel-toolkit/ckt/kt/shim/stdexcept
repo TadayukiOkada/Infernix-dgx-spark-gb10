@@ -1,0 +1,9 @@
+#pragma once
+namespace std {
+struct invalid_argument { explicit invalid_argument(const char*) {} };
+struct runtime_error { explicit runtime_error(const char*) {} };
+} // namespace std
+// The repo headers' host helpers `throw`; under -default-device they are compiled as device code,
+// where exceptions do not exist.  They are never called from a kernel, so make `throw X;` an
+// expression statement.
+#define throw (void)

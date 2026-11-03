@@ -54,6 +54,7 @@ from .reporting import environment_section, report_from_analysis
 from .shapes import benchmark_shape, discover_shapes, parse_shape_file
 from .source_discovery import build_inventory, discover_kernels
 from .autotune.cli import register_autotune_subparsers
+from .kt.cli import register_kt_subparsers
 from .util import LOG, ToolError, read_json, setup_logging, write_json
 
 DEFAULT_CACHE = ".ckt_cache"
@@ -2230,6 +2231,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---- ckt autotune: offline benchmark-driven CUDA autotuning ---------- #
     register_autotune_subparsers(sub, _add_common)
+
+    # ---- ckt kt: in-process Kernel Tuner qualification of product kernels - #
+    register_kt_subparsers(sub, _add_common)
 
     return p
 
