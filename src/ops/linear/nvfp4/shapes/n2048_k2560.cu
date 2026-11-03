@@ -63,7 +63,11 @@ using T32R128           = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 257) return nvfp4_a4_tma_route<>();
+    // GB10 2026-11-03: the prefill token tile is now picked per width by the 48-SM wave-fill rule
+    // (nvfp4_a4_tma_prefill_route). Measured on this shape: T = 257-384, 832-1152 and 1568-1920 run
+    // 2.6-18.0% ahead on the 128-token tile (mean 7.7%), and every width the rule declines measures
+    // 1.0-7.5% behind on that tile.
+    if (tokens >= 257) return nvfp4_a4_tma_prefill_route<Geometry>(tokens);
     if (tokens >= 129) return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
     if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();

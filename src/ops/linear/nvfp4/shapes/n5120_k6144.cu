@@ -48,7 +48,11 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 257) return nvfp4_a4_tma_route<>();
+    // GB10 2026-11-03: the prefill token tile is now picked per width by the 48-SM wave-fill rule
+    // (nvfp4_a4_tma_prefill_route). Measured here: T = 257-384 and 640-896 run 4.8-12.8% ahead on
+    // the 128-token tile (mean 6.5%); from 960 up the 17.3 MB weight re-read costs more than the
+    // wave saves, up to 13.9% behind at 1536.
+    if (tokens >= 257) return nvfp4_a4_tma_prefill_route<Geometry>(tokens);
     if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R128>();

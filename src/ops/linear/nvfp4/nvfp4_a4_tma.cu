@@ -42,6 +42,28 @@ void launch_nvfp4_a4_tma_linear(const Nvfp4A4Operands& p, __nv_bfloat16* output,
     throw std::invalid_argument("NVFP4 TMA linear: unsupported geometry");
 }
 
+// The 1-term prefill GEMM on a 128-token tile instead of the 256-token one: the same 128-row weight
+// panel and the same K order, with 4 stages to keep the producer ahead at 1 CTA/SM. Halving the
+// token tile doubles the grid, which pays exactly where the 256-token grid leaves a short last wave
+// across the 48 SMs or pads its last token tile -- see nvfp4_a4_prefer_narrow_token_tile, which
+// decides per shape and width. The route that reaches this entry always carries the Tiled128 scale
+// layout, which is what selects the 128-token schedule in `launch`.
+void launch_nvfp4_a4_tma_linear_narrow(const Nvfp4A4Operands& p, __nv_bfloat16* output,
+                                       cudaStream_t stream) {
+    switch (p.k) {
+    case 2560:
+        launch<2560, 128, 4>(p, output, stream);
+        return;
+    case 6144:
+        launch<6144, 128, 4>(p, output, stream);
+        return;
+    case 17408:
+        launch<17408, 128, 4>(p, output, stream);
+        return;
+    }
+    throw std::invalid_argument("NVFP4 narrow-token TMA linear: unsupported geometry");
+}
+
 namespace {
 template <int K, Nvfp4A4TmaPromotions Promotions = kNvfp4A4TmaWeightCodeL2_128B>
 void launch_residual(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream) {

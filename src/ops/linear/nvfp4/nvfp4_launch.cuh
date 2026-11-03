@@ -89,6 +89,54 @@ constexpr Nvfp4A4Route nvfp4_a4_tma_route() {
     return {nvfp4_linear_a4_tma<Layout>, Layout, false};
 }
 
+template <Nvfp4ScaleLayout Layout>
+void nvfp4_linear_a4_tma_narrow(const Weight& weight, Tensor& out, Nvfp4A4Workspace scratch,
+                                int tokens, cudaStream_t stream) {
+    launch_nvfp4_a4_tma_linear_narrow(nvfp4_a4_operands(weight, scratch, tokens, Layout),
+                                      static_cast<__nv_bfloat16*>(out.data), stream);
+}
+
+constexpr Nvfp4A4Route nvfp4_a4_tma_narrow_route() {
+    return {nvfp4_linear_a4_tma_narrow<Nvfp4ScaleLayout::Tiled128>, Nvfp4ScaleLayout::Tiled128,
+            false};
+}
+
+// Which 1-term A4 prefill token tile to run, on the 48 SMs of GB10 (both tiles hold one CTA/SM).
+// A 256-token tile packs twice the work of a 128-token tile into one CTA, so it wins while the grid
+// fills whole waves; when ceil(rows/128) * ceil(T/256) leaves a short last wave, or the last token
+// tile is only partly real, the 128-token tile fills the machine better. Wave fill alone is not
+// enough: halving the token tile doubles how many times each weight panel is streamed, so the win
+// stops once that extra traffic exceeds what the 24 MiB L2 absorbs. Measured on GB10 over 161
+// shape/width points (bench/ops/nvfp4_route_sweep.cu, cold 48 MiB L2, 15 repeats): the two
+// conditions below pick the faster tile at 19 of 20 held-out points, average 6.5% ahead across the
+// widths they select (worst +1.0%), and the widths they decline are up to 40% behind.
+constexpr bool nvfp4_a4_prefer_narrow_token_tile(std::int32_t rows, std::int32_t k,
+                                                 std::int32_t tokens) {
+    constexpr std::int32_t kWaveCtas = 48;
+    const std::int32_t row_tiles    = rows / 128;
+    const std::int32_t wide_tiles   = (tokens + 255) / 256;
+    const std::int32_t narrow_tiles = (tokens + 127) / 128;
+    // Whole waves times the token work one CTA owns, in units of one 128-token tile.
+    const std::int64_t wide_cost =
+        ((static_cast<std::int64_t>(row_tiles) * wide_tiles + kWaveCtas - 1) / kWaveCtas) * 2;
+    const std::int64_t narrow_cost =
+        (static_cast<std::int64_t>(row_tiles) * narrow_tiles + kWaveCtas - 1) / kWaveCtas;
+    if (narrow_cost * 8 > 7 * wide_cost) return false;
+    // Weight bytes = codes (k/2) + scales (k/16) per row. The narrow grid re-reads them
+    // (narrow_tiles - wide_tiles) panel-times more; the measured boundary sits between 51 MiB,
+    // where the tile is still 5% ahead, and 66 MiB, where it is 8% behind.
+    const std::int64_t weight_bytes = static_cast<std::int64_t>(rows) * k * 9 / 16;
+    return weight_bytes * (narrow_tiles - wide_tiles) <= (52LL << 20);
+}
+
+// The 1-term TMA prefill route for a shape, with the token tile chosen by that rule.
+template <class Geometry>
+constexpr Nvfp4A4Route nvfp4_a4_tma_prefill_route(std::int32_t tokens) {
+    return nvfp4_a4_prefer_narrow_token_tile(Geometry::kOutputRows, Geometry::kInputRows, tokens)
+               ? nvfp4_a4_tma_narrow_route()
+               : nvfp4_a4_tma_route<>();
+}
+
 template <class Geometry, class Schedule>
 constexpr Nvfp4A4Route nvfp4_a4_mma_route() {
     return {nvfp4_linear_a4_mma<Geometry, Schedule>, Nvfp4ScaleLayout::RowMajor, true};

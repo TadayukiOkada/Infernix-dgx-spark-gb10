@@ -5,6 +5,15 @@ namespace infernix::ops::detail {
 void launch_nvfp4_a4_tma_linear(const Nvfp4A4Operands& p, __nv_bfloat16* output,
                                 cudaStream_t stream);
 
+// The 1-term TMA GEMM on a 128-token tile rather than the 256-token prefill tile, for the prefill
+// widths whose 256-token grid leaves a short last wave across the 48 SMs or pads its last token tile
+// (nvfp4_a4_prefer_narrow_token_tile picks them). Measured 2026-11-03 over 161 shape/width points:
+// 2 to 18% ahead where the rule fires, 1 to 40% behind where it does not -- halving the token tile
+// doubles the weight traffic each token tile re-reads, and that cost grows with the weight matrix.
+// Registered for the K whose shapes were measured; K = 5120 was not.
+void launch_nvfp4_a4_tma_linear_narrow(const Nvfp4A4Operands& p, __nv_bfloat16* output,
+                                       cudaStream_t stream);
+
 void launch_nvfp4_a4_residual_tma_linear(const Nvfp4A4Operands& p, __nv_bfloat16* output,
                                          cudaStream_t stream);
 
