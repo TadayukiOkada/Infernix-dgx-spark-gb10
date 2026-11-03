@@ -28,6 +28,8 @@ versioned source of each repository's model card.
 ## Repository-local guides
 
 - [Benchmarks](../bench/README.md)
+- [Linear kernel tables](performance/kernels/): measured `TFLOP/s` and effective `GB/s` for the
+  schedule each Linear `/shapes/` dispatch selects at every token count, one file per family.
 - [GB10 optimization roadmap](gb10_roadmap.md): measured GB10 (`sm_121a`) hardware profile, the
   completed Phase 1 kernel, schedule and build-pipeline work, and the remaining Phase 2
   verification and retuning queue.

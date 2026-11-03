@@ -489,6 +489,11 @@ the practical utilization measure for read-dominated points, and on GB10 `DRAM_%
 now differ only by the spec-vs-measured denominator (273 vs 246). Physical traffic and instruction
 utilization still require NCU.
 
+Recorded results for every registered `/shapes/` problem are published per family in the
+[Linear kernel tables](../docs/performance/kernels/): one row per token count with the schedule the
+dispatch table selects at that count and its `TFLOP/s` and effective `GB/s`, measured with this
+benchmark's default `exact` route set.
+
 ## GGUF projection and expert 8-bit wide routes
 
 `infernix_ggml_linear_bench` times one public `ops::ggml_linear` call per point (all of a shape's segments, BF16

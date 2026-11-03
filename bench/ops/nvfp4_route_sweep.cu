@@ -383,6 +383,52 @@ void launch_a4_tma_repeats(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A
 
 using A4PrefillSchedule = Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCodeL2_128B, 1, 128>;
 
+// Pipelines the quantizer and the GEMM across token chunks on a second stream: the quantize of
+// chunk c+1 overlaps the GEMM of chunk c. Chunks start on 128-token boundaries, which keeps the
+// tiled scale layout tile-aligned and the chunk workspaces disjoint; each chunk's GEMM waits on its
+// own quantize event on the consuming stream. Measured on 2026-11-02 and rejected: the pair is
+// slower than the back-to-back production launches (+20.5% at [5120,17408] T=1024, +24.0% at
+// [16384,2560] T=1024, +6.4% at T=2048; 4 chunks up to +93%), because both kernels are
+// bandwidth-hungry and each chunk's GEMM fits the 48-SM wave worse.
+template <class Schedule, int Chunks>
+void launch_a4_chunked_overlap(const Tensor& x, const Weight& w, Tensor& out, Nvfp4A4Workspace ws,
+                               cudaStream_t stream) {
+    static cudaStream_t side             = nullptr;
+    static cudaEvent_t quantized[Chunks] = {};
+    static bool initialized              = false;
+    if (!initialized) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+        for (int i = 0; i < Chunks; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&quantized[i], cudaEventDisableTiming));
+        }
+        initialized = true;
+    }
+    const int tokens = x.ne[1];
+    const int chunk  = (((tokens + Chunks - 1) / Chunks) + 127) & ~127;
+    auto* x_base     = static_cast<__nv_bfloat16*>(x.data);
+    auto* out_base   = static_cast<__nv_bfloat16*>(out.data);
+    for (int c = 0; c < Chunks; ++c) {
+        const int begin = c * chunk;
+        const int count = std::min(chunk, tokens - begin);
+        if (count <= 0) break;
+        Nvfp4A4Workspace slice  = ws;
+        slice.codes             = ws.codes + static_cast<std::size_t>(begin) * (w.k / 2);
+        slice.scales            = ws.scales + static_cast<std::size_t>(begin) * (w.k / 16);
+        slice.scale_bytes       = static_cast<std::size_t>(count + 128) * (w.k / 16);
+        const Tensor activations =
+            Tensor(x_base + static_cast<std::int64_t>(begin) * w.k, DType::BF16, {w.k, count});
+        const cudaStream_t quantize_stream = c == 0 ? stream : side;
+        launch_nvfp4_a4_quantize(activations, w, slice, Schedule::kScaleLayout, quantize_stream,
+                                 false);
+        CUDA_CHECK(cudaEventRecord(quantized[c], quantize_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, quantized[c], 0));
+        launch_nvfp4_a4_tma_mma<Schedule>(
+            nvfp4_a4_operands(w, slice, count, Schedule::kScaleLayout),
+            LinearBf16Output{out_base + static_cast<std::int64_t>(begin) * w.n, w.n},
+            LinearIdentityEpilogue{}, stream);
+    }
+}
+
 const A4RouteCandidate kA4Candidates[] = {
     {"production", launch_a4_production, 1, 0},
 
@@ -457,6 +503,17 @@ const A4RouteCandidate kA4Candidates[] = {
     {"a4_split_1q1g",            launch_a4_tma_repeats<A4PrefillSchedule, 1, 1>, 128, 0},
     {"a4_split_2q1g",            launch_a4_tma_repeats<A4PrefillSchedule, 2, 1>, 128, 0},
     {"a4_split_1q2g",            launch_a4_tma_repeats<A4PrefillSchedule, 1, 2>, 128, 0},
+
+    // Eager prefill serializes the quantizer and the GEMM on one stream, so these arms pipeline them
+    // across token chunks on a second stream: chunk c+1's quantize overlaps chunk c's GEMM. Chunks
+    // are whole 128-token plane tiles, so the tiled scale layout stays tile-aligned and the chunks
+    // touch disjoint workspace. GB10 2026-11-02: this loses everywhere it was measured - +20.5% at
+    // [5120,17408] T=1024, +24.0% at [16384,2560] T=1024, +6.4% at T=2048 (c4 is worse again). The
+    // two kernels are both bandwidth-hungry, so overlap buys contention rather than idle recovery,
+    // and each chunk's GEMM fits the 48-SM wave worse. Kept as the arm that shows it; no production
+    // route owns a second stream.
+    {"a4_over_c2", launch_a4_chunked_overlap<A4PrefillSchedule, 2>, 256, 0},
+    {"a4_over_c4", launch_a4_chunked_overlap<A4PrefillSchedule, 4>, 512, 0},
 
     // GB10 2026-11-01 (T2): the 2-term residual TMA GEMM at an explicit weight-panel height, so the
     // pair route's wave fit on 48 SMs is measured rather than inherited from the ctas_128 gate.
