@@ -569,13 +569,15 @@ void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaS
         return true;
     }();
     (void)configured;
-    const int dynamic = detail::nvfp4_prepare_shared<bytes, kernel, true>();
+    const int dynamic        = detail::nvfp4_prepare_shared<bytes, kernel, true>();
+    constexpr int kRowBlocks = MatrixShape<M, G>::kRowGroups / S::kRowGroups;
+    const int ctas           = call.mean_job_columns <= 1 ? std::min(persistent_ctas(), 2 * kRowBlocks) : persistent_ctas();
 #ifdef _WIN32
-    kernel<<<persistent_ctas(), S::kThreads, dynamic, stream>>>(static_cast<const Descriptors*>(call.descriptors),
-                                                                 call, pass, epilogue);
+    kernel<<<ctas, S::kThreads, dynamic, stream>>>(static_cast<const Descriptors*>(call.descriptors),
+                                                   call, pass, epilogue);
 #else
-    kernel<<<persistent_ctas(), S::kThreads, dynamic, stream>>>(*static_cast<const Descriptors*>(call.descriptors),
-                                                                 call, pass, epilogue);
+    kernel<<<ctas, S::kThreads, dynamic, stream>>>(*static_cast<const Descriptors*>(call.descriptors),
+                                                   call, pass, epilogue);
 #endif
     CUDA_CHECK(cudaGetLastError());
 }

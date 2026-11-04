@@ -346,7 +346,7 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
             }
             read_offsets = scattered_offsets_.data();
         }
-        const std::size_t active_threads = std::min<std::size_t>(kReadThreads, std::max<std::size_t>(2, blocks / 4));
+        const std::size_t active_threads = std::min<std::size_t>(kReadThreads, std::max<std::size_t>(2, blocks / 2));
         pool_->run(active_threads, [&](std::size_t t, std::size_t n_threads) {
             const std::size_t lo = blocks * t / n_threads, hi = blocks * (t + 1) / n_threads;
             file_.read_direct_blocks(

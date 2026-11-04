@@ -878,7 +878,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 // columns, value channel i mod 16 of its state tile at every eighth column from i / 16, and the last warp one
 // column's gates per lane; the recurrence then runs from shared memory as recurrent_record_kernel's.
 template <bool ADirect, class State>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 5)
     recurrent_record_conv_kernel(const __grid_constant__ RecordConvAccess<State> access) {
     __shared__ __align__(16) RecordConvShared shared;
     const RecordAccess<false, State>& record = access.record;
@@ -898,32 +898,23 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         access.conv_states + static_cast<std::int64_t>(record.initial_slots[coord.batch]) * 3 * C;
     const ConvChannel qch = load_conv_channel(access.conv_weight, history, C, qc);
     const ConvChannel kch = load_conv_channel(access.conv_weight, history, C, kc);
-    const ConvChannel vch = load_conv_channel(access.conv_weight, history, C, vc);
     pdl::enter_streaming();
 
     const __nv_bfloat16* x = access.qkv + static_cast<std::int64_t>(coord.batch) * width * C;
-    __nv_bfloat16 xq[kRecordConvMaxWidth], xk[kRecordConvMaxWidth];
-#pragma unroll
-    for (int t = 0; t < kRecordConvMaxWidth; ++t) {
-        if (t < width) {
-            xq[t] = x[t * C + qc];
-            xk[t] = x[t * C + kc];
-        }
-    }
     __nv_bfloat16 q0 = qch.s0, q1 = qch.s1, q2 = qch.s2, k0 = kch.s0, k1 = kch.s1, k2 = kch.s2;
-#pragma unroll
-    for (int t = 0; t < kRecordConvMaxWidth; ++t) {
-        if (t < width) {
-            shared.query[t][thread] = conv_column(qch, q0, q1, q2, xq[t]);
-            shared.key[t][thread]   = conv_column(kch, k0, k1, k2, xk[t]);
-            q0 = q1;
-            q1 = q2;
-            q2 = xq[t];
-            k0 = k1;
-            k1 = k2;
-            k2 = xk[t];
-        }
+    for (std::int32_t t = 0; t < width; ++t) {
+        const __nv_bfloat16 xq  = x[t * C + qc];
+        const __nv_bfloat16 xk  = x[t * C + kc];
+        shared.query[t][thread] = conv_column(qch, q0, q1, q2, xq);
+        shared.key[t][thread]   = conv_column(kch, k0, k1, k2, xk);
+        q0 = q1;
+        q1 = q2;
+        q2 = xq;
+        k0 = k1;
+        k1 = k2;
+        k2 = xk;
     }
+    const ConvChannel vch = load_conv_channel(access.conv_weight, history, C, vc);
     for (std::int32_t column = thread / kBlockDv; column < width; column += kStateDim / kBlockDv) {
         __nv_bfloat16 in[4];
 #pragma unroll
@@ -1152,7 +1143,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
 }
 
 template <class Geometry, class State>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);

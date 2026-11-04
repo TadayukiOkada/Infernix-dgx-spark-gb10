@@ -40,7 +40,7 @@ __device__ __forceinline__ void decode8(uint2 code, float scale, float (&w)[8]) 
 }
 
 template <int kPassCols, bool kExactSinglePass>
-__global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kernel(
+__global__ __launch_bounds__(kWarps * 32, 4) void q8_linear_swiglu_stream_pair_kernel(
     const bf16* __restrict__ x, const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     int m_rows, int padded_k, int columns, bf16* __restrict__ out) {
     const int lane = static_cast<int>(threadIdx.x) & 31, warp = static_cast<int>(threadIdx.x) >> 5;
@@ -69,82 +69,40 @@ __global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kern
     }
     pdl::wait_for_dependencies();
 
-    if constexpr (kExactSinglePass) {
-        float gate[kPassCols], up[kPassCols];
+    float gate[kPassCols], up[kPassCols];
+#pragma unroll
+    for (int c = 0; c < kPassCols; ++c) {
+        gate[c] = 0.0F;
+        up[c]   = 0.0F;
+    }
+#pragma unroll
+    for (int m = 0; m < kChunks; ++m) {
+        const int kk          = m * 256 + lane * 8;
+        const unsigned g_bits = (scale_bits[0][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
+        const unsigned u_bits = (scale_bits[1][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
+        float wg[8], wu[8];
+        decode8(code[0][m], __half2float(__ushort_as_half(static_cast<unsigned short>(g_bits))), wg);
+        decode8(code[1][m], __half2float(__ushort_as_half(static_cast<unsigned short>(u_bits))), wu);
 #pragma unroll
         for (int c = 0; c < kPassCols; ++c) {
-            gate[c] = 0.0F;
-            up[c]   = 0.0F;
-        }
+            const uint4 values = load_ldg<uint4>(x + static_cast<std::int64_t>(c) * kK + kk);
+            const float2 x0 = bf16x2_bits_to_float2(values.x), x1 = bf16x2_bits_to_float2(values.y);
+            const float2 x2 = bf16x2_bits_to_float2(values.z), x3 = bf16x2_bits_to_float2(values.w);
+            const float xv[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
 #pragma unroll
-        for (int m = 0; m < kChunks; ++m) {
-            const int kk          = m * 256 + lane * 8;
-            const unsigned g_bits = (scale_bits[0][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
-            const unsigned u_bits = (scale_bits[1][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
-            float wg[8], wu[8];
-            decode8(code[0][m], __half2float(__ushort_as_half(static_cast<unsigned short>(g_bits))), wg);
-            decode8(code[1][m], __half2float(__ushort_as_half(static_cast<unsigned short>(u_bits))), wu);
-#pragma unroll
-            for (int c = 0; c < kPassCols; ++c) {
-                const uint4 values = load_ldg<uint4>(x + static_cast<std::int64_t>(c) * kK + kk);
-                const float2 x0 = bf16x2_bits_to_float2(values.x), x1 = bf16x2_bits_to_float2(values.y);
-                const float2 x2 = bf16x2_bits_to_float2(values.z), x3 = bf16x2_bits_to_float2(values.w);
-                const float xv[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    gate[c] = fmaf(wg[j], xv[j], gate[c]);
-                    up[c]   = fmaf(wu[j], xv[j], up[c]);
-                }
+            for (int j = 0; j < 8; ++j) {
+                gate[c] = fmaf(wg[j], xv[j], gate[c]);
+                up[c]   = fmaf(wu[j], xv[j], up[c]);
             }
         }
+    }
 #pragma unroll
-        for (int c = 0; c < kPassCols; ++c) {
-            const float g = warp_sum(gate[c]);
-            const float u = warp_sum(up[c]);
-            if (lane == 0) {
-                out[static_cast<std::int64_t>(c) * m_rows + i] = __float2bfloat16_rn(g / (1.0F + expf(-g)) * u);
-            }
-        }
-    } else {
-        float gate[kPassCols], up[kPassCols];
-#pragma unroll
-        for (int c = 0; c < kPassCols; ++c) {
-            gate[c] = 0.0F;
-            up[c]   = 0.0F;
-        }
-#pragma unroll
-        for (int m = 0; m < kChunks; ++m) {
-            const int kk          = m * 256 + lane * 8;
-            const unsigned g_bits = (scale_bits[0][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
-            const unsigned u_bits = (scale_bits[1][m / 2] >> ((m % 2) * 16)) & 0xFFFFU;
-            float wg[8], wu[8];
-            decode8(code[0][m], __half2float(__ushort_as_half(static_cast<unsigned short>(g_bits))), wg);
-            decode8(code[1][m], __half2float(__ushort_as_half(static_cast<unsigned short>(u_bits))), wu);
-#pragma unroll
-            for (int c = 0; c < kPassCols; ++c) {
-                if (c < columns) {
-                    const uint4 values = load_ldg<uint4>(x + static_cast<std::int64_t>(c) * kK + kk);
-                    const float2 x0 = bf16x2_bits_to_float2(values.x), x1 = bf16x2_bits_to_float2(values.y);
-                    const float2 x2 = bf16x2_bits_to_float2(values.z), x3 = bf16x2_bits_to_float2(values.w);
-                    const float xv[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        gate[c] = fmaf(wg[j], xv[j], gate[c]);
-                        up[c]   = fmaf(wu[j], xv[j], up[c]);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int c = 0; c < kPassCols; ++c) {
-            if (c < columns) {
-                const float g = warp_sum(gate[c]);
-                const float u = warp_sum(up[c]);
-                if (lane == 0) {
-                    out[static_cast<std::int64_t>(c) * m_rows + i] =
-                        __float2bfloat16_rn(g / (1.0F + expf(-g)) * u);
-                }
-            }
+    for (int c = 0; c < kPassCols; ++c) {
+        const float g = warp_sum(gate[c]);
+        const float u = warp_sum(up[c]);
+        if (lane == 0) {
+            out[static_cast<std::int64_t>(c) * m_rows + i] =
+                __float2bfloat16_rn(g / (1.0F + expf(-g)) * u);
         }
     }
 }
@@ -153,48 +111,34 @@ __global__ __launch_bounds__(kWarps * 32) void q8_linear_swiglu_stream_pair_kern
 
 void q8_linear_swiglu_stream_pair_launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const int m_rows = out.ne[0], columns = x.ne[1];
-    if (x.ne[0] != kK || w.k != kK || w.n != 2 * m_rows || columns <= 0) {
+    if (x.ne[0] != kK || w.k != kK || w.n != 2 * m_rows || columns <= 0 || columns > 16) {
         throw std::invalid_argument("Q8 LinearSwiGLU stream pair: unsupported problem");
     }
     const dim3 grid((m_rows + kWarps - 1) / kWarps), block(kWarps * 32);
-    const auto launch = [&]<int kPassCols, bool kExactSinglePass>() {
+    const auto launch = [&]<int kPassCols>() {
         CUDA_CHECK(pdl::launch_consumer(
-            {grid, block, 0, stream}, q8_linear_swiglu_stream_pair_kernel<kPassCols, kExactSinglePass>,
+            {grid, block, 0, stream}, q8_linear_swiglu_stream_pair_kernel<kPassCols, true>,
             static_cast<const bf16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), m_rows, w.padded_shape[1], columns,
             static_cast<bf16*>(out.data)));
     };
     switch (columns) {
-    case 1:
-        launch.template operator()<1, true>();
-        break;
-    case 2:
-        launch.template operator()<2, true>();
-        break;
-    case 3:
-        launch.template operator()<3, true>();
-        break;
-    case 4:
-        launch.template operator()<4, true>();
-        break;
-    case 5:
-        launch.template operator()<5, true>();
-        break;
-    case 8:
-        launch.template operator()<8, true>();
-        break;
-    case 16:
-        launch.template operator()<16, true>();
-        break;
-    default:
-        if (columns <= 8) {
-            launch.template operator()<8, false>();
-        } else if (columns <= 16) {
-            launch.template operator()<16, false>();
-        } else {
-            launch.template operator()<8, false>();
-        }
-        break;
+    case 1: launch.template operator()<1>(); break;
+    case 2: launch.template operator()<2>(); break;
+    case 3: launch.template operator()<3>(); break;
+    case 4: launch.template operator()<4>(); break;
+    case 5: launch.template operator()<5>(); break;
+    case 6: launch.template operator()<6>(); break;
+    case 7: launch.template operator()<7>(); break;
+    case 8: launch.template operator()<8>(); break;
+    case 9: launch.template operator()<9>(); break;
+    case 10: launch.template operator()<10>(); break;
+    case 11: launch.template operator()<11>(); break;
+    case 12: launch.template operator()<12>(); break;
+    case 13: launch.template operator()<13>(); break;
+    case 14: launch.template operator()<14>(); break;
+    case 15: launch.template operator()<15>(); break;
+    default: launch.template operator()<16>(); break;
     }
 }
 

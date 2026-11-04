@@ -149,8 +149,8 @@ void quantized_case(infernix::QType qtype, std::int32_t n, std::int32_t k, std::
     }
     std::vector<std::uint16_t> wide_bits;
     std::vector<float> wide_values;
-    random_activations(k, 17, seed + 1, wide_bits, wide_values);
-    for (const std::int32_t t : {1, 3, 4, 8, 9, 16, 17}) {
+    random_activations(k, 25, seed + 1, wide_bits, wide_values);
+    for (const std::int32_t t : {1, 3, 4, 8, 9, 16, 17, 20, 24, 25}) {
         std::vector<std::uint16_t> bits(wide_bits.begin(), wide_bits.begin() + static_cast<std::ptrdiff_t>(k) * t);
         std::vector<float> values(wide_values.begin(), wide_values.begin() + static_cast<std::ptrdiff_t>(k) * t);
         const auto out = run_q8(weight, bits, k, t);

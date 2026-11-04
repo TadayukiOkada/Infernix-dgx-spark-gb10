@@ -486,19 +486,22 @@ __global__ void __launch_bounds__(kThreads, 3)
 // and each x chunk is widened once for both rows. Lane l still accumulates chunks l, l + 32, ... in
 // order per (row, column) and the warp reduces by the same butterfly, so the bits equal the narrow
 // kernels' at every width.
-constexpr int kTallThreads     = 256;
-constexpr int kTallWarps       = kTallThreads / 32;
-constexpr int kTallRowsPerWarp = 2;
-constexpr int kTall2CtaColumns = 9;
-constexpr int kTallMaxColumns  = 16;
-constexpr int kTallMinRows     = 32768;
+constexpr int kTallThreads        = 256;
+constexpr int kTallWarps          = kTallThreads / 32;
+constexpr int kTallRowsPerWarp    = 2;
+constexpr int kTall2CtaColumns    = 9;
+constexpr int kTallMaxColumns     = 32;
+constexpr int kTallPassLaneChunks = 3;
+constexpr int kTallPassChunks     = 32 * kTallPassLaneChunks;
+constexpr int kTallMinRows        = 32768;
 // From these widths the tall mapping is faster (RTX 5090, [248320, 2560], 2026-10-08): BF16 840 vs
 // 1043 us at 8 columns and 869 vs 1500 at 9; q8_g32_fp16 841 vs 1209 at 9 but slower up to 8
 // (799 vs 762), where the narrow mapping stays near the DRAM floor.
 constexpr int kTallMinColumnsBf16 = 8;
 constexpr int kTallMinColumnsQ8   = 1;
-constexpr int kTallMinColumnsQ4   = 8;
-constexpr std::size_t kTallMaxSharedBytes = static_cast<std::size_t>(kTallMaxColumns) * kMaxK * sizeof(bf16);
+constexpr int kTallMinColumnsQ4   = 1;
+constexpr std::size_t kTallMaxSharedBytes =
+    static_cast<std::size_t>(kTallMaxColumns) * kTallPassChunks * sizeof(uint4);
 
 struct TallBf16 {
     Segments segments;
@@ -526,25 +529,6 @@ struct TallQ8 {
         const float scale = __half2float(c.scale);
 #pragma unroll
         for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(v[i]) * scale; }
-    }
-};
-
-struct TallQ8Wide {
-    const std::int8_t* codes;
-    const __half* scales;
-    int padded_k;
-    struct Chunk {
-        uint2 code;
-        float scale;
-    };
-    __device__ Chunk load(int row, int chunk) const {
-        return {reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k)[chunk],
-                __half2float(scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4])};
-    }
-    __device__ static void decode(const Chunk& c, float (&w)[8]) {
-        const auto* v = reinterpret_cast<const std::int8_t*>(&c.code);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(v[i]) * c.scale; }
     }
 };
 
@@ -633,53 +617,61 @@ __global__ void __launch_bounds__(
     }
 }
 
-template <class Codec>
+template <class Codec, int MaxCols = kTallMaxColumns>
 __global__ void __launch_bounds__(
     kTallThreads, (std::is_same_v<Codec, TallQ8> || std::is_same_v<Codec, TallQ4>) ? 2 : 1)
     projection_tall_kernel(const bf16* __restrict__ x, int k, int columns, int rows, Codec codec,
                            float* __restrict__ out) {
-    extern __shared__ uint4 staged[]; // [columns][chunks]
+    extern __shared__ uint4 staged[]; // [columns][kTallPassChunks]
     const int chunks    = k / 8;
     const int lane      = static_cast<int>(threadIdx.x) % 32;
     const int first_row = (static_cast<int>(blockIdx.x) * kTallWarps + static_cast<int>(threadIdx.x) / 32) *
                           kTallRowsPerWarp;
-    // 1. Every chunk of both rows, before x is staged.
-    typename Codec::Chunk w[kTallRowsPerWarp][kMaxLaneChunks];
+    float sums[kTallRowsPerWarp][MaxCols] = {};
+    for (int pass_begin = 0; pass_begin < chunks; pass_begin += kTallPassChunks) {
+        const int pass_chunks = min(kTallPassChunks, chunks - pass_begin);
+        typename Codec::Chunk w[kTallRowsPerWarp][kTallPassLaneChunks];
 #pragma unroll
-    for (int r = 0; r < kTallRowsPerWarp; ++r) {
-        const int row = min(first_row + r, rows - 1);
+        for (int r = 0; r < kTallRowsPerWarp; ++r) {
+            const int row = min(first_row + r, rows - 1);
 #pragma unroll
-        for (int i = 0; i < kMaxLaneChunks; ++i) {
-            const int chunk = lane + 32 * i;
-            if (chunk < chunks) { w[r][i] = codec.load(row, chunk); }
+            for (int i = 0; i < kTallPassLaneChunks; ++i) {
+                const int chunk = pass_begin + lane + 32 * i;
+                if (chunk < chunks) { w[r][i] = codec.load(row, chunk); }
+            }
         }
-    }
-    for (int i = static_cast<int>(threadIdx.x); i < columns * chunks; i += kTallThreads) {
-        const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(reinterpret_cast<const uint4*>(x) + i)
-                     : "memory");
-    }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-    __syncthreads();
-    // 2. Per chunk in lane order: widen both rows' weights, then each column's x once.
-    float sums[kTallRowsPerWarp][kTallMaxColumns] = {};
+        if (pass_begin > 0) { __syncthreads(); }
+        for (int i = static_cast<int>(threadIdx.x); i < columns * kTallPassChunks; i += kTallThreads) {
+            const int column = i / kTallPassChunks;
+            const int c      = i % kTallPassChunks;
+            if (c < pass_chunks) {
+                const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
+                const auto* src =
+                    reinterpret_cast<const uint4*>(x) + static_cast<std::size_t>(column) * chunks + pass_begin + c;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
 #pragma unroll
-    for (int i = 0; i < kMaxLaneChunks; ++i) {
-        const int chunk = lane + 32 * i;
-        if (chunk >= chunks) { break; }
-        float wf[kTallRowsPerWarp][8];
+        for (int i = 0; i < kTallPassLaneChunks; ++i) {
+            const int c     = lane + 32 * i;
+            const int chunk = pass_begin + c;
+            if (chunk >= chunks) { break; }
+            float wf[kTallRowsPerWarp][8];
 #pragma unroll
-        for (int r = 0; r < kTallRowsPerWarp; ++r) { Codec::decode(w[r][i], wf[r]); }
+            for (int r = 0; r < kTallRowsPerWarp; ++r) { Codec::decode(w[r][i], wf[r]); }
 #pragma unroll
-        for (int column = 0; column < kTallMaxColumns; ++column) {
-            if (column < columns) {
-                float xf[8];
-                widen8(staged[column * chunks + chunk], xf);
+            for (int column = 0; column < MaxCols; ++column) {
+                if (column < columns) {
+                    float xf[8];
+                    widen8(staged[column * kTallPassChunks + c], xf);
 #pragma unroll
-                for (int r = 0; r < kTallRowsPerWarp; ++r) {
+                    for (int r = 0; r < kTallRowsPerWarp; ++r) {
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) { sums[r][column] = fmaf(wf[r][j], xf[j], sums[r][column]); }
+                        for (int j = 0; j < 8; ++j) { sums[r][column] = fmaf(wf[r][j], xf[j], sums[r][column]); }
+                    }
                 }
             }
         }
@@ -688,7 +680,7 @@ __global__ void __launch_bounds__(
     for (int r = 0; r < kTallRowsPerWarp; ++r) {
         const int row = first_row + r;
 #pragma unroll
-        for (int column = 0; column < kTallMaxColumns; ++column) {
+        for (int column = 0; column < MaxCols; ++column) {
             if (column < columns) {
                 float v = sums[r][column];
                 for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, offset); }
@@ -700,12 +692,23 @@ __global__ void __launch_bounds__(
 
 template <class Codec>
 void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& codec, Tensor& out, cudaStream_t stream) {
-    const int rows_per_cta   = kTallWarps * kTallRowsPerWarp;
-    const int blocks         = (rows + rows_per_cta - 1) / rows_per_cta;
-    const std::size_t staged = static_cast<std::size_t>(columns) * k * sizeof(bf16);
+    const int rows_per_cta         = kTallWarps * kTallRowsPerWarp;
+    const int blocks               = (rows + rows_per_cta - 1) / rows_per_cta;
+    const std::size_t staged_exact = static_cast<std::size_t>(columns) * k * sizeof(bf16);
+    const std::size_t staged_pass  = static_cast<std::size_t>(columns) * kTallPassChunks * sizeof(uint4);
     const auto launch_exact = [&]<int MaxCols>() {
-        projection_tall_exact_kernel<Codec, MaxCols><<<blocks, kTallThreads, staged, stream>>>(
+        projection_tall_exact_kernel<Codec, MaxCols><<<blocks, kTallThreads, staged_exact, stream>>>(
             static_cast<const bf16*>(x.data), k, rows, codec, static_cast<float*>(out.data));
+    };
+    const auto launch_pass = [&]<int MaxCols>() {
+        static const bool configured = [] {
+            return cudaFuncSetAttribute(projection_tall_kernel<Codec, MaxCols>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
+        }();
+        require(configured, "the tall kernel's shared memory could not be configured");
+        projection_tall_kernel<Codec, MaxCols><<<blocks, kTallThreads, staged_pass, stream>>>(
+            static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
     };
     switch (columns) {
     case 1:
@@ -723,16 +726,21 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
     case 5:
         launch_exact.template operator()<5>();
         return;
-    default: {
-        static const bool configured = [] {
-            return cudaFuncSetAttribute(projection_tall_kernel<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
-        }();
-        require(configured, "the tall kernel's shared memory could not be configured");
-        projection_tall_kernel<Codec><<<blocks, kTallThreads, staged, stream>>>(
-            static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
+    default:
+        if (columns <= 8) {
+            launch_pass.template operator()<8>();
+        } else if (columns <= 12) {
+            launch_pass.template operator()<12>();
+        } else if (columns <= 16) {
+            launch_pass.template operator()<16>();
+        } else if (columns <= 20) {
+            launch_pass.template operator()<20>();
+        } else if (columns <= 24) {
+            launch_pass.template operator()<24>();
+        } else {
+            launch_pass.template operator()<kTallMaxColumns>();
+        }
         return;
-    }
     }
 }
 
@@ -835,15 +843,10 @@ void detail::projection_fp32_route(const Tensor& x, const Weight& weight, Tensor
                         TallQ4{static_cast<const std::uint8_t*>(weight.qdata),
                                static_cast<const __half*>(weight.scales), padded_k},
                         out, stream);
-        } else if (columns <= kTall2CtaColumns) {
+        } else {
             launch_tall(x, k, columns, rows,
                         TallQ8{static_cast<const std::int8_t*>(weight.qdata),
                                static_cast<const __half*>(weight.scales), padded_k},
-                        out, stream);
-        } else {
-            launch_tall(x, k, columns, rows,
-                        TallQ8Wide{static_cast<const std::int8_t*>(weight.qdata),
-                                   static_cast<const __half*>(weight.scales), padded_k},
                         out, stream);
         }
     } else if (q4) {
@@ -909,7 +912,7 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
         projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows, (columns + kWideColumns - 1) / kWideColumns),
                                  kWideThreads, kWideSharedBytes, stream>>>(
             static_cast<const bf16*>(x.data), k, columns, rows, segments, static_cast<float*>(out.data));
-    } else if (columns <= kColumns) {
+    } else {
         constexpr int threads = 128, rows_per_warp = 1, rows_per_cta = threads / 32 * rows_per_warp;
         const auto kernel = columns == 1   ? projection_kernel<threads, rows_per_warp, 1>
                             : columns == 2 ? projection_kernel<threads, rows_per_warp, 2>
@@ -920,11 +923,6 @@ void detail::projection_fp32_route(const Tensor& x, std::span<const Tensor* cons
         CUDA_CHECK(pdl::launch_consumer({dim3((rows + rows_per_cta - 1) / rows_per_cta, column_groups.y), dim3(threads),
                                          staged, stream},
                                         kernel, static_cast<const bf16*>(x.data), k,
-                                        columns, rows, segments, static_cast<float*>(out.data)));
-    } else {
-        CUDA_CHECK(pdl::launch_consumer({dim3((rows + kRowsPerCta - 1) / kRowsPerCta, column_groups.y), dim3(kThreads),
-                                         staged, stream},
-                                        projection_kernel<kThreads, kRowsPerWarp>, static_cast<const bf16*>(x.data), k,
                                         columns, rows, segments, static_cast<float*>(out.data)));
     }
     const cudaError_t error = cudaGetLastError();

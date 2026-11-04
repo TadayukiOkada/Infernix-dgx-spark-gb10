@@ -360,6 +360,9 @@ int main() {
             failures += check(q::fast_path_applies(FastPath::Q8SlicedK, w4dense, options) &&
                                   q::fast_path_qualified(FastPath::Q8SlicedK, w4dense),
                               "q8-sliced-k applies and is registered on W4Dense (its Q8 weights)");
+            failures += check(q::fast_path_applies(FastPath::RouterMma, w4dense, options) &&
+                                  q::fast_path_qualified(FastPath::RouterMma, w4dense),
+                              "router-mma applies and is registered on W4Dense");
         }
     }
     {
@@ -427,14 +430,16 @@ int main() {
         failures += check(!q::fast_path_applies(FastPath::ScreenedLmHead, dense8, scoring),
                           "screened-lm-head does not apply to causal scoring");
     }
-    for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8}) {
+    for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8,
+                                     DenseKernels::Nvfp4}) {
         for (const bool a4 : {false, true}) {
             for (const auto kv : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                                   KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
                                   KvCacheStorage::Q4KeyVq2Value}) {
-                const bool measured = dense == DenseKernels::Mxfp8 && !a4 && kv == KvCacheStorage::Int8Group64;
+                const bool measured = (dense == DenseKernels::Mxfp8 && !a4 && kv == KvCacheStorage::Int8Group64) ||
+                                      (dense == DenseKernels::Nvfp4 && a4);
                 failures += check(q::fast_path_qualified(FastPath::ScreenedLmHead, {dense, a4, kv}) == measured,
-                                  "screened-lm-head is qualified on FP4-Local with INT8 KV only");
+                                  "screened-lm-head is qualified on FP4-Local (INT8 KV) and W4Dense");
             }
         }
     }
@@ -445,15 +450,17 @@ int main() {
     failures += check(infernix::parse_fast_path("screened-lm-head") == FastPath::ScreenedLmHead,
                       "screened-lm-head parses");
 
-    // fp16-gdn-state applies to every artifact (36 GDN layers each), is qualified nowhere, keeps a request
-    // invariant (its roundings follow the request's own calls) and sets no Forward flag (the Program's
-    // state pool carries it).
+    // fp16-gdn-state applies to every artifact (36 GDN layers each), is qualified on W4Dense (Nvfp4, a4=true),
+    // keeps a request invariant (its roundings follow the request's own calls) and sets no Forward flag (the
+    // Program's state pool carries it).
     for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8,
                                      DenseKernels::Ggml, DenseKernels::Nvfp4}) {
         failures += check(q::fast_path_applies(FastPath::Fp16GdnState, {dense, false, KvCacheStorage::Int8Group64}, options) &&
                               !q::fast_path_qualified(FastPath::Fp16GdnState, {dense, false, KvCacheStorage::Int8Group64}),
-                          "fp16-gdn-state is an unqualified candidate on every artifact");
+                          "fp16-gdn-state is an unqualified candidate on a4=false artifacts");
     }
+    failures += check(q::fast_path_qualified(FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}),
+                      "fp16-gdn-state is qualified on W4Dense");
     selection.paths = {FastPath::Fp16GdnState};
     failures += check(selection.request_invariant(), "fp16-gdn-state coupled requests");
     failures += check(selection.forward().dense_routes == infernix::ops::LinearRoutes::Exact,
@@ -461,7 +468,7 @@ int main() {
     failures += check(infernix::parse_fast_path("fp16-gdn-state") == FastPath::Fp16GdnState, "fp16-gdn-state parses");
 
     // block-verification: DFlash2 and MTP chains (the program accepts them through the sparse rule),
-    // unqualified, and a row's acceptance reads only that row.
+    // qualified on W4Dense (Nvfp4, a4=true), and a row's acceptance reads only that row.
     {
         infernix::EngineOptions dflash2 = options;
         dflash2.speculative.backend     = infernix::SpeculativeBackend::DFlash2;
@@ -470,11 +477,13 @@ int main() {
         infernix::EngineOptions none    = options;
         none.speculative.backend        = infernix::SpeculativeBackend::None;
         const FastPathConfiguration dense{DenseKernels::Q8, false, KvCacheStorage::Int8Group64};
+        const FastPathConfiguration w4dense{DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64};
         failures += check(q::fast_path_applies(FastPath::BlockVerification, dense, dflash2) &&
                               q::fast_path_applies(FastPath::BlockVerification, dense, mtp) &&
                               !q::fast_path_applies(FastPath::BlockVerification, dense, none) &&
-                              !q::fast_path_qualified(FastPath::BlockVerification, dense),
-                          "block-verification is an unqualified candidate on drafted chains");
+                              !q::fast_path_qualified(FastPath::BlockVerification, dense) &&
+                              q::fast_path_qualified(FastPath::BlockVerification, w4dense),
+                          "block-verification is qualified on W4Dense and an unqualified candidate on a4=false drafted chains");
         selection.paths = {FastPath::BlockVerification};
         failures += check(selection.request_invariant(), "block-verification coupled requests");
     }

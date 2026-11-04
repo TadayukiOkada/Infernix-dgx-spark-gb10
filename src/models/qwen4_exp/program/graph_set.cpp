@@ -91,11 +91,20 @@ void ProgramImpl::capture_graph_set() {
         const std::int32_t pair_width = 1 + std::min(pair_max, neural_k());
         if (options_.pair_speculation) {
             for (std::int32_t rows = 2; rows <= lanes; ++rows) {
+                const std::int32_t ngram_max =
+                    options_.ngram_draft_tokens > 0
+                        ? std::min<std::int32_t>(static_cast<std::int32_t>(options_.ngram_draft_tokens),
+                                                 rows == 2 ? kPairNgramMaxDrafts
+                                                           : std::min(kMultiRowNgramMaxDrafts, 32 / rows - 1))
+                        : 0;
                 if (rows == 2 ? (mtp_ || dflash2_) : (dflash2_ && rows <= dflash2_rows_)) {
-                    if (pair_width > 1) { verified.emplace_back(rows, pair_width); }
+                    const std::int32_t width = std::max(pair_width, 1 + ngram_max);
+                    if (width > 1) { verified.emplace_back(rows, width); }
                 } else if (mtp_ && rows >= 3 && kMultiRowDrafts > 0.5) {
-                    const std::int32_t multi_width = 1 + std::min(kMultiRowMaxDrafts, neural_k());
+                    const std::int32_t multi_width = std::max(1 + std::min(kMultiRowMaxDrafts, neural_k()), 1 + ngram_max);
                     if (multi_width > 1) { verified.emplace_back(rows, multi_width); }
+                } else if (ngram_max > 0 && (rows == 2 || kMultiRowDrafts > 0.5)) {
+                    verified.emplace_back(rows, 1 + ngram_max);
                 }
             }
         }

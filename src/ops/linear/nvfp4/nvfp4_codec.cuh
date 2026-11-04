@@ -81,6 +81,49 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
 #endif
 }
 
+__device__ __forceinline__ void nvfp4_scaled_two_pairs_bf16(std::uint8_t code0, std::uint8_t code1,
+                                                            std::uint8_t scale, unsigned& out0,
+                                                            unsigned& out1) {
+#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
+    unsigned values0, values1, multiplier;
+    const unsigned packed_pair = static_cast<unsigned>(code0) | (static_cast<unsigned>(code1) << 8);
+    asm("{\n"
+        ".reg .b8 b0, b1;\n"
+        "mov.b32 {b0, b1, _, _}, %2;\n"
+        "cvt.rn.bf16x2.e2m1x2 %0, b0;\n"
+        "cvt.rn.bf16x2.e2m1x2 %1, b1;\n"
+        "}\n"
+        : "=r"(values0), "=r"(values1)
+        : "r"(packed_pair));
+    const auto scale_pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(multiplier) : "h"(scale_pair));
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(out0) : "r"(values0), "r"(multiplier));
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(out1) : "r"(values1), "r"(multiplier));
+#else
+    const __half2 mult = decode_nvfp4_e4m3_f16x2(scale);
+    unsigned h0, h1;
+    const unsigned packed_pair = static_cast<unsigned>(code0) | (static_cast<unsigned>(code1) << 8);
+    asm("{\n"
+        ".reg .b8 b0, b1;\n"
+        "mov.b32 {b0, b1, _, _}, %2;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
+        "cvt.rn.f16x2.e2m1x2 %1, b1;\n"
+        "}\n"
+        : "=r"(h0), "=r"(h1)
+        : "r"(packed_pair));
+    const float2 prod0 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&h0), mult));
+    const float2 prod1 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&h1), mult));
+    union {
+        __nv_bfloat162 pair;
+        unsigned bits;
+    } r0, r1;
+    r0.pair = __floats2bfloat162_rn(prod0.x, prod0.y);
+    r1.pair = __floats2bfloat162_rn(prod1.x, prod1.y);
+    out0    = r0.bits;
+    out1    = r1.bits;
+#endif
+}
+
 __device__ __forceinline__ uint4 nvfp4_scaled_oct_bf16(std::uint32_t codes4, std::uint8_t scale) {
     const __half2 mult = decode_nvfp4_e4m3_f16x2(scale);
     unsigned h0, h1, h2, h3;

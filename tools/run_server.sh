@@ -168,10 +168,13 @@ export INFERNIX_EXPERTS_ON_GPU=1
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency volume \
+    --ngram-cache-mib 4096 \
     --kv-dtype int8 \
     --spec mtp \
     --draft-tokens auto \
     --temperature 1.0 \
+    --ngram-draft-tokens 31 \
+    --ngram-min-match 4 \
     --top-p 0.9 \
     --min-p 0.1 \
     --top-k 20 \

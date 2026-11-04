@@ -53,6 +53,8 @@ constexpr auto k27BLaunchers =
     make_launchers<34816, 5120>(std::make_index_sequence<kLastSmallT / 8>{});
 constexpr auto kFlashNextLaunchers =
     make_launchers<15360, 2560>(std::make_index_sequence<kLastSmallT / 8>{});
+constexpr auto kSharedLaunchers =
+    make_launchers<1280, 2560>(std::make_index_sequence<kLastSmallT / 8>{});
 constexpr auto k122BLaunchers =
     make_launchers<18432, 3072>(std::make_index_sequence<kLastSmallT / 8>{});
 
@@ -66,6 +68,8 @@ void q8_dflash2_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weig
     const std::size_t index = static_cast<std::size_t>((x.ne[1] - 1) / 8);
     if (x.ne[0] == 5120) {
         k27BLaunchers[index](x, weight, out, stream);
+    } else if (x.ne[0] == 2560 && weight.n == 1280) {
+        kSharedLaunchers[index](x, weight, out, stream);
     } else if (x.ne[0] == 2560) {
         kFlashNextLaunchers[index](x, weight, out, stream);
     } else if (x.ne[0] == 3072) {

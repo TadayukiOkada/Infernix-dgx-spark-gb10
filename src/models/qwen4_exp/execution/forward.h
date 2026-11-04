@@ -125,6 +125,7 @@ struct ForwardVerify {
     GdnReplayRecords gdn; // narrowed to the call's width; physical record row b = sequence b
     Tensor ple_inputs;    // BF16 [S*H, W, B]: the PLE convolution inputs
     Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
+    const std::int32_t* valid_columns = nullptr; // optional device I32 [B]: live columns (1 + extent) per row
 };
 
 // Visual embeddings of a call's image columns (design §19.3.2): they replace those columns' token

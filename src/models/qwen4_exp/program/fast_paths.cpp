@@ -450,6 +450,13 @@ constexpr std::array kQualified{
     // +7.2 %), MTP 3 with --lm-head-draft +3.7 % (4 of 4, worst +3.3 %); it runs where the artifact carries the
     // LM head's screen (select_fast_paths).
     Qualification{FastPath::ScreenedLmHead, {DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ScreenedLmHead, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
     // f16-accumulate-prefill is off by default on GB10. It was qualified here on the 5090's 1:2
     // FP32-vs-FP16 HMMA rate (pp32768 +5.3 %, pp4096 neutral); sm_121a runs FP32-accumulating HMMA at 1:1
     // parity, so that advantage is absent, and timing the three MXFP8 routes through ops::linear on GB10
@@ -523,6 +530,13 @@ constexpr std::array kQualified{
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::SampledMtpDrafts, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
@@ -542,6 +556,13 @@ constexpr std::array kQualified{
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
     // W4Dense (NVFP4 dense), both expert activation precisions and every KV format (task T1,
     // 2026-10-30): dflash2-pairs joins the owner's every-configuration registration of 2026-10-24
     // (T7 found this dense kind missing, so DFlash2 decoded plain at concurrency 2 on the artifact;
@@ -582,6 +603,20 @@ constexpr std::array kQualified{
     Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::Q8SlicedK, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {

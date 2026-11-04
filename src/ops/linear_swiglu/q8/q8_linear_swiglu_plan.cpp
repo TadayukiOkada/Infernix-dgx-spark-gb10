@@ -40,10 +40,12 @@ constexpr std::array<RouteSpec, 7> kDFlash2Routes{{
 }};
 
 // Qwen3.8-Flash-Next's shared expert, gate/up [1280, 2560] -> [640]: the register-streamed pair
-// route while the weights dominate, then the paired-row MMA tiles.
-constexpr std::array<RouteSpec, 3> kFlashNextSharedRoutes{{
-    {1, 16, Q8LinearSwiGluScheduleId::StreamPair},
-    {17, 256, Q8LinearSwiGluScheduleId::MmaR32C64},
+// route while the weights dominate, the sliced-K paired-row MMA ladder for small multi-row T, then
+// the paired-row MMA tiles.
+constexpr std::array<RouteSpec, 4> kFlashNextSharedRoutes{{
+    {1, 8, Q8LinearSwiGluScheduleId::StreamPair},
+    {9, 40, Q8LinearSwiGluScheduleId::DFlash2SmallT},
+    {41, 256, Q8LinearSwiGluScheduleId::MmaR32C64},
     {257, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
 }};
 

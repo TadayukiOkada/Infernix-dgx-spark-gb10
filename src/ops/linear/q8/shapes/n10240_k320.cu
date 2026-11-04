@@ -27,6 +27,8 @@ using StreamR2 = Q8A16StreamSchedule<320, 2, 1, 8, MaxCols, ColsPerPass, Q8Strea
 
 Q8Launch select_q8_n10240_k320(std::int32_t tokens) {
     if (tokens <= 8) return launch_q8_a16_stream_linear<StreamR2<8, 8>>;
+    if (tokens <= 16) return launch_q8_a16_mma_r32_t16;
+    if (tokens <= 24) return launch_q8_a16_mma_r32_t24;
     if (tokens <= 32) return launch_q8_a16_mma_r32_t16;
     if (tokens <= 48) return launch_q8_a16_mma_r32_t24;
     if (tokens <= 64) return launch_q8_a16_mma_r64x32_t128_k64_a2;

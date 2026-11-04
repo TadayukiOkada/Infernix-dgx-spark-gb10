@@ -93,6 +93,51 @@ __global__ void __launch_bounds__(kThreads) norm_kernel(const bf16* __restrict__
     }
 }
 
+template <class Norm = bf16, int PerThread = kNormPerThread, bool Full = false>
+__global__ void __launch_bounds__(kThreads) inject_norm_kernel(const bf16* __restrict__ y_in,
+                                                               const float* __restrict__ inject,
+                                                               bf16* __restrict__ residual,
+                                                               const Norm* __restrict__ weight, int hidden,
+                                                               int streams, int width, float eps,
+                                                               bf16* __restrict__ out) {
+    pdl::enter();
+    __shared__ float scratch[kThreads / 32];
+    const int s     = blockIdx.x, t = blockIdx.y;
+    const float sc  = inject[static_cast<std::size_t>(t) * streams + s];
+    const bf16* yin = y_in + static_cast<std::size_t>(t) * hidden;
+    bf16* x         = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
+    bf16* y         = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
+    const Norm* w   = weight + static_cast<std::size_t>(s) * hidden;
+    bf16 xs[PerThread];
+    Norm ws[PerThread];
+#pragma unroll
+    for (int i = 0; i < PerThread; ++i) {
+        const int d = threadIdx.x + i * kThreads;
+        if (Full || d < hidden) {
+            const bf16 r = __float2bfloat16_rn(__bfloat162float(x[d]) + sc * __bfloat162float(yin[d]));
+            x[d]         = r;
+            xs[i]        = r;
+            ws[i]        = w[d];
+        }
+    }
+    float sum = 0.0F;
+#pragma unroll
+    for (int i = 0; i < PerThread; ++i) {
+        if (Full || threadIdx.x + i * kThreads < hidden) {
+            const float v = __bfloat162float(xs[i]);
+            sum += v * v;
+        }
+    }
+    const float inv = rsqrtf(block_sum(sum, scratch) / static_cast<float>(hidden) + eps);
+#pragma unroll
+    for (int i = 0; i < PerThread; ++i) {
+        const int d = threadIdx.x + i * kThreads;
+        if (Full || d < hidden) {
+            y[d] = __float2bfloat16_rn(__bfloat162float(xs[i]) * inv * (1.0F + norm_value(ws[i])));
+        }
+    }
+}
+
 __global__ void gates_kernel(const bf16* __restrict__ z, int rows, int rank, int streams, int columns,
                              bf16* __restrict__ mix, float* __restrict__ inject) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -198,6 +243,52 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::in
     check_launch("norm");
 }
 
+void hyper_connection_inject_norm(const Tensor& y, const Tensor& inject, Tensor& residual,
+                                  const Tensor& weight, std::int32_t streams, float eps, Tensor& out,
+                                  cudaStream_t stream) {
+    require(streams > 0 && contiguous_2d(y, DType::BF16) && contiguous_2d(inject, DType::FP32) &&
+                contiguous_2d(residual, DType::BF16) && contiguous_2d(out, DType::BF16) &&
+                (contiguous_2d(weight, DType::BF16) || contiguous_2d(weight, DType::FP32)),
+            "inject norm requires contiguous tensors and a BF16 or FP32 weight");
+    const int width = residual.ne[0], columns = residual.ne[1];
+    require(width % streams == 0 && (width / streams) % 8 == 0 && weight.ne[0] == width &&
+                weight.ne[1] == 1 && out.ne[0] == width && out.ne[1] == columns && columns > 0 &&
+                y.ne[0] == width / streams && y.ne[1] == columns && inject.ne[0] == streams &&
+                inject.ne[1] == columns,
+            "inject norm shapes disagree");
+    require(eps > 0, "norm epsilon must be positive");
+    require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
+    const int hidden = width / streams;
+    const pdl::LaunchConfig cfg{dim3(streams, columns), dim3(kThreads), 0, stream};
+    cudaError_t status = cudaSuccess;
+    if (weight.dtype == DType::FP32) {
+        if (hidden == kThreads * 10) {
+            status = pdl::launch_consumer(cfg, inject_norm_kernel<float, 10, true>,
+                                          static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                                          static_cast<bf16*>(residual.data), static_cast<const float*>(weight.data),
+                                          hidden, streams, width, eps, static_cast<bf16*>(out.data));
+        } else {
+            status = pdl::launch_consumer(cfg, inject_norm_kernel<float>,
+                                          static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                                          static_cast<bf16*>(residual.data), static_cast<const float*>(weight.data),
+                                          hidden, streams, width, eps, static_cast<bf16*>(out.data));
+        }
+    } else {
+        if (hidden == kThreads * 10) {
+            status = pdl::launch_consumer(cfg, inject_norm_kernel<bf16, 10, true>,
+                                          static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                                          static_cast<bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                                          hidden, streams, width, eps, static_cast<bf16*>(out.data));
+        } else {
+            status = pdl::launch_consumer(cfg, inject_norm_kernel<bf16>,
+                                          static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                                          static_cast<bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                                          hidden, streams, width, eps, static_cast<bf16*>(out.data));
+        }
+    }
+    if (status != cudaSuccess) { check_launch("inject norm"); }
+}
+
 void hyper_connection_gates(const Tensor& z, std::int32_t rank, std::int32_t streams, Tensor& mix,
                             Tensor* inject, cudaStream_t stream) {
     require(contiguous_2d(z, DType::BF16) && contiguous_2d(mix, DType::BF16) && rank > 0 && streams > 0,
@@ -295,27 +386,42 @@ void hyper_connection_inject_mix(const Tensor& y, const Tensor& pending_inject, 
                                  const Tensor& norm_weight, const Weight& down, const Weight& up,
                                  LinearPolicy policy, std::int32_t streams, std::int32_t rank, float eps,
                                  Tensor& x, Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
+    require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
+                (contiguous_2d(norm_weight, DType::BF16) || contiguous_2d(norm_weight, DType::FP32)) && streams > 0 &&
+                rank > 0,
+            "inject mix requires contiguous BF16 tensors and a BF16 or FP32 norm weight");
     const std::int32_t T = residual.ne[1], hidden = x.ne[0];
+    require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * hidden && norm_weight.ne[0] == residual.ne[0] &&
+                down.k == residual.ne[0] && up.n == residual.ne[0] && up.k == rank &&
+                down.n == rank + (inject != nullptr ? streams : 0),
+            "inject mix shapes disagree");
+    if (inject != nullptr) {
+        require(contiguous_2d(*inject, DType::FP32) && inject->ne[0] == streams && inject->ne[1] == T,
+                "inject mix output must be FP32 [S, T]");
+    }
+    require(eps > 0, "inject mix epsilon must be positive");
     require(inject == nullptr || inject->data != pending_inject.data,
             "inject mix: the mix's injects would overwrite the pending ones");
-    if (contiguous_2d(residual, DType::BF16) && detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
-        require(contiguous_2d(x, DType::BF16) &&
-                    (contiguous_2d(norm_weight, DType::BF16) || contiguous_2d(norm_weight, DType::FP32)) &&
-                    x.ne[1] == T && residual.ne[0] == streams * hidden && norm_weight.ne[0] == residual.ne[0] &&
-                    down.n == rank + (inject != nullptr ? streams : 0) && eps > 0,
-                "inject mix shapes disagree");
-        if (inject != nullptr) {
-            require(contiguous_2d(*inject, DType::FP32) && inject->ne[0] == streams && inject->ne[1] == T,
-                    "inject mix output must be FP32 [S, T]");
-        }
-        auto scope                = workspace.scope();
+    auto scope = workspace.scope();
+    if (detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
         const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
         detail::hc_inject_mix_fused(y, pending_inject, residual, norm_weight, down, up, streams, rank, eps, x, inject,
                                     partials.data, stream);
         return;
     }
-    hyper_connection_inject(y, pending_inject, residual, stream);
-    hyper_connection_mix(residual, norm_weight, down, up, policy, streams, rank, eps, x, inject, workspace, stream);
+    Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
+    hyper_connection_inject_norm(y, pending_inject, residual, norm_weight, streams, eps, normalized, stream);
+    Tensor z = workspace.alloc(DType::BF16, {down.n, T});
+    linear(normalized, down, z, policy, workspace, stream);
+    Tensor m = workspace.alloc(DType::BF16, {rank, T});
+    hyper_connection_gates(z, rank, streams, m, inject, stream);
+    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
+        detail::hc_up_collapse(m, up, normalized, streams, x, stream);
+        return;
+    }
+    Tensor u = workspace.alloc(DType::BF16, {up.n, T});
+    linear(m, up, u, policy, workspace, stream);
+    detail::hc_collapse(u, normalized, streams, x, stream);
 }
 
 std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, const Weight& up, LinearPolicy policy,

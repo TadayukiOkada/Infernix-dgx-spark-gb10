@@ -17,7 +17,8 @@
 
 namespace infernix::ops {
 
-inline constexpr int kTopLogprobsBlock = 256;
+inline constexpr int kTopLogprobsBlock       = 256;
+inline constexpr int kTopLogprobsSerialBlock = 1024;
 // Largest K the K-pass selection serves: the sampled-draft (4) and DFlash2 candidate (16) heads
 // stay on it until the radix selection is timed at their shapes.
 inline constexpr int kTopLogprobsSerialMaximum = 16;
@@ -76,7 +77,10 @@ __launch_bounds__(BlockSize) __global__
     const Logit* values       = logits + static_cast<std::int64_t>(column) * physical_rows;
     float local_max              = -CUDART_INF_F;
     float local_sum              = 0.0f;
-    unsigned long long first_key = 0;
+    unsigned long long k0        = 0;
+    unsigned long long k1        = 0;
+    unsigned long long k2        = 0;
+    unsigned long long k3        = 0;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
         const float value   = logprob_logit(values[row]);
@@ -87,7 +91,23 @@ __launch_bounds__(BlockSize) __global__
         local_max = new_max;
         local_sum += expf(value - local_max);
         const unsigned long long key = top_logprobs_key(value, row);
-        if (key < ~0ULL && key > first_key) { first_key = key; }
+        if (key < ~0ULL) {
+            if (key > k0) {
+                k3 = k2;
+                k2 = k1;
+                k1 = k0;
+                k0 = key;
+            } else if (key > k1) {
+                k3 = k2;
+                k2 = k1;
+                k1 = key;
+            } else if (key > k2) {
+                k3 = k2;
+                k2 = key;
+            } else if (key > k3) {
+                k3 = key;
+            }
+        }
     }
     const float maximum = target_logprobs_block_max<BlockSize>(local_max);
     local_sum *= expf(local_max - maximum);
@@ -102,7 +122,9 @@ __launch_bounds__(BlockSize) __global__
     for (std::int32_t rank = 0; rank < count; ++rank) {
         unsigned long long best = 0;
         if (rank == 0) {
-            best = first_key;
+            best = k0;
+        } else if (rank < 4) {
+            best = k0 < previous ? k0 : (k1 < previous ? k1 : (k2 < previous ? k2 : (k3 < previous ? k3 : 0ULL)));
         } else {
             for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
                  row += BlockSize) {

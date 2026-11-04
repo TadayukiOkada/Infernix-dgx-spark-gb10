@@ -27,7 +27,7 @@ namespace infernix::ops::detail {
 // 121.5 us = 27.7 TFLOP/s; N = 320 is too narrow to fill the wide tiles, so the task's 60 TF bar
 // is not reachable at this width).
 Q8Launch select_q8_n320_k10240(std::int32_t tokens) {
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
     if (tokens <= 80) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
     if (tokens <= 112) return launch_q8_a16_sliced_r16_t48_w4_s2;
     if (tokens <= 129) return launch_q8_a16_sliced_r16_t48_w4_s1;

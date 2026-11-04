@@ -32,6 +32,7 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
+    if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 2, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
     if (tokens <= 48) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>;
@@ -60,6 +61,12 @@ void launch_routes(const Nvfp4A16Operands& operands, Output output, cudaStream_t
     if (tokens <= 16) {
         launch_nvfp4_a16_sliced_k_mma<
             Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2, 2>, Geometry::kInputRows>>(
+            operands, output, epilogue, stream);
+        return;
+    }
+    if (tokens <= 24) {
+        launch_nvfp4_a16_sliced_k_mma<
+            Nvfp4ScheduleInstance<Nvfp4SlicedInstance<24, 4, 2, 2>, Geometry::kInputRows>>(
             operands, output, epilogue, stream);
         return;
     }

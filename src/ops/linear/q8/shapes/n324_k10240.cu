@@ -22,7 +22,7 @@ namespace infernix::ops::detail {
 // tile's 105); from 130 the RowTiles2 rung loses
 // to the 32-row K128 MMA here (111.1 vs 150.5 us at 256), so the MMA ladder starts early.
 Q8Launch select_q8_n324_k10240(std::int32_t tokens) {
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
     if (tokens <= 80) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
     if (tokens <= 112) return launch_q8_a16_sliced_r16_t48_w4_s2;
     if (tokens <= 129) return launch_q8_a16_sliced_r16_t48_w4_s1;

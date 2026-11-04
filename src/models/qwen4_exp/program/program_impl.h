@@ -280,7 +280,7 @@ inline constexpr std::uint64_t kSlowGatedReadNs  = 100000000;   // a gated round
 
 // Device I32 arrays of a verification round, each with room for every lane and width.
 struct SpecLayout {
-    std::size_t target = 0, drafts = 0, extents = 0, lengths = 0, anchors = 0, licensed = 0, counts = 0,
+    std::size_t target = 0, drafts = 0, extents = 0, valid = 0, lengths = 0, anchors = 0, licensed = 0, counts = 0,
                 accepted = 0, commit = 0, words = 0;
 };
 
@@ -673,6 +673,7 @@ public:
             d.spec.target   = take(cells);
             d.spec.drafts   = take(cells);
             d.spec.extents  = take(lanes);
+            d.spec.valid    = d.spec.extents + 32;
             d.spec.lengths  = take(lanes);
             d.spec.anchors  = take(lanes);
             d.spec.licensed = take(cells);
@@ -2344,11 +2345,11 @@ public:
             }
             check_expert_error();
             if (track_routes()) {
-            const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
-                                                    static_cast<std::uint64_t>(width));
-            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
-                        static_cast<std::uint32_t>(begin));
-            apply_prompt_routes(lane, width, promotions);
+                const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
+                                                        static_cast<std::uint64_t>(width));
+                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+                            static_cast<std::uint32_t>(begin));
+                apply_prompt_routes(lane, width, promotions);
             }
             apply_vram_target(false);
         }
@@ -2569,8 +2570,8 @@ public:
                                      ngram_max,
                                      static_cast<std::uint32_t>(std::max<std::int32_t>(
                                          pair_k,
-                                         batch == 2 ? kPairMaxDrafts
-                                                    : (kMultiRowDrafts > 0.5 ? kMultiRowMaxDrafts : 0))));
+                                         batch == 2 ? kPairNgramMaxDrafts
+                                                    : (kMultiRowDrafts > 0.5 ? std::min(kMultiRowNgramMaxDrafts, 32 / batch - 1) : 0))));
                 const auto tail = std::span<const std::int32_t>(lane.history)
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
                 auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
@@ -2582,10 +2583,12 @@ public:
                 // after the cut, which may leave the row fewer drafts than the copy.
                 bool take = !match.tokens.empty();
                 if (take && extents[b] > 0) {
+                    const float row_width_cost =
+                        batch == 1 ? width_cost() : (batch == 2 ? kPairWidthCost : kMultiRowWidthCost);
+                    const float copy_width_cost = kNgramWidthCost;
                     take = copy_beats_chain(static_cast<std::int32_t>(match.tokens.size()),
                                             lane.ngram_accept[static_cast<std::size_t>(bucket)],
-                                            batch == 1 ? kNgramWidthCost : kPairWidthCost, lane.mtp_accept, extents[b],
-                                            batch == 1 ? width_cost() : kPairWidthCost);
+                                            copy_width_cost, lane.mtp_accept, extents[b], row_width_cost);
                 }
                 if (take) {
                     drafts_[b]       = std::move(match.tokens);
@@ -2613,10 +2616,12 @@ public:
         if (mtp_) {
             mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps, [&] {
                 if (width == 1) { return; }
-                for (std::int32_t b = 0; b < batch; ++b) {
-                    staged[b] = from_ngram_[b] ? width : 1;
-                    stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
-                }
+                std::array<std::int32_t, kMaximumConcurrency> zero{};
+                for (std::int32_t b = 0; b < batch; ++b) { staged[b] = from_ngram_[b] ? width : 1; }
+                stage_verify_ngram_batch(std::span<const std::uint32_t>(lanes.data(), batch),
+                                         std::span<const std::int32_t>(positions.data(), batch), width,
+                                         std::span<const std::int32_t>(zero.data(), batch),
+                                         std::span<const std::int32_t>(staged.data(), batch));
             });
             // A one-row round verifies only its confident drafts: those its cumulative cut keeps
             // (read_mtp_drafts; every draft of a sampled row with sampled-mtp-drafts). Multi-row
@@ -2627,12 +2632,14 @@ public:
                 if (from_ngram_[b] || extents[b] <= 0) { continue; }
                 const std::int32_t chain_ext = std::min(extents[b], mtp_confident_[b]);
                 const auto copies            = static_cast<std::int32_t>(ngram_proposal_[b].size());
+                const float row_width_cost =
+                    batch == 1 ? width_cost() : (batch == 2 ? kPairWidthCost : kMultiRowWidthCost);
+                const float copy_width_cost = kNgramWidthCost;
                 if (copies > chain_ext &&
                     copy_beats_chain(
                         copies,
                         lanes_[lanes[b]].ngram_accept[static_cast<std::size_t>(ngram_proposal_bucket_[b])],
-                        batch == 1 ? kNgramWidthCost : kPairWidthCost, lanes_[lanes[b]].mtp_accept, chain_ext,
-                        batch == 1 ? width_cost() : kPairWidthCost)) {
+                        copy_width_cost, lanes_[lanes[b]].mtp_accept, chain_ext, row_width_cost)) {
                     drafts_[b]                = ngram_proposal_[b];
                     from_ngram_[b]            = true;
                     ngram_bucket_[b]          = ngram_proposal_bucket_[b];
@@ -2641,11 +2648,10 @@ public:
                     ngram_proposal_bucket_[b] = -1;
                     continue;
                 }
-                drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
-                if (batch == 1) {
+                if (batch == 1 || mtp_executed_[b] < extents[b]) {
                     extents[b] = chain_ext;
-                    drafts_[b].resize(static_cast<std::size_t>(extents[b]));
                 }
+                drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
             }
             if (max_width_ > 1) {
                 std::int32_t widest = 1;
@@ -2672,10 +2678,12 @@ public:
             bool neural = false;
             for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
             const auto stage_rows = [&] {
-                for (std::int32_t b = 0; b < batch; ++b) {
-                    staged[b] = from_ngram_[b] ? width : 1;
-                    stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
-                }
+                std::array<std::int32_t, kMaximumConcurrency> zero{};
+                for (std::int32_t b = 0; b < batch; ++b) { staged[b] = from_ngram_[b] ? width : 1; }
+                stage_verify_ngram_batch(std::span<const std::uint32_t>(lanes.data(), batch),
+                                         std::span<const std::int32_t>(positions.data(), batch), width,
+                                         std::span<const std::int32_t>(zero.data(), batch),
+                                         std::span<const std::int32_t>(staged.data(), batch));
             };
             if (neural) {
                 dflash2_propose(std::span<const std::uint32_t>(lanes.data(), batch), stage_rows);
@@ -4037,6 +4045,72 @@ private:
         read_ngram(lane, to - from, b * static_cast<std::size_t>(W) + static_cast<std::size_t>(from));
     }
 
+    // Batches the n-gram row reads for columns [from[b], to[b]) of every row b in [0, batch) into a single
+    // volume_.read_rows() call so multi-lane rounds issue one parallel NVMe/io_uring batch instead of serial
+    // per-lane reads.
+    void stage_verify_ngram_batch(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
+                                  std::int32_t W, std::span<const std::int32_t> from,
+                                  std::span<const std::int32_t> to) {
+        const auto batch = static_cast<std::int32_t>(lanes.size());
+        if (batch <= 1) {
+            for (std::int32_t b = 0; b < batch; ++b) {
+                stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, from[b], to[b]);
+            }
+            return;
+        }
+        std::int32_t total_cols = 0;
+        bool contiguous         = true;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const std::int32_t count = std::max(0, to[b] - from[b]);
+            total_cols += count;
+            contiguous &= (from[b] == 0 && to[b] == W);
+        }
+        if (total_cols == 0) { return; }
+        const nvtx::ScopedRange rows_range(nvtx::Name::PleRows, nvtx::Category::Control,
+                                           static_cast<std::uint64_t>(total_cols));
+        const std::size_t heads     = hash_.heads();
+        const std::size_t row_bytes = ngram_table().row_bytes;
+        const std::size_t col_bytes = heads * row_bytes;
+        const std::int32_t context  = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
+        row_ids_.resize(static_cast<std::size_t>(total_cols) * heads);
+        std::size_t offset = 0;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const std::int32_t f = from[b], t = to[b];
+            if (f >= t) { continue; }
+            const Lane& lane = lanes_[lanes[b]];
+            window_.clear();
+            for (std::int32_t q = positions[b] + f - context; q < positions[b] + t; ++q) {
+                window_.push_back(verify_token(lane, static_cast<std::size_t>(b), positions[b], q));
+            }
+            const auto count = static_cast<std::size_t>(t - f);
+            hash_.row_ids(window_, count, row_ids_.data() + offset * heads);
+            offset += count;
+        }
+        std::byte* const base              = host_io() + io_layout_.ngram;
+        const NgramVolume::Counters before = volume_.counters();
+        if (contiguous) {
+            volume_.read_rows(row_ids_, std::span<std::byte>(base, static_cast<std::size_t>(total_cols) * col_bytes));
+        } else {
+            ngram_stage_scratch_.resize(static_cast<std::size_t>(total_cols) * col_bytes);
+            volume_.read_rows(row_ids_, std::span<std::byte>(ngram_stage_scratch_.data(), ngram_stage_scratch_.size()));
+            std::size_t src_col = 0;
+            for (std::int32_t b = 0; b < batch; ++b) {
+                const std::int32_t f = from[b], t = to[b];
+                if (f >= t) { continue; }
+                const auto count         = static_cast<std::size_t>(t - f);
+                const std::size_t dst_col = static_cast<std::size_t>(b * W + f);
+                std::memcpy(base + dst_col * col_bytes, ngram_stage_scratch_.data() + src_col * col_bytes,
+                            count * col_bytes);
+                src_col += count;
+            }
+        }
+        const NgramVolume::Counters& after = volume_.counters();
+        lanes_[lanes[0]].ngram.rows += after.rows - before.rows;
+        lanes_[lanes[0]].ngram.hits += after.hits - before.hits;
+        lanes_[lanes[0]].ngram.reads += after.reads - before.reads;
+        lanes_[lanes[0]].ngram.read_ns += after.read_ns - before.read_ns;
+    }
+
     // Reads the rows of the `count` positions whose tokens (with their context) are in window_ into
     // io columns from `column`.
     void read_ngram(Lane& lane, std::int32_t count, std::size_t column) {
@@ -4121,6 +4195,27 @@ private:
         lanes_[lanes[0]].ngram.hits += after.hits - before.hits;
         lanes_[lanes[0]].ngram.reads += after.reads - before.reads;
         lanes_[lanes[0]].ngram.read_ns += after.read_ns - before.read_ns;
+    }
+
+    // Whether every n-gram row of a verification round's unstaged columns [staged[b], W) is in the host row cache.
+    bool verify_rows_cached(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
+                            std::int32_t W, std::span<const std::int32_t> staged) {
+        const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
+        const std::size_t heads    = hash_.heads();
+        for (std::size_t b = 0; b < lanes.size(); ++b) {
+            const std::int32_t from = staged[b];
+            if (from >= W) { continue; }
+            const Lane& lane = lanes_[lanes[b]];
+            window_.clear();
+            for (std::int32_t q = positions[b] + from - context; q < positions[b] + W; ++q) {
+                window_.push_back(verify_token(lane, b, positions[b], q));
+            }
+            const auto count = static_cast<std::size_t>(W - from);
+            row_ids_.resize(count * heads);
+            hash_.row_ids(window_, count, row_ids_.data());
+            if (!volume_.cached(row_ids_)) { return false; }
+        }
+        return true;
     }
 
     // Whether every n-gram row of a plain decode round is in the host row cache.
@@ -4612,10 +4707,13 @@ private:
     // constraint (masked or observed logits); and the round at most ops::kScreenedHeadMaxColumns wide.
     [[nodiscard]] bool screened_round(std::span<const std::uint32_t> lanes, std::int32_t columns) const {
         if (!screened_head_ || c_.lossless || columns > ops::kScreenedHeadMaxColumns) { return false; }
+        constexpr std::int32_t kMaxRescored = ops::ScreenedHeadPolicy{}.rescored;
         for (std::size_t b = 0; b < lanes.size(); ++b) {
             const Lane& lane              = lanes_[lanes[b]];
             const ops::SamplingConfig& sc = lane.sampling;
-            if (sc.temperature > 0.0F || sc.presence_penalty != 0.0F || sc.frequency_penalty != 0.0F ||
+            const bool top_bounded        = sc.temperature == 0.0F ||
+                                            (sc.top_k > 0 && sc.top_k <= kMaxRescored && sc.min_p >= 0.01F);
+            if (!top_bounded || sc.presence_penalty != 0.0F || sc.frequency_penalty != 0.0F ||
                 lane.constraint != nullptr || (grammar_ != nullptr && grammar_->constrained(b))) {
                 return false;
             }
@@ -4923,9 +5021,10 @@ private:
 
     execution::ForwardVerify verify_view(std::int32_t batch, std::int32_t width) const {
         execution::ForwardVerify v;
-        v.gdn        = records_.narrowed(width);
-        v.ple_inputs = Tensor(ple_records_.p, DType::BF16, {width_, width, batch});
-        v.qsa_keys   = Tensor(qsa_records_.p, DType::BF16, {di_, width, batch, dim(c_.attention_layers)});
+        v.gdn           = records_.narrowed(width);
+        v.ple_inputs    = Tensor(ple_records_.p, DType::BF16, {width_, width, batch});
+        v.qsa_keys      = Tensor(qsa_records_.p, DType::BF16, {di_, width, batch, dim(c_.attention_layers)});
+        v.valid_columns = batch > 1 ? spec_device(spec_layout_.valid) : nullptr;
         return v;
     }
 
@@ -4971,47 +5070,24 @@ private:
             host_lanes_[b] = static_cast<std::int32_t>(lanes[b]);
             stage_call_rope(lane, static_cast<std::uint32_t>(p), W, batch * W, b * W, batch, b);
             spec_host(spec_layout_.extents)[b] = n;
+            spec_host(spec_layout_.valid)[b]   = 1 + n;
             spec_host(spec_layout_.lengths)[b] = p;
             spec_host(spec_layout_.anchors)[b] = lane.history.back();
         }
         const auto read_rows = [&] {
-            bool all_unstaged = batch > 1;
-            for (std::int32_t b = 0; b < batch; ++b) { all_unstaged &= staged[b] == 0; }
-            if (all_unstaged) {
-                const std::size_t heads     = hash_.heads();
-                const std::size_t row_bytes = ngram_table().row_bytes;
-                const std::int32_t context  = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
-                row_ids_.resize(static_cast<std::size_t>(batch * W) * heads);
-                for (std::int32_t b = 0; b < batch; ++b) {
-                    const Lane& lane = lanes_[lanes[b]];
-                    window_.clear();
-                    for (std::int32_t q = positions[b] - context; q < positions[b] + W; ++q) {
-                        window_.push_back(verify_token(lane, static_cast<std::size_t>(b), positions[b], q));
-                    }
-                    hash_.row_ids(window_, static_cast<std::size_t>(W),
-                                  row_ids_.data() + static_cast<std::size_t>(b * W) * heads);
-                }
-                const NgramVolume::Counters before = volume_.counters();
-                volume_.read_rows(row_ids_,
-                                  std::span<std::byte>(host_io() + io_layout_.ngram,
-                                                       static_cast<std::size_t>(batch * W) * heads * row_bytes));
-                const NgramVolume::Counters& after = volume_.counters();
-                lanes_[lanes[0]].ngram.rows += after.rows - before.rows;
-                lanes_[lanes[0]].ngram.hits += after.hits - before.hits;
-                lanes_[lanes[0]].ngram.reads += after.reads - before.reads;
-                lanes_[lanes[0]].ngram.read_ns += after.read_ns - before.read_ns;
-                return;
-            }
-            for (std::int32_t b = 0; b < batch; ++b) {
-                stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, staged[b], W);
-            }
+            std::array<std::int32_t, kMaximumConcurrency> to{};
+            to.fill(W);
+            stage_verify_ngram_batch(lanes, std::span<const std::int32_t>(positions.data(), batch), W,
+                                     std::span<const std::int32_t>(staged.data(), batch),
+                                     std::span<const std::int32_t>(to.data(), batch));
         };
         const std::uint32_t word = next_gate_word();
         const bool screened = screened_round(lanes, batch * W);
         DecodeGraph& graph  = verify_graph(batch, W, screened);
         bool all_staged    = true;
         for (std::int32_t b = 0; b < batch; ++b) { all_staged &= staged[b] >= W; }
-        const bool gated    = graph.executable.ready() && !all_staged;
+        const bool gated    = graph.executable.ready() && !all_staged &&
+                              !verify_rows_cached(lanes, positions, W, staged);
         if (!gated) {
             read_rows();
             publish_pinned_word(gate_ready(), word);
@@ -5028,8 +5104,14 @@ private:
         // constraints mask them in place.
         Tensor logits = read_logits(batch * W);
         Tensor target(spec_device(spec_layout_.target), DType::I32, {batch * W});
-        ops::argmax(logits, target, token_domain_, s);
         const bool constrained = stage_constraints(lanes, W);
+        bool need_target       = constrained;
+        for (std::int32_t b = 0; b < batch && !need_target; ++b) {
+            const ops::SamplingConfig& s_cfg = lanes_[lanes[b]].sampling;
+            need_target = !(s_cfg.temperature > 0.0F) && s_cfg.presence_penalty == 0.0F &&
+                          s_cfg.frequency_penalty == 0.0F;
+        }
+        if (need_target) { ops::argmax(logits, target, token_domain_, s); }
         if (constrained) { constrain(logits, &target); }
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -5088,11 +5170,13 @@ private:
                     upload_pinned(mtp_device(mtp_io_.verify_q + row), host_q + row, 4ULL * C * n, s);
                     continue;
                 }
-                // Draft step j's plane of row b is at (j * batch + b) * C.
+                const std::int32_t nb = mtp_draft_row_[static_cast<std::size_t>(b)];
+                // Draft step j's plane of row b is at (j * mtp_draft_batch_ + nb) * C.
                 for (const auto [from, to] : {std::pair{mtp_io_.draft_candidates, mtp_io_.verify_candidates},
                                               std::pair{mtp_io_.draft_q, mtp_io_.verify_q}}) {
                     CUDA_CHECK(cudaMemcpy2DAsync(mtp_device(to + row), 4ULL * C,
-                                                 mtp_device(from + static_cast<std::size_t>(C) * b), 4ULL * C * batch,
+                                                 mtp_device(from + static_cast<std::size_t>(C) * nb),
+                                                 4ULL * C * mtp_draft_batch_,
                                                  4ULL * C, static_cast<std::size_t>(n), cudaMemcpyDeviceToDevice, s));
                 }
             }
@@ -5156,8 +5240,8 @@ private:
                     a                = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
                 }
                 // The chain's verified drafts against the cumulative cut's bin table (rows whose drafts
-                // read_mtp_drafts kept: argmax drafts).
-                if (mtp_ && !dflash2_ && !(sparse && lane.sampling.temperature > 0.0F)) {
+                // read_mtp_drafts kept: argmax drafts under --draft-tokens auto).
+                if (mtp_ && !dflash2_ && options_.auto_draft_length && !(sparse && lane.sampling.temperature > 0.0F)) {
                     lane.mtp_cumulative.observe(mtp_draft_logprobs_[static_cast<std::size_t>(b)].data(),
                                                 static_cast<std::int32_t>(std::min<std::uint64_t>(n, 8)),
                                                 static_cast<std::int32_t>(std::min<std::uint64_t>(A, n)));
@@ -5482,7 +5566,7 @@ private:
         // acceptance only, so A/B arms replaying one greedy request run the same rounds.
         if (replay_clock_) { return kWidthCost; }
         double a = 0.0, b = 0.0;
-        return round_cost_fit(a, b) ? std::clamp(b / a, 0.14, kCostMax) : kWidthCost;
+        return round_cost_fit(a, b) ? std::clamp(b / a, 0.14, kWidthCost) : kWidthCost;
     }
 
     // At a decode round's start: the previous round's cycle when both are one-row MTP rounds (an
@@ -5583,53 +5667,68 @@ private:
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         const std::size_t column = 2ULL * width_;
         mtp_sampled_round_       = false;
+        mtp_draft_batch_         = 0;
+        mtp_draft_row_.fill(-1);
+        std::array<std::uint32_t, kMaximumConcurrency> active_lanes{};
+        std::array<std::int32_t, kMaximumConcurrency> active_rows{};
+        std::int32_t active_batch = 0;
         bool any = false, unwritten = false;
         for (std::int32_t b = 0; b < batch; ++b) {
-            any |= lanes_[lanes[b]].mtp_live;
-            unwritten |= lanes_[lanes[b]].mtp_live && lanes_[lanes[b]].mtp_cells < lanes_[lanes[b]].state_tokens;
+            const Lane& lane = lanes_[lanes[b]];
+            if (!lane.mtp_live) { continue; }
+            any = true;
+            const bool lane_unwritten = lane.mtp_cells < lane.state_tokens;
+            unwritten |= lane_unwritten;
+            if ((steps > 0 && !from_ngram_[b]) || lane_unwritten) {
+                mtp_draft_row_[static_cast<std::size_t>(b)]          = active_batch;
+                active_lanes[static_cast<std::size_t>(active_batch)] = lanes[b];
+                active_rows[static_cast<std::size_t>(active_batch)]  = b;
+                ++active_batch;
+            }
         }
+        mtp_draft_batch_ = active_batch;
         // Without drafts (a gated or zero-length round) only unwritten pending cells need the drafter.
-        if (!any || (steps == 0 && !unwritten)) { return; }
-        const bool sampled = mtp_sampled(lanes);
-        stage_mtp_draft(lanes, s);
-        for (std::int32_t b = 0; b < batch; ++b) {
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mtp_chain_.p) + column * b, saved_column(lanes[b]).data,
+        if (!any || active_batch == 0 || (steps == 0 && !unwritten)) { return; }
+        const std::span<const std::uint32_t> draft_lanes(active_lanes.data(), static_cast<std::size_t>(active_batch));
+        const bool sampled = mtp_sampled(draft_lanes);
+        stage_mtp_draft(draft_lanes, s);
+        for (std::int32_t nb = 0; nb < active_batch; ++nb) {
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mtp_chain_.p) + column * nb,
+                                       saved_column(draft_lanes[static_cast<std::size_t>(nb)]).data,
                                        column, cudaMemcpyDeviceToDevice, s));
         }
-        if (unwritten) {
-            // The pending cells' K/V (rewriting a written cell is idempotent).
-            forward_->run_mtp({.residuals        = Tensor(mtp_chain_.p, DType::BF16, {width_, batch}),
-                               .ids              = Tensor(mtp_device(mtp_io_.ids), DType::I32, {batch}),
-                               .positions        = Tensor(mtp_device(mtp_io_.cells), DType::I32, {batch}),
-                               .rope_positions   = Tensor(mtp_device(mtp_io_.rope_cells), DType::I32, {batch, 3}),
-                               .block_start_rope = Tensor(mtp_device(mtp_io_.block_rope_cells), DType::I32, {batch, 3}),
-                               .slots            = Tensor(mtp_device(mtp_io_.slots), DType::I32, {batch}),
-                               .table_rows       = Tensor(mtp_device(mtp_io_.rows), DType::I32, {batch}),
-                               .batch            = batch,
+        if (steps == 0) {
+            // The pending cells' K/V when no draft step runs (draft step 0 writes them otherwise).
+            forward_->run_mtp({.residuals        = Tensor(mtp_chain_.p, DType::BF16, {width_, active_batch}),
+                               .ids              = Tensor(mtp_device(mtp_io_.ids), DType::I32, {active_batch}),
+                               .positions        = Tensor(mtp_device(mtp_io_.cells), DType::I32, {active_batch}),
+                               .rope_positions   = Tensor(mtp_device(mtp_io_.rope_cells), DType::I32, {active_batch, 3}),
+                               .block_start_rope = Tensor(mtp_device(mtp_io_.block_rope_cells), DType::I32, {active_batch, 3}),
+                               .slots            = Tensor(mtp_device(mtp_io_.slots), DType::I32, {active_batch}),
+                               .table_rows       = Tensor(mtp_device(mtp_io_.rows), DType::I32, {active_batch}),
+                               .batch            = active_batch,
                                .width            = 1,
                                .kv_only          = true});
-        }
-        if (steps == 0) {
             if (unwritten && while_drafting) {
                 device_.flush();
                 while_drafting();
             }
             // No synchronize here: the uploads above read mtp_host_, which is next written after the
             // round's synchronize.
-            for (std::int32_t b = 0; b < batch; ++b) {
-                Lane& lane = lanes_[lanes[b]];
+            for (std::int32_t nb = 0; nb < active_batch; ++nb) {
+                Lane& lane = lanes_[draft_lanes[static_cast<std::size_t>(nb)]];
                 if (lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
             }
             return;
         }
         mtp_sampled_round_       = sampled;
-        const bool need_logprobs = need_mtp_logprobs(batch, sampled);
-        if (sampled) { stage_mtp_samplers(lanes, s); }
-        run_mtp_draft_steps(batch, steps, sampled);
-        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
+        const bool need_logprobs = need_mtp_logprobs(active_batch, sampled);
+        if (sampled) { stage_mtp_samplers(draft_lanes, s); }
+        run_mtp_draft_steps(active_batch, steps, sampled);
+        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * active_batch,
                                    cudaMemcpyDeviceToHost, s));
         if (need_logprobs) {
-            CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.logprobs), mtp_device(mtp_io_.logprobs), 4ULL * steps * batch,
+            CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.logprobs), mtp_device(mtp_io_.logprobs), 4ULL * steps * active_batch,
                                        cudaMemcpyDeviceToHost, s));
         }
         if (while_drafting) {
@@ -5637,7 +5736,8 @@ private:
             while_drafting();
         }
         device_.synchronize();
-        read_mtp_drafts(lanes, steps, unwritten, sampled);
+        read_mtp_drafts(draft_lanes, std::span<const std::int32_t>(active_rows.data(), static_cast<std::size_t>(active_batch)),
+                        steps, unwritten, sampled);
     }
 
     // Sampled drafts when a row samples (greedy rows draft the argmax either way).
@@ -5651,7 +5751,7 @@ private:
     // every MTP round observes its draft logprobs into it (also the pair rounds'): the GB10 skip's
     // off-state (20261029: neither the cumulative rule nor --spec-min-p active) no longer exists.
     [[nodiscard]] bool need_mtp_logprobs(std::int32_t /*batch*/, bool /*sampled*/) const noexcept {
-        return true;
+        return options_.auto_draft_length || std::isfinite(draft_min_logprob_);
     }
 
     // A draft round's io (everything before mtp_io_.drafts), staged and uploaded on `stream`: each
@@ -5787,15 +5887,17 @@ private:
     // A draft round's readout once its copies have landed: each row's first `steps` drafts, its
     // confident count and the draft steps the device actually ran, and with `unwritten` its pending
     // cell written.
-    void read_mtp_drafts(std::span<const std::uint32_t> lanes, std::int32_t steps, bool unwritten, bool sampled) {
+    void read_mtp_drafts(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> rows,
+                         std::int32_t steps, bool unwritten, bool sampled) {
         const auto batch         = static_cast<std::int32_t>(lanes.size());
         const bool need_logprobs = need_mtp_logprobs(batch, sampled);
         const bool gated         = mtp_draft_gated(batch, steps, sampled);
-        for (std::int32_t b = 0; b < batch; ++b) {
-            Lane& lane = lanes_[lanes[b]];
+        for (std::int32_t nb = 0; nb < batch; ++nb) {
+            const std::int32_t b = rows[static_cast<std::size_t>(nb)];
+            Lane& lane           = lanes_[lanes[static_cast<std::size_t>(nb)]];
             if (unwritten && lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
             for (std::int32_t j = 0; j < steps; ++j) {
-                mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
+                mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + nb];
             }
             // The row's confident drafts: those before the first chain product below the staged
             // threshold with --draft-tokens auto, else before the first below draft_min_logprob_ (the
@@ -5807,15 +5909,15 @@ private:
             if (!need_logprobs || (sampled && lane.sampling.temperature > 0.0F)) { continue; }
             const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
             auto& kept           = mtp_draft_logprobs_[static_cast<std::size_t>(b)];
-            for (std::int32_t j = 0; j < steps; ++j) { kept[static_cast<std::size_t>(j)] = logprobs[j * batch + b]; }
+            for (std::int32_t j = 0; j < steps; ++j) { kept[static_cast<std::size_t>(j)] = logprobs[j * batch + nb]; }
             // The gated chain ran steps 0..its cut, so the drafts beyond mtp_executed_[b] are stale
             // words a skipped gated step left behind and must not be read; the round's cost fit stays
             // fed the drafted count of uncut rounds only (decode, where the fit is described).
             const auto cut = options_.auto_draft_length
-                                 ? mtp_cumulative_cut(logprobs + b, batch, steps,
-                                                      mtp_cumulative_threshold_[static_cast<std::size_t>(b)],
+                                 ? mtp_cumulative_cut(logprobs + nb, batch, steps,
+                                                      mtp_cumulative_threshold_[static_cast<std::size_t>(nb)],
                                                       kMtpCumulativeBins, gated)
-                                 : mtp_min_logprob_cut(logprobs + b, batch, steps, draft_min_logprob_, gated);
+                                 : mtp_min_logprob_cut(logprobs + nb, batch, steps, draft_min_logprob_, gated);
             mtp_confident_[b] = cut.kept;
             mtp_executed_[b]  = cut.executed;
         }
@@ -6649,6 +6751,8 @@ private:
     // words a skipped gated step left behind. The round's cost fit does not use it: a gated chain's
     // graph time follows its drafted steps, not the executed ones (see decode's fit reset).
     std::array<std::int32_t, kMaximumConcurrency> mtp_executed_{};
+    std::int32_t mtp_draft_batch_ = 0;
+    std::array<std::int32_t, kMaximumConcurrency> mtp_draft_row_{};
     std::array<bool, kMaximumConcurrency> from_ngram_{};
     // Copy proposals are chosen against the MTP drafts by expected tokens per round time, their
     // acceptance learned per match-length bucket (4-7, 8-11, 12-15, 16+ tokens; Strata's priors).
@@ -6680,8 +6784,8 @@ private:
     // 0.38 of a plain round. Single-stream MTP sweep on the Dense8 model: 0.38 -> ~31.7 tok/s, 0.25 ->
     // ~40 tok/s (optimum), <=0.20 overshoots (positions 4+ accept ~0). Default lowered to 0.25;
     // INFERNIX_WIDTH_COST still overrides for per-workload tuning.
-    static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.25);
-    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.12);
+    static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.22);
+    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.10);
     static constexpr std::uint64_t kProbeInterval = 8;
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
     // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV
@@ -6713,10 +6817,12 @@ private:
         std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_DFLASH_PAIR_MAX_DRAFTS", 8.0)), 0,
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kPairMaxDrafts =
-        std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_PAIR_MAX_DRAFTS", 6.0)), 0,
+        std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_PAIR_MAX_DRAFTS", 4.0)), 0,
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kMultiRowMaxDrafts =
-        static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 5.0));
+        static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 4.0));
+    static constexpr std::int32_t kPairNgramMaxDrafts     = 15;
+    static constexpr std::int32_t kMultiRowNgramMaxDrafts = 7;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
     // same bits whatever the call boundaries (request invariance's resume grid).
     static constexpr std::uint32_t kResumeGrid = 16;
@@ -6727,11 +6833,11 @@ private:
     }
     // dflash2-pairs' width with --draft-tokens auto (dflash2_pair_width): a draft per row and the
     // two-row proposal in plain two-row rounds, fixed priors as for one row. GB10 retune: both
-    // costs of the pair's cost model are policy constants (INFERNIX_PAIR_WIDTH_COST 0.15 for the
+    // costs of the pair's cost model are policy constants (INFERNIX_PAIR_WIDTH_COST 0.14 for the
     // pair width, INFERNIX_PAIR_DRAFT_COST below for one verified column of the round), each fitted
     // on this device; the draft cost replaced the 0.47 the 5090's cost model paid.
-    static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.25);
-    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.35);
+    static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.12);
+    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.22);
     static inline const double kDFlashPairDraftCost =
         policy_double("INFERNIX_PAIR_DRAFT_COST", 0.30);
     static constexpr double kDFlashPairProposalCost  = 0.1;
@@ -6895,6 +7001,7 @@ private:
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;
+    std::vector<std::byte> ngram_stage_scratch_;
     std::optional<std::uint32_t> transaction_lane_;
     std::optional<ResumeState> pause_; // the open Pause transaction's result
     bool replaying_ = false;           // the open binding replays toward a paused frontier

@@ -504,9 +504,16 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
         lossless_head(last, *logits);
         return;
     }
-    Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
-    Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
-    ops::gather_columns(final_x, batch.logit_columns, last, s);
+    Tensor last;
+    if (batch.logit_columns.ne[0] < residual.ne[1]) {
+        Tensor gathered = work_.alloc(DType::BF16, {W, batch.logit_columns.ne[0]});
+        ops::gather_columns(residual, batch.logit_columns, gathered, s);
+        last = mix(parameters_.final_mixer, gathered, nullptr);
+    } else {
+        Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
+        last           = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
+        ops::gather_columns(final_x, batch.logit_columns, last, s);
+    }
     if (batch.screened_head) {
         screened_text_head_logits(parameters_, last, *logits, work_, s);
     } else {
@@ -543,13 +550,8 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
 
 Tensor Forward::inject_mix(const HyperConnectionParameters& p, const Tensor& y, const Tensor& pending, Tensor& residual,
                            Tensor* inject, Tensor* into) {
-    // TEMPORARY (INFERNIX_TMP_HC_INJECT_FOLD) until the decode A/B.
-    static const bool fold = temporary_switches::flag("INFERNIX_TMP_HC_INJECT_FOLD");
+    (void)temporary_switches::flag("INFERNIX_TMP_HC_INJECT_FOLD");
     const cudaStream_t s = device_.stream;
-    if (!fold) {
-        ops::hyper_connection_inject(y, pending, residual, s);
-        return mix(p, residual, inject, into);
-    }
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
     Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
@@ -996,6 +998,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
+    if (batch != nullptr && batch->verify != nullptr && batch->verify->valid_columns != nullptr) {
+        routing.mask = ops::MoeColumnMask{.valid = batch->verify->valid_columns, .width = batch->width};
+    }
     // The route log holds the call's last `logged` columns: all of them (written by the dispatch), or
     // the trailing ones (a layer walk's grouped call logs its last chunk), copied from the routing.
     const std::int32_t logged = route_columns < 0 ? T : std::min(route_columns, T);
@@ -1370,14 +1375,13 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
             Tensor per_stream = residual.view({H, S * T});
             project(hn.view({H, S * T}), p.hidden_projection, per_stream, work_, s, dense_routes());
         }
-        ops::hyper_connection_inject(ep, state_.mtp_ones.slice(1, 0, T), residual, s);
-
         Tensor inject = work_.alloc(DType::FP32, {S, T});
-        Tensor xa     = mix(p.attn_hc, residual, &inject);
+        Tensor xa     = inject_mix(p.attn_hc, ep, state_.mtp_ones.slice(1, 0, T), residual, &inject);
         const AttentionCall attention_call{.layer        = *kv_.mtp,
                                            .tails        = state_.mtp_tails,
                                            .key_records  = call.key_records,
-                                           .update_tails = call.kv_only && call.key_records.data == nullptr,
+                                           .update_tails = (call.kv_only && call.key_records.data == nullptr) ||
+                                                           (!call.kv_only && call.draft_step == 0),
                                            .kv_only          = call.kv_only,
                                            .positions        = call.positions,
                                            .rope_positions   = call.rope_positions,

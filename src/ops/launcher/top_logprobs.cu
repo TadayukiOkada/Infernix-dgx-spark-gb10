@@ -22,7 +22,7 @@ void top_logprobs_launch(const Tensor& logits, std::int32_t valid_rows, Tensor& 
             top_logprobs_select_kernel<kTopLogprobsBlock><<<columns, kTopLogprobsBlock, 0, stream>>>(
                 values, top_ids, top, valid_rows, logits.ne[0], count);
         } else {
-            top_logprobs_kernel<kTopLogprobsBlock><<<columns, kTopLogprobsBlock, 0, stream>>>(
+            top_logprobs_kernel<kTopLogprobsSerialBlock><<<columns, kTopLogprobsSerialBlock, 0, stream>>>(
                 values, top_ids, top, valid_rows, logits.ne[0], count);
         }
     };

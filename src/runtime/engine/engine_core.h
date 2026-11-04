@@ -1084,9 +1084,49 @@ private:
     }
 
     void remove_completed_slot(std::uint32_t lane) {
+        deferred_first_tokens_[lane] = 0U;
         slots_[lane].reset();
         request_admission_check();
         scheduler_.capacity_released();
+    }
+
+    [[nodiscard]] bool has_tail_prefill_ready() const noexcept {
+        if (scheduler_.decode_share().share > 0.0) { return false; }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& slot = slots_[lane];
+            if (!slot ||
+                slot->cancelled.load(std::memory_order_acquire) ||
+                slot->is_replaying() || slot->recovery_pending ||
+                !slot->is_prefilling() || !slot->admitted_begin ||
+                slot->computed_prompt_tokens == 0 ||
+                (slot->sequence && instance_.program->context_blocks(*slot->sequence))) {
+                continue;
+            }
+            const BeginSummary& begin = *slot->admitted_begin;
+            const std::uint32_t total_to_compute =
+                begin.prompt_tokens - begin.reused_prompt_tokens;
+            if (total_to_compute <= slot->computed_prompt_tokens) { continue; }
+            if (total_to_compute - slot->computed_prompt_tokens <= 16U) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void flush_deferred_first_output(std::uint32_t lane, EnginePhaseScope* phase = nullptr) {
+        const std::uint32_t accepted = std::exchange(deferred_first_tokens_[lane], 0U);
+        if (accepted == 0U) { return; }
+        const auto& request = slots_[lane];
+        if (!request) { return; }
+        auto published = request->output.commit_preview();
+        auto timing    = record_committed_output(request, accepted);
+        append_output(request, std::move(published), std::move(timing), phase);
+    }
+
+    void flush_all_deferred_first_outputs(EnginePhaseScope* phase = nullptr) {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            flush_deferred_first_output(lane, phase);
+        }
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -1165,6 +1205,7 @@ private:
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
             }
+            flush_deferred_first_output(lane);
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             auto aborted                = instance_.program->abort(*request->sequence);
             request->generation_timings = aborted.timings;
@@ -1448,9 +1489,17 @@ private:
                 }
                 if (!cancelled[row]) { request->budget->commit(accepted); }
                 update_recovery(request, cancelled[row]);
-                auto published = request->output.commit_preview();
-                auto timing    = record_committed_output(request, accepted);
-                append_output(request, std::move(published), std::move(timing), &phase);
+                const bool defer_first_output =
+                    !decode_round && !decisions[row].terminal && !cancelled[row] &&
+                    continuations[row] == ContinuationAction::Decode && has_tail_prefill_ready();
+                if (defer_first_output) {
+                    deferred_first_tokens_[lane] = accepted;
+                } else {
+                    flush_all_deferred_first_outputs(&phase);
+                    auto published = request->output.commit_preview();
+                    auto timing    = record_committed_output(request, accepted);
+                    append_output(request, std::move(published), std::move(timing), &phase);
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -1730,6 +1779,7 @@ private:
     // state and replays the rest.
     bool pause_resident(std::uint32_t lane) {
         if (instance_.program->has_context_transaction()) { return false; }
+        flush_deferred_first_output(lane);
         auto request = slots_[lane];
         ProgramCallScope call(*this);
         const auto pause_started = Clock::now();
@@ -2744,7 +2794,17 @@ private:
                     }
                     decode = selected;
                 }
+                if (!decode.empty() && controls.empty() && has_tail_prefill_ready()) {
+                    decode = RoundMembership{};
+                }
+                if (!has_tail_prefill_ready()) {
+                    flush_all_deferred_first_outputs();
+                }
+                if (!controls.empty()) {
+                    flush_all_deferred_first_outputs();
+                }
                 if (!decode.empty()) {
+                    flush_all_deferred_first_outputs();
                     set_host_work_class(HostWorkClass::Decode, decode.lane_span());
                     run_decode_round(decode, cancelled);
                     executed = true;
@@ -2885,6 +2945,7 @@ private:
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
+    std::array<std::uint32_t, kMaximumConcurrency> deferred_first_tokens_{};
     std::atomic<bool> admission_check_pending_{false};
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;

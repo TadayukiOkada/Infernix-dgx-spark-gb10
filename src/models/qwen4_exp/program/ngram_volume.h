@@ -97,7 +97,7 @@ private:
     static constexpr std::size_t kInFlight         = 64;  // blocks read at once (one thread)
     static constexpr std::size_t kReadThreads      = 8;   // threads of a large call
     static constexpr std::size_t kParallelInFlight = 16;  // blocks in flight per thread of a large call
-    static constexpr std::size_t kParallelBlocks   = 16;  // distinct blocks that fan out across reader threads
+    static constexpr std::size_t kParallelBlocks   = 64;  // distinct blocks that fan out across reader threads
     struct ReaderPool;
     // INFERNIX_TMP_NGRAM_PARALLEL_GATHER (candidates §8.3 GX-08): a RAM-mode call of at least this many
     // rows gathers them on kReadThreads threads (the same bytes), not one.

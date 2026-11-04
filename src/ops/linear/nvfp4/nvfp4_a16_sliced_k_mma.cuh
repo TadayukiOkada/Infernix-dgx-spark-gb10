@@ -177,22 +177,23 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
 #pragma unroll
         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
-            const int code_col   = k_step * 16 + lid * 2;
-            const auto load_pair = [&](int row, int col, std::uint8_t scale) {
-                const int byte   = (warp_k0 + col) / 2;
-                const int offset = ((byte / 16) ^ (row & kCodeSwizzle)) * 16 + (byte & 15);
-                return nvfp4_scaled_pair_bf16(code_shared[stage][row][offset], scale);
+            const int code_col = k_step * 16 + lid * 2;
+            const int byte0    = (warp_k0 + code_col) / 2;
+            const int byte_hi  = byte0 / 16;
+            const int byte_lo  = byte0 & 15;
+            const auto load_two_pairs = [&](int row, std::uint8_t scale, unsigned& out0, unsigned& out1) {
+                const int offset = (byte_hi ^ (row & kCodeSwizzle)) * 16 + byte_lo;
+                nvfp4_scaled_two_pairs_bf16(code_shared[stage][row][offset], code_shared[stage][row][offset + 4], scale,
+                                            out0, out1);
             };
             unsigned a[kRowTiles][4];
 #pragma unroll
             for (int tile = 0; tile < kRowTiles; ++tile) {
-                const int top          = tile * 16 + gid;
-                const auto s_top       = static_cast<std::uint8_t>(scale_top[tile] >> (k_step * 8));
-                const auto s_bot       = static_cast<std::uint8_t>(scale_bot[tile] >> (k_step * 8));
-                a[tile][0]             = load_pair(top, code_col, s_top);
-                a[tile][1]             = load_pair(top + 8, code_col, s_bot);
-                a[tile][2]             = load_pair(top, code_col + 8, s_top);
-                a[tile][3]             = load_pair(top + 8, code_col + 8, s_bot);
+                const int top    = tile * 16 + gid;
+                const auto s_top = static_cast<std::uint8_t>(scale_top[tile] >> (k_step * 8));
+                const auto s_bot = static_cast<std::uint8_t>(scale_bot[tile] >> (k_step * 8));
+                load_two_pairs(top, s_top, a[tile][0], a[tile][2]);
+                load_two_pairs(top + 8, s_bot, a[tile][1], a[tile][3]);
             }
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {

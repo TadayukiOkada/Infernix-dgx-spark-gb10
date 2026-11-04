@@ -121,15 +121,18 @@ __global__ void __launch_bounds__(kQuantizeThreads)
 // One CTA per job: for each routed entry of the job's expert, its plane row (its dispatch index) and
 // the expert, indexed by the entry's token * top_k + slot.
 __global__ void __launch_bounds__(kQuantizeThreads)
-    map_entries_kernel(MoeDispatch dispatch, std::int32_t* __restrict__ map) {
-    const int job = static_cast<int>(blockIdx.x);
-    if (job >= *dispatch.job_count) { return; }
-    const int expert = dispatch.jobs[job];
-    const int end    = dispatch.offsets[expert + 1];
-    for (int p = dispatch.offsets[expert] + static_cast<int>(threadIdx.x); p < end; p += static_cast<int>(blockDim.x)) {
-        const int entry   = dispatch.entries[p];
-        map[2 * entry]     = p;
-        map[2 * entry + 1] = expert;
+    map_entries_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ pass_tiles, int passes,
+                       std::int32_t* __restrict__ map) {
+    if (pass_tiles[passes] == 0) { return; }
+    const int total_jobs = *dispatch.job_count;
+    for (int job = static_cast<int>(blockIdx.x); job < total_jobs; job += static_cast<int>(gridDim.x)) {
+        const int expert = dispatch.jobs[job];
+        const int end    = dispatch.offsets[expert + 1];
+        for (int p = dispatch.offsets[expert] + static_cast<int>(threadIdx.x); p < end; p += static_cast<int>(blockDim.x)) {
+            const int entry   = dispatch.entries[p];
+            map[2 * entry]     = p;
+            map[2 * entry + 1] = expert;
+        }
     }
 }
 
@@ -139,8 +142,9 @@ __global__ void __launch_bounds__(kQuantizeThreads)
 // kernel's. Requires a dispatch without a shared job (entries == tokens * top_k).
 __global__ void __launch_bounds__(kQuantizeThreads, 3)
     quantize_token_kernel(const std::uint16_t* __restrict__ x, int top_k, int tokens, MoeDispatch dispatch,
-                          const ExpertScales* __restrict__ scales, const std::int32_t* __restrict__ map,
-                          std::uint8_t* __restrict__ plane) {
+                          const ExpertScales* __restrict__ scales, const std::int32_t* __restrict__ pass_tiles,
+                          int passes, const std::int32_t* __restrict__ map, std::uint8_t* __restrict__ plane) {
+    if (pass_tiles[passes] == 0) { return; }
     static_assert(kGateUpBlocks % 32 == 0);
     constexpr int kWarps     = kQuantizeThreads / 32;
     constexpr int kPerLane   = kGateUpBlocks / 32;
@@ -855,13 +859,19 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         check_launch("encode x");
         return call;
     }
-    if (entries == static_cast<int>(x.ne[1]) * top_k && workspace.entry_map != nullptr) {
-        map_entries_kernel<<<max_jobs, kQuantizeThreads, 0, stream>>>(dispatch, workspace.entry_map);
-        quantize_token_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
+    if (x.ne[1] > 64 && entries == static_cast<int>(x.ne[1]) * top_k && workspace.entry_map != nullptr) {
+        constexpr int kWarps   = kQuantizeThreads / 32;
+        const int map_blocks   = std::max(1, std::min<int>(max_jobs, persistent_ctas()));
+        const int token_blocks = std::max(1, std::min<int>(persistent_ctas() * 2,
+                                                           (static_cast<int>(x.ne[1]) + kWarps - 1) / kWarps));
+        map_entries_kernel<<<map_blocks, kQuantizeThreads, 0, stream>>>(
+            dispatch, workspace.pass_tiles, call.passes, workspace.entry_map);
+        quantize_token_kernel<<<token_blocks, kQuantizeThreads, 0, stream>>>(
             static_cast<const std::uint16_t*>(x.data), top_k, static_cast<int>(x.ne[1]), dispatch, source.scales,
-            workspace.entry_map, workspace.x_plane);
+            workspace.pass_tiles, call.passes, workspace.entry_map, workspace.x_plane);
     } else {
-        quantize_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
+        const int quant_blocks = std::max(1, std::min<int>(persistent_ctas() * 2, max_tiles(max_jobs, entries)));
+        quantize_kernel<<<quant_blocks, kQuantizeThreads, 0, stream>>>(
             static_cast<const std::uint16_t*>(x.data), top_k, dispatch, source.scales, workspace.tiles,
             workspace.pass_tiles, call.passes, workspace.x_plane);
     }
