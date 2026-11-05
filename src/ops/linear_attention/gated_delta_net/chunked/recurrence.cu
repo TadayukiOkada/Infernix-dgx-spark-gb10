@@ -64,20 +64,25 @@ __device__ __forceinline__ std::uint32_t pack_f16x2_sat(float lo, float hi) {
     return out;
 }
 
+// Two already-FP16 elements as one MMA B fragment pair; the snapshot stores them pre-saturated.
+__device__ __forceinline__ std::uint32_t pack_half2(__half lo, __half hi) {
+    return std::uint32_t(__half_as_ushort(lo)) | (std::uint32_t(__half_as_ushort(hi)) << 16);
+}
+
 template <int DV>
-__device__ __forceinline__ void load_f16_b(const float* p, int k, int n, int lane, unsigned& b0,
+__device__ __forceinline__ void load_f16_b(const __half* p, int k, int n, int lane, unsigned& b0,
                                            unsigned& b1) {
     const int t = lane & 3, col = n * 8 + lane / 4;
-    b0 = pack_f16x2_sat(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
-    b1 =
-        pack_f16x2_sat(p[value_index<DV>(k + 2 * t + 8, col)], p[value_index<DV>(k + 2 * t + 9, col)]);
+    b0 = pack_half2(p[value_index<DV>(k + 2 * t, col)], p[value_index<DV>(k + 2 * t + 1, col)]);
+    b1 = pack_half2(p[value_index<DV>(k + 2 * t + 8, col)],
+                    p[value_index<DV>(k + 2 * t + 9, col)]);
 }
 
 // On GB10 (sm_121a), m16n8k16.row.col.f32.f16.f16.f32 runs at full FP16 Tensor Core throughput
 // (125.31 TFLOP/s, 1:1 with f16acc), so Fp16Accumulate accumulates directly in FP32 without
 // intermediate FP16 partial-sum rounding or half2-to-float2 unpacks.
 
-template <int DV>
+template <int DV, bool Fp16>
 struct RecurrenceShared {
     struct alignas(256) Stage {
         QkChunk qk;
@@ -85,12 +90,18 @@ struct RecurrenceShared {
         __nv_bfloat16 value[kChunkSize * DV];
     } stage[2];
 
-    float snapshot[kStateDim * DV];
+    // Fp16 operands consume the state snapshot as FP16 (16 KiB at DV=64). When DV/8 >= kWarps
+    // (DV=64), each warp owns a disjoint 8-column slice across all 128 keys, so the exact route
+    // stages 16 keys per k-step (4 KiB at DV=64), unlocking 2 CTAs/SM on both routes.
+    static constexpr int kSnapshotRows =
+        (!Fp16 && (DV / 8 >= kThreads<DV> / 32)) ? kChunkSize : kStateDim;
+    using Snapshot = std::conditional_t<Fp16, __half, float>;
+    Snapshot snapshot[kSnapshotRows * DV];
     float delta[kChunkSize * DV];
 };
 
-template <int DV>
-__device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage& stage,
+template <int DV, bool Fp16>
+__device__ __forceinline__ void load_stage(typename RecurrenceShared<DV, Fp16>::Stage& stage,
                                            const Arguments& args, const QkChunk* qk_workspace,
                                            const ControlChunk* control_workspace, int head,
                                            int value_start, int chunk, int tid) {
@@ -200,7 +211,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
     constexpr int MPW    = (kStateDim / 16) / MW;
     constexpr int NPW    = NT > kWarps ? NT / kWarps : 1;
     extern __shared__ __align__(256) unsigned char backing[];
-    auto& sm      = *reinterpret_cast<RecurrenceShared<DV>*>(backing);
+    auto& sm      = *reinterpret_cast<RecurrenceShared<DV, Fp16>*>(backing);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid / 32;
     const int g = lane / 4, t = lane & 3;
     const int head        = blockIdx.x / (kStateDim / DV);
@@ -225,27 +236,39 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             state[ni][mi][3] = stored_state(state_in[state_base + (value + 1) * kStateDim + key + 8]);
         }
     }
-    load_stage<DV>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0, tid);
+    load_stage<DV, Fp16>(sm.stage[0], args, qk_workspace, control_workspace, head, value_start, 0,
+                         tid);
     if (chunks > 1)
-        load_stage<DV>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start, 1,
-                       tid);
+        load_stage<DV, Fp16>(sm.stage[1], args, qk_workspace, control_workspace, head, value_start,
+                             1, tid);
 
     for (int chunk = 0; chunk < chunks; ++chunk) {
         if (chunk + 1 < chunks)
             cp_wait<1>();
         else
             cp_wait<0>();
+        if constexpr (Fp16 || NT < kWarps) {
 #pragma unroll
-        for (int ni = 0; ni < NPW; ++ni) {
-            const int n = n_start + ni * kWarps;
+            for (int ni = 0; ni < NPW; ++ni) {
+                const int n = n_start + ni * kWarps;
 #pragma unroll
-            for (int mi = 0; mi < MPW; ++mi) {
-                const int key = (m_start + mi * MW) * 16 + g;
-                const int col = n * 8 + t * 2;
-                store_vec(sm.snapshot + value_index<DV>(key, col),
-                          make_float2(state[ni][mi][0], state[ni][mi][1]));
-                store_vec(sm.snapshot + value_index<DV>(key + 8, col),
-                          make_float2(state[ni][mi][2], state[ni][mi][3]));
+                for (int mi = 0; mi < MPW; ++mi) {
+                    const int key = (m_start + mi * MW) * 16 + g;
+                    const int col = n * 8 + t * 2;
+                    if constexpr (Fp16) {
+                        // Saturating FP16 rounding done once; every k-step reuses these bits.
+                        *reinterpret_cast<std::uint32_t*>(sm.snapshot + value_index<DV>(key, col)) =
+                            pack_f16x2_sat(state[ni][mi][0], state[ni][mi][1]);
+                        *reinterpret_cast<std::uint32_t*>(sm.snapshot +
+                                                          value_index<DV>(key + 8, col)) =
+                            pack_f16x2_sat(state[ni][mi][2], state[ni][mi][3]);
+                    } else {
+                        store_vec(sm.snapshot + value_index<DV>(key, col),
+                                  make_float2(state[ni][mi][0], state[ni][mi][1]));
+                        store_vec(sm.snapshot + value_index<DV>(key + 8, col),
+                                  make_float2(state[ni][mi][2], state[ni][mi][3]));
+                    }
+                }
             }
         }
         __syncthreads();
@@ -258,18 +281,26 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
             float prediction[NPW][4]{};
             if constexpr (!Fp16) {
 #pragma unroll
-                for (int k = 0; k < kStateDim; k += 16) {
+                for (int mi = 0; mi < MPW; ++mi) {
+                    const int k = mi * 16;
                     unsigned ka0[4], ka1[4], qa[4];
                     load_vector_tf32_a(qk.k, k, lane, ka0);
                     load_vector_tf32_a(qk.k, k + 8, lane, ka1);
                     load_vector_bf16_a(qk.q, k, lane, qa);
 #pragma unroll
                     for (int ni = 0; ni < NPW; ++ni) {
-                        const int n    = warp + ni * kWarps;
-                        const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
-                        const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
-                        const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
-                        const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
+                        const int n   = warp + ni * kWarps;
+                        const int col = n * 8 + t * 2;
+                        store_vec(sm.snapshot + value_index<DV>(g, col),
+                                  make_float2(state[ni][mi][0], state[ni][mi][1]));
+                        store_vec(sm.snapshot + value_index<DV>(g + 8, col),
+                                  make_float2(state[ni][mi][2], state[ni][mi][3]));
+                        __syncwarp();
+                        const float b0 = sm.snapshot[value_index<DV>(2 * t, n * 8 + g)];
+                        const float b1 = sm.snapshot[value_index<DV>(2 * t + 1, n * 8 + g)];
+                        const float b2 = sm.snapshot[value_index<DV>(2 * t + 8, n * 8 + g)];
+                        const float b3 = sm.snapshot[value_index<DV>(2 * t + 9, n * 8 + g)];
+                        __syncwarp();
                         mma_tf32_bits(prediction[ni][0], prediction[ni][1], prediction[ni][2],
                                       prediction[ni][3], ka0[0], ka0[1], ka0[2], ka0[3],
                                       __float_as_uint(b0), __float_as_uint(b1));
@@ -282,7 +313,8 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                     }
                 }
             } else {
-                // S is rounded to FP16 once per element for both products, accumulated in FP32.
+                // S was rounded to FP16 (saturating) once per element when the snapshot was
+                // stored; both products consume those bits, accumulated in FP32.
 #pragma unroll
                 for (int k = 0; k < kStateDim; k += 16) {
                     unsigned ka[4], qa[4];
@@ -290,12 +322,13 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
                     load_vector_bf16_a(qk.q, k, lane, qa);
 #pragma unroll
                     for (int ni = 0; ni < NPW; ++ni) {
-                        const int n    = warp + ni * kWarps;
-                        const float b0 = sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)];
-                        const float b1 = sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)];
-                        const float b2 = sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)];
-                        const float b3 = sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)];
-                        const unsigned s0 = pack_f16x2_sat(b0, b1), s1 = pack_f16x2_sat(b2, b3);
+                        const int n = warp + ni * kWarps;
+                        const unsigned s0 =
+                            pack_half2(sm.snapshot[value_index<DV>(k + 2 * t, n * 8 + g)],
+                                       sm.snapshot[value_index<DV>(k + 2 * t + 1, n * 8 + g)]);
+                        const unsigned s1 =
+                            pack_half2(sm.snapshot[value_index<DV>(k + 2 * t + 8, n * 8 + g)],
+                                       sm.snapshot[value_index<DV>(k + 2 * t + 9, n * 8 + g)]);
                         mma_f16(prediction[ni][0], prediction[ni][1], prediction[ni][2],
                                 prediction[ni][3], ka[0], ka[1], ka[2], ka[3], s0, s1);
                         mma_f16(history[ni][0], history[ni][1], history[ni][2], history[ni][3],
@@ -462,8 +495,8 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
         }
         __syncthreads();
         if (chunk + 2 < chunks) {
-            load_stage<DV>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
-                           value_start, chunk + 2, tid);
+            load_stage<DV, Fp16>(sm.stage[chunk & 1], args, qk_workspace, control_workspace, head,
+                                 value_start, chunk + 2, tid);
         }
     }
 #pragma unroll
@@ -484,7 +517,7 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 template <int DV, bool Fp16, class State>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
-    constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
+    constexpr int shared_bytes = sizeof(RecurrenceShared<DV, Fp16>);
     CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16, State>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
     chunk_recurrence_kernel<DV, Fp16, State>

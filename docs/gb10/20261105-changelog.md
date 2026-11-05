@@ -421,3 +421,113 @@ and 2-stage / 2-CTA-per-SM `context_kv_grouped_kernel`) on NVIDIA GB10 (`sm_121a
 - `select_us` is unchanged (within noise) relative to base; the shipped value of T4 is the removed `cub::BlockScan` dependency, 2,144 B less static SMEM in `qsa_select_global_kernel`, and a measured falsification of the packed-query premise (now documented at the wide-kernel source).
 - `qsa_score_wide_kernel` stays at 2 CTAs/SM with 42,240 B dynamic SMEM. Any future 3-CTA attempt must shrink SMEM without adding per-leaf instructions — e.g. keeping the FP32 query staging and halving the staged column count per pass — which re-reads pooled keys and needs its own A/B; not attempted here.
 - The scan replacement's benefit is structural (dependency + SMEM); at widths where the select kernel is a larger share of a round (decode-side narrow batches with large contexts) it can at best be neutral — no point measured a real gain, none measured a real loss.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T5: GQA-shared GDN `prepare_group_kernel` (group-dispatched) and 2-CTA/SM state snapshots in `chunk_recurrence_kernel`
+
+## 1. Accounting
+
+- Base commit: `a362a9883` (`dev-rebased-20261028`).
+- Files changed: `src/ops/linear_attention/gated_delta_net/chunked/prepare.cu` (M, +236/−9),
+  `src/ops/linear_attention/gated_delta_net/chunked/recurrence.cu` (M, +70/−37).
+- `tools/cuda_stack/cuda_stack_allowlist.json`: unchanged (no new or eliminated spills; every
+  touched kernel is `STACK:0, LOCAL:0` before and after).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **Held**: `prepare_kernel` loaded Q/K, L2-normalized and ran the `K*K^T` / `Q*K^T` MMAs once per
+  value head, 3× redundantly for the production GQA group (48/16). The FP16 FastPath stored the
+  chunk-boundary state as FP32 and re-`pack_f16x2_sat` it every k16 step.
+- **Corrected — serializing the heads inside one CTA regresses**: the first implementation looped
+  `g_idx = 0..group-1` sequentially after the shared MMA and measured prepare **+48 % at T=512 and
+  +32 % at T=2048** — the per-head control chain (g/beta global-load latency, 16-step forward
+  substitution) was previously hidden by running heads in *separate* CTAs. Fixed by giving each
+  group head its own warp (warp `w` ↔ head `base+w`, per-warp ControlChunk/prefix/beta/lower
+  staging, cooperative all-warp publish).
+- **Corrected — 8-slot `PrepareGroupShared` (`38,912 B`, `REG:118`, 2 CTAs/SM) starved DRAM during
+  the serial control chain**: at 2 CTAs/SM, both resident CTAs enter the 2-warp MMA and 3-warp
+  16-step forward-substitution chain together with no other resident CTAs issuing Q/K DRAM loads,
+  regressing exact `T=2048` (+1.2 % vs base). Fixed by:
+  1. Sizing `kHeadWarps = 4` and unioning `QkChunk qk` (`8,192 B`, published to `qk_workspace`
+     during the shared MMA phase and dead thereafter) with the per-head control staging (`13,824 B`),
+     shrinking static SMEM from `38,912 B` to **`16,896 B`** and tightening `__launch_bounds__(256, 4)`
+     (`REG:64, STACK:0`), which doubles residency from **2 → 4 CTAs/SM** (`1,024` threads/SM) and
+     cuts `chunked.prepare` from `40.6 → 32.5–35.5 µs` at `T=512` and `210.0 → 187.2 µs` at
+     `T=2048` (`~260 GB/s` actual non-redundant DRAM bandwidth, ~95 % of the LPDDR5X ceiling).
+  2. Walking chunks in reverse (`chunks - 1 - raw_chunk`) when `chunks > 64` (`T > 1024`, where the
+     46.25 MiB prepare footprint exceeds GB10's 32 MiB L2 cache): in forward chunk order, `prepare`
+     evicts `chunk 0..~50` before `recurrence` starts at `chunk = 0`, causing 0 % L2 reuse and FIFO
+     thrashing; LIFO ordering leaves `chunk 0..~79` hot in L2 for `recurrence`, saving ~25 µs on
+     end-to-end `public.total` at `T=2048`.
+- **Corrected — group ≤ 2 must keep the per-head route**: with a small group (`group ≤ 2`),
+  `launch_prepare` dispatches `prepare_head_kernel` (grid `value_heads × chunks`), while `group ≥ 3`
+  dispatches `prepare_group_kernel` (grid `qk_heads × chunks`). Production checkpoints (Qwen3.5 /
+  Qwen3.8-Flash-Next: 48 value / 16 QK heads, group 3) take `prepare_group_kernel`.
+- **Corrected — `RecurrenceShared<64>` SMEM figures and Exact-route 2-CTA/SM unlock**: the task doc
+  cites `SHARED:44032`; the actual struct was `61,952 B` (stages `25,088 B` + snapshot `32,768 B` +
+  delta `4,096 B`), which capped `chunk_recurrence_kernel<64>` at **1 CTA/SM** (2 waves for 96 CTAs
+  on 48 SMs) despite `__launch_bounds__(256, 2)`.
+  - On the `Fp16` route, storing `sm.snapshot` as `__half` (`16,384 B`) reduces dynamic SMEM to
+    `45,568 B` (**1 → 2 CTAs/SM**, single-wave 96-CTA residency).
+  - On the `Exact` route (`!Fp16`), when `DV / 8 >= kWarps` (`DV=64`), each warp `w` (`0..7`) owns a
+    disjoint 8-column value slice across all 128 keys (`value_index<64>(row, w*8 + c)` is disjoint
+    across warps for every row). Staging one 16-key tile (`kChunkSize = 16` rows, `4,096 B`) per
+    `mi` step with `__syncwarp()` at loop-invariant shared-memory offsets shrinks Exact `DV=64`
+    dynamic SMEM from `61,952 B` to **`33,280 B`** (`REG:128, STACK:0`), unlocking **1 → 2 CTAs/SM**
+    (all 96 CTAs co-resident in 1 wave on 48 SMs, with 61 KiB L1 remaining per SM) while keeping
+    Exact arithmetic 100 % bit-identical.
+
+## 3. Subsystem breakdown
+
+- `prepare.cu` (M): split into `prepare_head_kernel` (`group ≤ 2`) and `prepare_group_kernel`
+  (`group ≥ 3`, `__launch_bounds__(256, 4)`, `kHeadWarps = 4`, `QkChunk` unioned with per-head
+  `ControlChunk`/prefix/beta/lower staging, LIFO chunk walk when `chunks > 64`). Outputs are 100 %
+  bit-identical to `prepare_head_kernel`.
+- `recurrence.cu` (M): `RecurrenceShared<DV, Fp16>` stores `snapshot` as `__half[kStateDim * DV]`
+  when `Fp16` (`45,568 B` total at `DV=64`, hoisted `pack_f16x2_sat` once per chunk boundary +
+  `pack_half2` / `load_f16_b` per k16 step) and as `float[kChunkSize * DV]` (`33,280 B` total at
+  `DV=64`) when `!Fp16 && (DV / 8 >= kWarps)`, unlocking 2 CTAs/SM on both `Exact` and `Fp16`
+  routes at `DV=64` with zero bit change on either route.
+
+## 4. Verification
+
+- `ctest --test-dir build-native -R "infernix_cuda_stack_check|infernix_gated_delta_net_test"`:
+  **2/2 passed (100 %)** (`infernix_cuda_stack_check` 1.44 s, `infernix_gated_delta_net_test`
+  23.58 s); full 15-test GDN oracle/replay/fold suite 15/15 passed.
+- Resources (`cuobjdump --dump-resource-usage build-native/apps/infernix-serve`):
+  - `prepare_head_kernel`: `REG:48 STACK:0 SHARED:12800 LOCAL:0` (unchanged)
+  - `prepare_group_kernel`: `REG:64 STACK:0 SHARED:16896 LOCAL:0` (4 CTAs/SM: 65,536 regs, 67,584 B
+    SMEM ≤ 101,376 B)
+  - `chunk_recurrence_kernel`: `Fp16` `REG:79/121/103/127` (`DV=8/16/32/64`), `Exact`
+    `REG:93/128/117/128` (`DV=8/16/32/64`), all `STACK:0 LOCAL:0`. Dynamic SMEM at `DV=64`:
+    `61,952 → 33,280 B` (`Exact`, 1 → 2 CTAs/SM) and `61,952 → 45,568 B` (`Fp16`, 1 → 2 CTAs/SM).
+- `infernix_gated_delta_net_bench` public route (flash-next shape `qk_heads=16, value_heads=48`,
+  cold-L2 32 MiB flush, CUDA Graph replay):
+
+  | route | T | task baseline µs | fresh HEAD base µs | candidate µs (min µs) | Δ vs task baseline | Δ vs fresh HEAD |
+  |---|---|---|---|---|---|---|
+  | exact | 16 | — | 33.9 | 30.5 (29.5) | — | **−10.0 %** |
+  | exact | 64 | — | 45.3 | 39.8 (38.8) | — | **−12.1 %** |
+  | exact | 512 | 159.97 | 155.3 | **140.1 (138.0)** | **−12.4 %** | **−9.8 %** |
+  | exact | 2048 | 639.97 | 628.4 | **576.2 (570.5)** | **−10.0 %** | **−8.3 %** |
+  | fp16-acc | 512 | 159.97 | 153.4 | **138.0 (135.2)** | **−13.7 %** | **−10.0 %** |
+  | fp16-acc | 2048 | 639.97 | 629.4 | **577.2 (569.9)** | **−9.8 %** | **−8.3 %** |
+
+  Stage breakdown at `T=512` (exact): `prepare` `40.6 → 32.5–35.5 µs` (`−13…−20 %`), `recurrence`
+  `110.3 → 104.3–105.1 µs` (`−5.4 %`).
+  Stage breakdown at `T=2048` (exact): `prepare` `206.7 → 187.2 µs` (`−9.4 %`), `recurrence`
+  `395.0 → 379.7 µs` (`−3.9 %`), plus `~25 µs` end-to-end L2 handoff gain from LIFO chunk ordering.
+- Group-size sweep (exact, `T=2048`): `g1` `330.5 → 333.5 µs` (min `327.5 µs`, head route, noise),
+  `g2` `499.4 → 502.5 µs` (min `497.0 µs`, head route, noise), `g3` `628.4 → 576.2 µs` (**−8.3 %**),
+  `g4` (`qk16/vh64`) `743.0 µs`, `g6` `1133.6 → 1013.6 µs` (**−10.6 %**), `g8` `1533.8 → 1328.9 µs`
+  (**−13.4 %**), `g16` (`qk1/vh16`) `190.0 → 179.1 µs` (**−5.7 %**).
+
+## 5. Regressions & adverse results (all found, all resolved)
+
+- **Serial-head-loop first attempt regressed prepare +48 % (T=512) / +32 % (T=2048)** — resolved by
+  the one-warp-per-head design.
+- **Shared route at group ≤ 2 regressed +6.5 % (g1) / +4.8…+6.5 % (g2)** — resolved by the
+  `group ≥ 3` dispatch band (`prepare_head_kernel` retained for `group ≤ 2`).
+- **2-CTA/SM `prepare_group_kernel` (`SHARED:38912, REG:118`) and 1-CTA/SM Exact `chunk_recurrence_kernel<64>` (`SHARED:61952`) initially left Exact T=512/T=2048 at +0.7 %/+1.2 %** — resolved in review by unioning `QkChunk` with 4-warp control staging (`SHARED:16896, REG:64`, 4 CTAs/SM), staging 16-row warp-disjoint Exact snapshots in `RecurrenceShared<64, false>` (`SHARED:33280, REG:128, STACK:0`, 2 CTAs/SM), and walking `prepare_group_kernel` chunks in LIFO order when `chunks > 64`. Both `T=512` (`−12.4 %` vs task baseline, `−9.8 %` vs fresh HEAD) and `T=2048` (`−10.0 %` vs task baseline, `−8.3 %` vs fresh HEAD) now exceed the `≥ 8 %` acceptance threshold across both Exact and `Fp16Accumulate` routes.
+- **2-half (64-row) Exact snapshot staging initially spilled 8 B (`STACK:8`) on `chunk_recurrence_kernel<64, false>` during `nvlink`** — caught by `infernix_cuda_stack_check`; resolved by switching to 16-row (`kChunkSize`) loop-invariant snapshot offsets per `mi` step, restoring `REG:128, STACK:0, LOCAL:0` on all `chunk_recurrence_kernel` instances.
