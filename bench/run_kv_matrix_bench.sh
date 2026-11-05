@@ -38,7 +38,7 @@ if [ "$FULL" = 1 ]; then
 else
     DEFAULT_KV='int8'
     DEFAULT_MODES='mtp'
-    DEFAULT_MODELS='nvfp4'
+    DEFAULT_MODELS='nvfp4 iq3s dense8'
 fi
 KV_DTYPES="${KV_DTYPES:-$DEFAULT_KV}"
 MODES="${MODES:-$DEFAULT_MODES}"

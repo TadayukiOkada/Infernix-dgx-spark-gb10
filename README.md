@@ -140,9 +140,120 @@ Measured on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`--kv-dtype fp8 -
 | **`c = 4`** | **44.86 ± 1.15** | **179.44** | **184.04** (`46.01`/stream) | `175.41` / `177.86` (`43.95` per-stream) | **+2.3% median / +3.5% peak** (**+94.6%** over un-tuned `c=4`) |
 
 #### OpenAI HTTP Server (`infernix-serve`) Context-Depth Scaling (`llama-benchy`)
-End-to-end HTTP serving throughput measured with `llama-benchy` (`pp2048 tg128` across prefix context depths `d0`, `d4096`, `d8192` at `temperature = 1.0`):
-- **Prefill throughput (`pp2048`)**: scales from **2,620 tok/s** at `d0` (`c = 1`) to **3,056 tok/s** at `d4096` and **3,408 tok/s** at `d8192` (`3,104–3,123 tok/s` under `c = 2, 4` concurrent load).
-- **Single- and multi-stream HTTP decode (`tg128`)**: fixing `round_cost_fit` end-of-request truncation and enabling `c = 2..4` multi-row MTP speculation lifted `c = 2` decode from `83.9 tok/s` to **125.0–127.1 tok/s** (`+51.4%`) and `c = 4` decode from `92.2 tok/s` to **179.4 tok/s** (`+94.6%`).
+
+`Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` — launch via `./tools/run_server.sh` (no extra args):
+
+```
+INFERNIX_EXPERTS_ON_GPU=1 infernix-serve \
+  Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix \
+  --ngram-volume Qwen3.8-Flash-Next-Local-NVFP4.ngram \
+  --ngram-residency volume --ngram-cache-mib 4096 \
+  --kv-dtype nvfp4 \
+  --spec mtp --draft-tokens auto --lm-head-draft \
+  --ngram-draft-tokens 31 --ngram-min-match 4 \
+  --temperature 1.0 --top-p 0.9 --min-p 0.1 --top-k 20 \
+  --max-context 262144 --max-concurrency 4
+```
+
+`llama-benchy` `pp2048 tg128` × prefix depths `d0 / d4096 / d8192` × `c = 1, 2, 4`, `temperature = 1.0`, 2026-11-05:
+
+| Test | `c` | `pp t/s` | `tg t/s` | TTFT (ms) | Total (ms) |
+|---|---:|---:|---:|---:|---:|
+| `pp2048 tg128 @ d0` | `c1` | **3,038\*** | **71.7** | 674 | 2,446 |
+| `pp2048 tg128 @ d0` | `c2` | 2,863 | **95.8** | 1,352 | 3,894 |
+| `pp2048 tg128 @ d0` | `c4` | 2,869 | **132.6** | 2,634 | 6,229 |
+| `pp2048 tg128 @ d4096` | `c1` | **3,826\*** | **70.2** | 1,606 | 3,414 |
+| `pp2048 tg128 @ d4096` | `c2` | 3,613 | **88.7** | 3,119 | 5,720 |
+| `pp2048 tg128 @ d4096` | `c4` | 3,624 | **128.4** | 6,213 | 9,710 |
+| `pp2048 tg128 @ d8192` | `c1` | **4,355\*** | **69.8** | 2,351 | 4,170 |
+| `pp2048 tg128 @ d8192` | `c2` | 4,010 | **102.8** | 4,627 | 7,051 |
+| `pp2048 tg128 @ d8192` | `c4` | 4,028 | **118.4** | 9,310 | 13,221 |
+
+\* `c = 1` prefill column is an estimator output, not wall-clock throughput — only `e2e_ttft`-derived rates are meaningful at `c = 1`.
+
+`Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` — same launcher and flags with `--kv-dtype int8`:
+
+```
+INFERNIX_EXPERTS_ON_GPU=1 infernix-serve \
+  Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix \
+  --ngram-volume Qwen3.8-Flash-Next-Local-NVFP4.ngram \
+  --ngram-residency volume --ngram-cache-mib 4096 \
+  --kv-dtype int8 \
+  --spec mtp --draft-tokens auto --lm-head-draft \
+  --ngram-draft-tokens 31 --ngram-min-match 4 \
+  --temperature 1.0 --top-p 0.9 --min-p 0.1 --top-k 20 \
+  --max-context 262144 --max-concurrency 4
+```
+
+`llama-benchy` `pp2048 tg128` × prefix depths `d0 / d4096 / d8192` × `c = 1, 2, 4`, `temperature = 1.0`, 2026-11-05:
+
+| Test | `c` | `pp t/s` | `tg t/s` | TTFT (ms) | Total (ms) |
+|---|---:|---:|---:|---:|---:|
+| `pp2048 tg128 @ d0` | `c1` | **2,978\*** | **83.0** | 688 | 2,217 |
+| `pp2048 tg128 @ d0` | `c2` | 2,862 | **109.4** | 1,341 | 3,583 |
+| `pp2048 tg128 @ d0` | `c4` | 2,929 | **140.2** | 2,631 | 6,038 |
+| `pp2048 tg128 @ d4096` | `c1` | **3,921\*** | **74.7** | 1,567 | 3,266 |
+| `pp2048 tg128 @ d4096` | `c2` | 3,617 | **108.7** | 3,067 | 5,353 |
+| `pp2048 tg128 @ d4096` | `c4` | 3,645 | **141.4** | 6,187 | 9,446 |
+| `pp2048 tg128 @ d8192` | `c1` | **4,335\*** | **73.1** | 2,362 | 4,100 |
+| `pp2048 tg128 @ d8192` | `c2` | 3,968 | **101.1** | 4,712 | 7,118 |
+| `pp2048 tg128 @ d8192` | `c4` | 3,988 | **139.7** | 9,376 | 12,781 |
+
+`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix` — same launcher and flags with `--kv-dtype int8` and the volume n-gram:
+
+```
+INFERNIX_EXPERTS_ON_GPU=1 infernix-serve \
+  Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix \
+  --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram \
+  --ngram-residency volume --ngram-cache-mib 4096 \
+  --kv-dtype int8 \
+  --spec mtp --draft-tokens auto --lm-head-draft \
+  --ngram-draft-tokens 31 --ngram-min-match 4 \
+  --temperature 1.0 --top-p 0.9 --min-p 0.1 --top-k 20 \
+  --max-context 262144 --max-concurrency 4
+```
+
+`llama-benchy` `pp2048 tg128` × prefix depths `d0 / d4096 / d8192` × `c = 1, 2, 4`, `temperature = 1.0`, 2026-11-05:
+
+| Test | `c` | `pp t/s` | `tg t/s` | TTFT (ms) | Total (ms) |
+|---|---:|---:|---:|---:|---:|
+| `pp2048 tg128 @ d0` | `c1` | **2,612\*** | **64.9** | 784 | 2,740 |
+| `pp2048 tg128 @ d0` | `c2` | 2,473 | **84.5** | 1,575 | 4,287 |
+| `pp2048 tg128 @ d0` | `c4` | 2,493 | **126.8** | 3,094 | 6,904 |
+| `pp2048 tg128 @ d4096` | `c1` | **3,206\*** | **62.9** | 1,916 | 3,937 |
+| `pp2048 tg128 @ d4096` | `c2` | 3,065 | **93.4** | 3,650 | 6,299 |
+| `pp2048 tg128 @ d4096` | `c4` | 3,109 | **124.7** | 7,246 | 10,984 |
+| `pp2048 tg128 @ d8192` | `c1` | **3,569\*** | **54.0** | 2,869 | 5,222 |
+| `pp2048 tg128 @ d8192` | `c2` | 3,258 | **90.0** | 5,750 | 8,483 |
+| `pp2048 tg128 @ d8192` | `c4` | 3,221 | **126.3** | 11,621 | 15,399 |
+
+`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix` — same launcher and flags with `--kv-dtype int8`, the RAM-pinned n-gram, and `--max-context 131072` (at `262144` the weights + 27.8 GiB pinned n-gram + host cache claim exceed GB10's unified-memory ledger at startup):
+
+```
+INFERNIX_EXPERTS_ON_GPU=1 infernix-serve \
+  Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix \
+  --ngram-volume Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram \
+  --ngram-residency ram \
+  --kv-dtype int8 \
+  --spec mtp --draft-tokens auto --lm-head-draft \
+  --ngram-draft-tokens 31 --ngram-min-match 4 \
+  --temperature 1.0 --top-p 0.9 --min-p 0.1 --top-k 20 \
+  --max-context 262144 --max-concurrency 4
+```
+
+`llama-benchy` `pp2048 tg128` × prefix depths `d0 / d4096 / d8192` × `c = 1, 2, 4`, `temperature = 1.0`, 2026-11-05:
+
+| Test | `c` | `pp t/s` | `tg t/s` | TTFT (ms) | Total (ms) |
+|---|---:|---:|---:|---:|---:|
+| `pp2048 tg128 @ d0` | `c1` | **1,406\*** | **63.4** | 1,457 | 3,460 |
+| `pp2048 tg128 @ d0` | `c2` | 1,318 | **84.5** | 2,972 | 5,850 |
+| `pp2048 tg128 @ d0` | `c4` | 1,305 | **112.6** | 5,846 | 10,196 |
+| `pp2048 tg128 @ d4096` | `c1` | **1,670\*** | **68.4** | 3,679 | 5,537 |
+| `pp2048 tg128 @ d4096` | `c2` | 1,538 | **83.9** | 7,334 | 10,274 |
+| `pp2048 tg128 @ d4096` | `c4` | 1,539 | **104.7** | 14,644 | 19,022 |
+| `pp2048 tg128 @ d8192` | `c1` | **1,758\*** | **64.1** | 5,825 | 7,808 |
+| `pp2048 tg128 @ d8192` | `c2` | 1,605 | **90.1** | 11,653 | 14,390 |
+| `pp2048 tg128 @ d8192` | `c4` | 1,605 | **106.1** | 23,421 | 27,954 |
 
 ---
 
