@@ -23,7 +23,8 @@ struct ProjectionFp32Output {
     }
 };
 
-using HeadSchedule = Bf16A16SlicedKMmaSchedule<32, 16, 4, 64, 2, Cache::cg, Cache::ca, 2>;
+using HeadSchedule   = Bf16A16SlicedKMmaSchedule<32, 16, 4, 64, 2, Cache::cg, Cache::ca, 2>;
+using HeadSchedule32 = Bf16A16SlicedKMmaSchedule<32, 32, 4, 64, 2, Cache::cg, Cache::ca, 2>;
 
 } // namespace
 
@@ -53,8 +54,12 @@ bool projection_fp32_bf16_mma_supported(int rows, int k, int columns) noexcept {
 void projection_fp32_bf16_mma(const Tensor& x, const void* weight, int rows, Tensor& out, cudaStream_t stream) {
     const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight),
                             rows, static_cast<int>(x.ne[0]), static_cast<int>(x.ne[1])};
-    launch_bf16_a16_sliced_k_mma<HeadSchedule>(p, ProjectionFp32Output{static_cast<float*>(out.data), rows},
-                                               LinearIdentityEpilogue{}, stream);
+    const ProjectionFp32Output output{static_cast<float*>(out.data), rows};
+    if (p.tokens <= 16) {
+        launch_bf16_a16_sliced_k_mma<HeadSchedule>(p, output, LinearIdentityEpilogue{}, stream);
+    } else {
+        launch_bf16_a16_sliced_k_mma<HeadSchedule32>(p, output, LinearIdentityEpilogue{}, stream);
+    }
 }
 
 } // namespace infernix::ops::detail

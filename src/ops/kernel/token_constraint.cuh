@@ -53,8 +53,9 @@ __launch_bounds__(BlockSize) __global__
     const std::int32_t n = count;
     if (n == 0) { return; }
 
+    __shared__ TargetLogprobsShared<BlockSize> lse_shared;
     Logit* values = logits + static_cast<std::int64_t>(column) * physical_rows;
-    const TargetLogprobsColumn full = target_logprobs_column<BlockSize>(values, valid_rows);
+    const TargetLogprobsColumn full = target_logprobs_column<BlockSize>(values, valid_rows, lse_shared);
 
     // Observations read the unmasked column: the masking below waits for the barrier after this.
     if (observe != nullptr) {

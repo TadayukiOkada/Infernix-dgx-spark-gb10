@@ -2306,7 +2306,8 @@ public:
         // the others, and a call the stream turns down, read them first.
         // FP4-Local from a volume (2026-10-30, three interleaved runs): pp16413 6,829 -> 6,999 tok/s, pp4096
         // 2,727 -> 2,802 (every pair ahead).
-        const bool rows_behind = expert_stream_ && width >= kStreamMinColumns && !walk_.active;
+        const bool rows_behind =
+            (expert_stream_ || options_.device_experts) && width >= kStreamMinColumns && !walk_.active;
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                static_cast<std::uint64_t>(rows_behind ? 0 : width));
@@ -2319,8 +2320,8 @@ public:
         const bool streamed = !walk_.active && stream_chunk(width);
         score_column_       = begin;
         const execution::VisionInput* vision = stage_vision(lane, static_cast<std::uint32_t>(begin), width);
-        if (rows_behind && streamed) {
-            run_rows_behind(lane, begin, width, chunk ? &*chunk : nullptr, vision);
+        if (rows_behind && (streamed || options_.device_experts)) {
+            run_rows_behind(lane, begin, width, chunk ? &*chunk : nullptr, vision, streamed);
         } else {
             if (rows_behind) {
                 const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
@@ -2576,6 +2577,13 @@ public:
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
                 auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
                 const int bucket = ngram_bucket(match.matched);
+                const float copy_width_cost = kNgramWidthCost;
+                if (!match.tokens.empty() && options_.auto_draft_length) {
+                    const std::int32_t opt = best_copy_length(
+                        static_cast<std::int32_t>(match.tokens.size()),
+                        lane.ngram_accept[static_cast<std::size_t>(bucket)], copy_width_cost);
+                    match.tokens.resize(static_cast<std::size_t>(opt));
+                }
                 // Any non-empty copy proposal competes with the row's MTP drafts on expected tokens per
                 // round time (kNgramWidthCost for a zero-draft-step copy verification; Strata's
                 // DraftPolicy) — not only a longer one: a short copy of a well-accepted match beats a
@@ -2585,7 +2593,6 @@ public:
                 if (take && extents[b] > 0) {
                     const float row_width_cost =
                         batch == 1 ? width_cost() : (batch == 2 ? kPairWidthCost : kMultiRowWidthCost);
-                    const float copy_width_cost = kNgramWidthCost;
                     take = copy_beats_chain(static_cast<std::int32_t>(match.tokens.size()),
                                             lane.ngram_accept[static_cast<std::size_t>(bucket)],
                                             copy_width_cost, lane.mtp_accept, extents[b], row_width_cost);
@@ -2648,7 +2655,7 @@ public:
                     ngram_proposal_bucket_[b] = -1;
                     continue;
                 }
-                if (batch == 1 || mtp_executed_[b] < extents[b]) {
+                if (batch == 1) {
                     extents[b] = chain_ext;
                 }
                 drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
@@ -4325,7 +4332,7 @@ private:
     // bounce) cannot block the helper's publish. A failed read publishes zero rows (the call's results are
     // discarded with its error). The same rows and the same arithmetic: no bit changes.
     void run_rows_behind(Lane& lane, std::int32_t begin, std::int32_t width, const execution::MtpChunk* chunk,
-                         const execution::VisionInput* vision) {
+                         const execution::VisionInput* vision, bool streamed) {
         const std::uint32_t word = next_gate_word();
         const execution::NgramRowGate gate{
             .pinned_rows = host_io() + io_layout_.ngram,
@@ -4344,7 +4351,7 @@ private:
             publish_pinned_word(gate_ready(), word);
         });
         try {
-            run(1, width, 1, chunk, vision, true, &gate);
+            run(1, width, 1, chunk, vision, streamed, &gate);
         } catch (...) {
             reader.join();
             throw;
@@ -4367,6 +4374,7 @@ private:
     // The call planner's costs: the fitted call costs, and the walk's spans as walk_span_end forms them.
     [[nodiscard]] prefix::CallCost call_cost() const {
         return prefix::CallCost{.model            = options_.prefix_cost,
+                                .served_columns   = options_.device_experts ? 0U : 8U,
                                 .span_seconds     = options_.prefix_span_seconds,
                                 .walk_min_columns = static_cast<std::uint32_t>(kStreamMinColumns),
                                 .walk_max_tokens  = kWalkMaxTokens};
@@ -4839,6 +4847,8 @@ private:
     // reads its inputs by address when it is launched).
     void prepare_graph(DecodeGraph& graph, const std::function<void()>& capture) {
         const cudaStream_t s = device_.stream;
+        // A first-use capture's host latency must not enter the online draft-length cost fit.
+        last_round_steps_ = -1;
         // A captured body bakes in whatever it reads by address: the arena *work_ points at and
         // the per-layer waits forward_call consumes. Neither may be a call's temporary.
         if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
@@ -5524,11 +5534,13 @@ private:
         std::int32_t best = 0;
         double best_score = 1.0;
         double reach = 1.0, tokens = 1.0;
-        const double cost = width_cost();
+        const double cost      = width_cost();
+        const double tile_cost = std::min(cost, 0.10);
         for (std::int32_t k = 1; k <= most; ++k) {
             reach *= lane.mtp_accept[static_cast<std::size_t>(k - 1)];
             tokens += reach;
-            const double score = tokens / (1.0 + cost * k);
+            const double round_cost = k <= 3 ? tile_cost * k : tile_cost * 3 + cost * (k - 3);
+            const double score      = tokens / (1.0 + round_cost);
             if (score > best_score) {
                 best_score = score;
                 best       = k;
@@ -5566,7 +5578,7 @@ private:
         // acceptance only, so A/B arms replaying one greedy request run the same rounds.
         if (replay_clock_) { return kWidthCost; }
         double a = 0.0, b = 0.0;
-        return round_cost_fit(a, b) ? std::clamp(b / a, 0.14, kWidthCost) : kWidthCost;
+        return round_cost_fit(a, b) ? std::clamp(b / a, 0.16, kWidthCost) : kWidthCost;
     }
 
     // At a decode round's start: the previous round's cycle when both are one-row MTP rounds (an
@@ -5612,11 +5624,13 @@ private:
         std::int32_t best = 0;
         double best_score = 2.0;
         double reach_a = 1.0, reach_b = 1.0, tokens = 2.0;
+        const double tile_cost = std::min(kPairWidthCost, 0.10);
         for (std::int32_t k = 1; k <= most; ++k) {
             reach_a *= a.mtp_accept[static_cast<std::size_t>(k - 1)];
             reach_b *= b.mtp_accept[static_cast<std::size_t>(k - 1)];
             tokens += reach_a + reach_b;
-            const double score = tokens / (1.0 + kPairWidthCost * k);
+            const double round_cost = k <= 3 ? tile_cost * k : tile_cost * 3 + kPairWidthCost * (k - 3);
+            const double score      = tokens / (1.0 + round_cost);
             if (score > best_score) {
                 best_score = score;
                 best       = k;
@@ -5640,6 +5654,7 @@ private:
         std::int32_t best         = 0;
         double best_score         = static_cast<double>(batch);
         double tokens             = static_cast<double>(batch);
+        const double tile_cost    = std::min(kMultiRowWidthCost, 0.10);
         std::array<double, kMaximumConcurrency> reach{};
         for (std::int32_t b = 0; b < batch; ++b) { reach[b] = 1.0; }
         for (std::int32_t k = 1; k <= most; ++k) {
@@ -5649,7 +5664,8 @@ private:
                 add += reach[b];
             }
             tokens += add;
-            const double score = tokens / (1.0 + kMultiRowWidthCost * k);
+            const double round_cost = k <= 3 ? tile_cost * k : tile_cost * 3 + kMultiRowWidthCost * (k - 3);
+            const double score      = tokens / (1.0 + round_cost);
             if (score > best_score) {
                 best_score = score;
                 best       = k;
@@ -6784,7 +6800,7 @@ private:
     // 0.38 of a plain round. Single-stream MTP sweep on the Dense8 model: 0.38 -> ~31.7 tok/s, 0.25 ->
     // ~40 tok/s (optimum), <=0.20 overshoots (positions 4+ accept ~0). Default lowered to 0.25;
     // INFERNIX_WIDTH_COST still overrides for per-workload tuning.
-    static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.22);
+    static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.18);
     static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.10);
     static constexpr std::uint64_t kProbeInterval = 8;
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
@@ -6817,10 +6833,10 @@ private:
         std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_DFLASH_PAIR_MAX_DRAFTS", 8.0)), 0,
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kPairMaxDrafts =
-        std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_PAIR_MAX_DRAFTS", 4.0)), 0,
+        std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_PAIR_MAX_DRAFTS", 3.0)), 0,
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kMultiRowMaxDrafts =
-        static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 4.0));
+        static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 3.0));
     static constexpr std::int32_t kPairNgramMaxDrafts     = 15;
     static constexpr std::int32_t kMultiRowNgramMaxDrafts = 7;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
@@ -6836,8 +6852,8 @@ private:
     // costs of the pair's cost model are policy constants (INFERNIX_PAIR_WIDTH_COST 0.14 for the
     // pair width, INFERNIX_PAIR_DRAFT_COST below for one verified column of the round), each fitted
     // on this device; the draft cost replaced the 0.47 the 5090's cost model paid.
-    static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.12);
-    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.22);
+    static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.16);
+    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.16);
     static inline const double kDFlashPairDraftCost =
         policy_double("INFERNIX_PAIR_DRAFT_COST", 0.30);
     static constexpr double kDFlashPairProposalCost  = 0.1;

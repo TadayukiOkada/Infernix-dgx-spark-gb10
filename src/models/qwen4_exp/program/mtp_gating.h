@@ -119,6 +119,27 @@ struct MtpDraftCut {
     return tokens;
 }
 
+// The prefix length in [0, copies] that maximizes expected tokens per round time under `copy_accept`
+// and `copy_cost`. Prevents a long --ngram-draft-tokens limit (e.g. 15) from diluting a 4-7 token
+// match's score below the neural chain's or inflating multi-row verification width with low-probability
+// tail positions.
+[[nodiscard]] inline std::int32_t best_copy_length(std::int32_t copies, double copy_accept,
+                                                   double copy_cost) noexcept {
+    std::int32_t best = 0;
+    double best_score = 1.0;
+    double reach = 1.0, tokens = 1.0;
+    for (std::int32_t k = 1; k <= copies; ++k) {
+        reach *= copy_accept;
+        tokens += reach;
+        const double score = tokens / (1.0 + copy_cost * static_cast<double>(k));
+        if (score > best_score) {
+            best_score = score;
+            best       = k;
+        }
+    }
+    return best;
+}
+
 // The same for a neural chain: `drafts` drafts with the lane's learned per-position acceptances
 // accept[0..drafts).
 [[nodiscard]] inline double expected_chain_tokens(std::span<const double> accept, std::int32_t drafts) noexcept {

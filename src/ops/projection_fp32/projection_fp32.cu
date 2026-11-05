@@ -617,16 +617,26 @@ __global__ void __launch_bounds__(
     }
 }
 
-template <class Codec, int MaxCols = kTallMaxColumns>
+template <class Codec, int MaxCols = kTallMaxColumns, bool SingleStage = false>
 __global__ void __launch_bounds__(
     kTallThreads, (std::is_same_v<Codec, TallQ8> || std::is_same_v<Codec, TallQ4>) ? 2 : 1)
     projection_tall_kernel(const bf16* __restrict__ x, int k, int columns, int rows, Codec codec,
                            float* __restrict__ out) {
-    extern __shared__ uint4 staged[]; // [columns][kTallPassChunks]
+    extern __shared__ uint4 staged[]; // [columns][SingleStage ? chunks : kTallPassChunks]
     const int chunks    = k / 8;
     const int lane      = static_cast<int>(threadIdx.x) % 32;
     const int first_row = (static_cast<int>(blockIdx.x) * kTallWarps + static_cast<int>(threadIdx.x) / 32) *
                           kTallRowsPerWarp;
+    if constexpr (SingleStage) {
+        for (int i = static_cast<int>(threadIdx.x); i < columns * chunks; i += kTallThreads) {
+            const auto dst  = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
+            const auto* src = reinterpret_cast<const uint4*>(x) + i;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
+    }
     float sums[kTallRowsPerWarp][MaxCols] = {};
     for (int pass_begin = 0; pass_begin < chunks; pass_begin += kTallPassChunks) {
         const int pass_chunks = min(kTallPassChunks, chunks - pass_begin);
@@ -640,20 +650,22 @@ __global__ void __launch_bounds__(
                 if (chunk < chunks) { w[r][i] = codec.load(row, chunk); }
             }
         }
-        if (pass_begin > 0) { __syncthreads(); }
-        for (int i = static_cast<int>(threadIdx.x); i < columns * kTallPassChunks; i += kTallThreads) {
-            const int column = i / kTallPassChunks;
-            const int c      = i % kTallPassChunks;
-            if (c < pass_chunks) {
-                const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
-                const auto* src =
-                    reinterpret_cast<const uint4*>(x) + static_cast<std::size_t>(column) * chunks + pass_begin + c;
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+        if constexpr (!SingleStage) {
+            if (pass_begin > 0) { __syncthreads(); }
+            for (int i = static_cast<int>(threadIdx.x); i < columns * kTallPassChunks; i += kTallThreads) {
+                const int column = i / kTallPassChunks;
+                const int c      = i % kTallPassChunks;
+                if (c < pass_chunks) {
+                    const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
+                    const auto* src =
+                        reinterpret_cast<const uint4*>(x) + static_cast<std::size_t>(column) * chunks + pass_begin + c;
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src) : "memory");
+                }
             }
+            asm volatile("cp.async.commit_group;\n" ::: "memory");
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+            __syncthreads();
         }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
-        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-        __syncthreads();
 #pragma unroll
         for (int i = 0; i < kTallPassLaneChunks; ++i) {
             const int c     = lane + 32 * i;
@@ -666,7 +678,8 @@ __global__ void __launch_bounds__(
             for (int column = 0; column < MaxCols; ++column) {
                 if (column < columns) {
                     float xf[8];
-                    widen8(staged[column * kTallPassChunks + c], xf);
+                    const int staged_idx = SingleStage ? (column * chunks + chunk) : (column * kTallPassChunks + c);
+                    widen8(staged[staged_idx], xf);
 #pragma unroll
                     for (int r = 0; r < kTallRowsPerWarp; ++r) {
 #pragma unroll
@@ -701,13 +714,23 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
             static_cast<const bf16*>(x.data), k, rows, codec, static_cast<float*>(out.data));
     };
     const auto launch_pass = [&]<int MaxCols>() {
+        if (staged_exact <= 49152U) {
+            static const bool configured_single = [] {
+                return cudaFuncSetAttribute(projection_tall_kernel<Codec, MaxCols, true>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize, 49152) == cudaSuccess;
+            }();
+            require(configured_single, "the single-stage tall kernel's shared memory could not be configured");
+            projection_tall_kernel<Codec, MaxCols, true><<<blocks, kTallThreads, staged_exact, stream>>>(
+                static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
+            return;
+        }
         static const bool configured = [] {
-            return cudaFuncSetAttribute(projection_tall_kernel<Codec, MaxCols>,
+            return cudaFuncSetAttribute(projection_tall_kernel<Codec, MaxCols, false>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
         }();
         require(configured, "the tall kernel's shared memory could not be configured");
-        projection_tall_kernel<Codec, MaxCols><<<blocks, kTallThreads, staged_pass, stream>>>(
+        projection_tall_kernel<Codec, MaxCols, false><<<blocks, kTallThreads, staged_pass, stream>>>(
             static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
     };
     switch (columns) {
@@ -758,7 +781,8 @@ bool mma_route(int rows, int columns, bool supported, detail::ProjectionRoute ro
 bool tall_route(int rows, int columns, int min_columns, detail::ProjectionRoute route) {
     if (route == detail::ProjectionRoute::Tall) { return true; }
     if (route == detail::ProjectionRoute::Narrow) { return false; }
-    return rows >= kTallMinRows && columns >= min_columns && columns <= kTallMaxColumns;
+    return (rows >= kTallMinRows || (columns > 16 && rows >= 512)) && columns >= min_columns &&
+           columns <= kTallMaxColumns;
 }
 
 } // namespace

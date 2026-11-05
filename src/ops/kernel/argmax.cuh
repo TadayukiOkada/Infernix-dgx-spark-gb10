@@ -38,10 +38,9 @@ __device__ __forceinline__ void argmax_warp_reduce(float& value, std::int32_t& i
     }
 }
 
-__device__ __forceinline__ void argmax_block_reduce(float& value, std::int32_t& index) {
-    __shared__ float warp_values[16];
-    __shared__ std::int32_t warp_indices[16];
-
+__device__ __forceinline__ void argmax_block_reduce(float& value, std::int32_t& index,
+                                                    float (&warp_values)[16],
+                                                    std::int32_t (&warp_indices)[16]) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     argmax_warp_reduce(value, index);
@@ -145,11 +144,10 @@ __device__ __forceinline__ void argmax_softmax_warp_reduce(ArgmaxSoftmax& s) {
 }
 
 // Thread 0 receives the block's combination: each warp's, then the warps' in order.
-__device__ __forceinline__ void argmax_softmax_block_reduce(ArgmaxSoftmax& s) {
-    __shared__ float warp_values[16];
-    __shared__ std::int32_t warp_indices[16];
-    __shared__ float warp_sums[16];
-
+__device__ __forceinline__ void argmax_softmax_block_reduce(ArgmaxSoftmax& s,
+                                                            float (&warp_values)[16],
+                                                            std::int32_t (&warp_indices)[16],
+                                                            float (&warp_sums)[16]) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     argmax_softmax_warp_reduce(s);
@@ -174,6 +172,9 @@ template <class Logit>
 __launch_bounds__(kArgmaxBlock) __global__
     void argmax_probability_column_kernel(const Logit* logits, std::int32_t* out, float* probability,
                                           std::int32_t valid_rows, std::int32_t physical_rows) {
+    __shared__ float warp_values[16];
+    __shared__ std::int32_t warp_indices[16];
+    __shared__ float warp_sums[16];
     pdl::enter();
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.x);
     const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
@@ -181,7 +182,7 @@ __launch_bounds__(kArgmaxBlock) __global__
     for (std::int32_t v = static_cast<std::int32_t>(threadIdx.x); v < valid_rows; v += blockDim.x) {
         argmax_softmax_consider(s, argmax_logit(logits[base + v]), v);
     }
-    argmax_softmax_block_reduce(s);
+    argmax_softmax_block_reduce(s, warp_values, warp_indices, warp_sums);
     if (threadIdx.x == 0) {
         out[t]         = s.index;
         probability[t] = 1.0F / s.sum;
@@ -233,7 +234,10 @@ __launch_bounds__(kArgmaxBlock) __global__
         }
     }
 
-    argmax_softmax_block_reduce(s);
+    __shared__ float warp_values[16];
+    __shared__ std::int32_t warp_indices[16];
+    __shared__ float warp_sums[16];
+    argmax_softmax_block_reduce(s, warp_values, warp_indices, warp_sums);
     __shared__ bool last;
     if (threadIdx.x == 0) {
         if (s.index != INT32_MAX) {
@@ -315,7 +319,9 @@ __launch_bounds__(kArgmaxBlock) __global__
         }
     }
 
-    argmax_block_reduce(best_value, best_index);
+    __shared__ float warp_values[16];
+    __shared__ std::int32_t warp_indices[16];
+    argmax_block_reduce(best_value, best_index, warp_values, warp_indices);
     if (threadIdx.x != 0 || best_index == INT32_MAX) { return; }
 
     int current = out[t];

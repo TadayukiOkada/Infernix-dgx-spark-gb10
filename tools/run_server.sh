@@ -173,7 +173,7 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --spec mtp \
     --draft-tokens auto \
     --temperature 1.0 \
-    --ngram-draft-tokens 31 \
+    --ngram-draft-tokens 15 \
     --ngram-min-match 4 \
     --top-p 0.9 \
     --min-p 0.1 \

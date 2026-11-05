@@ -1098,16 +1098,24 @@ private:
                 slot->cancelled.load(std::memory_order_acquire) ||
                 slot->is_replaying() || slot->recovery_pending ||
                 !slot->is_prefilling() || !slot->admitted_begin ||
-                slot->computed_prompt_tokens == 0 ||
                 (slot->sequence && instance_.program->context_blocks(*slot->sequence))) {
                 continue;
             }
             const BeginSummary& begin = *slot->admitted_begin;
             const std::uint32_t total_to_compute =
                 begin.prompt_tokens - begin.reused_prompt_tokens;
-            if (total_to_compute <= slot->computed_prompt_tokens) { continue; }
-            if (total_to_compute - slot->computed_prompt_tokens <= 16U) {
+            if (total_to_compute > slot->computed_prompt_tokens) {
                 return true;
+            }
+        }
+        if (free_lane() &&
+            (admission_check_pending_.load(std::memory_order_acquire) ||
+             scheduler_.admission_scan_pending())) {
+            std::lock_guard lock(queue_mutex_);
+            for (const auto& req : pending_) {
+                if (req && !req->background && !req->cancelled.load(std::memory_order_acquire)) {
+                    return true;
+                }
             }
         }
         return false;

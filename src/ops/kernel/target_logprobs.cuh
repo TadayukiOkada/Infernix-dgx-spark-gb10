@@ -16,26 +16,31 @@ namespace infernix::ops {
 inline constexpr int kTargetLogprobsBlock = 256;
 
 template <int BlockSize>
-__device__ __forceinline__ float target_logprobs_block_max(float value) {
+struct TargetLogprobsShared {
+    float warp_scratch[BlockSize / kWarpSize];
+    float scalar;
+};
+
+template <int BlockSize>
+__device__ __forceinline__ float target_logprobs_block_max(float value,
+                                                           TargetLogprobsShared<BlockSize>& shared) {
     static_assert(BlockSize >= kWarpSize && BlockSize <= 1024);
     static_assert((BlockSize & (BlockSize - 1)) == 0);
     constexpr int kWarps = BlockSize / kWarpSize;
-    __shared__ float warp_maxima[kWarps];
-    __shared__ float result;
 
     const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
     value          = warp_max(value);
-    if (lane == 0) { warp_maxima[warp] = value; }
+    if (lane == 0) { shared.warp_scratch[warp] = value; }
     __syncthreads();
 
     if (warp == 0) {
-        value = lane < kWarps ? warp_maxima[lane] : -CUDART_INF_F;
+        value = lane < kWarps ? shared.warp_scratch[lane] : -CUDART_INF_F;
         value = warp_max(value);
-        if (lane == 0) { result = value; }
+        if (lane == 0) { shared.scalar = value; }
     }
     __syncthreads();
-    return result;
+    return shared.scalar;
 }
 
 // A column's maximum valid logit and log(sum(exp(logit - maximum))), returned to every thread.
@@ -50,7 +55,8 @@ __device__ __forceinline__ float logprob_logit(float value) { return value; }
 
 template <int BlockSize, class Logit>
 __device__ __forceinline__ TargetLogprobsColumn
-target_logprobs_column(const Logit* values, std::int32_t valid_rows) {
+target_logprobs_column(const Logit* values, std::int32_t valid_rows,
+                       TargetLogprobsShared<BlockSize>& shared) {
     float local_max = -CUDART_INF_F;
     float local_sum = 0.0f;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
@@ -63,15 +69,13 @@ target_logprobs_column(const Logit* values, std::int32_t valid_rows) {
         local_max = new_max;
         local_sum += expf(value - local_max);
     }
-    const float maximum = target_logprobs_block_max<BlockSize>(local_max);
+    const float maximum = target_logprobs_block_max<BlockSize>(local_max, shared);
 
     local_sum *= expf(local_max - maximum);
-    __shared__ float warp_sums[BlockSize / kWarpSize];
-    __shared__ float log_sum;
-    const float sum = block_reduce_sum<BlockSize>(local_sum, warp_sums);
-    if (threadIdx.x == 0) { log_sum = logf(sum); }
+    const float sum = block_reduce_sum<BlockSize>(local_sum, shared.warp_scratch);
+    if (threadIdx.x == 0) { shared.scalar = logf(sum); }
     __syncthreads();
-    return {maximum, log_sum};
+    return {maximum, shared.scalar};
 }
 
 template <int BlockSize, class Logit>
@@ -79,9 +83,10 @@ __launch_bounds__(BlockSize) __global__
     void target_logprobs_kernel(const Logit* logits, const std::int32_t* target_ids,
                                 float* output, std::int32_t valid_rows,
                                 std::int32_t physical_rows, std::int32_t targets) {
+    __shared__ TargetLogprobsShared<BlockSize> shared;
     const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
     const Logit* values       = logits + static_cast<std::int64_t>(column) * physical_rows;
-    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows);
+    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows, shared);
     for (std::int32_t target = static_cast<std::int32_t>(threadIdx.x); target < targets;
          target += BlockSize) {
         const std::int64_t index = static_cast<std::int64_t>(column) * targets + target;

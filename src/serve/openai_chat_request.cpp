@@ -815,7 +815,8 @@ void parse_parallel_tool_calls(const Json& body, GenerationRequest& output) {
 }
 
 void parse_stop(const Json& body, GenerationRequest& output) {
-    output.ignore_eos = get_bool(body, "ignore_eos", false);
+    output.ignore_eos   = get_bool(body, "ignore_eos", false);
+    output.cache_prompt = get_bool(body, "cache_prompt", true);
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
     const Json& stop = body.at("stop");
     auto append      = [&](const Json& value) {

@@ -453,8 +453,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            infernix::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled) const {
     return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
-                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
-                                                    : CacheParticipation::Disabled,
+                        (options_.allow_prefix_reuse && request.cache_prompt)
+                            ? CacheParticipation::ReadWrite
+                            : CacheParticipation::Disabled,
                         DeadlinePolicy::ClientPendingTimeout);
 }
 
@@ -462,8 +463,9 @@ PreparedRequest GenerationService::prepare_continuation(
     const GenerationRequest& request, GenerationConsumerMode consumer_mode,
     infernix::GenerationObservationOptions observation, std::function<bool()> is_cancelled) const {
     return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
-                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
-                                                    : CacheParticipation::Disabled,
+                        (options_.allow_prefix_reuse && request.cache_prompt)
+                            ? CacheParticipation::ReadWrite
+                            : CacheParticipation::Disabled,
                         DeadlinePolicy::ClientPendingTimeout, /*admitted=*/true);
 }
 

@@ -1494,19 +1494,16 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
                                                                  : work_.alloc(DType::FP32, {1, T});
             ops::screened_head_top(final_x, head.rows->weight, *head.screen, valid, kScreenedHeadPolicy, top_row, logprob,
                                    head.token_ids, drafts, work_, s);
-        } else if (head.rows) {
-            ops::argmax(narrow, head.token_ids, drafts, rows_out, s);
-            if (call.draft_logprobs.data != nullptr) {
-                Tensor top_row = work_.alloc(DType::I32, {1, T});
-                Tensor logprob(call.draft_logprobs.data, DType::FP32, {1, T});
-                ops::top_logprobs(narrow, rows_out, top_row, logprob, s);
-            }
         } else if (call.draft_logprobs.data != nullptr) {
-            // The top row and its log-probability over the public tokens in one pass (same rows,
-            // same tie order as argmax).
+            // The top row and its log-probability in one pass (same rows, same tie order as argmax).
             Tensor drafts_2d = drafts.view({1, T});
             Tensor logprob(call.draft_logprobs.data, DType::FP32, {1, T});
             ops::top_logprobs(narrow, valid, drafts_2d, logprob, s);
+            if (head.rows) {
+                ops::proposal_remap_token_ids(drafts, static_cast<const std::int32_t*>(head.token_ids.data), rows_out, s);
+            }
+        } else if (head.rows) {
+            ops::argmax(narrow, head.token_ids, drafts, rows_out, s);
         } else {
             ops::argmax(narrow, drafts, valid, s);
         }
