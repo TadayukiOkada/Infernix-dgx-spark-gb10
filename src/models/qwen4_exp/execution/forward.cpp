@@ -311,6 +311,12 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         }
         return;
     }
+    // A tapped DFlash2 layer's stream mean rides the fused combine's kernel (the try sets it when
+    // it applies): the call's last draft_features columns go straight into that tap's rows of the
+    // features, instead of a standalone hyper_connection_stream_mean re-reading the residual.
+    Tensor draft_mean;
+    const Tensor* draft_mean_ptr  = nullptr;
+    std::int32_t draft_mean_first = 0;
     try {
         auto scope = work_.scope();
         if (block.ple) { ple(*block.ple, residual, batch); }
@@ -323,9 +329,23 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         Tensor xm       = inject_mix(block.mlp_hc, y, inject_a, residual, &inject);
         // The combine injects its output directly unless a tap records it.
         const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
+        if (fused_inject && batch.draft_features.data != nullptr &&
+            batch.draft_features.ne[0] ==
+                dim(config_.hidden_size) * static_cast<std::int32_t>(draft_taps_.size()) &&
+            batch.draft_features.ne[1] <= T) {
+            if (const auto it = std::find(draft_taps_.begin(), draft_taps_.end(), layer);
+                it != draft_taps_.end()) {
+                draft_mean      = batch.draft_features.slice(0, static_cast<std::int32_t>(it - draft_taps_.begin()) *
+                                                                   dim(config_.hidden_size),
+                                                               dim(config_.hidden_size));
+                draft_mean_ptr  = &draft_mean;
+                draft_mean_first = T - batch.draft_features.ne[1];
+            }
+        }
         Tensor ym = moe(block.moe, xm, layer,
                         tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch, -1,
-                        fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr);
+                        fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr, draft_mean_ptr,
+                        draft_mean_first);
         if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
         if (tap != nullptr) {
             const std::pair<std::vector<Tensor>*, const Tensor*> copies[] = {
@@ -341,7 +361,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     } catch (const std::exception& error) {
         throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
     }
-    if (batch.draft_features.data != nullptr) {
+    if (batch.draft_features.data != nullptr && draft_mean_ptr == nullptr) {
         const std::int32_t n = batch.draft_features.ne[1], T = residual.ne[1];
         if (n > T) { throw std::invalid_argument("Qwen4Exp forward: DFlash2 features exceed the call"); }
         capture_draft_features(layer, residual.slice(1, T - n, n), batch.draft_features);
@@ -999,7 +1019,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
 }
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-                    const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual) {
+                    const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual,
+                    const Tensor* stream_mean, std::int32_t stream_mean_first_column) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -1300,7 +1321,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[1], 0));
     }
     if (inject != nullptr) {
-        ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s);
+        ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s, stream_mean,
+                                stream_mean_first_column);
         return Tensor{};
     }
     Tensor y = work_.alloc(DType::BF16, {H, T});

@@ -313,12 +313,12 @@ void launch_hidden(const Tensor& hidden, const Weight& head,
         return launch_tile<Hidden, 64, 128>(hidden, head, row_to_global_ids, workspace, stream);
     case 80:
         return launch_tile<Hidden, 80, 128>(hidden, head, row_to_global_ids, workspace, stream);
-    case 112:
-        return launch_tile<Hidden, 112, 64>(hidden, head, row_to_global_ids, workspace, stream);
+    case 112: // the Q4 head's block_k 128 wide tiles (plan_for, GB10 measured 2026-11-05)
+        return launch_tile<Hidden, 112, 128>(hidden, head, row_to_global_ids, workspace, stream);
     case 96:
         return launch_tile<Hidden, 96, 128>(hidden, head, row_to_global_ids, workspace, stream);
     case 120:
-        return launch_tile<Hidden, 120, 64>(hidden, head, row_to_global_ids, workspace, stream);
+        return launch_tile<Hidden, 120, 128>(hidden, head, row_to_global_ids, workspace, stream);
     case 128:
         return launch_tile<Hidden, 128, 64>(hidden, head, row_to_global_ids, workspace, stream);
     }

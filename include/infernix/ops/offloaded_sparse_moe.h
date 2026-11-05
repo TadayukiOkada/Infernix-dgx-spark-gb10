@@ -408,7 +408,13 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
 /// moe_combine followed by hyper_connection_inject(y, inject, residual) without materializing y:
 /// residual[s*H+d, t] = bf16(residual[s*H+d, t] + inject[s, t] * y[d, t]), y the BF16 combine of
 /// column t, with the same bits as the two calls. inject: FP32 [S, T]; residual: BF16 [S*H, T].
+/// With stream_mean set, the same kernel pass also writes the stream mean of the injected
+/// residual columns [first, first + stream_mean->ne[1]) into it (BF16 [H, n], any row pitch),
+/// the same bits as hyper_connection_stream_mean on the updated residual. Masked columns take
+/// the mean of their untouched residual, as that call would.
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
-                        const Tensor& inject, Tensor& residual, cudaStream_t stream);
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream,
+                        const Tensor* stream_mean = nullptr,
+                        std::int32_t stream_mean_first_column = 0);
 
 } // namespace infernix::ops

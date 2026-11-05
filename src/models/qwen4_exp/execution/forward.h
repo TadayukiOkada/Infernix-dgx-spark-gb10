@@ -407,10 +407,13 @@ private:
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
     // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many
     // columns. With inject and residual, the output is injected into the residual streams (and not
-    // returned).
+    // returned); with stream_mean, the combine's kernel also writes that slice's stream mean (the
+    // DFlash2 tap's rows, the call's columns from stream_mean_first_column on) as
+    // hyper_connection_stream_mean on the injected residual would.
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
-               Tensor* residual = nullptr);
+               Tensor* residual = nullptr, const Tensor* stream_mean = nullptr,
+               std::int32_t stream_mean_first_column = 0);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, const Tensor& residual);
     // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes

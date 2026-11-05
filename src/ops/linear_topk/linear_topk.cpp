@@ -96,14 +96,17 @@ Plan plan_for(HeadProfile profile, int columns) {
     //   FP8: cols 49-80  -> tile96 (beats 64/80 at U=64 +2.3%, U=80 +7.5%);
     //          cols 89-96 keep the tuned tile96/block_k64 variant (U=96 best).
     //   Q4:  cols 49-80  -> tile80 (beats 64 at U=64 +1.9%).
+    //   Q4's wide tiles take block_k 128 (measured 2026-11-05, T9): tile 112/120
+    //   with block_k 128 run 21-28% (U=97-112) and 8-10% (U=113-120) ahead of the
+    //   block_k 64 ones; tile 128 keeps 64 (block_k 128 measured no faster there).
     if (profile == HeadProfile::Q4Optimized) {
         if (columns <= 16) return {16, 0};
         if (columns <= 32) return {64, 32};
         if (columns <= 48) return {64, 48};
         if (columns <= 80) return {64, 80};
         if (columns <= 96) return {64, 96};
-        if (columns <= 112) return {64, 112, 64};
-        if (columns <= 120) return {64, 120, 64};
+        if (columns <= 112) return {64, 112, 128};
+        if (columns <= 120) return {64, 120, 128};
         return {64, 128, 64};
     }
     if (profile == HeadProfile::Q8Full) {

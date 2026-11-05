@@ -975,3 +975,152 @@ baseline binary vs shipped binary, across `T = 16…128` on both `H = 5120` prof
   `--hidden` flag are documented only in the bench's own `--help`.
 - The measured ladder is a `T`-threshold table over the six registered geometries; it does not model
   `splits`, KV pressure or concurrent lanes, and was measured on synthetic operands at cold L2.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T9: Q4 `linear_topk` wide tiles retuned to `block_k = 128` (cliff removal); `hyper_connection_stream_mean` fused into `moe_combine_inject` for the DFlash2 target taps
+
+## 1. Accounting
+
+- Base commit (branch HEAD at work start): `55945225b6eafe8f49b4afabb3529026bd67af5a`, branch
+  `dev-rebased-20261028`. Working tree clean before; nothing committed (the reviewer commits).
+- Files changed (7 `M` + this changelog):
+  - `M src/ops/linear_topk/linear_topk.cpp` — Q4 wide-band plans take `block_k = 128`; sweep hook added and removed.
+  - `M src/ops/linear_topk/q4_m64.cu` — tiles 112/120 instantiate `kBlockK = 128`, tile 128 keeps 64.
+  - `M src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` — optional fused stream-mean output in both combine-inject kernels and the host entry.
+  - `M include/infernix/ops/offloaded_sparse_moe.h` — `moe_combine_inject` gains `stream_mean` + `stream_mean_first_column`.
+  - `M src/models/qwen4_exp/execution/forward.h` / `M src/models/qwen4_exp/execution/forward.cpp` — `Forward::moe` pass-through; `Forward::layer` routes the tapped DFlash2 layers' stream mean through the combine kernel and skips the standalone capture.
+  - `M tests/ops/test_offloaded_moe_layer.cu` — `test_combine_inject` parameterized over hidden/mask; fused-mean oracle in five configurations.
+- Stack-spill allowlist delta: none (zero new `STACK`/`LOCAL`; verified by `infernix_cuda_stack_check`).
+- Rebuild count: 4 single-invocation Ninja builds (HEAD baseline, forced-plan sweep build, final build, launcher-simplification rebuild). `*.cu` files touched after every header edit (dead CUDA depfiles).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **The `q8-full`/`fp8-full` `{64, 40}` cliff does not reproduce on this HEAD.** Three interleaved
+  cold-L2 rounds of `infernix_linear_topk_bench` on the freshly HEAD-built binary measured
+  U = 33..40 at 6.49–6.68 ms (202–208 GB/s) with the shipped `{64, 40}` schedule — parity with the
+  `{64, 48}` band (6.66–6.74 ms) and 2.15× faster than the task doc's 14,118.9 µs (95.7 GB/s).
+  The tile-40 kernel carries `REG:43 STACK:0 LOCAL:0`. A forced-plan sweep confirmed that routing
+  33..48 to `{64, 48}` as the task prescribed would make U = 33..40 0.3–2.2 % *slower* (padding to
+  48 columns), so the prescribed retune was not applied: it would install a regression to remove a
+  cliff that is not there in this machine state. The doc's absolute bar (≤ 6,500 µs) sits below
+  every schedule's rate in the region today (tile 48 itself reads 6,688–6,721 µs at U = 41..48,
+  vs the doc's 6,287 µs at U = 41) — a clock-state drift of ~6 %, not a dispatch gap.
+- **The Q4 cliff reproduces, is worse than documented, and is a `block_k` effect.** HEAD measured
+  U = 96 → 97: 2,537 → 3,795 µs (+49.6 %), U = 113: 4,417 µs, U = 121..128: 4,527–4,535 µs — the
+  whole `block_k = 64` wide-tile region (112/120/128), not only 97..120. The forced-plan sweep
+  (six plans × seven widths × three profiles, cold L2) picked `block_k = 128` at tiles 112 and 120
+  (−19…−25 % at 97..112, −9 % at 113..120); tile 128's `block_k = 128` variant measured no faster
+  (4,503 vs 4,527 µs, inside the identical-dispatch noise), so 121..128 keeps 64.
+  Q8/FP8 wide tiles prefer `block_k = 64` in the same sweep (e.g. q8 U = 97: `{120,64}` 9,075 µs vs
+  `{112,128}` 10,412 µs; fp8 U = 112: `{112,64}` 8,271 µs vs `{112,128}` 10,314 µs) — their shipped
+  ladders are unchanged and the launcher branches added for the sweep were removed as dead.
+- **The doc's file map and targets are stale.** `src/ops/offloaded_sparse_moe/cuda/moe_combine_inject.cu`
+  does not exist; `combine_inject_vec8_kernel` (not `moe_combine_inject_vec8_kernel`) lives in
+  `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (REG 48 at HEAD, not 40). The verification
+  targets `infernix_ops_sampling_Penalty_test` and `infernix_offloaded_sparse_moe_test` do not
+  exist; the members are `infernix_linear_topk_test` (in `infernix_ops_sampling_test`) and
+  `infernix_offloaded_moe_layer_test` (in `infernix_ops_offloaded_moe_test`), which is what was
+  built and run.
+- **The draft features are column-major** (`dflash_feature_columns` strides `2 × feature_width`
+  per column), so the tapped layer's rows are a row slice with pitch `taps × H`; the fused mean
+  output honors any row pitch, exactly as `hyper_connection_stream_mean` does.
+
+## 3. Subsystem breakdown
+
+- **`linear_topk.cpp` (`plan_for`)**: `Q4Optimized` columns 97..112 → `{64, 112, 128}`, 113..120 →
+  `{64, 120, 128}`; 121+ keeps `{64, 128, 64}`. Workspace capacity and execution share `plan_for`,
+  so the plan change needs no capacity change. Q8/FP8 ladders untouched.
+- **`q4_m64.cu` (`launch_hidden`)**: tiles 112/120 hard-coded to `kBlockK = 128` (the file's
+  per-tile convention), tile 128 keeps 64. The temporary `workspace.block_k` dispatch and the
+  temporary `INFERNIX_T9_PLAN` sweep hook were removed before the final build; `q8_m64.cu` and
+  `fp8_m64.cu` are back to their HEAD contents.
+- **`moe_layer.cu`**: `combine_inject_kernel` and `combine_inject_vec8_kernel` take
+  `mean_out/mean_pitch/mean_first`; with `mean_out` set they accumulate the stream-order FP32 mean
+  of the *injected* BF16 stream values in registers and write it beside the residual writes.
+  The vec8 path matches `stream_mean_vec8_kernel`'s bits (sum then `× (1/streams)`), the scalar one
+  matches `stream_mean_kernel`'s (`/ streams`); masked columns take the mean of their untouched
+  residual, as the standalone call would. `moe_combine_inject` validates the mean tensor
+  (BF16, `nb[0] == 2`, `ne[0] == hidden`, `ne[1] == columns − first`) and falls back to the scalar
+  kernel when the mean's pitch or alignment excludes vec8.
+- **`forward.cpp` / `forward.h`**: `Forward::layer` derives the tap's mean slice (the call's last
+  `draft_features.ne[1]` columns → that tap's `H` rows of the features) when the combine already
+  injects fused and the shapes are the ones `capture_draft_features` would accept, passes it
+  through `Forward::moe`, and skips the trailing standalone capture; every other case (tap
+  recording, walk path, invalid shapes) keeps the old path, including its error checks. The 5
+  standalone `hyper_connection_stream_mean` launches and their 5 × `[2560, 4, T]` re-reads per
+  target verification pass are gone.
+- **Tests**: `test_combine_inject` now parameterizes hidden and mask and compares the fused mean
+  bit-for-bit against the `moe_combine` → `hyper_connection_inject` → `hyper_connection_stream_mean`
+  reference over a trailing window through a `2 × hidden` pitch; new cases cover masked vec8
+  (`H = 2560`), the scalar kernel (`H = 20`), and masked scalar.
+
+## 4. Verification
+
+- `ninja -C build-native -j $(nproc) infernix-serve infernix_ops_sampling_test infernix_ops_offloaded_moe_test infernix_linear_topk_bench`: clean, zero warnings.
+- `ctest -R "infernix_cuda_stack_check|infernix_linear_topk_test|infernix_offloaded_moe_layer_test"`: 3/3 Passed on the final binary (an earlier run was also 5/5 with `infernix_offloaded_moe_team_test`/`_cuda_test`). All five `combine_inject` oracle lines report `bit-equal to combine + inject, mean bit-equal to stream_mean`.
+- Resources (`cuobjdump --dump-resource-usage` on `infernix-serve`): `combine_inject_kernel` REG 40 (unchanged), `combine_inject_vec8_kernel` REG 48 → 72/78, `STACK:0 LOCAL:0` everywhere; the spill allowlist is untouched.
+- Op bench, final binary vs the freshly HEAD-built binary, three interleaved cold-L2 rounds (median of 3):
+
+| profile | U | HEAD µs | T9 µs | Δ |
+|---|---|---|---|---|
+| q4-optimized | 96 | 2,537 | 2,545 | +0.3 % (same dispatch) |
+| q4-optimized | 97 | 3,795 | 2,856 | **−24.7 %** |
+| q4-optimized | 104 | 3,754 | 2,932 | **−21.9 %** |
+| q4-optimized | 112 | 3,692 | 2,991 | **−19.0 %** |
+| q4-optimized | 113 | 4,417 | 3,989 | **−9.7 %** |
+| q4-optimized | 120 | 4,440 | 4,044 | **−8.9 %** |
+| q4-optimized | 121/128 | 4,535/4,527 | 4,460/4,519 | −1.6/−0.2 % (same dispatch) |
+| q8-full | 32..48 | 6,325..6,739 | 6,358..6,727 | −0.2…+1.4 % (same dispatch) |
+
+- The 96 → 97 cliff is removed: +49.6 % → +12.7 % (2,545 → 2,856 µs on the final binary).
+- E2E real artifacts (`Qwen3.8-Flash-Next-Local-NVFP4-W4Dense` + `Qwen3.8-Flash-Next-DFlash2`):
+  `infernix_qwen4_exp_startup_capture_real_test` (`plain`, `mtp`, `dflash2` reproducible and default
+  routes, first-use and startup CUDA graph capture over the fused combine+mean kernel) Passed in 359.7 s.
+
+## 5. Regressions & adverse results (all found, all disclosed)
+
+- **The 112 → 113 relative step widens** (3,692 → 4,417 = +19.6 % at HEAD becomes 2,991 → 3,989 =
+  +33.4 %; absolute step +699 → +993 µs). Cause: 97..112 dropped ~20–25 % while 113+ could not
+  reach the same rate (see §6). No column is slower than HEAD — every U ∈ 113..128 is 8–10 %
+  faster in absolute µs; the step is worse only because the left side improved. Disposition:
+  accepted tradeoff, mechanism documented in §6.
+- **Q4 tile 128 with `block_k = 128` measured no faster** (4,503 vs 4,527 µs at U = 128,
+  same-dispatch spread ±1.7 %), so 121..128 stays on `block_k = 64` — the sweep premise that tile
+  128 might also want 128 is falsified.
+- **The task's acceptance bar is not met in its µs form and its baseline does not exist on HEAD**:
+  q8-full U = 38/39 measure 6,530/6,558 µs (206.9/206.0 GB/s) on the final binary — the GB/s side
+  of the bar (≥ 205) passes, the ≤ 6,500 µs side misses by 0.5–0.9 %. The doc's 14,118.9 µs
+  baseline is 2.15× above what the same dispatch measures on the HEAD binary today, and its
+  "fixed" reference point ({64,48} at 6,287 µs) measures 6,688–6,721 µs here. Per the
+  thermal-drift rule the A/B evidence above (identical dispatch ⇒ ±1.4 %) is the acceptance
+  evidence; the absolute bar is disclosed as unmet rather than tuned to.
+- **`combine_inject_vec8_kernel` registers 48 → 72/78** (mean accumulators). No spills
+  (`STACK:0 LOCAL:0`), still ≥ 2 CTAs/SM by registers at `__launch_bounds__(320)`, and the kernel's
+  grid is at most `columns` blocks — occupancy unaffected. Standalone combine timing was not
+  A/B'd (no op-level bench for it); the null-mean instruction path is unchanged and the E2E
+  DFlash2 tests above ran the real route.
+- Identical-dispatch columns moved within ±1.6 % (q8 32..48 up to +1.4 %, q4 96 +0.3 %,
+  121 −1.6 %, 128 −0.2 %) — binary-layout/clock drift band, no dispatch change behind any of them.
+- The prescribed `{64, 48}` routing for q8/fp8 U = 33..40 was measured to *cost* 0.3–2.2 %
+  (forced sweep: e.g. q8 U = 38 `{64,40}` 6,625 vs `{64,48}` 6,768 µs) and was therefore not
+  applied; not applying it is the regression-avoiding choice, disclosed here because it deviates
+  from the task's step 1.
+
+## 6. Accepted gaps / follow-ups
+
+- **The residual +33 % step at Q4 U = 113** is tile geometry: tile 112 with `block_k = 128` is the
+  only wide tile whose SMEM stays inside the two-CTA budget; any tile covering 113+ columns
+  exceeds it and runs at one CTA/SM. Removing that step needs a staging change in `q4_m64`'s
+  mainloop (narrower activation residency or split staging), not a dispatch change.
+- **Q8's 96 → 97 step (+18 %, 7,701 → 9,090 µs at HEAD) is unchanged** — it exists on HEAD, is
+  also tile geometry (no schedule covering 97 columns matches tile 96's rate; `{112,128}` and
+  `{120,128}` both measured slower than the shipped `{120,64}`), and the task's q8 claim was about
+  U = 33..40, not this band.
+- The layer-walk/prefill capture path (`dflash2_walk_features`) still uses standalone
+  `hyper_connection_stream_mean` calls; the task targeted the target-verification pass, and the
+  walk's windows span group slices that one combine call cannot cover.
+- `infernix_linear_topk_test` sweeps U = 1..120 for all profiles, so the new Q4 `{112,128}` and
+  `{120,128}` instantiations are oracle-covered; the removed sweep hook left no trace.
+- E2E note: `infernix_qwen4_exp_startup_capture_real_test` verified real-artifact DFlash2 + MTP
+  execution and CUDA graph capture end-to-end (Passed, 359.7 s); the additional multi-scenario
+  `infernix_qwen4_exp_speculative_sampling_real_test` was not run to completion (interrupted at
+  worker session exit after 8.5 min).

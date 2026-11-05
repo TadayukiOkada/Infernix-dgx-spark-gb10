@@ -3292,18 +3292,35 @@ __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __
 
 // combine_kernel's y, kept in a register, injected into the residual streams as
 // hyper_connection_inject does: residual[s*H+d,t] = bf16(residual + inject[s,t] * y[d,t]).
+// With mean_out set, the same pass writes hyper_connection_stream_mean of the injected column to
+// mean_out[t - mean_first, pitch] (stream order, divided by streams: the scalar kernel's bits).
 template <bool kMasked>
 __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
                                       const float* __restrict__ shared_gate, const bf16* __restrict__ shared,
                                       const float* __restrict__ inject, int hidden, int top_k, int streams,
-                                      int columns, bf16* __restrict__ residual, MoeColumnMask mask) {
+                                      int columns, bf16* __restrict__ residual, MoeColumnMask mask,
+                                      bf16* __restrict__ mean_out, std::int64_t mean_pitch, int mean_first) {
     // A programmatic dependent; its small grid lets the next mixer launch and fetch its weights at once.
     pdl::enter();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    const bool    write_mean = mean_out != nullptr && t >= mean_first;
     if constexpr (kMasked) {
-        if (!column_live(mask, t)) { return; }
+        if (!column_live(mask, t)) {
+            // The inject skips the column; its mean is the untouched residual's, as stream_mean's.
+            if (write_mean) {
+                float mean = 0.0F;
+                for (int s = 0; s < streams; ++s) {
+                    mean += __bfloat162float(
+                        residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d]);
+                }
+                mean_out[static_cast<std::size_t>(t - mean_first) * mean_pitch + d] =
+                    __float2bfloat16_rn(mean / static_cast<float>(streams));
+            }
+            return;
+        }
     }
     float sum = 0.0F;
     for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
@@ -3312,10 +3329,15 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
     }
     sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
     const float v           = __bfloat162float(__float2bfloat16_rn(sum));
-    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    float mean              = 0.0F;
     for (int s = 0; s < streams; ++s) {
         bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
         r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+        mean += __bfloat162float(r);
+    }
+    if (write_mean) {
+        mean_out[static_cast<std::size_t>(t - mean_first) * mean_pitch + d] =
+            __float2bfloat16_rn(mean / static_cast<float>(streams));
     }
 }
 
@@ -3361,13 +3383,36 @@ template <bool kMasked>
 __launch_bounds__(320) __global__ void combine_inject_vec8_kernel(
     const bf16* __restrict__ outputs, const float* __restrict__ weights, const float* __restrict__ shared_gate,
     const bf16* __restrict__ shared, const float* __restrict__ inject, int hidden, int top_k, int streams,
-    int columns, bf16* __restrict__ residual, MoeColumnMask mask) {
+    int columns, bf16* __restrict__ residual, MoeColumnMask mask, bf16* __restrict__ mean_out,
+    std::int64_t mean_pitch, int mean_first) {
     pdl::enter();
     const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    const bool    write_mean = mean_out != nullptr && t >= mean_first;
     if constexpr (kMasked) {
-        if (!column_live(mask, t)) { return; }
+        if (!column_live(mask, t)) {
+            // The inject skips the column; its mean is the untouched residual's, as stream_mean's.
+            if (write_mean) {
+                float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+                for (int s = 0; s < streams; ++s) {
+                    const uint4 r_packed = *reinterpret_cast<const uint4*>(
+                        residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
+                    const bf16* r_vals = reinterpret_cast<const bf16*>(&r_packed);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { mean[j] += __bfloat162float(r_vals[j]); }
+                }
+                const float inv_s = 1.0F / static_cast<float>(streams);
+                uint4       mean_packed;
+                bf16*       mean_bf16 = reinterpret_cast<bf16*>(&mean_packed);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
+                *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) =
+                    mean_packed;
+            }
+            return;
+        }
     }
     float sum[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (int k = 0; k < top_k; ++k) {
@@ -3388,7 +3433,7 @@ __launch_bounds__(320) __global__ void combine_inject_vec8_kernel(
     float v[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) { v[j] = __bfloat162float(__float2bfloat16_rn(sum[j])); }
-    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (int s = 0; s < streams; ++s) {
         const float inj = inject[static_cast<std::size_t>(t) * streams + s];
         uint4* r_ptr    = reinterpret_cast<uint4*>(
@@ -3398,6 +3443,19 @@ __launch_bounds__(320) __global__ void combine_inject_vec8_kernel(
 #pragma unroll
         for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
         *r_ptr = r_packed;
+        if (write_mean) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { mean[j] += __bfloat162float(r[j]); }
+        }
+    }
+    if (write_mean) {
+        // stream_mean_vec8_kernel's bits: the stream-order sum scaled by 1/streams.
+        const float inv_s = 1.0F / static_cast<float>(streams);
+        uint4       mean_packed;
+        bf16*       mean_bf16 = reinterpret_cast<bf16*>(&mean_packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
+        *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) = mean_packed;
     }
 }
 
@@ -3999,7 +4057,8 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
 }
 
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
-                        const Tensor& inject, Tensor& residual, cudaStream_t stream) {
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream,
+                        const Tensor* stream_mean, std::int32_t stream_mean_first_column) {
     require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) &&
                 contiguous(residual, DType::BF16) && contiguous(inject, DType::FP32),
             "combine inject requires contiguous BF16 tensors and FP32 inject");
@@ -4012,34 +4071,51 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
     const bool masked = routing.mask.valid != nullptr;
     require(!masked || (routing.mask.width > 0 && columns % routing.mask.width == 0),
             "a column mask needs whole rows of the call's columns");
+    std::int64_t mean_pitch = 0;
+    auto*        mean_out   = static_cast<bf16*>(nullptr);
+    if (stream_mean != nullptr) {
+        require(stream_mean->data != nullptr && stream_mean->dtype == DType::BF16 &&
+                    stream_mean->ne[2] == 1 && stream_mean->ne[3] == 1 && stream_mean->nb[0] == 2 &&
+                    stream_mean->nb[1] % 2 == 0 && stream_mean->nb[1] >= 2LL * stream_mean->ne[0],
+                "combine inject mean requires a BF16 row-pitched output");
+        require(stream_mean->ne[0] == hidden && stream_mean->ne[1] > 0 &&
+                    stream_mean_first_column >= 0 &&
+                    stream_mean->ne[1] == columns - stream_mean_first_column,
+                "combine inject mean columns disagree");
+        mean_pitch = stream_mean->nb[1] / 2;
+        mean_out   = static_cast<bf16*>(stream_mean->data);
+    }
     const auto* routed_out = static_cast<const bf16*>(outputs.data);
     const auto* weights    = static_cast<const float*>(routing.weights.data);
     const auto* gate       = static_cast<const float*>(routing.shared_gate.data);
     const auto* shared_out = static_cast<const bf16*>(shared.data);
     const auto* inject_in  = static_cast<const float*>(inject.data);
     auto* residual_io      = static_cast<bf16*>(residual.data);
-    if (hidden % 8 == 0 && aligned_16(routed_out) && aligned_16(shared_out) && aligned_16(residual_io)) {
+    if (hidden % 8 == 0 && aligned_16(routed_out) && aligned_16(shared_out) && aligned_16(residual_io) &&
+        (mean_out == nullptr || (mean_pitch % 8 == 0 && aligned_16(mean_out)))) {
         const int vec_elems = hidden / 8;
         const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
         const pdl::LaunchConfig cfg{dim3((vec_elems + threads - 1) / threads, columns), dim3(threads), 0, stream};
         if (masked) {
             CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_vec8_kernel<true>, routed_out, weights, gate,
                                             shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
-                                            routing.mask));
+                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
         } else {
             CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_vec8_kernel<false>, routed_out, weights, gate,
                                             shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
-                                            routing.mask));
+                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
         }
         return;
     }
     const pdl::LaunchConfig cfg{dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream};
     if (masked) {
         CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<true>, routed_out, weights, gate, shared_out,
-                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask));
+                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask,
+                                        mean_out, mean_pitch, stream_mean_first_column));
     } else {
         CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<false>, routed_out, weights, gate, shared_out,
-                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask));
+                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask,
+                                        mean_out, mean_pitch, stream_mean_first_column));
     }
 }
 

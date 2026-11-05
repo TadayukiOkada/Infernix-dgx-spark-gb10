@@ -1114,9 +1114,11 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
 }
 
 // moe_combine_inject against moe_combine followed by hyper_connection_inject (each qualified against
-// its own oracle): the residual streams bit-equal.
-void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed) {
-    constexpr int hidden = moe::kHidden;
+// its own oracle): the residual streams bit-equal. With a stream mean, the fused kernel's mean is
+// bit-equal to hyper_connection_stream_mean on the injected residual, over the trailing window,
+// through a row pitch, and for masked (un-injected) columns. hidden % 8 != 0 takes the scalar kernel.
+void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed, int hidden = moe::kHidden,
+                         bool masked = false) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> n(0.0F, 1.0F);
     const auto bf16s = [&](std::size_t count) {
@@ -1143,28 +1145,56 @@ void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed
     auto* d_fused   = device_copy(residual);
     std::uint16_t* d_y = nullptr;
     cuda_check(cudaMalloc(&d_y, shared.size() * sizeof(std::uint16_t)), "cudaMalloc");
-    const infernix::ops::MoeRouting routing{Tensor{}, Tensor(d_weights, DType::FP32, {top_k, columns}),
-                                            Tensor(d_gate, DType::FP32, {columns})};
+    const int mean_first = columns > 1 ? 1 : 0, mean_cols = columns - mean_first;
+    const auto mean_fill = std::vector<std::uint16_t>(static_cast<std::size_t>(2) * hidden * mean_cols, 0xABABU);
+    auto* d_ref_mean   = device_copy(std::vector<std::uint16_t>(static_cast<std::size_t>(hidden) * columns, 0U));
+    auto* d_fused_mean = device_copy(mean_fill); // the window's writes must replace every sentinel
+    std::int32_t* d_valid = nullptr;
+    cuda_check(cudaMalloc(&d_valid, sizeof(std::int32_t)), "cudaMalloc");
+    const std::int32_t live = masked ? columns / 2 : columns;
+    cuda_check(cudaMemcpy(d_valid, &live, sizeof(std::int32_t), cudaMemcpyHostToDevice), "copy");
+    infernix::ops::MoeRouting routing{Tensor{}, Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                       Tensor(d_gate, DType::FP32, {columns})};
+    if (masked) { routing.mask = infernix::ops::MoeColumnMask{.valid = d_valid, .width = columns}; }
     const Tensor t_outputs(d_outputs, DType::BF16, {hidden, columns * top_k});
     const Tensor t_shared(d_shared, DType::BF16, {hidden, columns});
     const Tensor t_inject(d_inject, DType::FP32, {streams, columns});
     Tensor t_y(d_y, DType::BF16, {hidden, columns});
     Tensor t_split(d_split, DType::BF16, {streams * hidden, columns});
     Tensor t_fused(d_fused, DType::BF16, {streams * hidden, columns});
+    const Tensor t_fused_mean =
+        Tensor(d_fused_mean, DType::BF16, {2 * hidden, mean_cols}).slice(0, 0, hidden); // pitch 2 * hidden
     infernix::ops::moe_combine(t_outputs, routing, t_shared, t_y, nullptr);
     infernix::ops::hyper_connection_inject(t_y, t_inject, t_split, nullptr);
-    infernix::ops::moe_combine_inject(t_outputs, routing, t_shared, t_inject, t_fused, nullptr);
+    Tensor t_ref_mean(d_ref_mean, DType::BF16, {hidden, columns});
+    infernix::ops::hyper_connection_stream_mean(t_split, streams, t_ref_mean, nullptr);
+    infernix::ops::moe_combine_inject(t_outputs, routing, t_shared, t_inject, t_fused, nullptr, &t_fused_mean,
+                                       mean_first);
     cuda_check(cudaDeviceSynchronize(), "combine inject");
     std::vector<std::uint16_t> split(residual.size()), fused(residual.size());
     cuda_check(cudaMemcpy(split.data(), d_split, split.size() * 2, cudaMemcpyDeviceToHost), "copy");
     cuda_check(cudaMemcpy(fused.data(), d_fused, fused.size() * 2, cudaMemcpyDeviceToHost), "copy");
     const bool same = split == fused && split != residual;
-    std::printf("combine_inject T=%d k=%d S=%d: %s\n", columns, top_k, streams,
-                same ? "bit-equal to combine + inject" : "DIFFERENT");
+    std::vector<std::uint16_t> ref_mean(static_cast<std::size_t>(hidden) * columns), fused_mean(mean_fill.size());
+    cuda_check(cudaMemcpy(ref_mean.data(), d_ref_mean, ref_mean.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    cuda_check(cudaMemcpy(fused_mean.data(), d_fused_mean, fused_mean.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    bool mean_same = true;
+    for (int column = 0; column < mean_cols && mean_same; ++column) {
+        for (int d = 0; d < hidden; ++d) {
+            mean_same = ref_mean[static_cast<std::size_t>(column + mean_first) * hidden + d] ==
+                        fused_mean[static_cast<std::size_t>(column) * 2 * hidden + d];
+            if (!mean_same) { break; }
+        }
+    }
+    std::printf("combine_inject T=%d k=%d S=%d H=%d masked=%d: %s, mean %s\n", columns, top_k, streams, hidden,
+                masked ? 1 : 0, same ? "bit-equal to combine + inject" : "DIFFERENT",
+                mean_same ? "bit-equal to stream_mean" : "DIFFERENT");
     check(same, "moe_combine_inject equals moe_combine followed by hyper_connection_inject");
+    check(mean_same, "moe_combine_inject's stream mean equals hyper_connection_stream_mean on the injected residual");
     for (void* p : {static_cast<void*>(d_outputs), static_cast<void*>(d_shared), static_cast<void*>(d_weights),
                     static_cast<void*>(d_gate), static_cast<void*>(d_inject), static_cast<void*>(d_split),
-                    static_cast<void*>(d_fused), static_cast<void*>(d_y)}) {
+                    static_cast<void*>(d_fused), static_cast<void*>(d_y), static_cast<void*>(d_ref_mean),
+                    static_cast<void*>(d_fused_mean), static_cast<void*>(d_valid)}) {
         cudaFree(p);
     }
 }
@@ -1629,6 +1659,10 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_route_pooled(256, 3, 8, 256, 271, true);
             test_route_pooled(256, 4, 8, 64, 277, true);
             for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
+            // The fused stream mean: a masked call's window (vec8), and the scalar kernel's path.
+            test_combine_inject(5, 10, 4, 311U, moe::kHidden, true);
+            test_combine_inject(5, 10, 4, 313U, 20);
+            test_combine_inject(5, 10, 4, 317U, 20, true);
             test_service_column_bound();
             test_service_failure_reported();
         }
