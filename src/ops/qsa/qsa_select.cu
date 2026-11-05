@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
         const int end           = static_cast<int>(clear_words * (cta + 1) / ctas);
         for (int i = begin + static_cast<int>(threadIdx.x); i < end; i += kScoreThreads) { clear[i] = 0; }
     }
-    __shared__ float4 qs[kScoreTileColumns][kScoreHeadSlots][32]; // lane l: q[h][l + 32 j], j = 0..3
+    __shared__ uint2 qs[kScoreTileColumns][kScoreHeadSlots][32]; // lane l: q[h][l + 32 j], j = 0..3 as 4 BF16s
     __shared__ int column_blocks[kScoreTileColumns];
     const int tile = static_cast<int>(blockIdx.y);
     const int c0 = tiles.first[tile], nc = tiles.columns[tile];
@@ -136,11 +136,11 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
     }
     for (int i = static_cast<int>(threadIdx.x); i < nc * kScoreHeadSlots * kIndexDim; i += kScoreThreads) {
         const int c = i / (kScoreHeadSlots * kIndexDim), h = (i / kIndexDim) % kScoreHeadSlots, d = i % kIndexDim;
-        const float value =
+        const std::uint16_t value =
             h < index_heads
-                ? __bfloat162float(index_q[(static_cast<std::size_t>(t0 + c) * index_heads + h) * kIndexDim + d])
-                : 0.0F;
-        reinterpret_cast<float*>(&qs[c][h][d % 32])[d / 32] = value;
+                ? __bfloat16_as_ushort(index_q[(static_cast<std::size_t>(t0 + c) * index_heads + h) * kIndexDim + d])
+                : 0U;
+        reinterpret_cast<std::uint16_t*>(&qs[c][h][d % 32])[d / 32] = value;
     }
     __syncthreads();
 
@@ -187,7 +187,12 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
             if (b0 >= blocks) { continue; } // warp-uniform: this column sees none of the step
             float4 q[kScoreHeadSlots];
 #pragma unroll
-            for (int h = 0; h < kScoreHeadSlots; ++h) { q[h] = qs[c][h][lane]; }
+            for (int h = 0; h < kScoreHeadSlots; ++h) {
+                const uint2 raw = qs[c][h][lane];
+                const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                q[h]            = make_float4(lo.x, lo.y, hi.x, hi.y);
+            }
             // Value bb * 4 + h: this lane's partial of block b0 + bb, head h, accumulated in j order
             // from 0 like the one-warp-per-block kernel's `dot += q[h][lane + 32 j] * key[j]`.
             float v[32];

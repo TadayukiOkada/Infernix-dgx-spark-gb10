@@ -2016,8 +2016,6 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
         cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize, kDownBytes);
         cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
                              cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
         return true;
     }();
     (void)configured;
@@ -3070,6 +3068,19 @@ __device__ __forceinline__ void publish_x_columns(const MoeCpuChannel& channel, 
 // call of 32 columns: every thread, after the routing), so the copy, ~4,300 cycles after the plan's
 // decision before, overlaps the routing and the request goes out that much sooner (2026-10-29); the
 // plan's system fence orders these stores too (every thread passed the barriers before it).
+struct RouteDispatchSmallShared {
+    std::int32_t count[kDispatchThreads];
+    std::int32_t cursor[kDispatchThreads];
+    std::int32_t routed[kDispatchThreads];
+    std::int32_t warp_totals[2][kDispatchThreads / 32];
+};
+
+union RouteDispatchPlanShared {
+    RouteDispatchSmallShared dispatch;
+    CpuPlanShared cpu;
+    FetchPlanShared fetch;
+};
+
 template <bool kMasked>
 __global__ void __launch_bounds__(kDispatchThreads)
     route_dispatch_plan_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
@@ -3079,16 +3090,13 @@ __global__ void __launch_bounds__(kDispatchThreads)
                                std::int32_t* __restrict__ route_log, MoeExpertSource source,
                                const bf16* __restrict__ x, int max_jobs, std::int32_t* __restrict__ cpu_flags,
                                CpuCall* __restrict__ call, FetchCall* __restrict__ fetch, MoeColumnMask mask) {
-    __shared__ std::int32_t count[kDispatchThreads];
-    __shared__ std::int32_t cursor[kDispatchThreads];
-    __shared__ std::int32_t routed[kDispatchThreads];
-    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    __shared__ RouteDispatchPlanShared sm;
     pdl::enter(); // launched as a programmatic dependent of the router projection
     const int i = threadIdx.x, warp = i / 32, lane = i % 32;
-    count[i]    = 0;
+    sm.dispatch.count[i] = 0;
     if (warp < columns) {
         const int id = route_column(logits, experts, top_k, warp, bf16_logits, ids, weights, shared_gate);
-        if (lane < top_k) { routed[warp * top_k + lane] = id; }
+        if (lane < top_k) { sm.dispatch.routed[warp * top_k + lane] = id; }
     } else {
         publish_x_columns(source.cpu, x, source.shape.hidden, columns, 32 * columns, kDispatchThreads - 32 * columns);
     }
@@ -3097,16 +3105,17 @@ __global__ void __launch_bounds__(kDispatchThreads)
         publish_x_columns(source.cpu, x, source.shape.hidden, columns, 0, kDispatchThreads);
     }
     const int routed_entries = columns * top_k, entries = routed_entries + (shared_job ? columns : 0);
-    dispatch_small(i < entries ? (i < routed_entries ? routed[i] : experts) : 0,
+    dispatch_small(i < entries ? (i < routed_entries ? sm.dispatch.routed[i] : experts) : 0,
                    !kMasked || (i < entries && entry_live<kMasked>(mask, i, routed_entries, top_k)), entries,
-                   routed_entries, experts + (shared_job ? 1 : 0), dispatch, route_log, count, cursor, warp_totals);
+                   routed_entries, experts + (shared_job ? 1 : 0), dispatch, route_log, sm.dispatch.count,
+                   sm.dispatch.cursor, sm.dispatch.warp_totals);
     __syncthreads();
     if (i >= kThreads) { return; }
-    cpu_plan<true>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call);
+    static_assert(CpuPlanShared::kChunks * kThreads >= kDispatchThreads, "a call's jobs fit the plan's chunks");
+    cpu_plan_body<true>(dispatch, source, x, columns, top_k, max_jobs, cpu_flags, call, sm.cpu);
     if (fetch != nullptr) {
-        __shared__ FetchPlanShared fetch_sm;
         plan_barrier<true>(); // the CPU plan's flags and job indices, which the fetch plan moves
-        fetch_plan_body<true>(dispatch, source, max_jobs, cpu_flags, call, fetch, fetch_sm);
+        fetch_plan_body<true>(dispatch, source, max_jobs, cpu_flags, call, fetch, sm.fetch);
     }
 }
 
@@ -3308,6 +3317,92 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
         bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
         r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
     }
+}
+
+template <bool kMasked>
+__launch_bounds__(320) __global__ void combine_vec8_kernel(const bf16* __restrict__ outputs,
+                                                           const float* __restrict__ weights,
+                                                           const float* __restrict__ shared_gate,
+                                                           const bf16* __restrict__ shared, int hidden, int top_k,
+                                                           int columns, bf16* __restrict__ y, MoeColumnMask mask) {
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    if constexpr (kMasked) {
+        if (!column_live(mask, t)) {
+            *reinterpret_cast<uint4*>(y + static_cast<std::size_t>(t) * hidden + d) = make_uint4(0U, 0U, 0U, 0U);
+            return;
+        }
+    }
+    float sum[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (int k = 0; k < top_k; ++k) {
+        const float w      = weights[static_cast<std::size_t>(t) * top_k + k];
+        const uint4 packed = *reinterpret_cast<const uint4*>(
+            outputs + (static_cast<std::size_t>(t) * top_k + k) * hidden + d);
+        const bf16* o = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sum[j] += w * __bfloat162float(o[j]); }
+    }
+    {
+        const float wg     = shared_gate[t];
+        const uint4 packed = *reinterpret_cast<const uint4*>(shared + static_cast<std::size_t>(t) * hidden + d);
+        const bf16* sh     = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sum[j] += wg * __bfloat162float(sh[j]); }
+    }
+    uint4 out_packed;
+    bf16* out_bf16 = reinterpret_cast<bf16*>(&out_packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { out_bf16[j] = __float2bfloat16_rn(sum[j]); }
+    *reinterpret_cast<uint4*>(y + static_cast<std::size_t>(t) * hidden + d) = out_packed;
+}
+
+template <bool kMasked>
+__launch_bounds__(320) __global__ void combine_inject_vec8_kernel(
+    const bf16* __restrict__ outputs, const float* __restrict__ weights, const float* __restrict__ shared_gate,
+    const bf16* __restrict__ shared, const float* __restrict__ inject, int hidden, int top_k, int streams,
+    int columns, bf16* __restrict__ residual, MoeColumnMask mask) {
+    pdl::enter();
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    if constexpr (kMasked) {
+        if (!column_live(mask, t)) { return; }
+    }
+    float sum[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (int k = 0; k < top_k; ++k) {
+        const float w      = weights[static_cast<std::size_t>(t) * top_k + k];
+        const uint4 packed = *reinterpret_cast<const uint4*>(
+            outputs + (static_cast<std::size_t>(t) * top_k + k) * hidden + d);
+        const bf16* o = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sum[j] += w * __bfloat162float(o[j]); }
+    }
+    {
+        const float wg     = shared_gate[t];
+        const uint4 packed = *reinterpret_cast<const uint4*>(shared + static_cast<std::size_t>(t) * hidden + d);
+        const bf16* sh     = reinterpret_cast<const bf16*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sum[j] += wg * __bfloat162float(sh[j]); }
+    }
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { v[j] = __bfloat162float(__float2bfloat16_rn(sum[j])); }
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    for (int s = 0; s < streams; ++s) {
+        const float inj = inject[static_cast<std::size_t>(t) * streams + s];
+        uint4* r_ptr    = reinterpret_cast<uint4*>(
+            residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
+        uint4 r_packed = *r_ptr;
+        bf16* r        = reinterpret_cast<bf16*>(&r_packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
+        *r_ptr = r_packed;
+    }
+}
+
+bool aligned_16(const void* p) noexcept {
+    return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U;
 }
 
 } // namespace
@@ -3873,17 +3968,32 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
     const bool masked = routing.mask.valid != nullptr;
     require(!masked || (routing.mask.width > 0 && columns % routing.mask.width == 0),
             "a column mask needs whole rows of the call's columns");
-    const dim3 grid((hidden + kThreads - 1) / kThreads, columns);
     const auto* routed_out = static_cast<const bf16*>(outputs.data);
     const auto* weights    = static_cast<const float*>(routing.weights.data);
     const auto* gate       = static_cast<const float*>(routing.shared_gate.data);
     const auto* shared_out = static_cast<const bf16*>(shared.data);
+    auto* y_out            = static_cast<bf16*>(y.data);
+    if (hidden % 8 == 0 && aligned_16(routed_out) && aligned_16(shared_out) && aligned_16(y_out)) {
+        const int vec_elems = hidden / 8;
+        const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
+        const dim3 grid((vec_elems + threads - 1) / threads, columns);
+        if (masked) {
+            combine_vec8_kernel<true><<<grid, threads, 0, stream>>>(routed_out, weights, gate, shared_out, hidden,
+                                                                    top_k, columns, y_out, routing.mask);
+        } else {
+            combine_vec8_kernel<false><<<grid, threads, 0, stream>>>(routed_out, weights, gate, shared_out, hidden,
+                                                                     top_k, columns, y_out, routing.mask);
+        }
+        check_launch("combine");
+        return;
+    }
+    const dim3 grid((hidden + kThreads - 1) / kThreads, columns);
     if (masked) {
         combine_kernel<true><<<grid, kThreads, 0, stream>>>(routed_out, weights, gate, shared_out, hidden, top_k, columns,
-                                                            static_cast<bf16*>(y.data), routing.mask);
+                                                            y_out, routing.mask);
     } else {
         combine_kernel<false><<<grid, kThreads, 0, stream>>>(routed_out, weights, gate, shared_out, hidden, top_k,
-                                                             columns, static_cast<bf16*>(y.data), routing.mask);
+                                                             columns, y_out, routing.mask);
     }
     check_launch("combine");
 }
@@ -3902,21 +4012,34 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
     const bool masked = routing.mask.valid != nullptr;
     require(!masked || (routing.mask.width > 0 && columns % routing.mask.width == 0),
             "a column mask needs whole rows of the call's columns");
+    const auto* routed_out = static_cast<const bf16*>(outputs.data);
+    const auto* weights    = static_cast<const float*>(routing.weights.data);
+    const auto* gate       = static_cast<const float*>(routing.shared_gate.data);
+    const auto* shared_out = static_cast<const bf16*>(shared.data);
+    const auto* inject_in  = static_cast<const float*>(inject.data);
+    auto* residual_io      = static_cast<bf16*>(residual.data);
+    if (hidden % 8 == 0 && aligned_16(routed_out) && aligned_16(shared_out) && aligned_16(residual_io)) {
+        const int vec_elems = hidden / 8;
+        const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
+        const pdl::LaunchConfig cfg{dim3((vec_elems + threads - 1) / threads, columns), dim3(threads), 0, stream};
+        if (masked) {
+            CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_vec8_kernel<true>, routed_out, weights, gate,
+                                            shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
+                                            routing.mask));
+        } else {
+            CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_vec8_kernel<false>, routed_out, weights, gate,
+                                            shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
+                                            routing.mask));
+        }
+        return;
+    }
     const pdl::LaunchConfig cfg{dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream};
     if (masked) {
-        CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<true>, static_cast<const bf16*>(outputs.data),
-                                        static_cast<const float*>(routing.weights.data),
-                                        static_cast<const float*>(routing.shared_gate.data),
-                                        static_cast<const bf16*>(shared.data), static_cast<const float*>(inject.data),
-                                        hidden, top_k, streams, columns, static_cast<bf16*>(residual.data),
-                                        routing.mask));
+        CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<true>, routed_out, weights, gate, shared_out,
+                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask));
     } else {
-        CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<false>, static_cast<const bf16*>(outputs.data),
-                                        static_cast<const float*>(routing.weights.data),
-                                        static_cast<const float*>(routing.shared_gate.data),
-                                        static_cast<const bf16*>(shared.data), static_cast<const float*>(inject.data),
-                                        hidden, top_k, streams, columns, static_cast<bf16*>(residual.data),
-                                        routing.mask));
+        CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<false>, routed_out, weights, gate, shared_out,
+                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask));
     }
 }
 

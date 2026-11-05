@@ -138,6 +138,109 @@ __global__ void __launch_bounds__(kThreads) inject_norm_kernel(const bf16* __res
     }
 }
 
+constexpr int kVec8Threads = 320; // 320 * 8 = 2560
+
+template <class Norm>
+__global__ void __launch_bounds__(kVec8Threads) norm_vec8_kernel(const bf16* __restrict__ residual,
+                                                                 const Norm* __restrict__ weight, int hidden,
+                                                                 int width, float eps, bf16* __restrict__ out) {
+    __shared__ float scratch[kVec8Threads / 32];
+    const int s   = blockIdx.x, t = blockIdx.y;
+    const int d   = threadIdx.x * 8;
+    const bf16* x = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
+    bf16* y       = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
+    const Norm* w = weight + static_cast<std::size_t>(s) * hidden + d;
+
+    const uint4 x_packed = *reinterpret_cast<const uint4*>(x);
+    const bf16* xs       = reinterpret_cast<const bf16*>(&x_packed);
+    float wf[8];
+    if constexpr (sizeof(Norm) == 4) {
+        const float4 w0 = *reinterpret_cast<const float4*>(w);
+        const float4 w1 = *reinterpret_cast<const float4*>(w + 4);
+        wf[0] = w0.x; wf[1] = w0.y; wf[2] = w0.z; wf[3] = w0.w;
+        wf[4] = w1.x; wf[5] = w1.y; wf[6] = w1.z; wf[7] = w1.w;
+    } else {
+        const uint4 w_packed = *reinterpret_cast<const uint4*>(w);
+        const bf16* ws       = reinterpret_cast<const bf16*>(&w_packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { wf[j] = __bfloat162float(ws[j]); }
+    }
+
+    float sum = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float v = __bfloat162float(xs[j]);
+        sum += v * v;
+    }
+    const float inv = rsqrtf(block_sum(sum, scratch) / static_cast<float>(hidden) + eps);
+    uint4 y_packed;
+    bf16* ys = reinterpret_cast<bf16*>(&y_packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        ys[j] = __float2bfloat16_rn(__bfloat162float(xs[j]) * inv * (1.0F + wf[j]));
+    }
+    *reinterpret_cast<uint4*>(y) = y_packed;
+}
+
+template <class Norm>
+__global__ void __launch_bounds__(kVec8Threads) inject_norm_vec8_kernel(const bf16* __restrict__ y_in,
+                                                                        const float* __restrict__ inject,
+                                                                        bf16* __restrict__ residual,
+                                                                        const Norm* __restrict__ weight, int hidden,
+                                                                        int streams, int width, float eps,
+                                                                        bf16* __restrict__ out) {
+    pdl::enter();
+    __shared__ float scratch[kVec8Threads / 32];
+    const int s     = blockIdx.x, t = blockIdx.y;
+    const int d     = threadIdx.x * 8;
+    const float sc  = inject[static_cast<std::size_t>(t) * streams + s];
+    const bf16* yin = y_in + static_cast<std::size_t>(t) * hidden + d;
+    bf16* x         = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
+    bf16* y         = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
+    const Norm* w   = weight + static_cast<std::size_t>(s) * hidden + d;
+
+    const uint4 x_in_packed   = *reinterpret_cast<const uint4*>(x);
+    const uint4 yin_in_packed = *reinterpret_cast<const uint4*>(yin);
+    const bf16* x_in          = reinterpret_cast<const bf16*>(&x_in_packed);
+    const bf16* yin_in        = reinterpret_cast<const bf16*>(&yin_in_packed);
+
+    uint4 x_out_packed;
+    bf16* xs = reinterpret_cast<bf16*>(&x_out_packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        xs[j] = __float2bfloat16_rn(__bfloat162float(x_in[j]) + sc * __bfloat162float(yin_in[j]));
+    }
+    *reinterpret_cast<uint4*>(x) = x_out_packed;
+
+    float wf[8];
+    if constexpr (sizeof(Norm) == 4) {
+        const float4 w0 = *reinterpret_cast<const float4*>(w);
+        const float4 w1 = *reinterpret_cast<const float4*>(w + 4);
+        wf[0] = w0.x; wf[1] = w0.y; wf[2] = w0.z; wf[3] = w0.w;
+        wf[4] = w1.x; wf[5] = w1.y; wf[6] = w1.z; wf[7] = w1.w;
+    } else {
+        const uint4 w_packed = *reinterpret_cast<const uint4*>(w);
+        const bf16* ws       = reinterpret_cast<const bf16*>(&w_packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { wf[j] = __bfloat162float(ws[j]); }
+    }
+
+    float sum = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float v = __bfloat162float(xs[j]);
+        sum += v * v;
+    }
+    const float inv = rsqrtf(block_sum(sum, scratch) / static_cast<float>(hidden) + eps);
+    uint4 y_packed;
+    bf16* ys = reinterpret_cast<bf16*>(&y_packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        ys[j] = __float2bfloat16_rn(__bfloat162float(xs[j]) * inv * (1.0F + wf[j]));
+    }
+    *reinterpret_cast<uint4*>(y) = y_packed;
+}
+
 __global__ void gates_kernel(const bf16* __restrict__ z, int rows, int rank, int streams, int columns,
                              bf16* __restrict__ mix, float* __restrict__ inject) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -193,6 +296,75 @@ __global__ void expand_kernel(const bf16* __restrict__ x, int hidden, int stream
     }
 }
 
+__launch_bounds__(320) __global__ void collapse_vec8_kernel(const bf16* __restrict__ logits,
+                                                            const bf16* __restrict__ normalized, int hidden,
+                                                            int streams, int columns, bf16* __restrict__ out) {
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    float sum[8]            = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (int s = 0; s < streams; ++s) {
+        const std::size_t i   = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
+        const uint4 l_packed  = *reinterpret_cast<const uint4*>(logits + i);
+        const uint4 n_packed  = *reinterpret_cast<const uint4*>(normalized + i);
+        const bf16* l_bf16    = reinterpret_cast<const bf16*>(&l_packed);
+        const bf16* n_bf16    = reinterpret_cast<const bf16*>(&n_packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            sum[j] += sigmoidf(__bfloat162float(l_bf16[j])) * __bfloat162float(n_bf16[j]);
+        }
+    }
+    const float inv_streams = static_cast<float>(streams);
+    uint4 out_packed;
+    bf16* out_bf16 = reinterpret_cast<bf16*>(&out_packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { out_bf16[j] = __float2bfloat16_rn(sum[j] / inv_streams); }
+    *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(t) * hidden + d) = out_packed;
+}
+
+__launch_bounds__(320) __global__ void inject_vec8_kernel(const bf16* __restrict__ y, const float* __restrict__ inject,
+                                                          int hidden, int streams, int columns,
+                                                          bf16* __restrict__ residual) {
+    pdl::enter();
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    const uint4 y_packed = *reinterpret_cast<const uint4*>(y + static_cast<std::size_t>(t) * hidden + d);
+    const bf16* y_bf16   = reinterpret_cast<const bf16*>(&y_packed);
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { v[j] = __bfloat162float(y_bf16[j]); }
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    for (int s = 0; s < streams; ++s) {
+        const float inj = inject[static_cast<std::size_t>(t) * streams + s];
+        uint4* r_ptr    = reinterpret_cast<uint4*>(
+            residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
+        uint4 r_packed = *r_ptr;
+        bf16* r        = reinterpret_cast<bf16*>(&r_packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
+        *r_ptr = r_packed;
+    }
+}
+
+__launch_bounds__(320) __global__ void expand_vec8_kernel(const bf16* __restrict__ x, int hidden, int streams,
+                                                          int columns, bf16* __restrict__ residual) {
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    const uint4 v           = *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + d);
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    for (int s = 0; s < streams; ++s) {
+        *reinterpret_cast<uint4*>(
+            residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d) = v;
+    }
+}
+
+bool aligned_16(const void* p) noexcept {
+    return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U;
+}
+
 // out column t (row pitch `pitch` elements) = the mean of the streams, summed in stream order.
 __global__ void stream_mean_kernel(const bf16* __restrict__ residual, int hidden, int streams, int columns,
                                    std::int64_t pitch, bf16* __restrict__ out) {
@@ -204,6 +376,29 @@ __global__ void stream_mean_kernel(const bf16* __restrict__ residual, int hidden
     float sum               = 0.0F;
     for (int s = 0; s < streams; ++s) { sum += __bfloat162float(column[static_cast<std::size_t>(s) * hidden]); }
     out[static_cast<std::size_t>(t) * pitch + d] = __float2bfloat16_rn(sum / static_cast<float>(streams));
+}
+
+__launch_bounds__(320) __global__ void stream_mean_vec8_kernel(const bf16* __restrict__ residual, int hidden,
+                                                               int streams, int columns, std::int64_t pitch,
+                                                               bf16* __restrict__ out) {
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
+    const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    const bf16* column      = residual + static_cast<std::size_t>(t) * width + d;
+    float sum[8]            = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (int s = 0; s < streams; ++s) {
+        const uint4 r_packed = *reinterpret_cast<const uint4*>(column + static_cast<std::size_t>(s) * hidden);
+        const bf16* r_vals   = reinterpret_cast<const bf16*>(&r_packed);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) { sum[k] += __bfloat162float(r_vals[k]); }
+    }
+    const float inv_s = 1.0F / static_cast<float>(streams);
+    uint4 out_packed;
+    bf16* out_vals = reinterpret_cast<bf16*>(&out_packed);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) { out_vals[k] = __float2bfloat16_rn(sum[k] * inv_s); }
+    *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(t) * pitch + d) = out_packed;
 }
 
 // The composed route's steps (private since hyper_connection_mix).
@@ -219,8 +414,14 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::in
     require(eps > 0, "norm epsilon must be positive");
     require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
     const int hidden = width / streams;
+    const bool vec8  = hidden == kVec8Threads * 8 && aligned_16(residual.data) && aligned_16(weight.data) &&
+                      aligned_16(out.data);
     if (weight.dtype == DType::FP32) {
-        if (hidden == kThreads * 10) {
+        if (vec8) {
+            norm_vec8_kernel<float><<<dim3(streams, columns), kVec8Threads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        } else if (hidden == kThreads * 10) {
             norm_kernel<float, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
@@ -230,7 +431,11 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::in
                 hidden, width, eps, static_cast<bf16*>(out.data));
         }
     } else {
-        if (hidden == kThreads * 10) {
+        if (vec8) {
+            norm_vec8_kernel<bf16><<<dim3(streams, columns), kVec8Threads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        } else if (hidden == kThreads * 10) {
             norm_kernel<bf16, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
@@ -259,10 +464,17 @@ void hyper_connection_inject_norm(const Tensor& y, const Tensor& inject, Tensor&
     require(eps > 0, "norm epsilon must be positive");
     require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
     const int hidden = width / streams;
-    const pdl::LaunchConfig cfg{dim3(streams, columns), dim3(kThreads), 0, stream};
+    const bool vec8  = hidden == kVec8Threads * 8 && aligned_16(y.data) && aligned_16(residual.data) &&
+                      aligned_16(weight.data) && aligned_16(out.data);
+    const pdl::LaunchConfig cfg{dim3(streams, columns), dim3(vec8 ? kVec8Threads : kThreads), 0, stream};
     cudaError_t status = cudaSuccess;
     if (weight.dtype == DType::FP32) {
-        if (hidden == kThreads * 10) {
+        if (vec8) {
+            status = pdl::launch_consumer(cfg, inject_norm_vec8_kernel<float>,
+                                          static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                                          static_cast<bf16*>(residual.data), static_cast<const float*>(weight.data),
+                                          hidden, streams, width, eps, static_cast<bf16*>(out.data));
+        } else if (hidden == kThreads * 10) {
             status = pdl::launch_consumer(cfg, inject_norm_kernel<float, 10, true>,
                                           static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
                                           static_cast<bf16*>(residual.data), static_cast<const float*>(weight.data),
@@ -274,7 +486,12 @@ void hyper_connection_inject_norm(const Tensor& y, const Tensor& inject, Tensor&
                                           hidden, streams, width, eps, static_cast<bf16*>(out.data));
         }
     } else {
-        if (hidden == kThreads * 10) {
+        if (vec8) {
+            status = pdl::launch_consumer(cfg, inject_norm_vec8_kernel<bf16>,
+                                          static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                                          static_cast<bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                                          hidden, streams, width, eps, static_cast<bf16*>(out.data));
+        } else if (hidden == kThreads * 10) {
             status = pdl::launch_consumer(cfg, inject_norm_kernel<bf16, 10, true>,
                                           static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
                                           static_cast<bf16*>(residual.data), static_cast<const bf16*>(weight.data),
@@ -334,6 +551,15 @@ void hc_collapse(const Tensor& u, const Tensor& normalized, std::int32_t streams
     require(width == streams * hidden && normalized.ne[0] == width && normalized.ne[1] == columns &&
                 x.ne[1] == columns && columns > 0,
             "collapse shapes disagree");
+    if (hidden % 8 == 0 && aligned_16(u.data) && aligned_16(normalized.data) && aligned_16(x.data)) {
+        const int vec_elems = hidden / 8;
+        const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
+        collapse_vec8_kernel<<<dim3((vec_elems + threads - 1) / threads, columns), threads, 0, stream>>>(
+            static_cast<const bf16*>(u.data), static_cast<const bf16*>(normalized.data), hidden, streams, columns,
+            static_cast<bf16*>(x.data));
+        check_launch("collapse");
+        return;
+    }
     collapse_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
         static_cast<const bf16*>(u.data), static_cast<const bf16*>(normalized.data), hidden, streams, columns,
         static_cast<bf16*>(x.data));
@@ -444,6 +670,17 @@ void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& resi
     require(inject.ne[1] == columns && residual.ne[0] == streams * hidden && residual.ne[1] == columns &&
                 columns > 0,
             "inject shapes disagree");
+    if (hidden % 8 == 0 && aligned_16(y.data) && aligned_16(residual.data)) {
+        const int vec_elems = hidden / 8;
+        const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
+        if (pdl::launch_consumer({dim3((vec_elems + threads - 1) / threads, columns), dim3(threads), 0, stream},
+                                 inject_vec8_kernel, static_cast<const bf16*>(y.data),
+                                 static_cast<const float*>(inject.data), hidden, streams, columns,
+                                 static_cast<bf16*>(residual.data)) != cudaSuccess) {
+            check_launch("inject");
+        }
+        return;
+    }
     if (pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
                              inject_kernel, static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
                              hidden, streams, columns, static_cast<bf16*>(residual.data)) != cudaSuccess) {
@@ -458,6 +695,14 @@ void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& resi
     const int hidden = x.ne[0], columns = x.ne[1];
     require(residual.ne[0] == streams * hidden && residual.ne[1] == columns && columns > 0,
             "expand shapes disagree");
+    if (hidden % 8 == 0 && aligned_16(x.data) && aligned_16(residual.data)) {
+        const int vec_elems = hidden / 8;
+        const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
+        expand_vec8_kernel<<<dim3((vec_elems + threads - 1) / threads, columns), threads, 0, stream>>>(
+            static_cast<const bf16*>(x.data), hidden, streams, columns, static_cast<bf16*>(residual.data));
+        check_launch("expand");
+        return;
+    }
     expand_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
         static_cast<const bf16*>(x.data), hidden, streams, columns, static_cast<bf16*>(residual.data));
     check_launch("expand");
@@ -469,11 +714,21 @@ void hyper_connection_stream_mean(const Tensor& residual, std::int32_t streams, 
                 out.dtype == DType::BF16 && out.ne[2] == 1 && out.ne[3] == 1 && out.nb[0] == 2 &&
                 out.nb[1] % 2 == 0 && out.nb[1] >= 2LL * out.ne[0],
             "stream mean requires a contiguous BF16 residual and BF16 output columns");
-    const int hidden = out.ne[0], columns = out.ne[1];
+    const int hidden        = out.ne[0], columns = out.ne[1];
+    const std::int64_t pitch = out.nb[1] / 2;
     require(residual.ne[0] == streams * hidden && residual.ne[1] == columns && columns > 0,
             "stream mean shapes disagree");
+    if (hidden % 8 == 0 && pitch % 8 == 0 && aligned_16(residual.data) && aligned_16(out.data)) {
+        const int vec_elems = hidden / 8;
+        const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
+        stream_mean_vec8_kernel<<<dim3((vec_elems + threads - 1) / threads, columns), threads, 0, stream>>>(
+            static_cast<const bf16*>(residual.data), hidden, streams, columns, pitch,
+            static_cast<bf16*>(out.data));
+        check_launch("stream mean");
+        return;
+    }
     stream_mean_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(residual.data), hidden, streams, columns, out.nb[1] / 2,
+        static_cast<const bf16*>(residual.data), hidden, streams, columns, pitch,
         static_cast<bf16*>(out.data));
     check_launch("stream mean");
 }

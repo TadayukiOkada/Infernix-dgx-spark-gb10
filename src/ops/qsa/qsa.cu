@@ -201,6 +201,26 @@ __global__ void tail_kernel(const bf16* __restrict__ raw, const std::int32_t* __
     }
 }
 
+__global__ void __launch_bounds__(32)
+    tail_vec8_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
+                     const std::int32_t* __restrict__ tail_slots, int width, int ratio,
+                     bf16* __restrict__ tails) {
+    pdl::enter(); // launched as a programmatic dependent
+    const int sequence = blockIdx.x, d = threadIdx.x * 8;
+    if (d >= kIndexDim) { return; }
+    const int start = positions[sequence * width];
+    const int last  = positions[sequence * width + width - 1];
+    const int base  = last - last % ratio;
+    const int end   = min(last, base + ratio - 2);
+    for (int q = max(base, start); q <= end; ++q) {
+        const int column = sequence * width + (q - start);
+        *reinterpret_cast<uint4*>(tails + (static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) *
+                                              kIndexDim +
+                                  d) =
+            *reinterpret_cast<const uint4*>(raw + static_cast<std::size_t>(column) * kIndexDim + d);
+    }
+}
+
 // One CTA per (sequence, layer): the tail after the first commit_columns[sequence] columns.
 __global__ void commit_tail_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
                                    const std::int32_t* __restrict__ commit_columns,
@@ -219,6 +239,30 @@ __global__ void commit_tail_kernel(const bf16* __restrict__ raw, const std::int3
         const int column = sequence * width + (q - start);
         layer_tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) * kIndexDim + d] =
             layer_raw[static_cast<std::size_t>(column) * kIndexDim + d];
+    }
+}
+
+__global__ void __launch_bounds__(32)
+    commit_tail_vec8_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
+                            const std::int32_t* __restrict__ commit_columns,
+                            const std::int32_t* __restrict__ tail_slots, int width, int batch, int ratio,
+                            int slots, bf16* __restrict__ tails) {
+    const int sequence = blockIdx.x, layer = blockIdx.y, d = threadIdx.x * 8;
+    const int n = commit_columns[sequence];
+    if (n <= 0 || d >= kIndexDim) { return; }
+    const int start = positions[sequence * width];
+    const int last  = start + n - 1;
+    const int base  = last - last % ratio;
+    const int end   = min(last, base + ratio - 2);
+    const bf16* layer_raw = raw + static_cast<std::size_t>(layer) * batch * width * kIndexDim;
+    bf16* layer_tails     = tails + static_cast<std::size_t>(layer) * slots * (ratio - 1) * kIndexDim;
+    for (int q = max(base, start); q <= end; ++q) {
+        const int column = sequence * width + (q - start);
+        *reinterpret_cast<uint4*>(layer_tails +
+                                  (static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) *
+                                      kIndexDim +
+                                  d) =
+            *reinterpret_cast<const uint4*>(layer_raw + static_cast<std::size_t>(column) * kIndexDim + d);
     }
 }
 
@@ -1077,11 +1121,22 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
             "pool launch failed");
     check_launch("pool");
     if (!batch.update_tails) { return; }
-    require(pdl::launch_consumer({dim3(batch.batch), dim3(kIndexDim), 0, stream}, tail_kernel,
-        static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(batch.positions.data),
-        static_cast<const std::int32_t*>(batch.tail_slots.data), batch.width, geometry.ratio,
-        static_cast<bf16*>(tails.data)) == cudaSuccess,
-            "tail launch failed");
+    const bool vec8 = ((reinterpret_cast<std::uintptr_t>(raw_keys.data) |
+                        reinterpret_cast<std::uintptr_t>(tails.data)) &
+                       15U) == 0U;
+    if (vec8) {
+        require(pdl::launch_consumer({dim3(batch.batch), dim3(32), 0, stream}, tail_vec8_kernel,
+            static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(batch.positions.data),
+            static_cast<const std::int32_t*>(batch.tail_slots.data), batch.width, geometry.ratio,
+            static_cast<bf16*>(tails.data)) == cudaSuccess,
+                "tail launch failed");
+    } else {
+        require(pdl::launch_consumer({dim3(batch.batch), dim3(kIndexDim), 0, stream}, tail_kernel,
+            static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(batch.positions.data),
+            static_cast<const std::int32_t*>(batch.tail_slots.data), batch.width, geometry.ratio,
+            static_cast<bf16*>(tails.data)) == cudaSuccess,
+                "tail launch failed");
+    }
     check_launch("tail");
 }
 
@@ -1096,10 +1151,20 @@ void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Ten
                 contiguous(tail_slots, DType::I32) && tail_slots.ne[0] == batch && contiguous(tails, DType::BF16) &&
                 tails.ne[0] == kIndexDim && tails.ne[1] == geometry.ratio - 1 && tails.ne[3] == layers,
             "commit tail shapes disagree");
-    commit_tail_kernel<<<dim3(batch, layers), kIndexDim, 0, stream>>>(
-        static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(positions.data),
-        static_cast<const std::int32_t*>(commit_columns.data), static_cast<const std::int32_t*>(tail_slots.data),
-        width, batch, geometry.ratio, tails.ne[2], static_cast<bf16*>(tails.data));
+    const bool vec8 = ((reinterpret_cast<std::uintptr_t>(raw_keys.data) |
+                        reinterpret_cast<std::uintptr_t>(tails.data)) &
+                       15U) == 0U;
+    if (vec8) {
+        commit_tail_vec8_kernel<<<dim3(batch, layers), 32, 0, stream>>>(
+            static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(commit_columns.data), static_cast<const std::int32_t*>(tail_slots.data),
+            width, batch, geometry.ratio, tails.ne[2], static_cast<bf16*>(tails.data));
+    } else {
+        commit_tail_kernel<<<dim3(batch, layers), kIndexDim, 0, stream>>>(
+            static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(commit_columns.data), static_cast<const std::int32_t*>(tail_slots.data),
+            width, batch, geometry.ratio, tails.ne[2], static_cast<bf16*>(tails.data));
+    }
     check_launch("commit tails");
 }
 

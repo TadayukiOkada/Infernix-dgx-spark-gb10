@@ -402,6 +402,39 @@ __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restri
     residual[i]         = __float2bfloat16_rn(__bfloat162float(residual[i]) + out);
 }
 
+__global__ void __launch_bounds__(kThreads)
+    conv_vec8_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
+                     const bf16* __restrict__ weight, int taps, int dilation, int span, int channels,
+                     int width, const bf16* __restrict__ states,
+                     const std::int32_t* __restrict__ source_slots, int columns,
+                     bf16* __restrict__ residual) {
+    const int c = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int t = blockIdx.y;
+    if (c >= channels || t >= columns) { return; }
+    const int sequence = t / width, local = t % width;
+    const int slot     = source_slots[sequence];
+    float acc[8]       = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (int j = 0; j < taps; ++j) {
+        const int source = local - (taps - 1 - j) * dilation;
+        float x[8], w[8];
+        if (source >= 0) {
+            load_bf16x<8>(normalized + static_cast<std::size_t>(sequence * width + source) * channels + c, x);
+        } else {
+            load_bf16x<8>(states + (static_cast<std::size_t>(slot) * span + (span + source)) * channels + c, x);
+        }
+        load_bf16x<8>(weight + static_cast<std::size_t>(j) * channels + c, w);
+#pragma unroll
+        for (int u = 0; u < 8; ++u) { acc[u] += w[u] * x[u]; }
+    }
+    const std::size_t i = static_cast<std::size_t>(t) * channels + c;
+    float g[8], r[8];
+    load_bf16x<8>(gated + i, g);
+    load_bf16x<8>(residual + i, r);
+#pragma unroll
+    for (int u = 0; u < 8; ++u) { r[u] += g[u] + acc[u] * sigmoidf(acc[u]); }
+    store_bf16x<8>(residual + i, r);
+}
+
 // The decode convolution: one column per sequence, so every tap but the last reads the history and
 // the shift moves it forward by exactly one column. One thread per (channel, sequence) reads the
 // span once, injects the residual and rewrites the slot, which is what conv_kernel and a separate
@@ -442,6 +475,57 @@ __global__ void __launch_bounds__(kThreads)
     if (SPAN > 0) { shifted[static_cast<std::size_t>(SPAN - 1) * channels] = latest; }
 }
 
+template <int SPAN>
+__global__ void __launch_bounds__(kThreads)
+    conv_state_vec8_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
+                           const bf16* __restrict__ weight, int taps, int dilation, int channels,
+                           bf16* __restrict__ states, const std::int32_t* __restrict__ source_slots,
+                           const std::int32_t* __restrict__ destination_slots, bf16* __restrict__ residual) {
+    const int c        = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int sequence = blockIdx.y;
+    if (c >= channels) { return; }
+    const int src             = source_slots[sequence], dst = destination_slots[sequence];
+    const std::size_t column  = static_cast<std::size_t>(sequence) * channels;
+    const bf16* const history = states + static_cast<std::size_t>(src) * SPAN * channels + c;
+    bf16* const shifted       = states + static_cast<std::size_t>(dst) * SPAN * channels + c;
+    uint4 past[SPAN];
+#pragma unroll
+    for (int k = 0; k < SPAN; ++k) {
+        past[k] = *reinterpret_cast<const uint4*>(history + static_cast<std::size_t>(k) * channels);
+    }
+    const uint4 latest = *reinterpret_cast<const uint4*>(normalized + column + c);
+    float acc[8]       = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+    for (int k = 0; k < SPAN; ++k) {
+        const int tap = k / dilation;
+        if (tap * dilation == k && tap + 1 < taps) {
+            float w[8], x[8];
+            load_bf16x<8>(weight + static_cast<std::size_t>(tap) * channels + c, w);
+            load_bf16x<8>(reinterpret_cast<const bf16*>(&past[k]), x);
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { acc[u] += w[u] * x[u]; }
+        }
+    }
+    {
+        float w[8], x[8];
+        load_bf16x<8>(weight + static_cast<std::size_t>(taps - 1) * channels + c, w);
+        load_bf16x<8>(reinterpret_cast<const bf16*>(&latest), x);
+#pragma unroll
+        for (int u = 0; u < 8; ++u) { acc[u] += w[u] * x[u]; }
+    }
+    float g[8], r[8];
+    load_bf16x<8>(gated + column + c, g);
+    load_bf16x<8>(residual + column + c, r);
+#pragma unroll
+    for (int u = 0; u < 8; ++u) { r[u] += g[u] + acc[u] * sigmoidf(acc[u]); }
+    store_bf16x<8>(residual + column + c, r);
+#pragma unroll
+    for (int k = 0; k + 1 < SPAN; ++k) {
+        *reinterpret_cast<uint4*>(shifted + static_cast<std::size_t>(k) * channels) = past[k + 1];
+    }
+    if (SPAN > 0) { *reinterpret_cast<uint4*>(shifted + static_cast<std::size_t>(SPAN - 1) * channels) = latest; }
+}
+
 // One thread per (channel, sequence) shifts the history in increasing order, so an in-place
 // update (source == destination slot) never reads an element it already overwrote.
 __global__ void state_kernel(const bf16* __restrict__ normalized, int span, int channels, int width,
@@ -461,6 +545,28 @@ __global__ void state_kernel(const bf16* __restrict__ normalized, int span, int 
             v = states[(static_cast<std::size_t>(src) * span + (span + index)) * channels + c];
         }
         states[(static_cast<std::size_t>(dst) * span + k) * channels + c] = v;
+    }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    state_vec8_kernel(const bf16* __restrict__ normalized, int span, int channels, int width, int sequences,
+                      bf16* __restrict__ states, const std::int32_t* __restrict__ source_slots,
+                      const std::int32_t* __restrict__ destination_slots) {
+    const int c        = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int sequence = blockIdx.y;
+    if (c >= channels || sequence >= sequences) { return; }
+    const int src = source_slots[sequence], dst = destination_slots[sequence];
+    for (int k = 0; k < span; ++k) {
+        const int index = width - span + k;
+        uint4 v;
+        if (index >= 0) {
+            v = *reinterpret_cast<const uint4*>(normalized +
+                                                static_cast<std::size_t>(sequence * width + index) * channels + c);
+        } else {
+            v = *reinterpret_cast<const uint4*>(
+                states + (static_cast<std::size_t>(src) * span + (span + index)) * channels + c);
+        }
+        *reinterpret_cast<uint4*>(states + (static_cast<std::size_t>(dst) * span + k) * channels + c) = v;
     }
 }
 
@@ -484,6 +590,29 @@ __global__ void commit_kernel(const bf16* __restrict__ normalized, int span, int
             v = states[(static_cast<std::size_t>(slot) * span + (span + index)) * channels + c];
         }
         states[(static_cast<std::size_t>(slot) * span + k) * channels + c] = v;
+    }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    commit_vec8_kernel(const bf16* __restrict__ normalized, int span, int channels, int stride,
+                       const std::int32_t* __restrict__ commit_columns, bf16* __restrict__ states,
+                       const std::int32_t* __restrict__ slots) {
+    const int c = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int b = blockIdx.y;
+    if (c >= channels) { return; }
+    const int n = commit_columns[b];
+    if (n <= 0) { return; }
+    const int slot = slots[b];
+    for (int k = 0; k < span; ++k) {
+        const int index = n - span + k;
+        uint4 v;
+        if (index >= 0) {
+            v = *reinterpret_cast<const uint4*>(normalized + static_cast<std::size_t>(b * stride + index) * channels + c);
+        } else {
+            v = *reinterpret_cast<const uint4*>(
+                states + (static_cast<std::size_t>(slot) * span + (span + index)) * channels + c);
+        }
+        *reinterpret_cast<uint4*>(states + (static_cast<std::size_t>(slot) * span + k) * channels + c) = v;
     }
 }
 
@@ -652,12 +781,21 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
     const auto* destination_p = static_cast<const std::int32_t*>(destination_slots.data);
     auto* states_p   = static_cast<bf16*>(states.data);
     auto* residual_p = static_cast<bf16*>(residual.data);
+    const bool vec8 = channels % 8 == 0 && aligned<16>(gated_p) && aligned<16>(normalized_p) &&
+                      aligned<16>(weight_p) && aligned<16>(states_p) && aligned<16>(residual_p);
     if (update && width == 1 && span >= 1 && span <= kFusedConvMaxSpan) {
-        const dim3 grid((channels + kThreads - 1) / kThreads, sequences);
+        const int tasks = vec8 ? (channels / 8) : channels;
+        const dim3 grid((tasks + kThreads - 1) / kThreads, sequences);
         const auto run = [&]<int SPAN>() {
-            conv_state_kernel<SPAN><<<grid, kThreads, 0, stream>>>(gated_p, normalized_p, weight_p, taps, dilation,
-                                                                  channels, states_p, source_p, destination_p,
-                                                                  residual_p);
+            if (vec8) {
+                conv_state_vec8_kernel<SPAN><<<grid, kThreads, 0, stream>>>(
+                    gated_p, normalized_p, weight_p, taps, dilation, channels, states_p, source_p, destination_p,
+                    residual_p);
+            } else {
+                conv_state_kernel<SPAN><<<grid, kThreads, 0, stream>>>(
+                    gated_p, normalized_p, weight_p, taps, dilation, channels, states_p, source_p, destination_p,
+                    residual_p);
+            }
         };
         switch (span) {
 #define INFERNIX_PLE_FUSED_STATE(n)                                                                        \
@@ -685,13 +823,24 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
         check_launch("conv state");
         return;
     }
-    conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, columns,
-        residual_p);
+    if (vec8) {
+        conv_vec8_kernel<<<dim3((channels / 8 + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
+            gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, columns,
+            residual_p);
+    } else {
+        conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
+            gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, columns,
+            residual_p);
+    }
     check_launch("conv");
     if (!update) { return; }
-    state_kernel<<<dim3((channels + kThreads - 1) / kThreads, sequences), kThreads, 0, stream>>>(
-        normalized_p, span, channels, width, sequences, states_p, source_p, destination_p);
+    if (vec8) {
+        state_vec8_kernel<<<dim3((channels / 8 + kThreads - 1) / kThreads, sequences), kThreads, 0, stream>>>(
+            normalized_p, span, channels, width, sequences, states_p, source_p, destination_p);
+    } else {
+        state_kernel<<<dim3((channels + kThreads - 1) / kThreads, sequences), kThreads, 0, stream>>>(
+            normalized_p, span, channels, width, sequences, states_p, source_p, destination_p);
+    }
     check_launch("state");
 }
 
@@ -704,10 +853,19 @@ void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Ten
     require(rows > 0 && width > 0 && commit_columns.ne[0] == rows && slots.ne[0] == rows &&
                 states.ne[0] == channels && states.ne[1] > 0,
             "commit shapes disagree");
-    commit_kernel<<<dim3((channels + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(normalized.data), states.ne[1], channels, width,
-        static_cast<const std::int32_t*>(commit_columns.data), static_cast<bf16*>(states.data),
-        static_cast<const std::int32_t*>(slots.data));
+    const auto* normalized_p = static_cast<const bf16*>(normalized.data);
+    auto* states_p           = static_cast<bf16*>(states.data);
+    if (channels % 8 == 0 && aligned<16>(normalized_p) && aligned<16>(states_p)) {
+        commit_vec8_kernel<<<dim3((channels / 8 + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(
+            normalized_p, states.ne[1], channels, width,
+            static_cast<const std::int32_t*>(commit_columns.data), states_p,
+            static_cast<const std::int32_t*>(slots.data));
+    } else {
+        commit_kernel<<<dim3((channels + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(
+            normalized_p, states.ne[1], channels, width,
+            static_cast<const std::int32_t*>(commit_columns.data), states_p,
+            static_cast<const std::int32_t*>(slots.data));
+    }
     check_launch("commit");
 }
 
