@@ -11,7 +11,6 @@
 #include "ops/common/score_id_order.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
-#include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -243,6 +242,10 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
 // so a thread's whole key leaf is one LDS.128. Two CTAs fit an SM (42 KiB
 // of shared memory and at most 128 registers per thread each): the kernel is latency-bound on its
 // dependent adds, and 16 warps per SM hide twice what 8 did.
+// Packed-BF16 query staging (uint2 lanes, 25,344 B, 3 CTAs/SM eligible) was measured and rejected:
+// widening every leaf costs one LDS.64 plus four shift/mask ALU ops per head against the FP32
+// staging's single LDS.128, and this kernel is warp-instruction-bound, so the 512 extra leaf ops per
+// key tile regressed select_us by 10..19% at every wide point even with occupancy raised to 3 CTAs.
 constexpr int kWideThreads      = 256;
 constexpr int kWideCtasPerSm    = 2;
 constexpr int kWideBlocks       = 32;                    // blocks per key tile
@@ -446,8 +449,7 @@ __global__ void __launch_bounds__(kWideThreads, kWideCtasPerSm)
 // ----------------------------------------------------------------------------------- selection
 
 struct SelectShared {
-    using Scan = cub::BlockScan<int, kSelectThreads>;
-    typename Scan::TempStorage scan;
+    int warp_totals[kSelectWarps];          // block_exclusive_sum's per-warp inclusive totals
     unsigned radix[256];
     int pick_digit, pick_above, pick_count; // radix_threshold's digit
     int bin, bin_above, bin_count;          // the score bin holding the top-th score
@@ -513,6 +515,33 @@ __device__ __forceinline__ void score_histogram(const float* column, int lo, int
     });
 }
 
+// Block-wide exclusive prefix sum over kSelectThreads: a 32-lane inclusive scan by shuffles per
+// warp, the kSelectWarps warp totals scanned by warp 0 in shared memory, then each thread adds its
+// warp's prefix. Integer sums are exact, so every result is bit-for-bit cub::BlockScan's. All 512
+// threads must call it (the two callers below do; the kernel's early exits precede them).
+__device__ __forceinline__ int block_exclusive_sum(int value, SelectShared& sh) {
+    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+    int inclusive = value;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int other = __shfl_up_sync(kFullMask, inclusive, o);
+        if (lane >= o) { inclusive += other; }
+    }
+    if (lane == 31) { sh.warp_totals[warp] = inclusive; }
+    __syncthreads();
+    if (warp == 0) {
+        int v = lane < kSelectWarps ? sh.warp_totals[lane] : 0;
+#pragma unroll
+        for (int o = 1; o < kSelectWarps; o <<= 1) {
+            const int other = __shfl_up_sync(kFullMask, v, o);
+            if (lane >= o) { v += other; }
+        }
+        if (lane < kSelectWarps) { sh.warp_totals[lane] = v; }
+    }
+    __syncthreads();
+    return (warp == 0 ? 0 : sh.warp_totals[warp - 1]) + inclusive - value;
+}
+
 // The bin holding the top-th highest score: sh.bin, the count above it and its own count.
 __device__ void find_score_bin(const unsigned* hist, int top_blocks, SelectShared& sh) {
     const int tid = static_cast<int>(threadIdx.x);
@@ -522,8 +551,7 @@ __device__ void find_score_bin(const unsigned* hist, int top_blocks, SelectShare
         count[k] = static_cast<int>(hist[kScoreBins - 1 - 4 * tid - k]);
         local += count[k];
     }
-    int above = 0;
-    SelectShared::Scan(sh.scan).ExclusiveSum(local, above);
+    int above = block_exclusive_sum(local, sh);
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         if (above < top_blocks && top_blocks <= above + count[k]) {
@@ -688,8 +716,7 @@ __device__ void compact_words(const unsigned* words, int nwords, int id_base, st
     const int end   = min(nwords, begin + per);
     int local       = 0;
     for (int w = begin; w < end; ++w) { local += __popc(words[w]); }
-    int offset = 0;
-    SelectShared::Scan(sh.scan).ExclusiveSum(local, offset);
+    int offset = block_exclusive_sum(local, sh);
     for (int w = begin; w < end; ++w) {
         unsigned bits = words[w];
         while (bits != 0) {

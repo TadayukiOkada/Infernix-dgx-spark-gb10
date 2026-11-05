@@ -362,3 +362,62 @@ and 2-stage / 2-CTA-per-SM `context_kv_grouped_kernel`) on NVIDIA GB10 (`sm_121a
 - The FP8 parity word is still written into the stage by the key group and consumed from `QkState` registers; the stage slot is now redundant for the split route and could be reclaimed (≤`16 B`/warp) by a follow-up.
 - `nvfp4` and the vector-quantized storages keep the combined gather. `Stage::SplitGather` would admit an NVFP4 route automatically if its key row ever reaches `256 B`, but that path is unmeasured.
 - The `Stages == 2` route (1 CTA/SM) is unchanged; the doc's premise that a second stage costs occupancy is untouched, and no attempt was made to make the split fill that role.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T4: 2-level warp prefix scan replaces `cub::BlockScan` in `qsa_select_global_kernel`; packed-BF16 query staging in `qsa_score_wide_kernel` measured and rejected
+
+## 1. Accounting
+
+- Base commit: `d6e2d6d9f` (branch `dev-rebased-20261028`).
+- Modified: `src/ops/qsa/qsa_select.cu` (`M`, final +34/−7) — scan replacement in `qsa_select_global_kernel` plus a source comment recording the measured rejection of the packed-BF16 query lever.
+- `tools/cuda_stack/cuda_stack_allowlist.json`: unchanged (both affected kernels are `STACK:0`/`LOCAL:0` in the shipped build and have no allowlist entries; nothing to ratchet).
+- Rebuilds: 3 full single-invocation device links (packed 3-CTA build, packed 2-CTA isolation build, final scan-only build) plus targeted object/bench builds. No header edits, so no `.cu` touch was needed.
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **Stale doc baselines**: the task doc quotes `qsa_score_wide_kernel` `REG:49, STACK:0, SHARED:42240`. The linked `infernix-serve` at base measured `REG:107 STACK:0 SHARED:1088` (static) + `42,240 B` dynamic. `REG:107` already capped the kernel at 2 CTAs/SM by registers too (2 CTAs allow ≤128), so SMEM alone was never the only limiter. The doc's select_us baselines (180.2/661.5 at `C=8192`, `w=512/2048`; ~1,794 at `C=32768, w=2048`) were current.
+- **No query weights exist here**: the doc's plan stages `bf16_to_f32(q) * w` and adds a `float ws[64]`; the kernel actually stages raw `bf16_to_f32(index_q)` with no per-(head, column) weight, so the packed variant needed no `ws` and its SMEM was `16,896 + 8,448 = 25,344 B` (not `25,600 B`).
+- **"Bitwise identical ⇒ free" is falsified (the core correction)**: packed BF16 `uint2` query staging is indeed bit-exact (all QSA oracle tests passed on both packed builds) and it did reach the intended occupancy — `REG:80 STACK:0`, `25,408 B`/CTA, `ckt math` confirms 3 CTAs/SM (24/48 warps) vs baseline 2 CTAs/SM (16/48). But every leaf then needs one `LDS.64` plus four shift/mask ALU ops per head (16 ops) where the FP32 staging needed a single `LDS.128`: +512 leaf instructions per thread per key tile. `qsa_score_wide_kernel` is warp-instruction-issue-bound (the T2 finding for QSA kernels), so select_us regressed **+10.3…+18.2% at every wide point** in both packed variants: 3 CTAs/SM (`kWideCtasPerSm=3`, REG clamped to 85) and 2 CTAs/SM with the grid identical to baseline (isolating the mechanism from occupancy). The lever was reverted in full.
+- **Bench flag corrections**: `infernix_qsa_attention_bench` takes `--storage/--contexts/--widths`, not the doc's `--kv-dtype/--context/--width`.
+- **Scan replacement**: `cub::BlockScan<int, 512>::ExclusiveSum` over 4 bins/thread is replaced by `block_exclusive_sum`: a 32-lane `__shfl_up_sync` inclusive scan per warp, the 16 warp totals written to a 16-int shared array, warp 0 scans them, every thread adds its warp prefix. Integer sums are exact, so every `above`/`offset` is bit-for-bit cub's; both call sites (`find_score_bin`, `compact_words`) were converted because `SelectShared::TempStorage` was removed. All 512 threads reach both sites (the kernel's early exits precede them), and the call sites are separated by full barriers, so the reused `warp_totals` array has no WAR hazard.
+
+## 3. Subsystem breakdown
+
+- `src/ops/qsa/qsa_select.cu` (`M`):
+  - Removed `#include <cub/block/block_scan.cuh>` (cub is no longer used in this file).
+  - `SelectShared`: `typename Scan::TempStorage scan` → `int warp_totals[kSelectWarps]` (64 B); linked static SMEM 4,320 → 2,176 B.
+  - New `block_exclusive_sum` (2-level warp scan, two barriers); `find_score_bin` and `compact_words` call it.
+  - Wide-kernel section keeps the FP32 query staging and `kWideCtasPerSm = 2`, with a comment recording the measured rejection of packed staging so the lever is not retried blind.
+
+## 4. Verification
+
+- `cuobjdump --dump-resource-usage build-native/apps/infernix-serve` (final build):
+  - `qsa_score_wide_kernel`: `REG:107 STACK:0 SHARED:1088 LOCAL:0` — byte-identical resources to base (lever reverted).
+  - `qsa_select_global_kernel`: `REG:63 STACK:0 SHARED:2176 LOCAL:0` (base: `REG:63 STACK:0 SHARED:4320`).
+- `ctest -R "infernix_cuda_stack_check|infernix_qsa"`: 10/10 passed on both the packed build (oracle proof of bit-exactness) and the final scan-only build (stack gate, `qsa_{index,bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2}_test`, `qsa_select_test`).
+- A/B (`/tmp/t4_base_qsa_bench` freshly HEAD-rebuilt vs candidate, 3 interleaved rounds, median of 50 cold-L2 graphs per point, `--storage int8,bf16 --contexts 8192,32768 --widths 16,64,512,2048`):
+
+  | point | base select_us | scan select_us | Δ |
+  |---|---|---|---|
+  | bf16 C=8192 w=16/64/512/2048 | 28.4 / 30.4 / 177.9 / 657.1 | 28.4 / 30.4 / 177.9 / 659.3 | +0.0 / −0.1 / +0.0 / +0.3% |
+  | bf16 C=32768 w=16/64/512/2048 | 44.9 / 67.3 / 456.4 / 1781.4 | 45.0 / 67.3 / 458.4 / 1799.8 | +0.2 / +0.0 / +0.4 / +1.0% |
+  | int8 C=8192 w=16/64/512/2048 | 28.4 / 30.5 / 177.8 / 655.0 | 28.4 / 30.4 / 178.0 / 657.2 | +0.0 / −0.4 / +0.1 / +0.3% |
+  | int8 C=32768 w=16/64/512/2048 | 45.2 / 67.3 / 456.4 / 1784.5 | 45.1 / 67.4 / 458.3 / 1800.0 | −0.3 / +0.1 / +0.4 / +0.9% |
+
+  All points within ±1.0% (per-round spread comparable inside each arm) — the scan replacement is performance-neutral within the drift band.
+- Packed-query variant A/B (3 rounds, bf16, select_us medians): `w=512` 173.8→196.6/198.3 at `C=8192` and 456.5→536.3 at `C=32768`; `w=2048` 655.1→735.1…739.0 at `C=8192` and 1771→2114…2120 at `C=32768`. The full 16-point ranges and worst cases are in §5.
+
+## 5. Regressions & adverse results (all found, all disclosed)
+
+- **Packed-BF16 query staging regressed every wide-route point** (both variants; per-round medians stable, not noise): 3-CTA build `select_us` +10.3…+17.3% at `w=512/2048`, +13.9…+18.2% at `w=64`, `total_us` +0.9…+5.8% (worst `int8 C=32768 w=2048`: 6,050.6→6,349.7 us); 2-CTA isolation build matched it (+13.0…+19.3%), proving the cost is the per-leaf widen instructions, not the occupancy or register clamp. Disposition: **reverted in full** — the shipped diff contains no wide-kernel change.
+- **The packed 3-CTA build missed even its own resource sub-bar**: `REG:80`, not the doc's `REG ≤ 64` (80 is exactly the 3-CTA register boundary; `launch_bounds(256,3)` left zero headroom).
+- **The ≥12% `select_us` acceptance bar is not met.** The scan replacement measured ±1.0% (neutral); the score kernel dominates wide-route `select_us` (T7 profile: score ≈ 2.8× select at `T=32768`), and its specified lever regresses. Both T4 levers are now exhausted; the bar would require a different score-kernel mechanism outside T4's spec.
+- Narrow route (`w=16`, `qsa_score_kernel` + select kernel): unchanged (±0.3%), as expected — `qsa_score_kernel` was not touched.
+- Regression check covered: all 16 bench points × 3 interleaved rounds vs the freshly HEAD-built baseline binary, STACK/LOCAL for all three select-pipeline kernels, static SMEM, oracle test results and tolerances (10/10), and the stack-spill ratchet (no allowlist change needed). No other regression found.
+
+## 6. Accepted gaps / follow-ups
+
+- `select_us` is unchanged (within noise) relative to base; the shipped value of T4 is the removed `cub::BlockScan` dependency, 2,144 B less static SMEM in `qsa_select_global_kernel`, and a measured falsification of the packed-query premise (now documented at the wide-kernel source).
+- `qsa_score_wide_kernel` stays at 2 CTAs/SM with 42,240 B dynamic SMEM. Any future 3-CTA attempt must shrink SMEM without adding per-leaf instructions — e.g. keeping the FP32 query staging and halving the staged column count per pass — which re-reads pooled keys and needs its own A/B; not attempted here.
+- The scan replacement's benefit is structural (dependency + SMEM); at widths where the select kernel is a larger share of a round (decode-side narrow batches with large contexts) it can at best be neutral — no point measured a real gain, none measured a real loss.
