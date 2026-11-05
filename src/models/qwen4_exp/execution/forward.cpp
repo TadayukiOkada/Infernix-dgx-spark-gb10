@@ -828,7 +828,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
             }
             project(x, *p.index_key_projection, ik, work_, s, dense_routes());
         }
-    } else if (!ggml && T == 1 && call.key_records.data == nullptr) {
+    } else if (!ggml && T == 1) {
         Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), 1});
         project(x, p.projection, projected, work_, s, dense_routes());
         q    = projected.slice(0, 0, QW).view({D, dim(a.heads), 1});
@@ -843,6 +843,9 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         } else {
             iq = projected.slice(0, 2 * QW + 2 * KW, IH * ID).view({ID, IH, 1});
             ik = projected.slice(0, 2 * QW + 2 * KW + IH * ID, ID);
+        }
+        if (call.key_records.data != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(call.key_records.data, ik.data, ik.bytes(), cudaMemcpyDeviceToDevice, s));
         }
     } else {
         q    = work_.alloc(DType::BF16, {D, dim(a.heads), T});
@@ -1253,6 +1256,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             source.fetch          = {}; // nothing is SSD-only: an unserved record would fail the call
         }
     }
+    const bool early_shared = side && !early && source.staging_slots == 0 && streaming == nullptr;
+    if (early_shared) {
+        CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
+        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
+    }
     const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
                                                                      max_jobs, expert_ws.data, outputs, s);
     if (log_tail != nullptr) {
@@ -1262,8 +1270,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     cudaStream_t shared_s = s;
     if (early) { CUDA_CHECK(cudaStreamWaitEvent(s, experts_.shared_events[3], 0)); }
     if (side) {
-        CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
-        CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
+        if (!early_shared) {
+            CUDA_CHECK(cudaEventRecord(experts_.shared_events[0], s));
+            CUDA_CHECK(cudaStreamWaitEvent(experts_.shared_stream, experts_.shared_events[0], 0));
+        }
         shared_s = experts_.shared_stream;
     }
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned,

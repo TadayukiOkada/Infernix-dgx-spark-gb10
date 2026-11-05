@@ -375,11 +375,11 @@ struct ContextPrefixColumns {
 
 template <int Hidden, int Columns, int KWarps = 8>
 using GroupedSchedule =
-    Q8A16SlicedKMmaSchedule<Columns, KWarps, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
+    Q8A16SlicedKMmaSchedule<Columns, KWarps, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
                             Q8ActivationStage::ActiveOnly, Hidden>;
 
 template <int Hidden, int Columns, int KWarps = 8>
-__global__ __launch_bounds__(KWarps * 32, 1) void context_kv_grouped_kernel(
+__global__ __launch_bounds__(KWarps * 32, 2) void context_kv_grouped_kernel(
     const __nv_bfloat16* x, const int* positions, const int* counts, const int* slots,
     DeviceLayers layers, float* scratch, int width, int batch, int min_count, int max_count) {
     const int l        = blockIdx.z >> 1;

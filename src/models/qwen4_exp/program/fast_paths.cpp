@@ -617,6 +617,20 @@ constexpr std::array kQualified{
     Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::RouterMma, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {

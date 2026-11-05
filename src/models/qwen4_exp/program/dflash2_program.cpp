@@ -107,8 +107,16 @@ std::pair<std::size_t, std::size_t> ProgramImpl::dflash2_verify_planes(std::int3
     constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
     bool copies              = false;
     for (std::int32_t b = 0; b < batch; ++b) { copies = copies || (from_ngram_[b] && !drafts_[b].empty()); }
-    // Row b's plane j stands at (b * K + j) * C in both layouts when K is the proposal's.
-    if (!copies && K == dflash_k_) { return {dflash_io_.candidates, dflash_io_.q}; }
+    // Row b's plane j stands at (b * K + j) * C in both layouts when batch == 1 or K is the proposal's.
+    if (!copies && (batch == 1 || K == dflash_k_)) { return {dflash_io_.candidates, dflash_io_.q}; }
+    if (!copies) {
+        for (const auto [from, to] : {std::pair{dflash_io_.candidates, dflash_io_.verify_candidates},
+                                      std::pair{dflash_io_.q, dflash_io_.verify_q}}) {
+            CUDA_CHECK(cudaMemcpy2DAsync(dflash_device(to), 4ULL * C * K, dflash_device(from), 4ULL * C * dflash_k_,
+                                         4ULL * C * K, static_cast<std::size_t>(batch), cudaMemcpyDeviceToDevice, s));
+        }
+        return {dflash_io_.verify_candidates, dflash_io_.verify_q};
+    }
     std::int32_t* host_candidates = dflash_host(dflash_io_.verify_candidates);
     auto* host_q                  = reinterpret_cast<float*>(dflash_host(dflash_io_.verify_q));
     for (std::int32_t b = 0; b < batch; ++b) {
@@ -195,6 +203,7 @@ void ProgramImpl::dflash2_call_context(std::int32_t batch, std::int32_t width) {
     const auto* positions  = reinterpret_cast<const std::int32_t*>(host_io() + io_layout_.positions);
     const auto* slots      = reinterpret_cast<const std::int32_t*>(host_io() + io_layout_.slots);
     const auto [column, n] = dflash_call_region(width);
+    if (n <= 0) { return; }
     // A restore into the lane's ring or a copy-out of it (a tap after its previous call) lands first.
     dflash2_wait_copies(lanes_.at(static_cast<std::size_t>(slots[0])));
     dflash2_context(column, n, positions[width - n], slots[0]);

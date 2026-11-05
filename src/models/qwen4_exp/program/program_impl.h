@@ -985,7 +985,7 @@ public:
         r_             = dim(c_.qsa.compress_ratio);
         draft_min_logprob_ = options_.draft_min_p > 0.0 ? std::log(options_.draft_min_p)
                                                         : -std::numeric_limits<double>::infinity();
-        dflash2_rows_ = static_cast<std::int32_t>(temporary_switches::integer("INFERNIX_TMP_DFLASH2_ROWS", 2, 2, 8));
+        dflash2_rows_ = static_cast<std::int32_t>(temporary_switches::integer("INFERNIX_TMP_DFLASH2_ROWS", 4, 2, 8));
         sampled_drafts_ = options_.sampled_mtp_drafts && plan_.mtp && max_width_ > 1 &&
                           sparse_acceptance(plan_.token_domain, max_width_, plan_.lanes);
         if (options_.sampled_mtp_drafts && plan_.mtp && !sampled_drafts_) {
@@ -1179,7 +1179,8 @@ public:
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
         experts.overlap_events = overlap_.events;
-        CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.shared_stream, cudaStreamNonBlocking, side_priority));
+        const int shared_priority = options_.device_experts ? least_priority : side_priority;
+        CUDA_CHECK(cudaStreamCreateWithPriority(&overlap_.shared_stream, cudaStreamNonBlocking, shared_priority));
         for (auto& event : overlap_.shared_events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.shared_stream = overlap_.shared_stream;
         experts.shared_events = overlap_.shared_events;
@@ -2526,7 +2527,8 @@ public:
                                 (batch == 2 ? (mtp_ || dflash2_) : (dflash2_ && batch > 2 && batch <= dflash2_rows_));
         std::int32_t pair_k = 0;
         if (pair_round) {
-            pair_k = choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]]);
+            pair_k = batch == 2 ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]])
+                                : std::min(kMultiRowMaxDrafts, neural_k());
         } else if (mtp_ && batch >= 3 && options_.pair_speculation && kMultiRowDrafts > 0.5) {
             pair_k = choose_multirow_draft_length(lanes, batch);
         }
@@ -2592,10 +2594,12 @@ public:
                 bool take = !match.tokens.empty();
                 if (take && extents[b] > 0) {
                     const float row_width_cost =
-                        batch == 1 ? width_cost() : (batch == 2 ? kPairWidthCost : kMultiRowWidthCost);
+                        dflash2_ ? kWidthCost
+                                 : (batch == 1 ? width_cost() : (batch == 2 ? kPairWidthCost : kMultiRowWidthCost));
+                    const std::int32_t chain_compare = dflash2_ ? neural_k() : extents[b];
                     take = copy_beats_chain(static_cast<std::int32_t>(match.tokens.size()),
                                             lane.ngram_accept[static_cast<std::size_t>(bucket)],
-                                            copy_width_cost, lane.mtp_accept, extents[b], row_width_cost);
+                                            copy_width_cost, lane.mtp_accept, chain_compare, row_width_cost);
                 }
                 if (take) {
                     drafts_[b]       = std::move(match.tokens);
@@ -2694,39 +2698,72 @@ public:
             };
             if (neural) {
                 dflash2_propose(std::span<const std::uint32_t>(lanes.data(), batch), stage_rows);
+                const std::int32_t staged_width = width;
                 for (std::int32_t b = 0; b < batch; ++b) {
                     if (!from_ngram_[b] && extents[b] > 0) {
-                        drafts_[b].assign(dflash_drafts_[b].begin(), dflash_drafts_[b].begin() + extents[b]);
+                        extents[b] = std::min(extents[b], dflash_confident_[b]);
                     }
                 }
+                std::int32_t shared_k = dflash_k_;
                 // A one-row round verifies its drafts up to the first whose selector probability is
                 // below --spec-min-p, and with --draft-tokens auto only the calibrated length of them
                 // (draft_length.h). The proposal staged only column 0's n-gram rows.
                 if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
-                    extents[0] = std::min(extents[0], dflash_confident_[0]);
                     if (options_.auto_draft_length) { extents[0] = dflash2_auto_length(lanes_[lanes[0]], extents[0]); }
-                    drafts_[0].resize(static_cast<std::size_t>(extents[0]));
-                    width = 1 + extents[0];
-                } else if (batch == 2 && options_.auto_draft_length) {
-                    // A pair round (dflash2-pairs) verifies one width for both rows, chosen from both rows'
-                    // drafts (dflash2_pair_width); its drafter rows keep that many.
+                } else if (batch >= 2 && options_.auto_draft_length) {
+                    // A multi-row DFlash2 round verifies one width across its drafter rows, chosen from
+                    // all rows' drafts (dflash2_pair_width); its drafter rows keep at most that many.
                     const auto rows = static_cast<std::size_t>(batch);
-                    const std::int32_t k = dflash2_pair_width(std::span<const std::uint32_t>(lanes.data(), rows),
-                                                              std::span<const std::int32_t>(extents.data(), rows));
-                    std::int32_t pair_width = 1;
+                    shared_k        = dflash2_pair_width(std::span<const std::uint32_t>(lanes.data(), rows),
+                                                         std::span<const std::int32_t>(extents.data(), rows));
                     for (std::int32_t b = 0; b < batch; ++b) {
-                        if (!from_ngram_[b] && extents[b] > k) {
-                            extents[b] = k;
-                            drafts_[b].resize(static_cast<std::size_t>(k));
+                        if (!from_ngram_[b] && extents[b] > shared_k) { extents[b] = shared_k; }
+                    }
+                }
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    if (from_ngram_[b]) { continue; }
+                    const std::int32_t max_copies =
+                        batch == 1 ? static_cast<std::int32_t>(ngram_proposal_[b].size())
+                                   : std::min<std::int32_t>(static_cast<std::int32_t>(ngram_proposal_[b].size()), shared_k);
+                    if (max_copies > extents[b]) {
+                        const Lane& lane      = lanes_[lanes[b]];
+                        const double copy_acc = lane.ngram_accept[static_cast<std::size_t>(ngram_proposal_bucket_[b])];
+                        const double copy_score =
+                            expected_copy_tokens(max_copies, copy_acc) /
+                            (1.0 + static_cast<double>(kNgramWidthCost) * static_cast<double>(max_copies));
+                        const double cost =
+                            batch == 1 ? kDFlashDraftCost : (batch == 2 ? kDFlashPairDraftCost : kMultiRowWidthCost);
+                        const double dflash_tokens =
+                            extents[b] > 0
+                                ? runtime::speculative::expected_draft_tokens(
+                                      lane.dflash_calibration,
+                                      std::span<const float>(dflash_confidence_[b].data(),
+                                                             static_cast<std::size_t>(extents[b])),
+                                      extents[b])
+                                : 1.0;
+                        const double dflash_score =
+                            dflash_tokens / (1.0 + cost * static_cast<double>(extents[b]));
+                        if (copy_score > dflash_score) {
+                            ngram_proposal_[b].resize(static_cast<std::size_t>(max_copies));
+                            drafts_[b]                = std::move(ngram_proposal_[b]);
+                            from_ngram_[b]            = true;
+                            ngram_bucket_[b]          = ngram_proposal_bucket_[b];
+                            extents[b]                = max_copies;
+                            ngram_proposal_[b].clear();
+                            ngram_proposal_bucket_[b] = -1;
+                            staged[b]                 = std::min(staged[b], 1);
+                            continue;
                         }
-                        pair_width = std::max(pair_width, 1 + extents[b]);
                     }
-                    // The proposal staged row b's columns at b x the earlier width: row 0's stay in
-                    // place, row 1's are read again at the round's width.
-                    if (pair_width != width) {
-                        for (std::int32_t b = 1; b < batch; ++b) { staged[b] = 0; }
-                        width = pair_width;
-                    }
+                    drafts_[b].assign(dflash_drafts_[b].begin(), dflash_drafts_[b].begin() + extents[b]);
+                }
+                std::int32_t widest = 1;
+                for (std::int32_t b = 0; b < batch; ++b) { widest = std::max(widest, 1 + extents[b]); }
+                width = widest;
+                // The proposal staged row b's columns at b x the earlier width: row 0's stay in
+                // place, rows 1..batch-1 are read again when the round's width changes.
+                if (width != staged_width) {
+                    for (std::int32_t b = 1; b < batch; ++b) { staged[b] = 0; }
                 }
                 neural = false;
                 for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
@@ -4947,7 +4984,7 @@ private:
         // or forced tokens' last window (the ring keeps no earlier position).
         if (dflash2_) {
             const auto [column, n] = decode_round ? std::pair<std::int32_t, std::int32_t>{0, cols} : dflash_call_region(cols);
-            fb.draft_features      = dflash_feature_columns(column, n);
+            if (n > 0) { fb.draft_features = dflash_feature_columns(column, n); }
         }
         // A scored prompt's calls keep their final residuals for the LM head (causal_score).
         if (scoring_) { fb.residual_out = score_residuals(score_column_, cols); }
@@ -6813,7 +6850,7 @@ private:
     // Re-checked on NVIDIA FP4-Local with the tensor-core narrow experts (2026-10-30, two runs each): 0.15 / 0.20 /
     // 0.25 / 0.40 / 0.50 against 0.31 after a 16K prompt 0.981 / 0.984 / 0.991 / 0.974 / 0.954x, at short context
     // 0.973 / 0.989 / 1.002 / 0.990 / 0.963x, on the struct fixture 0.982 / 0.988 / 0.993 / 1.016 / 1.019x.
-    static constexpr double kDFlashDraftCost    = 0.31;
+    static inline const double kDFlashDraftCost = policy_double("INFERNIX_DFLASH_DRAFT_COST", 0.31);
     static constexpr double kDFlashProposalCost = 0.1;
     // The online draft cost (width_cost): sample decay (about 50 rounds), the rounds and the share of
     // K's variance (of the mean square) it needs, its ceiling, and the cycle that counts as a gap.
@@ -6855,14 +6892,14 @@ private:
     static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.16);
     static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.16);
     static inline const double kDFlashPairDraftCost =
-        policy_double("INFERNIX_PAIR_DRAFT_COST", 0.30);
+        policy_double("INFERNIX_PAIR_DRAFT_COST", 0.22);
     static constexpr double kDFlashPairProposalCost  = 0.1;
     // The cumulative cut's per-row thresholds and draft log-probabilities (the device gate's for row 0
     // of a one-row round, the host cut's for every row; MtpCumulative is always on).
-    // TEMPORARY (INFERNIX_TMP_DFLASH2_ROWS=<n>, 2 by default), until its A/B: dflash2-pairs' rounds for up to n
-    // rows (DFlash2 at C = 2: +28 % decode; three or more rows decode plain today, a choice measured for MTP's
-    // one draft each, not DFlash2's one proposal for every row). Each row keeps at most kPairMaxDrafts drafts.
-    std::int32_t dflash2_rows_ = 2;
+    // TEMPORARY (INFERNIX_TMP_DFLASH2_ROWS=<n>, 4 by default), until its A/B: dflash2-pairs' rounds for up to n
+    // rows (DFlash2 at C = 2: +28 % decode; with shared calibrated width up to kMultiRowMaxDrafts at C = 3..4,
+    // multi-row rounds verify one DFlash2 proposal across all active rows instead of falling back to W = 1).
+    std::int32_t dflash2_rows_ = 4;
     std::array<float, kMaximumConcurrency> mtp_cumulative_threshold_{};
     // A fixed draft length's cut: log(--spec-min-p), -inf without one (every draft verified).
     double draft_min_logprob_ = 0.0;
@@ -6954,40 +6991,54 @@ private:
         if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, most); }
         return best;
     }
-    // dflash2-pairs with --draft-tokens auto: the drafts per row a two-row round verifies after its
-    // proposal (draft_length.h's pair_draft_width), from each row's expected tokens: a drafter row's
-    // from its drafts' calibrated probabilities, a copy row's from its bucket's acceptance (its whole
-    // copy is verified, so it bounds the width from below). `extents`: each row's drafts so far (at
-    // most kPairMaxDrafts). One draft more every kProbeInterval pair rounds, as for one row.
+    // dflash2-pairs with --draft-tokens auto: the drafts per row a multi-row round verifies after its
+    // proposal, from each row's expected tokens: a drafter row's from its drafts' calibrated
+    // probabilities, a copy row's from its bucket's acceptance (its whole copy is verified, so it
+    // bounds the width from below). `extents`: each row's drafts so far. One draft more every
+    // kProbeInterval multi-row rounds, as for one row.
     std::int32_t dflash2_pair_width(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> extents) {
-        std::array<std::array<double, kPairMaxDraftsCapacity + 1>, 2> tokens{};
+        const std::size_t rows = lanes.size();
+        std::array<double, kPairMaxDraftsCapacity + 1> sum_tokens{};
         std::int32_t least = 0, most = 0;
-        for (std::size_t b = 0; b < 2; ++b) {
-            const Lane& lane = lanes_[lanes[b]];
-            const std::int32_t n = extents[b];
+        for (std::size_t b = 0; b < rows; ++b) {
+            const Lane& lane     = lanes_[lanes[b]];
+            const std::int32_t n = std::clamp(extents[b], 0, kPairMaxDraftsCapacity);
             most                 = std::max(most, n);
             const double p       = from_ngram_[b] && ngram_bucket_[b] >= 0
                                        ? lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])]
                                        : 0.0;
             if (from_ngram_[b]) { least = std::max(least, n); }
-            double reach = 1.0;
-            tokens[b][0] = 1.0;
+            double reach   = 1.0;
+            double row_tok = 1.0;
+            sum_tokens[0] += row_tok;
             for (std::int32_t k = 1; k <= kDFlashPairMaxDrafts; ++k) {
                 const auto at = static_cast<std::size_t>(k);
-                if (k > n) {
-                    tokens[b][at] = tokens[b][at - 1];
-                } else if (from_ngram_[b]) {
-                    reach *= p;
-                    tokens[b][at] = tokens[b][at - 1] + reach;
-                } else {
-                    tokens[b][at] = runtime::speculative::expected_draft_tokens(
-                        lane.dflash_calibration,
-                        std::span<const float>(dflash_confidence_[b].data(), static_cast<std::size_t>(n)), k);
+                if (k <= n) {
+                    if (from_ngram_[b]) {
+                        reach *= p;
+                        row_tok += reach;
+                    } else {
+                        row_tok = runtime::speculative::expected_draft_tokens(
+                            lane.dflash_calibration,
+                            std::span<const float>(dflash_confidence_[b].data(), static_cast<std::size_t>(n)), k);
+                    }
                 }
+                sum_tokens[at] += row_tok;
             }
         }
-        std::int32_t best = runtime::speculative::pair_draft_width(tokens[0], tokens[1], least, most,
-                                                                   kDFlashPairDraftCost, kDFlashPairProposalCost);
+        least             = std::clamp(least, 0, kPairMaxDraftsCapacity);
+        most              = std::clamp(most, least, kPairMaxDraftsCapacity);
+        const double cost = rows >= 3 ? kMultiRowWidthCost : kDFlashPairDraftCost;
+        std::int32_t best = least;
+        double best_score = -1.0;
+        for (std::int32_t k = least; k <= most; ++k) {
+            const double score =
+                sum_tokens[static_cast<std::size_t>(k)] / (1.0 + kDFlashPairProposalCost + cost * k);
+            if (score > best_score) {
+                best_score = score;
+                best       = k;
+            }
+        }
         if (++pair_policy_rounds_ % kProbeInterval == 0) { best = std::min(best + 1, most); }
         return best;
     }

@@ -78,6 +78,51 @@ __device__ __forceinline__ void load_row(const Segments& segments, int row, int 
 // it. Decode-width calls give each warp one row (Threads = 128, RowsPerWarp = 1: 129 CTAs for a
 // 513-row router instead of 17), so a router's latency is one DRAM round trip instead of ~40; wide
 // calls keep four rows per warp, which stages x in fewer CTAs. Both mappings produce the same bits.
+// One or four tail rows (e.g. Qwen4Exp's 1-row shared_score after the 512-row router in router-mma).
+// Stages the tail weight rows once into shared memory (5 KiB per row at K = 2560), then each warp
+// computes one output column's dot product in registers with the narrow kernels' exact lane-chunk order
+// and warp butterfly, writing to out[col * out_stride + row].
+constexpr int kTailRowWarps = 8;
+constexpr int kTailRowThreads = kTailRowWarps * 32;
+
+__global__ void __launch_bounds__(kTailRowThreads, 4)
+    projection_tail_row_kernel(const bf16* __restrict__ x, int k, int columns, const bf16* __restrict__ w,
+                               float* __restrict__ out, int out_stride) {
+    extern __shared__ uint4 w_staged[]; // [chunks]
+    const int chunks = k / 8;
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int column = static_cast<int>(blockIdx.x) * kTailRowWarps + warp;
+    const auto* ws   = reinterpret_cast<const uint4*>(w);
+    for (int c = tid; c < chunks; c += kTailRowThreads) { w_staged[c] = ws[c]; }
+    __syncthreads();
+    if (column >= columns) { return; }
+    const auto* xs = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(column) * k);
+    uint4 x_loaded[kMaxLaneChunks];
+#pragma unroll
+    for (int i = 0; i < kMaxLaneChunks; ++i) {
+        const int chunk = lane + 32 * i;
+        if (chunk < chunks) { x_loaded[i] = xs[chunk]; }
+    }
+    float sum = 0.0F;
+#pragma unroll
+    for (int i = 0; i < kMaxLaneChunks; ++i) {
+        const int chunk = lane + 32 * i;
+        if (chunk >= chunks) { break; }
+        const uint4 wp = w_staged[chunk];
+        const uint4 xp = x_loaded[i];
+        const bf16* wv = reinterpret_cast<const bf16*>(&wp);
+        const bf16* xv = reinterpret_cast<const bf16*>(&xp);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            sum = fmaf(__bfloat162float(wv[j]), __bfloat162float(xv[j]), sum);
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset); }
+    if (lane == 0) { out[static_cast<std::size_t>(column) * out_stride] = sum; }
+}
+
 template <int Threads, int RowsPerWarp, int MaxCols = kColumns>
 __global__ void __launch_bounds__(Threads, (Threads == 128 && MaxCols == 1) ? 8 : (Threads == 128 ? 4 : 2))
     projection_kernel(const bf16* __restrict__ x, int k, int columns, int rows, Segments segments, float* __restrict__ out) {
@@ -824,16 +869,25 @@ void projection_fp32_router_mma(const Tensor& x, std::span<const Tensor* const> 
             "router-mma: the first weight's rows and K must be multiples of 64");
     detail::projection_fp32_bf16_wide_mma(x, segments.data[0], first_rows, rows, static_cast<float*>(out.data), stream);
     if (rows > first_rows) {
-        // The other weights' rows: the wide SIMT kernel's own bits, from the row block after the first weight.
-        static const bool configured = [] {
-            return cudaFuncSetAttribute(projection_wide_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kWideSharedBytes) == cudaSuccess;
-        }();
-        require(configured, "the wide kernel's shared memory could not be configured");
-        const int offset = first_rows / kWideRows;
-        projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows - offset, (columns + kWideColumns - 1) / kWideColumns),
-                                 kWideThreads, kWideSharedBytes, stream>>>(
-            static_cast<const bf16*>(x.data), k, columns, rows, segments, static_cast<float*>(out.data), offset);
+        if (rows - first_rows == 1 && weights.size() == 2) {
+            // Single trailing row (Qwen4Exp's shared_score row 512): stage the 1 weight row into 5 KiB SMEM
+            // and compute 8 token columns per CTA without staging 31 dummy weight rows across 32 KiB SMEM.
+            const std::size_t w_bytes = static_cast<std::size_t>(k) * sizeof(bf16);
+            projection_tail_row_kernel<<<(columns + kTailRowWarps - 1) / kTailRowWarps, kTailRowThreads, w_bytes, stream>>>(
+                static_cast<const bf16*>(x.data), k, columns, segments.data[1],
+                static_cast<float*>(out.data) + first_rows, rows);
+        } else {
+            // The other weights' rows: the wide SIMT kernel's own bits, from the row block after the first weight.
+            static const bool configured = [] {
+                return cudaFuncSetAttribute(projection_wide_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            kWideSharedBytes) == cudaSuccess;
+            }();
+            require(configured, "the wide kernel's shared memory could not be configured");
+            const int offset = first_rows / kWideRows;
+            projection_wide_kernel<<<dim3((rows + kWideRows - 1) / kWideRows - offset, (columns + kWideColumns - 1) / kWideColumns),
+                                     kWideThreads, kWideSharedBytes, stream>>>(
+                static_cast<const bf16*>(x.data), k, columns, rows, segments, static_cast<float*>(out.data), offset);
+        }
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
