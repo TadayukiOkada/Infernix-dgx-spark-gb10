@@ -16,21 +16,31 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 using namespace infernix;
 using namespace infernix::bench;
 
 namespace {
 
-constexpr std::int32_t kHidden           = 5120;
 constexpr std::int32_t kMaximumWidth     = 16;
-constexpr std::int32_t kGroups           = 320;
 constexpr std::int32_t kTaps             = 2;
 constexpr std::int32_t kSides            = 2;
 infernix::bench::ColdFlushBytes kDefaultFlushBytes{};
 
+// The registered drafter geometries: (H, C) pairs the Op accepts.
+constexpr std::array<std::pair<std::int32_t, std::int32_t>, 6> kRegisteredProfiles{
+    std::pair{5120, 4096},  {5120, 17408}, {2560, 4096}, {2560, 7680}, {3072, 4096}, {3072, 9216}};
+
+bool registered(std::int32_t hidden, std::int32_t input_rows) {
+    for (const auto profile : kRegisteredProfiles)
+        if (profile.first == hidden && profile.second == input_rows) return true;
+    return false;
+}
+
 struct Options {
     int width               = 0;
+    std::int32_t hidden     = 0;
     std::int32_t input_rows = 0;
     std::int32_t batch_size = 0;
     int warmup              = 8;
@@ -54,6 +64,8 @@ Options parse_args(int argc, char** argv) {
             options.repeat = std::atoi(next("repeat"));
         } else if (!std::strcmp(argv[index], "--k")) {
             options.input_rows = std::atoi(next("K"));
+        } else if (!std::strcmp(argv[index], "--hidden")) {
+            options.hidden = std::atoi(next("hidden"));
         } else if (!std::strcmp(argv[index], "--batch")) {
             options.batch_size = std::atoi(next("batch"));
         } else if (!std::strcmp(argv[index], "--flush-mib")) {
@@ -61,7 +73,8 @@ Options parse_args(int argc, char** argv) {
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
             options.flush_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (!std::strcmp(argv[index], "--help") || !std::strcmp(argv[index], "-h")) {
-            std::printf("usage: %s [--width 2..16] [--k 4096|17408] [--batch 1..8] [--warmup N] "
+            std::printf("usage: %s [--width 2..16] [--k 4096|7680|9216|17408] "
+                        "[--hidden 2560|3072|5120] [--batch 1..8] [--warmup N] "
                         "[--repeat N] "
                         "[--flush-mib N]\n",
                         argv[0]);
@@ -73,8 +86,13 @@ Options parse_args(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("warmup must be nonnegative and repeat positive");
     }
-    if (options.input_rows != 0 && options.input_rows != 4096 && options.input_rows != 17408) {
-        throw std::invalid_argument("K must be 4096 or 17408");
+    if (options.hidden && options.hidden != 2560 && options.hidden != 3072 &&
+        options.hidden != 5120) {
+        throw std::invalid_argument("hidden must be 2560, 3072 or 5120");
+    }
+    if (options.input_rows && options.hidden &&
+        !registered(options.hidden, options.input_rows)) {
+        throw std::invalid_argument("(H, C) is not a registered drafter geometry");
     }
     if ((options.width && (options.width < 2 || options.width > 16)) || options.batch_size < 0 ||
         options.batch_size > 8) {
@@ -83,21 +101,22 @@ Options parse_args(int argc, char** argv) {
     return options;
 }
 
-void run_profile(std::int32_t input_rows, const Options& options, bench::L2FlushBuffer& flush,
-                 cudaStream_t stream) {
+void run_profile(std::int32_t hidden, std::int32_t input_rows, const Options& options,
+                 bench::L2FlushBuffer& flush, cudaStream_t stream) {
+    const std::int32_t groups = hidden / 16;
     DeviceBuffer input = make_bf16(static_cast<std::size_t>(input_rows) * kMaximumWidth * 8, 101U);
-    DeviceBuffer base  = make_bf16(static_cast<std::size_t>(kHidden) * kTaps * kSides, 103U);
+    DeviceBuffer base  = make_bf16(static_cast<std::size_t>(hidden) * kTaps * kSides, 103U);
     DeviceBuffer delta =
-        make_bf16(static_cast<std::size_t>(kGroups) * kTaps * kMaximumWidth * 8, 105U);
-    DeviceBuffer residual = make_bf16(static_cast<std::size_t>(kHidden) * kMaximumWidth * 8, 107U);
+        make_bf16(static_cast<std::size_t>(groups) * kTaps * kMaximumWidth * 8, 105U);
+    DeviceBuffer residual = make_bf16(static_cast<std::size_t>(hidden) * kMaximumWidth * 8, 107U);
     SavedBuffer residual_initial(residual);
     const auto restore = [&](cudaStream_t s) { residual_initial.restore(s); };
     PackedQuantizedWeight packed =
-        make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows, input_rows, 501U);
+        make_row_split_weight(QType::Q8_G32_FP16, hidden, input_rows, input_rows, 501U);
     const std::size_t capacity =
-        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(kHidden, input_rows, 2, 16, 1, 8);
+        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(hidden, input_rows, 2, 16, 1, 8);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
-    Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});
+    Tensor base_kernel(base.p, DType::BF16, {hidden, kTaps, kSides});
 
     for (int width = 2; width <= 16; ++width) {
         if (options.width && options.width != width) continue;
@@ -105,14 +124,14 @@ void run_profile(std::int32_t input_rows, const Options& options, bench::L2Flush
             if (options.batch_size != 0 && batch_size != options.batch_size) { continue; }
             const std::int32_t cols = width * batch_size;
             Tensor x(input.p, DType::BF16, {input_rows, width, batch_size});
-            Tensor finish_delta(delta.p, DType::BF16, {kGroups, kTaps, width, batch_size});
-            Tensor residual_view(residual.p, DType::BF16, {kHidden, width, batch_size});
-            const double flops = 2.0 * static_cast<double>(kHidden) * input_rows * cols;
+            Tensor finish_delta(delta.p, DType::BF16, {groups, kTaps, width, batch_size});
+            Tensor residual_view(residual.p, DType::BF16, {hidden, width, batch_size});
+            const double flops = 2.0 * static_cast<double>(hidden) * input_rows * cols;
             const double bytes = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(input_rows) * cols +
-                                 2.0 * static_cast<double>(kHidden) * kTaps * kSides +
-                                 2.0 * static_cast<double>(kGroups) * kTaps * cols +
-                                 4.0 * static_cast<double>(kHidden) * cols;
+                                 2.0 * static_cast<double>(hidden) * kTaps * kSides +
+                                 2.0 * static_cast<double>(groups) * kTaps * cols +
+                                 4.0 * static_cast<double>(hidden) * cols;
             const auto measure = [&](const char* route, auto&& launch) {
                 TimedGraph graph;
                 workspace.reset();
@@ -122,11 +141,12 @@ void run_profile(std::int32_t input_rows, const Options& options, bench::L2Flush
                     restore, graph, flush, stream, options.warmup, options.repeat);
                 const double tflops    = flops / timing.median_us / 1.0e6;
                 const double bandwidth = bytes / timing.median_us / 1.0e3;
-                std::printf("%d,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.2f,%.1f,%zu,%zu\n", input_rows, width,
-                            batch_size, cols, route, timing.median_us, timing.min_us, timing.p95_us,
-                            tflops, bandwidth, graph.nodes(), workspace.peak_used());
+                std::printf("%d,%d,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.2f,%.1f,%zu,%zu\n", hidden,
+                            input_rows, width, batch_size, cols, route, timing.median_us,
+                            timing.min_us, timing.p95_us, tflops, bandwidth, graph.nodes(),
+                            workspace.peak_used());
             };
-            const char* route = ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(kHidden,
+            const char* route = ops::detail::q8_linear_dynamic_grouped_conv_add_route_name(hidden,
                 input_rows, width, batch_size);
             measure(route, [&](cudaStream_t capture_stream) {
                 ops::linear_dynamic_grouped_conv_add(x, packed.weight, base_kernel, finish_delta,
@@ -146,14 +166,21 @@ int main(int argc, char** argv) {
     }
     try {
         const Options options = parse_args(argc, argv);
+        if (options.input_rows && !options.hidden) {
+            bool found = false;
+            for (const auto profile : kRegisteredProfiles)
+                if (profile.second == options.input_rows) found = true;
+            if (!found) throw std::invalid_argument("K is not a registered drafter input width");
+        }
         bench::L2FlushBuffer flush(options.flush_bytes);
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        std::printf("C,W,B,T,route,median_us,min_us,p95_us,effective_tflops,effective_gbs,"
+        std::printf("H,C,W,B,T,route,median_us,min_us,p95_us,effective_tflops,effective_gbs,"
                     "graph_nodes,workspace_bytes\n");
-        for (const std::int32_t input_rows : std::array<std::int32_t, 2>{4096, 17408}) {
-            if (options.input_rows != 0 && input_rows != options.input_rows) { continue; }
-            run_profile(input_rows, options, flush, stream);
+        for (const auto profile : kRegisteredProfiles) {
+            if (options.hidden && profile.first != options.hidden) continue;
+            if (options.input_rows && profile.second != options.input_rows) continue;
+            run_profile(profile.first, profile.second, options, flush, stream);
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

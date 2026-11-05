@@ -6,12 +6,19 @@
 
 namespace infernix::ops::detail {
 namespace {
+// Channels each reduce thread folds; 16 / this value threads cover one 16-channel group. Four
+// channels per thread (a 64-thread CTA) measured 1.1-3.7% slower on the whole Op, so the fold
+// stays at two-channel `__nv_bfloat162` accesses.
+constexpr int kChannelsPerThread = 2;
+
 // Hidden width H: G = H / 16 groups and 4 G coefficient rows (2 sides x 2 taps).
 template <int Hidden, int Capacity>
-__global__ __launch_bounds__(Capacity * 16, 4) void dynamic_grouped_conv_prepare_reduce_kernel(
-    const __nv_bfloat16* base, const float* partial, __nv_bfloat16* prepared, __nv_bfloat16* finish,
-    int width, int batch_size, int splits) {
-    constexpr int kGroups = Hidden / 16, kCoefficientRows = 4 * kGroups;
+__global__ __launch_bounds__(Capacity * (16 / kChannelsPerThread), 4)
+    void dynamic_grouped_conv_prepare_reduce_kernel(const __nv_bfloat16* base, const float* partial,
+                                                    __nv_bfloat16* prepared, __nv_bfloat16* finish,
+                                                    int width, int batch_size, int splits) {
+    constexpr int kGroups       = Hidden / 16, kCoefficientRows = 4 * kGroups;
+    constexpr int kGroupThreads = 16 / kChannelsPerThread;
     pdl::enter();
     __shared__ float projected[4][Capacity];
     __shared__ float normalized[Capacity][16];
@@ -27,9 +34,18 @@ __global__ __launch_bounds__(Capacity * 16, 4) void dynamic_grouped_conv_prepare
                            row];
         projected[coefficient][position] = sum;
     }
-    const int position = tid / 16, channel = tid % 16, hidden = group * 16 + channel;
+    const int position = tid / kGroupThreads, channel = (tid % kGroupThreads) * kChannelsPerThread;
+    const int hidden = group * 16 + channel;
     const std::int64_t offset = static_cast<std::int64_t>(batch * width + position) * Hidden + hidden;
-    if (position < width) { normalized[position][channel] = __bfloat162float(prepared[offset]); }
+    if (position < width) {
+#pragma unroll
+        for (int lane = 0; lane < kChannelsPerThread; lane += 2) {
+            const float2 values = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(prepared + offset + lane));
+            normalized[position][channel + lane]     = values.x;
+            normalized[position][channel + lane + 1] = values.y;
+        }
+    }
     __syncthreads();
     if (tid < 2 * Capacity && tid % Capacity < width) {
         const int tap = tid / Capacity, pos = tid % Capacity;
@@ -37,12 +53,24 @@ __global__ __launch_bounds__(Capacity * 16, 4) void dynamic_grouped_conv_prepare
             __float2bfloat16_rn(projected[2 + tap][pos]);
     }
     if (position < width) {
-        float value = (__bfloat162float(base[hidden]) + projected[0][position]) *
-                      normalized[position][channel];
-        if (position > 0)
-            value = fmaf(__bfloat162float(base[Hidden + hidden]) + projected[1][position],
-                         normalized[position - 1][channel], value);
-        prepared[offset] = __float2bfloat16_rn(value);
+#pragma unroll
+        for (int lane = 0; lane < kChannelsPerThread; lane += 2) {
+            const float2 scale = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(base + hidden + lane));
+            const float2 shift = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(base + Hidden + hidden + lane));
+            float2 value;
+            value.x = (scale.x + projected[0][position]) * normalized[position][channel + lane];
+            value.y = (scale.y + projected[0][position]) * normalized[position][channel + lane + 1];
+            if (position > 0) {
+                value.x = fmaf(shift.x + projected[1][position],
+                               normalized[position - 1][channel + lane], value.x);
+                value.y = fmaf(shift.y + projected[1][position],
+                               normalized[position - 1][channel + lane + 1], value.y);
+            }
+            *reinterpret_cast<__nv_bfloat162*>(prepared + offset + lane) =
+                __floats2bfloat162_rn(value.x, value.y);
+        }
     }
 }
 
@@ -50,7 +78,8 @@ template <int Hidden, int Capacity>
 void launch(DynamicConvPrepareRoute route, const Tensor& base, const float* partial,
             Tensor& prepared, Tensor& finish, cudaStream_t stream) {
     const dim3 grid(Hidden / 16, prepared.ne[2]);
-    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(Capacity * 16), 0, stream},
+    const dim3 block(Capacity * (16 / kChannelsPerThread));
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), block, 0, stream},
                                     dynamic_grouped_conv_prepare_reduce_kernel<Hidden, Capacity>,
                                     static_cast<const __nv_bfloat16*>(base.data), partial,
                                     static_cast<__nv_bfloat16*>(prepared.data),

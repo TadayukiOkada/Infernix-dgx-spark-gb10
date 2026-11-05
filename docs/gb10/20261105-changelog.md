@@ -763,3 +763,215 @@ and 2-stage / 2-CTA-per-SM `context_kv_grouped_kernel`) on NVIDIA GB10 (`sm_121a
   writes it; dropping it requires removing the fallback, which the admission band forbids.
 - The task doc's remaining PLE launch budget (`ple_embed` + `ple_proj` linear per step, single
   layer) is unchanged here; any further decode-step saving needs those, not the gate/conv pair.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T8: `uint4` conv-add `finish_kernel`, `__nv_bfloat162` prepare-reduce channel fold, and a measured schedule ladder for every registered drafter `(H, C)`
+
+## 1. Accounting
+
+- **Base commit**: `93e2112ab` (`dev-rebased-20261028`, `perf(ple): fuse decode ple_gate +
+  ple_conv_inject … (T7)`). Rebuild count: 6 single-invocation Ninja builds (HEAD baseline binary
+  for the interleaved A/B, one build carrying a temporary schedule-forcing knob for the sweep, the
+  final build, the 4-channel probe build, and the revert + final rebuild). The header edit
+  (`q8_dynamic_grouped_conv_add_kernels.h`) was followed by `find src/ops/dynamic_grouped_conv
+  -name '*.cu' -exec touch {} +` because CUDA depfiles are dead in `build-native`.
+- **Files** (5 M, +158/−84):
+  - `src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu` (`M`) — `uint4`
+    `finish_kernel`, `finish_value` helper removed, `MmaT96` launch case removed.
+  - `src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.cpp` (`M`) — measured ladder,
+    `MmaT96` route name removed.
+  - `src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h` (`M`) —
+    `Q8DynamicConvAddSchedule` drops `MmaT96`.
+  - `src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu` (`M`) —
+    2-channel `__nv_bfloat162` fold, half-size CTA.
+  - `bench/ops/linear_dynamic_grouped_conv_add_bench.cu` (`M`) — sweeps all six registered
+    `(H, C)` drafter geometries (`--hidden`, `H` column) instead of only `H = 5120`.
+- **`tools/cuda_stack/cuda_stack_allowlist.json`**: unchanged, no ratchet applied. Neither touched
+  kernel appears in the allowlist (`grep -c "dynamic_grouped_conv" → 0`) and both stay
+  `STACK:0 LOCAL:0` before and after, so there was nothing to lower. `infernix_cuda_stack_check`
+  passes on the unchanged allowlist.
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **The `W=16, B=3..4` cliff and its `p95` blow-up do not exist at this HEAD.** The doc's
+  `139.2 µs (p95 232.4)` / `166.2 µs (p95 283.6)` were taken at `98aff48b0`. A freshly built HEAD
+  binary on this host measures `122.9 µs (p95 124.9)` and `131.4 µs (p95 138.2)` for the same two
+  points (3 interleaved cold-L2 rounds, `--warmup 8 --repeat 40`, 256 MiB flush) — the tail sits
+  within 2–7 % of the median, so there was no tail-latency cliff left to remove and the absolute
+  `µs` bar had already drifted 12–21 % below the doc's baseline (§4/§5).
+- **`finish_kernel` is not the Op's cost.** nsys per-graph-node timing at `H=5120, C=4096, W=16,
+  B=4` puts it at **5.48 µs of the 131.4 µs Op (4.2 %)**; the other 125.9–131.6 µs is the Q8
+  projection, which is weight-streaming bound (`22.3 MB` of `Q8_G32_FP16` weights at ~200 GB/s
+  effective). Vectorizing it to `uint4` cut it to **4.31 µs (−21 %)**, i.e. ~1 % of the Op — the
+  doc's "up to 6 scalar 16-bit loads per thread" is real but the kernel is already L2-fed and
+  bandwidth-limited, not instruction-limited, so the 8× CTA reduction converts into 1.2 µs, not
+  into the tens of µs the premise implies.
+- **`TiledMma` at `T = 48` is already the argmin for `(5120, 4096)`** — the doc's step-2 hypothesis
+  that `T = 41..64` is mis-routed is only half right: the mis-routing is **above `T = 64`**, not
+  inside `48..64`. `S::MmaK128` is 5.1 % *behind* the production choice at `T = 48` for
+  `(5120, 4096)` (i.e. production `TiledMma` wins there), while `S::MmaT96`, the production choice
+  above `T = 64`, is never the fastest schedule at any of the 6 registered `(H, C)` ×
+  `T ∈ {32…128}` points measured, and `S::MmaT128` wins only at `(5120, 17408), T = 128`. `MmaT96`
+  was therefore deleted from this Op's schedule contract rather than re-banded.
+- **The crossover really is per-hidden-width, so the ladder is keyed on `hidden`.** `TiledMma`
+  launches `ceil(H/64)` row tiles × one 8-column slab; `H = 5120` is 80 row tiles (>1 wave on 48
+  SMs) and loses to the `K = 128` `r64×32` tile from 57 columns, while `H = 2560` (40 tiles) and
+  `H = 3072` (48 tiles, exactly one wave) hold it to 64 columns. Measured at 6 interleaved rounds
+  each: `T = 64` `TiledMma` is 5.3 % *behind* on `(5120, 4096)` and 4.5–14.9 % *ahead* on the other
+  four profiles, so a single boundary would mis-serve one side; the boundary is expressed per
+  hidden width instead of overfitting to the acceptance shape.
+- **4-channel staging in the prepare reduce kernel regresses; 2 channels is neutral.** `vec4`
+  (64-thread CTA at `Capacity = 16`) costs the reduce kernel 33.52 µs vs 28.77 µs baseline at
+  `W=16, B=8` (+16.5 %) and the whole Op +1.1…+3.7 %; `vec2` (128-thread CTA) holds the kernel at
+  28.69 µs median / 29.04 µs mean and 3.68 µs at `W=8, B=1` (baseline 3.69 µs). The 2-channel
+  version is shipped because it is the non-regressing half of the requested change; the reason it
+  cannot win is §6 (`partial` reads are strided by `kCoefficientRows`, not by channel).
+- **Verification-command corrections.** `infernix_ops_conv_vision_test` does not exist and
+  `infernix_rmsnorm_dynamic_grouped_conv_prepare_test` is misnamed: both op tests are
+  `FAMILY recurrent` sources (`tests/ops/tests.cmake:305,309`) that link into
+  `infernix_ops_recurrent_test`, under ctest names `infernix_dynamic_grouped_conv_prepare_test` and
+  `infernix_linear_dynamic_grouped_conv_add_test`. `--in-features` is not a flag of the add bench
+  (it is `--k`), and both benches take single integers, so the doc's
+  `--width 8,16 --batch 1,2,3,4` silently measures only `W=8, B=1` (`std::atoi` truncates at the
+  comma). Per-value sweeps were run instead.
+
+## 3. Subsystem breakdown
+
+- `q8_dynamic_grouped_conv_add_materialized.cu`: `finish_kernel<Rows>` now assigns each thread one
+  16-byte slice (`row = (blockIdx.x * blockDim.x + threadIdx.x) * 8`, grid `Rows/8` per column),
+  loads `projected`, `projected[index − Rows]`, `base[2·Rows + row]`, `base[3·Rows + row]` and
+  `residual` as `uint4`, folds four `__nv_bfloat162` pairs, and stores one `uint4`. Because
+  `Rows ∈ {2560, 3072, 5120}` is a multiple of 16, an 8-channel slice that starts on a multiple of
+  8 never crosses a 16-channel group, so both `delta` taps are read once per 8 channels instead of
+  once per channel. The `finish_value` helper is gone; per-channel arithmetic is unchanged
+  (`fmaf(base + delta, projection, value)` in the same order, previous-column term only when
+  `col % width != 0`, and its two loads stay predicated off on the first column of each batch,
+  which is also the only out-of-range address the scalar version had).
+- `q8_dynamic_grouped_conv_add_plan.cpp` + `..._kernels.h`: ladder is now
+  `C = 17408`: `T ≤ 48 → TiledMma`, `49..96 → MmaK128`, `> 96 → MmaT128`;
+  `C ∈ {4096, 7680, 9216}`: `T ≤ (H ≥ 5120 ? 56 : 64) → TiledMma`, else `MmaK128`. `MmaT96`
+  removed from the enum, the launch switch and the route-name table (`launch_q8_a16_mma_r64_t96`
+  itself stays — it is still the `tokens ≤ 96` entry of many `/shapes/` Linear tables).
+- `bf16_dynamic_grouped_conv_prepare_reduce.cu`: `kChannelsPerThread = 2`, so a group is 8 threads
+  (`__launch_bounds__(Capacity * 8, 4)`, block `Capacity * 8`), `base`/`base + Hidden`/`prepared`
+  travel as `__nv_bfloat162` and the `finish` write and split-`partial` coefficient sum are
+  untouched. FP32 accumulation order per output channel is bit-identical (the coefficient sum stays
+  one thread per `(coefficient row, position)`, and each channel's `(scale + projected) ·
+  normalized` / `fmaf(shift + projected, normalized[position − 1], ·)` is unchanged).
+- `bench/ops/linear_dynamic_grouped_conv_add_bench.cu`: `kHidden`/`kGroups` became per-profile
+  arguments, `--hidden 2560|3072|5120` and `--k 4096|7680|9216|17408` are validated against the six
+  registered pairs, the default sweep walks all six, and the CSV gains a leading `H` column so
+  rows from different profiles are distinguishable.
+
+## 4. Verification
+
+- **Resources** (`cuobjdump --dump-resource-usage build-native/apps/infernix-serve`):
+  `finish_kernel<2560|3072|5120>` `REG:40 STACK:0 SHARED:0 LOCAL:0` (was `REG:20`);
+  `dynamic_grouped_conv_prepare_reduce_kernel<2560|3072|5120, 8|16>`
+  `REG:38 STACK:0 SHARED:1664|2304 LOCAL:0` — identical registers and shared memory to HEAD.
+- **Oracles** (`ctest -R "infernix_cuda_stack_check|infernix_dynamic_grouped_conv_prepare_test|infernix_linear_dynamic_grouped_conv_add_test"`):
+  **3/3 passed**, 0 failed. The add test covers all 6 registered `(H, C)` × `W = 2..16` × `B = 1..8`
+  (120 shapes per profile, incl. 6 CUDA-Graph replay cases) against the FP64 `dot_fp64` projection
+  oracle with `relative_l2 = 3.2e-3`, plus exact preserved-input checks; the prepare test covers its
+  own `W/B` sweep. The 4-channel probe build was also oracle-green before being rejected.
+- **Add Op, whole-graph cold-L2 medians, fresh HEAD binary vs candidate, 3 interleaved rounds**
+  (`H = 5120`; `*` = route changed by the new ladder):
+
+  | C | T (W,B) | HEAD route → new route | HEAD µs | new µs | Δ | p95 Δ |
+  |---|---|---|---|---|---|---|
+  | 4096 | 16 (16,1) | tiled_mma | 107.5 | 105.9 | −1.5 % | 0.0 % |
+  | 4096 | 32 (16,2) | tiled_mma | 111.6 | 110.6 | −0.9 % | −0.3 % |
+  | 4096 | **48 (16,3)** | tiled_mma | 122.9 | 118.9 | **−3.2 %** | −1.6 % |
+  | 4096 | 56 (14,4) | tiled_mma | 122.8 | 124.9 | +1.7 % | 0.0 % |
+  | 4096 | **64 (16,4)** | tiled_mma → r64_c64_k128\* | 131.4 | 131.1 | **−0.3 %** | −3.7 % |
+  | 4096 | 72 (12,6) | r64_c96 → r64_c64_k128\* | 153.4 | 143.4 | −6.6 % | −7.6 % |
+  | 4096 | 96 (16,6) | r64_c96 → r64_c64_k128\* | 163.4 | 145.4 | −11.0 % | −10.9 % |
+  | 4096 | 128 (16,8) | r64_c128 → r64_c64_k128\* | 159.7 | 150.5 | −5.8 % | −6.6 % |
+  | 17408 | 32 (16,2) | tiled_mma | 454.7 | 459.8 | +1.1 % | −2.0 % |
+  | 17408 | 48 (16,3) | r64_c64_k128 → tiled_mma\* | 509.8 | 493.6 | −3.2 % | −25.3 % |
+  | 17408 | 56 (14,4) | r64_c64_k128 | 511.7 | 511.0 | −0.1 % | −0.2 % |
+  | 17408 | 64 (16,4) | r64_c64_k128 | 540.9 | 546.8 | +1.1 % | +4.3 % |
+  | 17408 | 72 (12,6) | r64_c96 → r64_c64_k128\* | 626.7 | 563.2 | −10.1 % | −5.6 % |
+  | 17408 | 96 (16,6) | r64_c96 → r64_c64_k128\* | 628.7 | 616.5 | −2.0 % | +7.8 % |
+  | 17408 | 128 (16,8) | r64_c128 | 622.6 | 625.7 | +0.5 % | +13.9 % |
+
+- **Narrow profiles** (the old binary cannot run `H ≠ 5120`, so the dispatch delta there comes from
+  the schedule knob inside one binary, 6 interleaved rounds at `T = 72`; `T = 96/128` are 1–2-round
+  means from the same sweep session, ±5 % wobble):
+
+  | profile | `T=72` old→new | Δ | `T=96` old→new | Δ | `T=128` old→new | Δ |
+  |---|---|---|---|---|---|---|
+  | 2560×4096 | 77.8 → 71.4 | −8.2 % | 98.7 → 74.7 | −24.3 % | 103.6 → 81.9 | −21.0 % |
+  | 2560×7680 | 149.5 → 130.0 | −13.0 % | 188.4 → 140.0 | −25.7 % | 192.9 → 149.5 | −22.5 % |
+  | 3072×4096 | 83.9 → 81.9 | −2.4 % | 110.6 → 90.1 | −18.5 % | 112.9 → 88.1 | −22.0 % |
+  | 3072×9216 | 190.3 → 180.0 | −5.4 % | 245.8 → 192.2 | −21.8 % | 379.1 → 200.4 | −47.1 %\* |
+
+  \* `379.1 µs` is an outlier against the 244–258 µs that profile reads at every neighbouring
+  `T`, so the honest `T=128` gain for `3072×9216` is ≈ −19 %, not −47 %.
+- **Acceptance bar, stated honestly.** At `C=4096, W=16, B=3/4` the shipped binary reads
+  `118.9 / 131.1 µs` (3-round medians; single-run confirmations 123.1 / 133.1), which is
+  **−14.6 % / −21.1 % against the doc's `139.2 / 166.2 µs` bar**, so the bar is numerically met —
+  but a freshly built HEAD binary already read `122.9 / 131.4 µs`, i.e. the bar was already met by
+  clock/binary drift before this task. Only **−3.2 % / −0.3 %** of it is attributable to these
+  changes. The gain this task actually delivers is at `T > 64` (−6.6 %…−11.0 % on `(5120, 4096)`,
+  −2.4 %…−25.7 % on the narrow profiles), which the bar does not cover.
+- **Prepare Op, whole-Op cold-L2 medians, HEAD vs shipped (3 interleaved rounds)**: `W=8,B=1`
+  66.2 → 66.2 (−0.05 %), `W=8,B=4` 75.5 → 75.6 (+0.2 %), `W=8,B=8` 83.7 → 82.7 (−1.2 %),
+  `W=16,B=1` 71.3 → 69.3 (−2.7 %), `W=16,B=4` 82.7 → 83.7 (+1.2 %), `W=16,B=8` 101.1 → 102.0
+  (+1.0 %). Isolated reduce kernel (nsys): 28.77 → 28.69 µs median at `W=16,B=8` and
+  3.692 → 3.680 µs at `W=8,B=1` — "does not regress", not an improvement.
+
+## 5. Regressions & adverse results
+
+Compared: the same bench binaries, same 256 MiB-flush cold-L2 protocol, interleaved rounds, HEAD
+baseline binary vs shipped binary, across `T = 16…128` on both `H = 5120` profiles plus the
+`H = 2560/3072` route table, kernel-level nsys for both touched kernels, and `cuobjdump` resources.
+
+- `(5120, 4096), T = 56`: **+1.7 % median** (122.8 → 124.9 µs) with an unchanged route, so only the
+  `uint4` finish kernel differs. Cause: none found — the same unchanged-route points read −0.9 % to
+  −3.2 % in the same session, and the isolated finish kernel got 21 % faster; this point sits inside
+  the ±3.5 % identical-dispatch drift band. Disposition: **accepted (noise band), not fixed**.
+- `(5120, 17408)`, unchanged-route points: `T=32` **+1.1 %**, `T=56` −0.1 %, `T=64` **+1.1 %
+  (p95 +4.3 %)**, `T=128` **+0.5 % (p95 +13.9 %)**. Cause: same as above (only the finish kernel
+  differs at those points); that profile's `p95` runs 5–30 % above its median in both binaries and
+  swings ±14 % round-to-round. Disposition: **accepted — median-level effects are inside drift, and
+  the `p95` spread is not attributable to this change and was not chased**.
+- Prepare Op whole-Op: **+1.2 % at `W=16,B=4`, +1.0 % at `W=16,B=8`, +0.2 % at `W=8,B=4`**, against
+  −2.7 % / −1.2 % / −0.05 % elsewhere. Cause: the reduce kernel is 10.9 % of the Op and the
+  vectorization left it unchanged (28.77 → 28.69 µs median); the Op numbers are drift. Disposition:
+  **accepted — the criterion is "improves or does not regress" and no point moved outside the noise
+  band**.
+- **Rejected candidate, not shipped**: 4 channels/thread in the reduce kernel — reduce kernel
+  33.52 µs vs 28.77 µs (+16.5 %) at `W=16,B=8`, 3.97 vs 3.69 µs (+7.6 %) at `W=8,B=1`, and whole-Op
+  +1.10 % / +3.72 % / +2.95 % / +1.76 % at `W16B1 / W16B4 / W16B8 / W8B1`. Reverted to 2 channels
+  (the shipped state); the rejection is recorded in the source comment.
+- **Acceptance criterion met only against a stale baseline** — see §4: −3.2 % / −0.3 % attributable
+  at the two named points. Not fixable by dispatch: `TiledMma` is the measured argmin at `T = 48`
+  and `K128` (the new choice) is the measured argmin at `T = 64` for that shape, so no plan change
+  can produce another 10 % there; the remaining `T = 48` gap is the projection's ~200 GB/s vs the
+  ~273 GB/s UMA floor, a Q8 `/shapes/` schedule question outside this task.
+- No test-tolerance, spill, occupancy, shared-memory or workspace-capacity change: `STACK`/`LOCAL`
+  stay 0, `REG` 20 → 40 for `finish_kernel` (the live `uint4` quads, no spill),
+  `REG:38`/`SHARED:1664|2304` unchanged for the reduce kernel, and the add test's exact
+  `workspace.peak_used()` assertions pass unchanged.
+
+## 6. Accepted gaps / follow-ups
+
+- The prepare reduce kernel's dominant cost is untouched and is *not* the channel fold: phase 1
+  maps threads to `position` while `partial` is laid out `[split][token][coefficient row]`, so each
+  warp's 16 live positions are `kCoefficientRows = 1280` floats apart — a fully uncoalesced
+  32 B-sector-per-float read, mitigated only by the 8-rows-per-cache-line reuse across the `H/16`
+  CTAs. Row-indexing phase 1 (which preserves the per-`(row, position)` FP32 sum order exactly) is
+  the next lever; it is outside T8's "vectorize the channel accesses" scope and untried here.
+- No `.infernix` artifact exists on this host, so there is no end-to-end `infernix-serve` /
+  `llama-benchy` check for this task: correctness rests on the op oracles (all 6 registered
+  `(H, C)` × `W = 2..16` × `B = 1..8`, incl. graph replays) rather than a model-level bit
+  comparison. The ladder changes which projection kernel computes `T > 56/64` and `T = 48` at
+  `C = 17408`, so request bits at those widths do change; both routes are the same
+  FP32-accumulating Q8 A16 MMA family and both are qualified by that same FP64-oracle test.
+- `TiledMma` remains admitted only up to `T = 88` (its launcher array is 11 eight-column entries);
+  the ladder never asks for more, but a future band above `T = 64` on a narrow profile would index
+  out of that array unless the table is extended.
+- `bench/README.md` documents the prepare bench but not the add bench, so the new `H` column and
+  `--hidden` flag are documented only in the bench's own `--help`.
+- The measured ladder is a `T`-threshold table over the six registered geometries; it does not model
+  `splits`, KV pressure or concurrent lanes, and was measured on synthetic operands at cold L2.

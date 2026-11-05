@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
+#include <cstdlib>
 #include <stdexcept>
 
 namespace infernix::ops::detail {
@@ -18,6 +19,11 @@ bool registered(int hidden, int input_rows) {
            (hidden == 3072 && (input_rows == 4096 || input_rows == 9216));
 }
 
+// Schedule ladder measured on GB10 (48 SMs) with the cold-L2 op benchmark at every registered
+// (H, C) and every T = width * batch in 32..128. The eight-column TiledMma ladder wins while its
+// 64-row tiles plus one column slab stay inside one wave; H = 5120 pays that slab from 57 columns
+// on, the narrower H = 2560/3072 projections hold to 64. The K=128 r64x32 tile takes over above
+// that, and the r64_c128 tile only pays off on the 17408-row projection's widest loads.
 Plan resolve_plan(int hidden, int input_rows, int width, int batch) {
     if (!registered(hidden, input_rows))
         throw std::invalid_argument(
@@ -26,25 +32,14 @@ Plan resolve_plan(int hidden, int input_rows, int width, int batch) {
         throw std::invalid_argument("linear dynamic grouped conv add: invalid W/B profile");
     const int columns = width * batch;
     using S           = Q8DynamicConvAddSchedule;
-    S schedule        = S::TiledMma;
+    S schedule        = S::MmaK128;
     if (input_rows == 17408) {
-        if (columns <= 32) {
+        if (columns <= 48)
             schedule = S::TiledMma;
-        } else if (columns <= 64) {
-            schedule = S::MmaK128;
-        } else if (columns <= 96) {
-            schedule = S::MmaT96;
-        } else {
+        else if (columns > 96)
             schedule = S::MmaT128;
-        }
-    } else {
-        if (columns <= 64) {
-            schedule = S::TiledMma;
-        } else if (columns <= 96) {
-            schedule = S::MmaT96;
-        } else {
-            schedule = S::MmaT128;
-        }
+    } else if (columns <= (hidden >= 5120 ? 56 : 64)) {
+        schedule = S::TiledMma;
     }
     return {schedule, static_cast<std::size_t>(hidden) * columns * sizeof(std::uint16_t)};
 }
@@ -67,8 +62,6 @@ const char* q8_linear_dynamic_grouped_conv_add_route_name(int hidden, int input_
         return "dynamic_grouped_conv_add.q8.tiled_mma.materialized_bf16";
     case Q8DynamicConvAddSchedule::MmaK128:
         return "dynamic_grouped_conv_add.q8.r64_c64_k128.materialized_bf16";
-    case Q8DynamicConvAddSchedule::MmaT96:
-        return "dynamic_grouped_conv_add.q8.r64_c96.materialized_bf16";
     case Q8DynamicConvAddSchedule::MmaT128:
         return "dynamic_grouped_conv_add.q8.r64_c128.materialized_bf16";
     }

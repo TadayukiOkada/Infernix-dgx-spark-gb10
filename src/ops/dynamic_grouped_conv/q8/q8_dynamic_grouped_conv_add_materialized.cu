@@ -14,21 +14,9 @@
 
 namespace infernix::ops::detail {
 namespace {
-// Hidden width (the projection's output rows) Rows, in G = Rows / 16 groups.
-template <int Rows>
-__device__ __forceinline__ void finish_value(int row, int col, int width, float current,
-                                             float previous, const __nv_bfloat16* base,
-                                             const __nv_bfloat16* delta, __nv_bfloat16* residual) {
-    constexpr int kGroups = Rows / 16;
-    const int index = col * Rows + row, di = col * 2 * kGroups + row / 16;
-    float value = fmaf(__bfloat162float(base[2 * Rows + row]) + __bfloat162float(delta[di]),
-                       current, __bfloat162float(residual[index]));
-    if (col % width != 0)
-        value =
-            fmaf(__bfloat162float(base[3 * Rows + row]) + __bfloat162float(delta[di + kGroups]),
-                 previous, value);
-    residual[index] = __float2bfloat16_rn(value);
-}
+// One 16-byte (8-channel) slice of the projected column per finish_kernel thread.
+constexpr int kFinishChannels = 8;
+constexpr int kFinishThreads  = 256;
 
 using Launch = Q8Launch;
 
@@ -68,16 +56,56 @@ constexpr auto mlp_2560       = make_launchers<2560, 7680>(std::make_index_seque
 constexpr auto attention_3072 = make_launchers<3072, 4096>(std::make_index_sequence<11>{});
 constexpr auto mlp_3072       = make_launchers<3072, 9216>(std::make_index_sequence<11>{});
 
+// Each thread folds one 16-byte slice of the projected column into the residual. Rows is a
+// multiple of 16, so an eight-channel slice that starts on a multiple of 8 never crosses a
+// 16-channel group boundary and both delta taps stay scalar.
 template <int Rows>
 __global__ void finish_kernel(const __nv_bfloat16* projected, const __nv_bfloat16* base,
                               const __nv_bfloat16* delta, __nv_bfloat16* residual, int width) {
+    constexpr int kGroups = Rows / 16;
     pdl::enter();
-    const int row = blockIdx.x * blockDim.x + threadIdx.x, col = blockIdx.y;
+    const int row = (static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                     static_cast<int>(threadIdx.x)) * kFinishChannels;
+    const int col = blockIdx.y;
     if (row >= Rows) return;
-    const int index = col * Rows + row;
-    finish_value<Rows>(row, col, width, __bfloat162float(projected[index]),
-                       col % width ? __bfloat162float(projected[index - Rows]) : 0.0f, base, delta,
-                       residual);
+    const int index = col * Rows + row, di = col * 2 * kGroups + row / 16;
+    const bool has_previous = col % width != 0;
+    const float current_tap = __bfloat162float(delta[di]);
+    const float previous_tap = has_previous ? __bfloat162float(delta[di + kGroups]) : 0.0f;
+
+    const uint4 current_bits   = *reinterpret_cast<const uint4*>(projected + index);
+    const uint4 base_bits      = *reinterpret_cast<const uint4*>(base + 2 * Rows + row);
+    const uint4 residual_bits  = *reinterpret_cast<const uint4*>(residual + index);
+    const uint4 previous_bits  = has_previous
+                                     ? *reinterpret_cast<const uint4*>(projected + index - Rows)
+                                     : make_uint4(0U, 0U, 0U, 0U);
+    const uint4 prior_base_bits = has_previous
+                                      ? *reinterpret_cast<const uint4*>(base + 3 * Rows + row)
+                                      : make_uint4(0U, 0U, 0U, 0U);
+    const auto* current  = reinterpret_cast<const __nv_bfloat162*>(&current_bits);
+    const auto* previous = reinterpret_cast<const __nv_bfloat162*>(&previous_bits);
+    const auto* tap      = reinterpret_cast<const __nv_bfloat162*>(&base_bits);
+    const auto* prior    = reinterpret_cast<const __nv_bfloat162*>(&prior_base_bits);
+    const auto* carried  = reinterpret_cast<const __nv_bfloat162*>(&residual_bits);
+
+    uint4 result;
+    auto* folded = reinterpret_cast<__nv_bfloat162*>(&result);
+#pragma unroll
+    for (int pair = 0; pair < kFinishChannels / 2; ++pair) {
+        float2 value = __bfloat1622float2(carried[pair]);
+        const float2 current_coefficient = __bfloat1622float2(tap[pair]);
+        const float2 current_projection  = __bfloat1622float2(current[pair]);
+        value.x = fmaf(current_coefficient.x + current_tap, current_projection.x, value.x);
+        value.y = fmaf(current_coefficient.y + current_tap, current_projection.y, value.y);
+        if (has_previous) {
+            const float2 previous_coefficient = __bfloat1622float2(prior[pair]);
+            const float2 previous_projection  = __bfloat1622float2(previous[pair]);
+            value.x = fmaf(previous_coefficient.x + previous_tap, previous_projection.x, value.x);
+            value.y = fmaf(previous_coefficient.y + previous_tap, previous_projection.y, value.y);
+        }
+        folded[pair] = __floats2bfloat162_rn(value.x, value.y);
+    }
+    *reinterpret_cast<uint4*>(residual + index) = result;
 }
 
 const std::array<Launch, 11>& tiled_launchers(int rows, int input_rows) {
@@ -93,8 +121,8 @@ const std::array<Launch, 11>& tiled_launchers(int rows, int input_rows) {
 template <int Rows>
 void finish(const Tensor& projected, const Tensor& base, const Tensor& delta, Tensor& residual,
             int width, int tokens, cudaStream_t stream) {
-    const dim3 grid((Rows + 255) / 256, tokens);
-    CUDA_CHECK(pdl::launch_consumer({grid, dim3(256), 0, stream}, finish_kernel<Rows>,
+    const dim3 grid((Rows / kFinishChannels + kFinishThreads - 1) / kFinishThreads, tokens);
+    CUDA_CHECK(pdl::launch_consumer({grid, dim3(kFinishThreads), 0, stream}, finish_kernel<Rows>,
                                     static_cast<const __nv_bfloat16*>(projected.data),
                                     static_cast<const __nv_bfloat16*>(base.data),
                                     static_cast<const __nv_bfloat16*>(delta.data),
@@ -114,9 +142,6 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
         break;
     case Q8DynamicConvAddSchedule::MmaK128:
         launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
-        break;
-    case Q8DynamicConvAddSchedule::MmaT96:
-        launch_q8_a16_mma_r64_t96(flat, weight, result, stream);
         break;
     case Q8DynamicConvAddSchedule::MmaT128:
         launch_q8_a16_mma_r64_t128(flat, weight, result, stream);
