@@ -35,6 +35,12 @@ constexpr int kTile   = 16;  // tokens per warp tile
 constexpr int kRows   = 16;  // MMA rows: one KV head's query heads, padded
 constexpr int kQRow   = 2 * kD; // bytes of one FP16/BF16 query row in shared memory
 
+// Which half of a stage one gather fills: both (one commit group), the key rows with their scales and
+// the parity word, or the value rows with theirs. The two halves of a stage are disjoint, so each is
+// its own commit group and the single-stage loop can wait for one only before the MMA phase that
+// reads it.
+constexpr int kGatherKey = 1, kGatherValue = 2, kGatherBoth = 3;
+
 // How a stored row enters the MMAs. Keys: BF16 rows on BF16 Tensor Cores; 8-bit codes (INT8, FP8
 // E4M3) widened exactly to FP16 with their scales applied to the FP32 partial of each scale group;
 // NVFP4 codes decoded exactly to FP16 values (E2M1 times E4M3 is exact in FP16). Values: FP16 rows;
@@ -128,7 +134,14 @@ struct Stage {
     static constexpr int Values     = kTile * K::Bytes;
     static constexpr int KeyScales  = Values + kTile * V::Bytes;
     static constexpr int ValueScales = KeyScales + kTile * K::ScaleSlot;
-    static constexpr int ParityWord = ValueScales + kTile * V::ScaleSlot;
+    // The value scales get two slots where the route gathers them with the keys: the QK phase settles
+    // the 8-bit values' exact decode rescale from them, so they must land before the value rows, while
+    // the next tile's are already being gathered as this tile's PV MMA reads them. A stage the combined
+    // route fills (a vector-quantized stage, or a storage whose gather the split does not pay for) needs
+    // one, and keeps its original footprint.
+    static constexpr bool SplitGather = Shape::Vq == 0 && K::Bytes >= kD;
+    static constexpr int ScaleSlots   = SplitGather ? 2 : 1;
+    static constexpr int ParityWord   = ValueScales + ScaleSlots * kTile * V::ScaleSlot;
     // Vector-quantized: the paged code rows, each row's FP16 code scale (K, V) as its aligned word,
     // the window tags (K, V) and each row's token and read mode.
     static constexpr int VqKeyCodes   = ParityWord + (Parity ? 16 : 0);
@@ -347,12 +360,24 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     unsigned char* stages = smem + kQRow * kRows + warp * (Stages * S::Bytes + S::Scratch);
     const int tiles       = (total + kTile - 1) / kTile;
 
-    // Gathers tile i's keys, values and scales into stage s; tokens past the column's list are
-    // zero-filled. Lane l locates row l % 16 once (its token, page space and row in the planes); the
-    // lanes copying a row's chunks take its addresses by shuffle.
-    const auto issue = [&](int i, int s) {
+    // The byte offset of tile i's value-scale slot. Consecutive tiles of one warp use different slots:
+    // the single-stage route gathers a tile's value scales with its keys, so the next tile's are already
+    // in flight while this tile's PV MMA still reads them.
+    const auto value_scale_at = [&](int i) {
+        return ((i / Warps) & (S::ScaleSlots - 1)) * (kTile * V::ScaleSlot);
+    };
+
+    // Gathers tile i's `Part` (both halves, or one of them) into stage s and commits it as one group;
+    // tokens past the column's list are zero-filled. Lane l locates row l % 16 once (its token, page
+    // space and row in the planes); the lanes copying a row's chunks take its addresses by shuffle.
+    // Splitting the gather into its own commit group is what lets the single-stage loop hide one half
+    // behind the MMA phase that reads the other half.
+    const auto issue = [&](int i, int s, auto part) {
+        constexpr int Part = decltype(part)::value;
+        static_assert(Part == kGatherBoth || Shape::Vq == 0,
+                      "a vector-quantized stage resolves both halves together");
         unsigned char* k_s = stages + s * S::Bytes;
-        unsigned char* v_s = k_s + S::Values;
+        [[maybe_unused]] unsigned char* v_s = k_s + S::Values;
         const int row      = lane & 15;
         const int index    = i * kTile + row;
         const bool valid   = index < total;
@@ -361,7 +386,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         int page;
         const auto* k_plane =
             static_cast<const unsigned char*>(qsa_space_plane(spaces, k_pages, spaces.host_k, spaces.lent_k, id, page));
-        const auto* v_plane =
+        [[maybe_unused]] const auto* v_plane =
             static_cast<const unsigned char*>(qsa_space_plane(spaces, v_pages, spaces.host_v, spaces.lent_v, id, page));
         const std::size_t row_at =
             static_cast<std::size_t>(kv_head + kv_heads * page) * kPagedKVPageSize + (token & kPagedKVPageMask);
@@ -423,10 +448,15 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             cp_commit();
             return;
         }
-        rows(k_s, k_plane + row_at * K::Bytes, std::integral_constant<int, K::Bytes>{});
-        rows(v_s, v_plane + row_at * V::Bytes, std::integral_constant<int, V::Bytes>{});
-        if constexpr (K::ScaleSlot > 0 || V::ScaleSlot > 0) {
-            // Lanes 0-15 gather their row's key scales, lanes 16-31 its value scales.
+        if constexpr ((Part & kGatherKey) != 0) {
+            rows(k_s, k_plane + row_at * K::Bytes, std::integral_constant<int, K::Bytes>{});
+        }
+        if constexpr ((Part & kGatherValue) != 0) {
+            rows(v_s, v_plane + row_at * V::Bytes, std::integral_constant<int, V::Bytes>{});
+        }
+        if constexpr ((Part & kGatherKey) != 0 && (K::ScaleSlot > 0 || V::ScaleSlot > 0)) {
+            // Lanes 0-15 gather their row's key scales, lanes 16-31 its value scales; both travel with
+            // the keys, and the parity word is the keys' token parity.
             const bool key    = lane < 16;
             const auto scales = [&](const void* pool, const void* host, const void* lent, int slot_bytes,
                                     unsigned char* dst) {
@@ -446,9 +476,12 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                            k_s + S::KeyScales + row * K::ScaleSlot);
                 }
             } else {
+                // The value scales travel with the key group: the exact power of two the 8-bit values
+                // decode by comes from them, and the QK phase settles it before the value rows
+                // themselves are waited for. Tile i's own slot keeps them clear of the next tile's.
                 if constexpr (V::ScaleSlot > 0) {
                     scales(v_scales, spaces.host_v_scale, spaces.lent_v_scale, V::ScaleSlot,
-                           k_s + S::ValueScales + row * V::ScaleSlot);
+                           k_s + S::ValueScales + value_scale_at(i) + row * V::ScaleSlot);
                 }
             }
             if constexpr (S::Parity) {
@@ -481,15 +514,34 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
     const float scale_l2 = scale * Log2E;
 
-    const auto compute = [&](int i, int s) {
+    // FP16 row scale of tile token `key` from its gathered word.
+    const auto row_scale = [&](const unsigned char* k_s, unsigned parity, int scales_at, int key) {
+        return reinterpret_cast<const __half*>(k_s + scales_at)[2 * key + ((parity >> key) & 1)];
+    };
+
+    // What the QK MMA and the online softmax leave for the PV MMA: the tile's probabilities as the FP16
+    // A fragments of one k step (`pa`, scaled by the exact power of two `down`'s inverse where the
+    // values are 8-bit codes) and the parity word as of this tile (the single-stage route refills that
+    // word for the next tile while the values are being multiplied, so the PV MMA must not read it back
+    // from shared memory).
+    struct QkState {
+        unsigned pa[4];
+        __half2 down;
+        unsigned parity;
+        int scale_at; // this tile's value-scale slot, which the PV MMA reads after the next tile's landed
+    };
+
+    // QK MMA over the tile's keys and the online softmax over its 16 tokens (columns past the list are
+    // masked), then the PV MMA's A fragments. Needs the key half of the stage plus the value scales,
+    // which the key commit group gathers so that the decode rescale is settled before the values land.
+    const auto score_tile = [&](int i, int s) {
         const unsigned char* k_s = stages + s * S::Bytes;
-        const unsigned char* v_s = k_s + S::Values;
-        unsigned parity          = 0;
-        if constexpr (S::Parity) { parity = *reinterpret_cast<const unsigned*>(k_s + S::ParityWord); }
-        // FP16 row scale of tile token `key` from its gathered word.
-        const auto row_scale = [&](int scales_at, int key) {
-            return reinterpret_cast<const __half*>(k_s + scales_at)[2 * key + ((parity >> key) & 1)];
-        };
+        QkState qk;
+        qk.parity = 0;
+        if constexpr (S::Parity) { qk.parity = *reinterpret_cast<const unsigned*>(k_s + S::ParityWord); }
+        const unsigned parity = qk.parity;
+        qk.scale_at           = V::ScaleSlot > 0 ? value_scale_at(i) : 0;
+        float pr[2][4];
         float score[2][4];
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
@@ -536,8 +588,8 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                         ks0              = __half2float(ks[key * Groups + g]);
                         ks1              = __half2float(ks[(key + 1) * Groups + g]);
                     } else {
-                        ks0 = __half2float(row_scale(S::KeyScales, key));
-                        ks1 = __half2float(row_scale(S::KeyScales, key + 1));
+                        ks0 = __half2float(row_scale(k_s, parity, S::KeyScales, key));
+                        ks1 = __half2float(row_scale(k_s, parity, S::KeyScales, key + 1));
                     }
                     score[nt][0] = __fmaf_rn(ks0, acc[nt][0], score[nt][0]);
                     score[nt][1] = __fmaf_rn(ks1, acc[nt][1], score[nt][1]);
@@ -604,7 +656,6 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
         m0 = nm0;
         m1 = nm1;
         const float base0 = nm0 * scale_l2, base1 = nm1 * scale_l2;
-        float pr[2][4];
         float bl0 = 0.0f, bl1 = 0.0f;
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
@@ -631,37 +682,59 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                 }
             }
         }
-
+        // The PV MMA's A fragments: this tile's probabilities as one FP16 k step. Where the values are
+        // 8-bit codes the decoded values stay finite in FP16 by dividing a tile's scales by 2^shift and
+        // multiplying the probabilities by it (both exact, so every product is unchanged); the shift
+        // comes from the value scales and is settled here, before the value rows themselves are waited
+        // for, so the PV MMA starts on its loads.
         if constexpr (S::EvenOddValues) {
-            // Decoded values stay finite in FP16: a tile whose largest scale exceeds MaxScale decodes
-            // with its scales divided by 2^shift and multiplies the probabilities by 2^shift
-            // (both exact, so every product is unchanged).
-            constexpr int Groups = V::Groups;
             float own;
             if constexpr (Shape::Value == Code::Int8) {
-                const __half* vs = reinterpret_cast<const __half*>(k_s + S::ValueScales);
+                const __half* vs = reinterpret_cast<const __half*>(k_s + S::ValueScales + qk.scale_at);
                 const __half2 pair = load_vec<__half2>(&vs[2 * lane]);
                 own                = fmaxf(fabsf(__low2float(pair)), fabsf(__high2float(pair)));
             } else {
-                own = lane < 16 ? fabsf(__half2float(row_scale(S::ValueScales, lane))) : 0.0f;
+                own = lane < 16
+                          ? fabsf(__half2float(row_scale(k_s, parity, S::ValueScales + qk.scale_at, lane)))
+                          : 0.0f;
             }
             const float vmax = warp_max(own, FullMask);
             int shift        = 0;
             while (shift < 14 && ldexpf(vmax, -shift) > V::MaxScale) { ++shift; }
             const float up = ldexpf(1.0f, shift);
-            unsigned pa[4];
-            pa[0] = pack_f16x2(pr[0][0] * up, pr[0][1] * up);
-            pa[1] = pack_f16x2(pr[0][2] * up, pr[0][3] * up);
-            pa[2] = pack_f16x2(pr[1][0] * up, pr[1][1] * up);
-            pa[3] = pack_f16x2(pr[1][2] * up, pr[1][3] * up);
-            const __half2 down = __float2half2_rn(ldexpf(1.0f, -shift));
+            qk.down        = __float2half2_rn(ldexpf(1.0f, -shift));
+            qk.pa[0]       = pack_f16x2(pr[0][0] * up, pr[0][1] * up);
+            qk.pa[1]       = pack_f16x2(pr[0][2] * up, pr[0][3] * up);
+            qk.pa[2]       = pack_f16x2(pr[1][0] * up, pr[1][1] * up);
+            qk.pa[3]       = pack_f16x2(pr[1][2] * up, pr[1][3] * up);
+        } else {
+            qk.down  = __half2half2(__float2half(0.0f));
+            qk.pa[0] = pack_f16x2(pr[0][0], pr[0][1]);
+            qk.pa[1] = pack_f16x2(pr[0][2], pr[0][3]);
+            qk.pa[2] = pack_f16x2(pr[1][0], pr[1][1]);
+            qk.pa[3] = pack_f16x2(pr[1][2], pr[1][3]);
+        }
+        return qk;
+    };
+
+    // PV MMA over the tile's values with the A fragments of `qk`; needs the value rows and scales and
+    // nothing else the key half holds.
+    const auto value_tile = [&](int s, const QkState& qk) {
+        const unsigned char* k_s = stages + s * S::Bytes;
+        const unsigned char* v_s = k_s + S::Values;
+        const unsigned parity    = qk.parity;
+        const unsigned (&pa)[4]  = qk.pa;
+
+        if constexpr (S::EvenOddValues) {
+            constexpr int Groups = V::Groups;
+            const __half2 down = qk.down;
             const int v_mat = lane >> 3, v_rin = lane & 7;
             const int v_row = v_rin + ((v_mat & 1) << 3);
             const auto value_scale = [&](int key, int g) {
                 if constexpr (Shape::Value == Code::Int8) {
-                    return reinterpret_cast<const __half*>(k_s + S::ValueScales)[key * Groups + g];
+                    return reinterpret_cast<const __half*>(k_s + S::ValueScales + qk.scale_at)[key * Groups + g];
                 } else {
-                    return row_scale(S::ValueScales, key);
+                    return row_scale(k_s, parity, S::ValueScales + qk.scale_at, key);
                 }
             };
 #pragma unroll
@@ -685,11 +758,6 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                 }
             }
         } else {
-            unsigned pa[4];
-            pa[0] = pack_f16x2(pr[0][0], pr[0][1]);
-            pa[1] = pack_f16x2(pr[0][2], pr[0][3]);
-            pa[2] = pack_f16x2(pr[1][0], pr[1][1]);
-            pa[3] = pack_f16x2(pr[1][2], pr[1][3]);
             const int v_mat = lane >> 3, v_rin = lane & 7;
             const int v_row = v_rin + ((v_mat & 1) << 3);
             // P x V over FP16 rows of `row_bytes` holding dimensions 8 c0 .. 8 c1 - 1 (16-byte chunks).
@@ -717,7 +785,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
                     for (int hc = 0; hc < 2; ++hc) {
                         const int chunk = c + hc;
                         const int g     = 2 * chunk + g_in;
-                        const unsigned char* vs = k_s + S::ValueScales + g;
+                        const unsigned char* vs = k_s + S::ValueScales + qk.scale_at + g;
                         unsigned b0[4], b1[4];
                         decode_v_quad_nvfp4(r[2 * hc], e4m3_to_half(vs[key * V::ScaleSlot]),
                                             e4m3_to_half(vs[(key + 1) * V::ScaleSlot]), b0);
@@ -776,29 +844,59 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 
             __syncwarp();
         }
     };
-    if constexpr (Stages == 1) {
-        // Two CTAs per SM: the other warps hide each tile's gather.
+    // Splitting the gather pays where a tile's key row is at least one byte per dimension (16 scattered
+    // 16-byte chunks): the gather is then long enough to hide behind the phase that does not read it.
+    // With 128-byte rows (NVFP4 keys) the second addressing, commit-group and wait per tile measured
+    // 3.5-5 % slower than the combined gather, so `Stage::SplitGather` keeps one group for it.
+    if constexpr (Stages == 1 && S::SplitGather) {
+        // Two CTAs per SM, one stage: the key half and the value half are separate commit groups, so a
+        // tile's values stream in behind its QK MMA and online softmax and the next tile's keys behind
+        // the PV MMA. Each half of the stage is refilled only after the phase that reads it is done (the
+        // `__syncwarp` barriers), and `cp_wait<1>` leaves exactly the one group the other phase still
+        // needs in flight. The other warps (this CTA's and the other CTA's) hide what is left.
+        if (warp < tiles) { issue(warp, 0, std::integral_constant<int, kGatherKey>{}); }
         for (int i = warp; i < tiles; i += Warps) {
-            issue(i, 0);
+            issue(i, 0, std::integral_constant<int, kGatherValue>{});
+            cp_wait<1>();  // this tile's keys are staged; its values may still be streaming
+            __syncwarp();
+            const QkState qk = score_tile(i, 0);
+            __syncwarp();  // every lane is done with the key rows before the next tile's overwrite
+            if (i + Warps < tiles) {
+                issue(i + Warps, 0, std::integral_constant<int, kGatherKey>{});
+                cp_wait<1>();  // this tile's values are staged; the next tile's keys may still stream
+            } else {
+                cp_wait<0>();
+            }
+            __syncwarp();
+            value_tile(0, qk);
+            __syncwarp();  // the value rows are read out before the next tile's overwrite
+        }
+    } else if constexpr (Stages == 1) {
+        // Two CTAs per SM: the other warps hide each tile's gather, whose keys and values stay one
+        // commit group (see `Stage::SplitGather`).
+        for (int i = warp; i < tiles; i += Warps) {
+            issue(i, 0, std::integral_constant<int, kGatherBoth>{});
             cp_wait<0>();
             __syncwarp();
             expand(0);
-            compute(i, 0);
+            const QkState qk = score_tile(i, 0);
+            value_tile(0, qk);
             __syncwarp();
         }
     } else {
         int s = 0;
-        if (warp < tiles) { issue(warp, 0); }
+        if (warp < tiles) { issue(warp, 0, std::integral_constant<int, kGatherBoth>{}); }
         for (int i = warp; i < tiles; i += Warps) {
             if (i + Warps < tiles) {
-                issue(i + Warps, s ^ 1);
+                issue(i + Warps, s ^ 1, std::integral_constant<int, kGatherBoth>{});
                 cp_wait<1>();
             } else {
                 cp_wait<0>();
             }
             __syncwarp();
             expand(s);
-            compute(i, s);
+            const QkState qk = score_tile(i, s);
+            value_tile(s, qk);
             __syncwarp();
             s ^= 1;
         }

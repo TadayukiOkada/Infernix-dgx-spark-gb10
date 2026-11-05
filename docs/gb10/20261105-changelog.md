@@ -268,3 +268,97 @@ and 2-stage / 2-CTA-per-SM `context_kv_grouped_kernel`) on NVIDIA GB10 (`sm_121a
 - **Cross-lane strided stats gather in `merge_kernel` (`base[lane * stride + kHeadDim]`)**: Parallelizing the split stats read across `lane < splits` caused 32 lanes in warp 0 to gather across 32 distinct `24,768 B` pages simultaneously (32 uncoalesced L1 sector requests instead of 1 warp-uniform L1 broadcast sector), regressing `width=1` by `+3..+7 us`. Replaced with the 128-thread (`4`-warp) `float2` vectorized `merge_kernel` that keeps `s` warp-uniform while halving CTA warp count and vectorizing row loads/stores.
 - **Sharing K/V SMEM plane on `Int8Group64` (`ShareKV = true` for `Int8Group64`)**: While `ShareKV = true` is required for `BFloat16` to fit below `50,176 B` (`81,552 B -> 48,784 B`), `Int8Group64`'s separate K and V planes already fit inside `49,808 B <= 50,176 B` at 2 CTAs/SM; serializing V `cp.async` behind the Score loop on `Int8Group64` added ~`6 us` at `width=8, context=8192`. Keeping `ShareKV` enabled only for `BFloat16` (`Stages == 1`) gives both `BFloat16` and `Int8Group64` 2 CTAs/SM while allowing `Int8Group64` to overlap both K and V `cp.async` with query load and Hadamard rotation.
 - **Compiler register spills at 64 regs/thread (`__launch_bounds__(512, 2)`)**: Naive 2-CTA/SM bounds initially caused `4..16 B` scalar spills in `Exact=true` instantiations due to LLVM IndVarSimplify expanding `n` into `end - begin` across the kernel and keeping `blockIdx.x/y/z` live until the epilogue. Fixed to `0` spills across all 34 functions using `kSingleTile`, `asm("" : "+r"(n))`, and epilogue PTX `mov.u32` reads of `%ctaid.x/y/z` and `%tid.x`.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T3: Overlap `cp.async` Key/Value tile gathers with QK/softmax and PV MMA in `qsa_prompt_kernel` (`Stages == 1`)
+
+## 1. Accounting
+
+- **Base commit**: `69bb2d5b6` (`perf(qsa): enable 2-CTA/SM decode occupancy, empty-split early exit, 2-token score loop, and float2 merge (T2)`).
+- **Modified files**: `src/ops/qsa/qsa_prompt.cu` (`M`, `+149/−51`), `docs/gb10/20261105-changelog.md` (`M`).
+- **Allowlist delta**: none. `tools/cuda_stack/cuda_stack_allowlist.json` is untouched — the ratchet neither admitted nor retired an entry, because `STACK:0 LOCAL:0` holds for all 14 `qsa_prompt_kernel` instantiations before and after.
+- **Rebuilds**: 7 single-invocation Ninja builds of `infernix-serve infernix_ops_attention_test infernix_qsa_attention_bench` (HEAD baseline bench binary for the interleaved A/B, the doc's literal split, the value-scales-with-keys variant, the double-buffered fix, the per-storage `ScaleSlots` fix, the shipped build, and a comment-only rebuild).
+
+## 2. Architectural rationale and task-premise corrections ("Why" on GB10 `sm_121a`)
+
+1. **The mechanism itself holds, and its size is storage-dependent**:
+   - `qsa_prompt_kernel<Storage, 1>` runs `2` CTAs/SM with one `Stage` per warp, and the grid is one CTA per `(selected column, kv_head)`, so the old loop `issue(i, 0); cp_wait<0>()` put each tile's whole scattered gather (`16` rows × `2` planes of up to `512 B`, in `16`-byte chunks pulled through `table[]`) directly in front of the only phases that could compute on it. Splitting the gather into a key commit group and a value commit group inside the same stage lets `V(i)` stream behind `QK` MMA + online softmax and `K(i + Warps)` behind the PV MMA, with `cp_wait<1>` leaving exactly the one group the other phase still needs in flight.
+   - NCU (synthetic bench inputs) confirms the causal chain where the gather is the stall: `bf16, 8192/2048` `stalled_long_scoreboard` `2.85 → 1.31` warp-cycles per issued instruction and tensor-pipe utilization `16.9% → 20.3%`; `bf16, 32768/2048` (L2 hit `84.6%`) `3.37 → 1.89` and `15.8% → 18.2%`.
+2. **Correction — the doc's K/V grouping is not what pays; the value *scales* must travel with the keys**:
+   - The doc's step 1 groups the value rows with the value scales. That leaves the `EvenOddValues` decode-rescale (`vmax = warp_max(own)` over the tile's value scales, then `while (shift < 14 && ldexpf(vmax, -shift) > V::MaxScale)`) on the PV MMA's critical path immediately after the value wait, i.e. a serial `redux` + up-to-`14`-iteration loop between two dependent MMAs. Gathering the value scales into the key commit group moves that chain into the QK phase, which has the value rows still in flight, and is worth a further `2–4` points (`int8` `−0.6% → −4.2%`, `k8v4` `−6.5% → −9.4%`). `pack_f16x2(pr * up)` / `down` are an exact power-of-two pair, so this is bit-identical wherever it is computed.
+3. **Correction — the split is not free for a small gather, so it is gated**:
+   - With `128 B` key rows (NVFP4) the second per-tile addressing pass (`attended_token` + `table[]` load + `qsa_space_plane`), the second `cp.async.commit_group` and the second wait cost more than the overlap returns: the literal split measured `+3.5 … +5.1%` on `nvfp4`. `Stage::SplitGather = Shape::Vq == 0 && K::Bytes >= kD` (one byte per dimension = `16` scattered chunks per row) keeps one commit group for NVFP4 keys and every vector-quantized storage; after the gate `nvfp4` is `−0.6 … +0.7%`, i.e. unchanged.
+4. **Correction — the doc's stated resources are stale**:
+   - Live `cuobjdump -res-usage` on `infernix-serve` is `REG:238..255 STACK:0 LOCAL:0` (not `REG:121..128`), and the stage is *dynamic* shared memory, so `SHARED` reads `0` in `cuobjdump` (not `46,592`/`47,616`). The real per-CTA footprint is `41,984 B` (`int8`), `41,536 B` (`fp8`), `34,112 B` (`k8v4`), `40,960 B` (`bf16`), `26,624 B` (`nvfp4`), read from NCU `launch__shared_mem_per_block_dynamic`. `2` CTAs/SM is both the SMEM and the register limit here (`Block Limit Registers = 2` at `255` regs), which is why the stage growth had to stay small.
+5. **Correction — a split stage needs double-buffered value scales, and the parity word must live in registers**:
+   - Putting the value scales in the key commit group means the *next* tile's key gather refills them while the *current* tile's PV MMA is still reading them. `ScaleSlots = 2` slots indexed by `value_scale_at(i) = ((i / Warps) & 1) * (kTile * V::ScaleSlot)` makes the slot the PV phase reads the one the pending gather has not touched yet; the slot count is only allocated where the split route runs (`nvfp4`/VQ keep `1`), which also removed the `+256 B`/CTA that uniform `2` cost them. The FP8 row-scale parity word is likewise carried per tile in `QkState` registers rather than re-read from the stage, because the next tile's key gather overwrites it before PV runs.
+6. **Correction — the doc's verification commands do not exist as written**: the bench takes `--storage/--contexts/--widths` (not `--kv-dtype/--context/--width`), and there is no `infernix_qsa_test` target; the gate is `ctest -R "infernix_cuda_stack_check|infernix_qsa"` (10 tests).
+
+## 3. Subsystem breakdown
+
+| Action | File | Mechanism |
+|---|---|---|
+| M | `src/ops/qsa/qsa_prompt.cu` | `issue(i, s, Part)` gains a compile-time gather-part (`kGatherKey`/`kGatherValue`/`kGatherBoth`) so one stage is filled by two commit groups; key group = key rows + key scales + value scales + parity word, value group = value rows. `Stage` adds `SplitGather` (`Vq == 0 && K::Bytes >= kD`) and `ScaleSlots` (`2` where the split runs, else `1`), with `value_scale_at(i) = ((i / Warps) & (ScaleSlots − 1)) * (kTile * V::ScaleSlot)` selecting the slot. The monolithic `compute` is split into `score_tile` (QK MMA + online softmax + the `EvenOddValues` decode-rescale folded into `QkState{pa[4], down, parity, scale_at}`) and `value_tile` (PV MMA reading `qk.scale_at`/`qk.parity`), so the rescale leaves the PV critical path. New `Stages == 1 && SplitGather` loop: prologue `issue(warp, 0, Key)`, then per tile `issue(i, 0, Value); cp_wait<1>; score_tile; __syncwarp; issue(i + Warps, 0, Key); cp_wait<1>/<0>; __syncwarp; value_tile; __syncwarp`, each half of the stage refilled only after the phase that reads it is done. NVFP4/VQ `Stages == 1` and the `Stages == 2` route keep the combined-gather form (behaviour unchanged). |
+
+## 4. Verification & benchmark results
+
+- **Tests** (`ctest --test-dir build-native -R "infernix_cuda_stack_check|infernix_qsa" --output-on-failure`, on the final shipped source): **10/10 passed (100%)** — `infernix_cuda_stack_check`, `infernix_qsa_index_test`, `infernix_qsa_bf16_test`, `infernix_qsa_int8_test`, `infernix_qsa_fp8_test`, `infernix_qsa_nvfp4_test`, `infernix_qsa_k8v4_test`, `infernix_qsa_vq2_test`, `infernix_qsa_k4v2_test`, `infernix_qsa_select_test`. These cover the prompt route at `W = 43, 86, 256, 257, 300, 4096` chunks against the independent FP32 oracle for every storage, plus the cross-width bit-exactness invariant.
+- **Resources** (`cuobjdump -res-usage build-native/apps/infernix-serve`): all **14** `qsa_prompt_kernel` instantiations `STACK:0 SHARED:0 LOCAL:0`, `REG:238..255` — identical to HEAD, so no allowlist entry was added or retired.
+- **Occupancy** (NCU `launch__shared_mem_per_block_dynamic`, `launch__occupancy_limit_shared_mem`):
+
+| Storage | `Stage::Bytes` × warps + Q/merge, per CTA | HEAD | T3 | limit |
+|---|---|---:|---:|---|
+| `int8` | `4 × stage + 8,192` | `41,984 B` | `42,496 B` (`+512`) | `2` CTAs/SM |
+| `fp8` | `4 × stage + 8,192` | `41,536 B` | `41,792 B` (`+256`) | `2` CTAs/SM |
+| `k8v4` | `4 × stage + 8,192` | `34,112 B` | `35,136 B` (`+1,024`) | `2` CTAs/SM |
+| `bf16` | `2 × stage + 8,192` | `40,960 B` | `40,960 B` (`+0`, no scales) | `2` CTAs/SM |
+| `nvfp4` | `4 × stage + 8,192` | `26,624 B` | `26,624 B` (`+0`, gated out) | `2` CTAs/SM |
+
+  Every value is `≤ 48,128 B` and the measured `launch__occupancy_limit_shared_mem` stays `2` for all five storages, so the `2` CTAs/SM the T2 work bought is preserved.
+- **Benchmarks** (`./build-native/bench/infernix_qsa_attention_bench --storage int8,bf16,fp8,k8v4,nvfp4 --contexts 8192,32768 --widths 64,512,2048 --warmup 5 --repeat 50`, 3 interleaved rounds of a freshly HEAD-rebuilt baseline binary vs the shipped binary, cold L2, CUDA-graph medians; `attention_us = total − select`):
+
+| Storage | Context | Width | Task-doc baseline | In-session HEAD (3-round mean) | T3 (3-round mean) | vs doc | vs HEAD |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `int8` | `8192` | `64` | — | `189.0` | `183.6` | — | **−2.8%** |
+| **`int8`** | **`8192`** | **`512`** | **`1,089.6`** | `1,075.3` | `1,041.0` | `−4.5%` | **−3.2%** |
+| **`int8`** | **`8192`** | **`2048`** | **`9,335.8`** | `4,260.0` | `4,045.5` | `−56.7%` | **−5.0%** |
+| `int8` | `32768` | `64` | — | `239.8` | `233.9` | — | **−2.5%** |
+| `int8` | `32768` | `512` | `1,178.7` | `1,157.4` | `1,101.3` | `−6.6%` | **−4.8%** |
+| `int8` | `32768` | `2048` | `11,786.1` | `4,469.7` | `4,282.4` | `−63.7%` | **−4.2%** |
+| `bf16` | `8192` | `64` | — | `277.2` | `239.8` | — | **−13.5%** |
+| **`bf16`** | **`8192`** | **`512`** | **`2,257.8`** | `1,645.2` | `1,353.8` | `−40.0%` | **−17.7%** |
+| **`bf16`** | **`8192`** | **`2048`** | **`14,111.9`** | `6,513.4` | `5,413.9` | `−61.6%` | **−16.9%** |
+| `bf16` | `32768` | `64` | — | `393.9` | `376.1` | — | **−4.5%** |
+| `bf16` | `32768` | `512` | `4,476.3` | `1,872.7` | `1,712.8` | `−61.7%` | **−8.5%** |
+| `bf16` | `32768` | `2048` | `17,126.4` | `7,199.6` | `6,435.5` | `−62.4%` | **−10.6%** |
+| `fp8` | `8192` | `64 / 512 / 2048` | — | `231.0 / 1,336.7 / 5,136.2` | `202.0 / 1,171.5 / 4,305.9` | — | **−12.6 / −12.4 / −16.2%** |
+| `fp8` | `32768` | `64 / 512 / 2048` | — | `283.1 / 1,375.3 / 5,298.2` | `250.4 / 1,198.7 / 4,502.1` | — | **−11.6 / −12.8 / −15.0%** |
+| `k8v4` | `8192` | `64 / 512 / 2048` | — | `202.1 / 1,151.1 / 4,460.9` | `185.1 / 1,039.0 / 4,003.9` | — | **−8.4 / −9.7 / −10.2%** |
+| `k8v4` | `32768` | `64 / 512 / 2048` | — | `233.9 / 1,187.3 / 4,627.9` | `233.0 / 1,076.6 / 4,198.0` | — | **−0.4 / −9.3 / −9.3%** |
+| `nvfp4` | `8192` | `64 / 512 / 2048` | — | `172.0 / 943.5 / 3,734.5` | `172.1 / 944.8 / 3,712.9` | — | **+0.1 / +0.1 / −0.6%** |
+| `nvfp4` | `32768` | `64 / 512 / 2048` | — | `184.4 / 967.4 / 3,838.1` | `185.8 / 963.2 / 3,834.3` | — | **+0.7 / −0.4 / −0.1%** |
+
+- **Acceptance verdict against the doc's `≥ 10%` bar** (`width = 512` and `2048`, `context = 8192` and `32768`, `int8` and `bf16`), measured against the in-session HEAD binary (the doc's absolute bars are stale — e.g. it quotes `bf16 8192/2048 = 14,111.9 µs` where HEAD measures `6,513.4 µs` in this session):
+  - `bf16, 8192`: `−17.7%` (`512`) and `−16.9%` (`2048`) — **met**.
+  - `bf16, 32768`: `−10.6%` (`2048`) — **met**; `−8.5%` (`512`) — **missed**.
+  - `int8`: `−2.5 … −5.0%` — **missed at all four points**.
+  - Outside the bar: `fp8` `−11.6 … −16.2%`, `k8v4` `−8.4 … −10.2%` (except `32768/64` `−0.4%`), `nvfp4` unchanged by design.
+
+## 5. Regressions and adverse results (all found, all disclosed)
+
+- **A race in the first working variant**: the value-scales-with-keys grouping (correction 2) let `issue(i + Warps, Key)` refill the value-scale slots while `value_tile(i)` still read them. It was the *fastest* variant on the bench, and `ctest -R "infernix_cuda_stack_check|infernix_qsa"` failed 3 of 10 tests / 38 individual checks, e.g. `qsa_attention k8v4 prompt W=86 B=1 selected: reduction criterion failed at index 304891 actual=0.046875 reference=0.124421` and `FAIL: qsa_attention k8v4 prompt W=4096 from 0: the split stage gives the combined gather's bits (first difference at column 65, head 0)` in `infernix_qsa_int8_test`, `infernix_qsa_fp8_test`, `infernix_qsa_k8v4_test`. Fixed by the `ScaleSlots = 2` double buffer (§2.5); the shipped build is 10/10.
+- **The doc's literal grouping regressed NVFP4 by `+3.5 … +5.1%`** (second addressing pass, commit group and wait per tile against a `128 B` key row). Fixed by the `Stage::SplitGather` gate; `nvfp4` is now `−0.6 … +0.7%`, i.e. inside run-to-run spread.
+- **Uniform `ScaleSlots = 2` regressed storages that never take the split**: the `+256 B`/CTA stage growth cost `k8v4 32768/64` `221–223 → 231–236 µs` (`+4.7%`) and `nvfp4 32768/64` `178–180 → 185–188 µs` (`+4.5%`), plus `nvfp4 8192/64` `+1.5%`, consistently across 3 interleaved rounds. Fixed by tying `ScaleSlots` to `SplitGather`; those points are now `−0.4%` and `−0.4…+0.7%`.
+- **`int8` is not gather-bound, so the bar is unreachable by reordering loads** (`−2.5 … −5.0%`, best case `−5.0%` vs the `≥ 10%` ask). At `int8, 8192/2048` the base kernel spends only `1.39` of `≈5.99` warp-cycles per issued instruction on `stalled_long_scoreboard`, against `wait 1.53`, `barrier 0.86`, `short_scoreboard 0.49`; after the overlap `long_scoreboard` falls to `1.18` while `wait` rises to `1.63` and `short_scoreboard` to `0.52` — the removed memory stall lands in the MMA/softmax dependency chain instead of leaving the SM, giving `issue_active 33.0% → 36.0%`, tensor `26.2% → 27.4%` and `−5%` duration. `4` warps × `2` CTAs already hide most of the gather; the `bf16` shape (`2` warps, `512 B` rows) is the one that is genuinely latency-bound.
+- **`bf16, 32768/512` misses the bar at `−8.5%`** (vs `−17.7%`/`−16.9%` at `context = 8192` and `−10.6%` at `32768/2048`): the selected-column count is set by the budget, so the extra work at `32768` is that the same gathers come out of a `4×` larger page pool, which is a smaller share of the `24 MiB` L2 (NCU on the neighbouring `32768/2048` shape measured an `84.6%` L2 hit rate). `32768/512` itself was not profiled, so this is the plausible cause, not a measured one.
+- **`k8v4, 32768/64` is flat (`−0.4%`)** and the `width = 64` points range `−2.5 … +0.7%`. The grid is `(columns, kv_heads)`, so `width = 64` launches `128` CTAs against the `96` resident ones (`2` CTAs/SM × `48` SMs) — a `1.33`-wave call whose tail and prologue dominate the per-tile gain the split buys; the per-warp tile count itself is unchanged. The only points above HEAD in the final build are `nvfp4 8192/64` (`+0.1%`), `nvfp4 8192/512` (`+0.1%`) and `nvfp4 32768/64` (`+0.7%`) — all three are gated out of the split and sit inside the baseline binary's own round-to-round spread (`nvfp4 32768/64` HEAD rounds: `187.8 / 185.5 / 179.9 µs`, `±4.3%`). No storage that takes the split got slower than HEAD at any measured point.
+
+## 6. Accepted gaps
+
+- The `int8`/`fp8`-class `4`-warp routes are dependency-bound, not gather-bound; removing the remaining `wait`/`short_scoreboard`/`barrier` chain needs the warp-specialized TMA producer/consumer redesign (task T5), not a load reorder. The `≥ 10%` `int8` bar is therefore not reachable inside T3's mechanism.
+- No cross-binary bit-equality measurement was run. The split changes only *when* bytes are staged and *in which phase* the exact power-of-two decode rescale is folded, never the arithmetic order (per-warp tile sets, MMA order, online-softmax recurrence, warp-order merge are untouched), and correctness rests on the independent-FP32-oracle tests plus the cross-width bit-exact invariant. A `--prompt-v2 0,1,1,0`-style in-process bit comparison across the two groupings was not performed for the final build.
+- `qsa_prompt_split()`, `qsa_prompt_force()` and the bench's `--prompt-v2` no longer route anything (the separate split stage was removed on GB10 before this task), so `test_prompt_variants` compares a variant against itself. Removing that dead API is outside T3's target file and was left alone.
+- The FP8 parity word is still written into the stage by the key group and consumed from `QkState` registers; the stage slot is now redundant for the split route and could be reclaimed (≤`16 B`/warp) by a follow-up.
+- `nvfp4` and the vector-quantized storages keep the combined gather. `Stage::SplitGather` would admit an NVFP4 route automatically if its key row ever reaches `256 B`, but that path is unmeasured.
+- The `Stages == 2` route (1 CTA/SM) is unchanged; the doc's premise that a second stage costs occupancy is untouched, and no attempt was made to make the split fill that role.
