@@ -107,6 +107,7 @@ struct QsaBatch {
 
 /// q: BF16 [Di, index_heads, T] in place: q = RoPE(norm(q; weight), rope_positions), with
 /// rope_positions I32 [T, 3] axis-major (axis a of column t at word a * T + t).
+/// geometry.rotary_dim must be divisible by 4.
 void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_positions,
                      const QsaGeometry& geometry, cudaStream_t stream);
 

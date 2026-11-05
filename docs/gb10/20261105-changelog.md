@@ -1124,3 +1124,169 @@ baseline binary vs shipped binary, across `T = 16…128` on both `H = 5120` prof
   execution and CUDA graph capture end-to-end (Passed, 359.7 s); the additional multi-scenario
   `infernix_qwen4_exp_speculative_sampling_real_test` was not run to completion (interrupted at
   worker session exit after 8.5 min).
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T10: `qsa_pool_keys` tail write fused into `pool_kernel`'s idle CTAs (one launch per call, both tail kernels deleted); barrier-free one-warp-per-head `index_query_kernel` with zero shared memory
+
+## 1. Accounting
+
+- Base commit (branch HEAD at work start): `f2f1f2acc`, branch `dev-rebased-20261028`. Working
+  tree clean before; nothing committed (the reviewer commits).
+- Files changed (2 `M` + this changelog):
+  - `M src/ops/qsa/qsa.cu` — `pool_kernel` takes `update_tails` and writes the raw-key tails from
+    its otherwise-idle CTAs (with a straddling-completion WAR guard); `tail_kernel` and
+    `tail_vec8_kernel` deleted together with both launches in `qsa_pool_keys`;
+    `index_query_kernel` rebuilt as one warp per index head (block `(32, index_heads)`, grid
+    `columns`), one `warp_sum`, zero shared memory, zero barriers.
+  - `M include/infernix/ops/qsa.h` — documents `qsa_index_query`'s new
+    `geometry.rotary_dim % 4 == 0` requirement (the pair-aligned warp mapping).
+- Stack-spill allowlist delta: none. Both touched kernels and the deleted ones are `STACK:0
+  LOCAL:0`; `infernix_cuda_stack_check` passes with the unchanged allowlist (261 entries).
+- Rebuild count: 6 single-invocation Ninja builds (HEAD baseline, candidate v1, mapping-fix v2,
+  pure-HEAD A/B baseline, final candidate, plus the v3 relink after the A/B stash round-trip).
+  `src/ops/qsa/*.cu` touched after the header edit (dead CUDA depfiles).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **The doc's RoPE partner is wrong for every real geometry.** The task assumed partners at
+  `d ± 64` (`rotary = 128`); the Qwen3.8-Flash-Next / Qwen3.8-Flash geometry — and every QSA test,
+  YaRN variant and `qwen4_exp` config route — uses `rotary_dim = 64`, so the partner is `d ± 32`.
+  The shipped mapping is pair-based, `(i, i + half)` with `half = rotary / 2`, so the real geometry
+  is the fast path, not the special case.
+- **"100% disjoint, so the fused write eliminates the tail kernel with zero extra work" is
+  incomplete: the fused write as specified creates a WAR race.** The CTAs are disjoint, but the
+  straddling block-completion CTA *reads* `tails[q % R]` for its block's positions `q` before the
+  call, and a later position `p = q + R` of the latest block maps to the *same* slot. Concretely:
+  `start = 2, width = 6` — the `p = 3` completion CTA reads slots 0 and 1 (positions 0, 1) while
+  the idle `p = 5` CTA would write slot 1 (`5 − 4`). The old two-kernel order serialized that
+  read-before-write; one kernel does not. Fix shipped: when a call starts mid-block and completes
+  a block (`start % R != 0 && start + (R - 1 - start % R) <= last`), that straddling CTA performs
+  *all* of the sequence's tail writes after its reads, and the sequence's idle CTAs skip theirs.
+  Aligned calls (prefill from 0, and every width-1 decode: reads and writes provably disjoint)
+  keep the doc's per-CTA write. Positions, slots and values are bitwise what the deleted kernels
+  wrote; the `index` oracle covers exactly these splits (`start = 1, 2, 3 mod 4`, blocks completed
+  inside and across steps).
+- **The doc's two-angle-per-lane mapping regresses the latency-bound widths.** Measured with ncu
+  against HEAD: its mapping (lane owns pairs `(2l, 2l + half)` and `(2l + 1, 2l + half + 1)`) chains
+  two dependent `rope_angle` calls in one warp — with one warp per head there is no second warp to
+  overlap them, so T = 5..64 measured +6…+42 % (launch 8: 6.30 → 8.93 µs). Shipped instead: for
+  `half ≤ 32` (every real geometry) lane `i < half` owns exactly one pair plus the unrotated pair
+  `rotary + 2i`, so the warp's critical path is one `rope_angle`; the two-pair mapping remains only
+  for `half > 32` (`rotary > 64`, no shipped geometry). `half * 2 + (32 − half) * 4 = 128 − 2 · half`
+  tiles `[rotary, 128)` exactly at 4 elements per lane.
+- **The verification commands do not run.** The bench's flags are `--storage/--contexts/--widths`
+  (not `--kv-dtype/--context/--width`), and `infernix_qsa_attention_bench` times only
+  `qsa_attention()` — it never calls `qsa_pool_keys` or `qsa_index_query`, so it is a regression
+  check on the untouched attention path, not the change's measurement. `infernix_qsa_test` is not
+  a Ninja target (the QSA test compiles into `infernix_ops_attention_test`; the
+  `build-native/tests/infernix_qsa_test` on disk is a stale 2026-10-28 binary), and
+  `ctest -R infernix_qsa_test` matches no test — the registered names are
+  `infernix_qsa_<part>_test`. The change was measured with nsys/ncu on
+  `infernix_ops_attention_test qsa --part index` (synthetic inputs), which is the Op's own oracle
+  driver.
+
+## 3. Subsystem breakdown
+
+- **`pool_kernel`** gains `bf16* tails` (was `const`) and `bool update_tails`. Non-completing CTA
+  (`(p + 1) % ratio != 0`): when `update_tails` and the sequence has no straddling completion, the
+  CTA whose `p ∈ [max(base, start), min(last, base + ratio − 2)]` writes
+  `tails[(tail_slots[seq] · (ratio − 1) + (p − base)) · kIndexDim + d] = raw[t · kIndexDim + d]`
+  (scalar bf16, coalesced per warp; the `tail_vec8` alignment branch is gone). Completing CTA:
+  after the mean loop that may read the tails, the straddler (`start % ratio != 0` and
+  `p == start + (ratio − 1 − start % ratio)`) writes the whole `[max(base, start), end]` span from
+  `raw` — same thread, read-before-write, so the WAR hazard the naive fusion introduced is
+  serialized where it matters. `last >= 0` guards both paths.
+- **`qsa_pool_keys`**: the `update_tails` tail launch (`tail_vec8_kernel` / `tail_kernel`,
+  `13×` per forward pass — 12 QSA layers + the MTP drafter) is deleted; one kernel per call.
+  `qsa_commit_tails` (verification commits) is untouched.
+- **`index_query_kernel`**: block `(32, index_heads)`, grid `(columns)` — 4× fewer CTAs; warp
+  `threadIdx.y` is head `h`. Lane loads its 4 elements (`half ≤ 32`: two scalar pair elements +
+  one `__nv_bfloat162` unrotated pair; `half > 32`: two `__nv_bfloat162` pairs), one `warp_sum`
+  over the row, RMSNorm with the unit-offset weight (BF16 rounding of the normalized vector kept
+  as the semantic boundary), one (or two) `rope_angle` on the column's three-axis M-RoPE position
+  (`rope + t`, stride `gridDim.x`), and vector/scalar BF16 stores. `__shared__` and
+  `__syncthreads` are gone: SASS contains zero `BAR`/`LDS`/`STS`/`LDL`/`STL` in 608 instructions.
+- **`qsa_index_query`**: requires `rotary_dim % 4 == 0` (keeps `half` even, which aligns every
+  contiguous pair access); documented in `qsa.h`. `qsa_prepare` and the attention kernels are
+  untouched; the FP32 reduction reassociation (butterfly over 32 lanes instead of
+  4 warp partials summed in shared memory) is criterion-gated by the existing `kKeyCriterion`.
+
+## 4. Verification
+
+- Resources (`cuobjdump --dump-resource-usage build-native/apps/infernix-serve`, candidate):
+  `index_query_kernel` REG 29 → 37, **SHARED 1552 → 0**, STACK 0, LOCAL 0; SASS 608 instr, zero
+  `BAR`/`LDS`/`STS`/`LDL`/`STL` (0 CTA barriers). `pool_kernel` REG 34 → 38, STACK 0, LOCAL 0,
+  SHARED 1552 (norm staging unchanged). `tail_kernel` (REG 30) and `tail_vec8_kernel` (REG 45)
+  no longer exist in the binary.
+- Tests: `ctest -R "infernix_cuda_stack_check|infernix_qsa"` → **10/10 passed** (stack gate +
+  `infernix_qsa_{index,bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2,select}`), including the `index` part's
+  exact-tail and pooled-key checks over calls with `start = 1, 2, 3 mod 4` and blocks completed
+  inside/across steps, on the final binary.
+- Launch counts (nsys, `qsa --part index`): `tail_vec8_kernel` **160 → 0**, `tail_kernel` 0 → 0,
+  `pool_kernel` 296 → 296, `index_query_kernel` 8 → 8 — `qsa_pool_keys` now launches one kernel
+  (13 fewer launches per forward round at the 12 + 1 call sites).
+- Op GPU time (nsys, same trace, cold device): `pool_kernel` total 911.3 → 957.3 µs (+5.1 %, it
+  absorbs the tail writes); `pool + tail_vec8` combined **1111.7 → 957.3 µs (−13.9 %)** with 160
+  fewer launches. `index_query_kernel` 8-launch total 37.8 → 36.3 µs (−4.1 %).
+- `index_query` ncu `gpu__time_duration.sum`, 3 interleaved base/candidate rounds (µs medians;
+  launch order T = 1, 5, 64, 1024, then YaRN {1, 64}, then YaRN positions ≤ 2²⁰ {1, 64}):
+
+  | shape | HEAD | T10 | Δ |
+  |---|---|---|---|
+  | T=1 | 7.30 | 6.82 | −6.6 % |
+  | T=5 | 9.25 | 6.08 | −34.3 % |
+  | T=64 | 21.38 | 9.63 | −55.0 % |
+  | T=1024 | 30.18 | 15.49 | −48.7 % |
+  | T=1 YaRN | 4.96 | 4.61 | −7.1 % |
+  | T=64 YaRN | 18.91 | 5.50 | −70.9 % |
+  | T=1 YaRN-lg | 5.06 | 4.86 | −3.9 % |
+  | T=64 YaRN-lg | 7.23 | 5.95 | −17.7 % |
+
+  8-launch sum 104.3 → 58.9 µs (−43.5 %). Both binaries are bimodal at T = 64/1024 (≈ 8 µs vs
+  ≈ 22 µs low/high clock states); in the matched low state T = 64 reads 7.33 → 7.87 µs (+7.4 %,
+  +0.54 µs, below the ≈ 2 µs timer tick) — see §5.
+- Bench regression check (`infernix_qsa_attention_bench --storage int8,bf16 --contexts 8192
+  --widths 1,8,16,64,512`, 2 interleaved full rounds, medians of 50, cold L2, graph): attention
+  path unchanged — all ten cases within −1.9…+1.7 % except `int8 W=1` (see §5).
+
+## 5. Regressions & adverse results
+
+Compared: fresh-HEAD binaries vs the final candidate, same workloads (`qsa --part index` under
+nsys/ncu, `qsa_attention_bench` int8+bf16 ctx 8192 widths 1..512), interleaved rounds.
+
+- **`pool_kernel` alone is +5.1 %** (nsys total 911.3 → 957.3 µs over 296 launches): the fused
+  tail writes moved into it. Disposition: accepted — the work is unchanged in kind, and the
+  pool+tail combined figure falls −13.9 % with 160 fewer launches (§4).
+- **First-mapping index_query regression (+6…+42 % at T = 5..64)** measured on candidate v1
+  before shipping (paired ncu: T=64 8.83 → 10.59, T=64 YaRN-lg 6.30 → 8.93 µs): fixed by the
+  one-pair-per-lane mapping (§2). Not in the shipped binary.
+- **`int8 W=1 attention_us +6.8 %` in the bench A/B** (26.8 → 28.6 µs round mean): the attention
+  kernels are byte-identical code in both binaries; the split `attention_us = total − select`
+  inherits the select-graph's clock state (candidate rounds read `select_us` 16.35/16.51 vs base
+  18.1). Four focused rounds: total 45.64 (base) vs 45.91 µs (candidate) = +0.6 %, within the
+  tick. Disposition: measurement artifact, not a regression.
+- **T=64 low-clock +7.4 % (7.33 → 7.87 µs)** in the one matched-clock pair; +0.54 µs is below the
+  timer tick and the same shape reads −55 % in the high state. Disposition: unresolved at this
+  resolution; disclosed. No production shape depends on it (decode T = 1..8 read −3.9…−34.3 %
+  consistently).
+- **`index_query` FP32 reduction reassociated** (row sum: butterfly over 32 lanes vs 4 warp
+  partials): output bits may differ from HEAD within the Op's published criterion
+  (`kKeyCriterion`), which the `index` oracle enforces; the route stays deterministic and
+  request-invariant. Disposition: accepted contract-level numeric shift, criterion-gated.
+- No STACK/LOCAL change anywhere (gate passes); `pool_kernel` REG +4 and `index_query_kernel`
+  REG +8 are the cost of the register-resident layouts — occupancy at these launch sizes is not
+  register-limited (≤ 128-thread CTAs, grids ≤ columns × 4).
+
+## 6. Accepted gaps / follow-ups
+
+- `rotary > 64` keeps the two-angle mapping (no shipped geometry; unmeasured). The contract
+  narrowed to `rotary_dim % 4 == 0` for `qsa_index_query`; a `rotary ≡ 2 (mod 4)` model would
+  need a scalar-pair mapping added there.
+- The fused write is scalar bf16 (2 B/thread). `tail_vec8`'s `uint4` is gone; the write is still
+  fully coalesced (64 B per warp instruction). An `__nv_bfloat162` pair write per idle thread is
+  possible but was not measured — the pool+tail sum is already −13.9 %.
+- The end-to-end launch-count gain (13 per round) was verified structurally (call sites + nsys
+  on the Op driver), not with a real-artifact `run_kv_matrix_bench.sh` A/B: the fused work is
+  Op-level and the campaign-level E2E gate belongs to a multi-op milestone.
+- `pool_kernel`'s idle CTAs now issue three extra position loads (`start`, `last`, straddle
+  test) before exiting; at width 1 decode every non-completing call's single CTA takes that path
+  (it also does the tail write, which the removed kernel did in a separate launch).

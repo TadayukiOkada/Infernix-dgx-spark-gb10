@@ -101,28 +101,77 @@ __device__ __forceinline__ void rope_angle(const std::int32_t* rope, std::int64_
 
 // ------------------------------------------------------------------------------- index query
 
-// One CTA (128 threads) per (index head, column).
-__global__ void __launch_bounds__(kIndexDim)
+// One CTA per column: warp `threadIdx.y` is index head h (blockDim = (32, heads)); the row's sum
+// of squares is one warp reduction, so the kernel uses no shared memory and no barrier. Every
+// rotary pair (i, i + half) and its angle live in one thread. For half <= 32 (every real QSA
+// geometry) lane i < half owns exactly one pair, plus the unrotated pair (rotary + 2i, +1), and
+// the lanes past half take four unrotated elements each: half * 2 + (32 - half) * 4 = 128 - 2 *
+// half tiles [rotary, kIndexDim) exactly and the warp's critical path is one rope_angle. Only
+// half > 32 (rotary > 64, no shipped geometry) has more pairs than lanes: there lanes take the
+// two pairs (2l, 2l + half) and (2l + 1, 2l + half + 1) and lanes past half / 2 cover the
+// unrotated region four elements each. rotary % 4 == 0 keeps half even, which aligns every
+// contiguous pair load and store to a __nv_bfloat162.
+__global__ void __launch_bounds__(32 * 4)
     index_query_kernel(bf16* __restrict__ q, const bf16* __restrict__ weight,
                        const std::int32_t* __restrict__ rope, int heads, int rotary,
                        float theta, PreparedRope yarn, float eps) {
-    __shared__ float scratch[4];
-    __shared__ float normed[kIndexDim];
     pdl::enter(); // launched as a programmatic dependent
-    const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
-    bf16* row     = q + (static_cast<std::size_t>(t) * heads + h) * kIndexDim;
-    const float x = __bfloat162float(row[d]);
-    const float inv = rsqrtf(block_sum(x * x, scratch) / kIndexDim + eps);
-    normed[d]       = __bfloat162float(__float2bfloat16_rn(x * inv * (1.0F + __bfloat162float(weight[d]))));
-    __syncthreads();
-    float out = normed[d];
-    if (d < rotary) {
-        const int half = rotary / 2, i = d % half;
-        float c, s;
-        rope_angle(rope + t, gridDim.y, i, rotary, theta, yarn, c, s);
-        out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
+    const int t = blockIdx.x, h = threadIdx.y, lane = threadIdx.x;
+    const int half = rotary / 2;
+    bf16* row = q + (static_cast<std::size_t>(t) * heads + h) * kIndexDim;
+    const bool one_pair = half <= 32, pair_rotated = one_pair ? lane < half : lane < half / 2;
+    int e0, e1, e2, e3;
+    if (one_pair) { // pair (lane, lane + half) for lanes < half; e2..e3 are never rotary partners
+        e0 = pair_rotated ? lane : rotary + 2 * half + 4 * (lane - half);
+        e1 = pair_rotated ? lane + half : e0 + 1;
+        e2 = pair_rotated ? rotary + 2 * lane : e0 + 2;
+    } else { // two bf162 pairs per lane: (e0, e0 + 1) and (e2, e2 + 1)
+        e0 = pair_rotated ? 2 * lane : rotary + (lane - half / 2) * 4;
+        e2 = pair_rotated ? e0 + half : e0 + 2;
     }
-    row[d] = __float2bfloat16_rn(out);
+    e3 = e2 + 1;
+    float x0, x1, x2, x3;
+    if (pair_rotated && one_pair) { // the pair straddles the half split: two scalar elements
+        x0 = __bfloat162float(row[e0]);
+        x1 = __bfloat162float(row[e1]);
+    } else {
+        const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(row + e0);
+        x0                     = __low2float(a);
+        x1                     = __high2float(a);
+    }
+    const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(row + e2);
+    x2                     = __low2float(b);
+    x3                     = __high2float(b);
+    const float inv = rsqrtf(warp_sum(x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3) / kIndexDim + eps);
+    const auto normed   = [&](float x, int e) {
+        return __bfloat162float(__float2bfloat16_rn(x * inv * (1.0F + __bfloat162float(weight[e]))));
+    };
+    const float n0 = normed(x0, e0), n1 = normed(x1, e1), n2 = normed(x2, e2), n3 = normed(x3, e3);
+    float o0 = n0, o1 = n1, o2 = n2, o3 = n3;
+    if (pair_rotated) {
+        // Pair i rotates by the column's axis i % 3 angle; the low element takes -s and the high
+        // element +s, exactly as the elementwise reference. one_pair holds the pair in (e0, e1),
+        // the two-pair layout in (e0, e2) and (e1, e3).
+        float c0, s0, c1, s1;
+        rope_angle(rope + t, gridDim.x, one_pair ? lane : e0, rotary, theta, yarn, c0, s0);
+        if (one_pair) {
+            o0 = n0 * c0 - n1 * s0;
+            o1 = n1 * c0 + n0 * s0;
+        } else {
+            rope_angle(rope + t, gridDim.x, e0 + 1, rotary, theta, yarn, c1, s1);
+            o0 = n0 * c0 - n2 * s0;
+            o2 = n2 * c0 + n0 * s0;
+            o1 = n1 * c1 - n3 * s1;
+            o3 = n3 * c1 + n1 * s1;
+        }
+    }
+    if (pair_rotated && one_pair) {
+        row[e0] = __float2bfloat16_rn(o0);
+        row[e1] = __float2bfloat16_rn(o1);
+    } else {
+        *reinterpret_cast<__nv_bfloat162*>(row + e0) = __floats2bfloat162_rn(o0, o1);
+    }
+    *reinterpret_cast<__nv_bfloat162*>(row + e2) = __floats2bfloat162_rn(o2, o3);
 }
 
 // --------------------------------------------------------------------------------- pooled keys
@@ -136,22 +185,47 @@ __device__ __forceinline__ bf16* pooled_element(bf16* pool, const QsaPageSpaces&
            static_cast<std::int64_t>(slot_width) * (position & kPagedKVPageMask) + lane;
 }
 
-// One CTA (128 threads) per column; columns that complete a block pool it.
+// One CTA (128 threads) per column; columns that complete a block pool it. The other CTAs are
+// otherwise idle and (when update_tails) write the raw key of their position to the sequence's
+// tail slot: the tail positions p of the latest block satisfy p % ratio <= ratio - 2, so they are
+// always among the non-completing columns, and the fused write covers exactly the positions the
+// separate tail kernel used to copy. A block the call completes whose first position precedes the
+// call reads the tails for those earlier positions; its tail slot q % ratio is exactly the slot a
+// later position p' = q + ratio of the latest block would overwrite, so when such a straddling
+// completion exists this CTA performs all of the sequence's tail writes instead, after its reads —
+// the idle CTAs of that sequence skip their write and no CTA races another's tail read.
 __global__ void __launch_bounds__(kIndexDim)
     pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict__ weight,
-                const bf16* __restrict__ tails, const std::int32_t* __restrict__ tables,
+                bf16* __restrict__ tails, const std::int32_t* __restrict__ tables,
                 int table_stride, const std::int32_t* __restrict__ table_rows,
                 const std::int32_t* __restrict__ positions,
                 const std::int32_t* __restrict__ tail_slots,
                 const std::int32_t* __restrict__ rope, const std::int32_t* __restrict__ block_rope,
                 int batch, int width, int ratio, int rotary, float theta, PreparedRope yarn, float eps,
-                bf16* __restrict__ pooled, QsaPageSpaces spaces) {
+                bool update_tails, bf16* __restrict__ pooled, QsaPageSpaces spaces) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     pdl::enter(); // launched as a programmatic dependent
     const int t = blockIdx.x, d = threadIdx.x;
     const int p = positions[t];
-    if ((p + 1) % ratio != 0) { return; }
+    if ((p + 1) % ratio != 0) {
+        if (update_tails) {
+            const int sequence = t / width;
+            const int start    = positions[sequence * width];
+            const int last     = positions[sequence * width + width - 1];
+            const int shift    = start % ratio;
+            const bool straddles = last >= 0 && shift != 0 && start + (ratio - 1 - shift) <= last;
+            if (!straddles) {
+                const int base = last - last % ratio;
+                const int end  = min(last, base + ratio - 2);
+                if (p >= base && p <= end) {
+                    tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) +
+                           (p - base)) * kIndexDim + d] = raw[static_cast<std::size_t>(t) * kIndexDim + d];
+                }
+            }
+        }
+        return;
+    }
     const int sequence = t / width;
     const int start    = positions[sequence * width];
     const int first    = p - ratio + 1;
@@ -161,6 +235,20 @@ __global__ void __launch_bounds__(kIndexDim)
                                   : tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) +
                                            (q % ratio)) * kIndexDim + d];
         sum += __bfloat162float(v);
+    }
+    if (update_tails) {
+        const int shift = start % ratio;
+        if (shift != 0 && p == start + (ratio - 1 - shift)) { // this CTA straddles: it owns the writes
+            const int last = positions[sequence * width + width - 1];
+            if (last >= 0) {
+                const int base = last - last % ratio;
+                const int end  = min(last, base + ratio - 2);
+                for (int q = max(base, start); q <= end; ++q) {
+                    tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) +
+                           (q - base)) * kIndexDim + d] = raw[static_cast<std::size_t>(t + (q - p)) * kIndexDim + d];
+                }
+            }
+        }
     }
     const float mean = __bfloat162float(__float2bfloat16_rn(sum / static_cast<float>(ratio)));
     const float inv  = rsqrtf(block_sum(mean * mean, scratch) / kIndexDim + eps);
@@ -180,45 +268,6 @@ __global__ void __launch_bounds__(kIndexDim)
     const int slot_width      = kIndexDim / ratio;
     const int token           = first + d / slot_width;
     *pooled_element(pooled, spaces, table, token, slot_width, d % slot_width) = __float2bfloat16_rn(out);
-}
-
-// One CTA per sequence: the raw keys of the latest block's positions q % R < R - 1, up to the
-// call's last position. A block the call completes keeps them too: a later call that rewrites its
-// last position alone (the MTP drafter's prepend and draft step 0) re-pools it from the tails.
-__global__ void tail_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
-                            const std::int32_t* __restrict__ tail_slots, int width, int ratio,
-                            bf16* __restrict__ tails) {
-    pdl::enter(); // launched as a programmatic dependent
-    const int sequence = blockIdx.x, d = threadIdx.x;
-    const int start    = positions[sequence * width];
-    const int last     = positions[sequence * width + width - 1];
-    const int base     = last - last % ratio;
-    const int end      = min(last, base + ratio - 2);
-    for (int q = max(base, start); q <= end; ++q) { // positions before the call are in the tail already
-        const int column = sequence * width + (q - start);
-        tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) * kIndexDim + d] =
-            raw[static_cast<std::size_t>(column) * kIndexDim + d];
-    }
-}
-
-__global__ void __launch_bounds__(32)
-    tail_vec8_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
-                     const std::int32_t* __restrict__ tail_slots, int width, int ratio,
-                     bf16* __restrict__ tails) {
-    pdl::enter(); // launched as a programmatic dependent
-    const int sequence = blockIdx.x, d = threadIdx.x * 8;
-    if (d >= kIndexDim) { return; }
-    const int start = positions[sequence * width];
-    const int last  = positions[sequence * width + width - 1];
-    const int base  = last - last % ratio;
-    const int end   = min(last, base + ratio - 2);
-    for (int q = max(base, start); q <= end; ++q) {
-        const int column = sequence * width + (q - start);
-        *reinterpret_cast<uint4*>(tails + (static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) *
-                                              kIndexDim +
-                                  d) =
-            *reinterpret_cast<const uint4*>(raw + static_cast<std::size_t>(column) * kIndexDim + d);
-    }
 }
 
 // One CTA per (sequence, layer): the tail after the first commit_columns[sequence] columns.
@@ -1232,7 +1281,8 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_po
                 rope_positions.numel() == 3 * static_cast<std::int64_t>(columns) &&
                 norm_weight.numel() == kIndexDim && columns > 0,
             "index query shapes disagree (RoPE positions are [T, 3])");
-    require(pdl::launch_consumer({dim3(geometry.index_heads, columns), dim3(kIndexDim), 0, stream}, index_query_kernel,
+    require(geometry.rotary_dim % 4 == 0, "index query needs a rotary width divisible by 4");
+    require(pdl::launch_consumer({dim3(columns), dim3(32, geometry.index_heads), 0, stream}, index_query_kernel,
         static_cast<bf16*>(q.data), static_cast<const bf16*>(norm_weight.data),
         static_cast<const std::int32_t*>(rope_positions.data), geometry.index_heads, geometry.rotary_dim,
         geometry.theta, index_rope(geometry), geometry.eps) == cudaSuccess,
@@ -1256,35 +1306,18 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
                 contiguous(batch.block_start_rope, DType::I32) && batch.block_start_rope.ne[0] == batch.batch &&
                 batch.block_start_rope.numel() == 3 * static_cast<std::int64_t>(batch.batch),
             "pool RoPE positions are [T, 3] and block starts [batch, 3]");
+    // The tail write (when update_tails) is fused into pool_kernel's otherwise-idle CTAs.
     require(pdl::launch_consumer({dim3(columns), dim3(kIndexDim), 0, stream}, pool_kernel,
         static_cast<const bf16*>(raw_keys.data), static_cast<const bf16*>(norm_weight.data),
-        static_cast<const bf16*>(tails.data), static_cast<const std::int32_t*>(batch.block_tables.data),
+        static_cast<bf16*>(tails.data), static_cast<const std::int32_t*>(batch.block_tables.data),
         batch.block_tables.ne[0], static_cast<const std::int32_t*>(batch.table_rows.data),
         static_cast<const std::int32_t*>(batch.positions.data), static_cast<const std::int32_t*>(batch.tail_slots.data),
         static_cast<const std::int32_t*>(batch.rope_positions.data),
         static_cast<const std::int32_t*>(batch.block_start_rope.data), batch.batch, batch.width, geometry.ratio,
-        geometry.rotary_dim, geometry.theta, index_rope(geometry), geometry.eps,
+        geometry.rotary_dim, geometry.theta, index_rope(geometry), geometry.eps, batch.update_tails,
         static_cast<bf16*>(layer.pooled_pages.data), layer.spaces) == cudaSuccess,
             "pool launch failed");
     check_launch("pool");
-    if (!batch.update_tails) { return; }
-    const bool vec8 = ((reinterpret_cast<std::uintptr_t>(raw_keys.data) |
-                        reinterpret_cast<std::uintptr_t>(tails.data)) &
-                       15U) == 0U;
-    if (vec8) {
-        require(pdl::launch_consumer({dim3(batch.batch), dim3(32), 0, stream}, tail_vec8_kernel,
-            static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(batch.positions.data),
-            static_cast<const std::int32_t*>(batch.tail_slots.data), batch.width, geometry.ratio,
-            static_cast<bf16*>(tails.data)) == cudaSuccess,
-                "tail launch failed");
-    } else {
-        require(pdl::launch_consumer({dim3(batch.batch), dim3(kIndexDim), 0, stream}, tail_kernel,
-            static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(batch.positions.data),
-            static_cast<const std::int32_t*>(batch.tail_slots.data), batch.width, geometry.ratio,
-            static_cast<bf16*>(tails.data)) == cudaSuccess,
-                "tail launch failed");
-    }
-    check_launch("tail");
 }
 
 void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Tensor& commit_columns,
