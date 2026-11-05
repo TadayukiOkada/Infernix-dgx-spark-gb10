@@ -10,6 +10,10 @@
 //     the updated residual, and the state shift exactly: the history becomes the trailing span
 //     columns of (old history, this call's conv inputs), in place or into another slot; an empty
 //     destination leaves every state unchanged; untouched slots and guards stay intact.
+//   - ple_gate_conv_inject: at one column per sequence (width == 1) with a state update it must be
+//     bitwise-identical to the composed pair (residual and states, BF16 and FP32 norms, in-place
+//     and moved slots), must match the end-to-end FP64 formula (with the conv consuming the
+//     once-rounded gate outputs), and at any other width it takes the composed route exactly.
 
 #include "infernix/ops/ple.h"
 #include "ops/op_family.h"
@@ -280,6 +284,186 @@ void test_conv(int channels, int taps, int dilation, int sequences, int width, b
     g_failures += d_residual.verify_guards(label + " residual");
 }
 
+// ple_gate_conv_inject on identical copies against the composed ple_gate + ple_conv_inject: the
+// updated residual and the shifted states must agree bit for bit, and the entrypoint must take the
+// fused kernel (which never writes gated/normalized) exactly when the geometry is one column per
+// sequence with an aligned vectorizable gate and convolution and a folded span. The residual is
+// also checked against the end-to-end FP64 formula, where the convolution consumes the gate's
+// once-rounded outputs.
+void test_gate_conv(int streams, int hidden, int taps, int dilation, int sequences, int width, bool distinct,
+                    bool fp32_norms, std::uint32_t seed) {
+    const std::string label = "ple_gate_conv_inject S=" + std::to_string(streams) + " H=" + std::to_string(hidden) +
+                              " K=" + std::to_string(taps) + " d=" + std::to_string(dilation) +
+                              " B=" + std::to_string(sequences) + " W=" + std::to_string(width) +
+                              (fp32_norms ? " f32" : " bf16") + (distinct ? " moved" : " in place");
+    std::mt19937 rng(seed);
+    const int span    = (taps - 1) * dilation;
+    const int columns = sequences * width;
+    const int slots   = 2 * sequences + 1;
+    const std::size_t W = static_cast<std::size_t>(streams) * hidden;
+    const auto key      = random_bf16(W * columns, rng, -2.0F, 2.0F);
+    const auto value    = random_bf16(static_cast<std::size_t>(hidden) * columns, rng, -1.5F, 1.5F);
+    const auto residual = random_bf16(W * columns, rng, -3.0F, 3.0F);
+    const auto weight   = random_bf16(W * taps, rng, -0.8F, 0.8F);
+    const auto states   = random_bf16(static_cast<std::size_t>(W) * span * slots, rng, -2.0F, 2.0F);
+    const auto key_norm_bits   = random_bf16(W, rng, -0.5F, 0.5F);
+    const auto query_norm_bits = random_bf16(W, rng, -0.5F, 0.5F);
+    const auto conv_norm_bits  = random_bf16(W, rng, -0.5F, 0.5F);
+    std::vector<std::int32_t> source(sequences), destination(sequences);
+    for (int i = 0; i < sequences; ++i) {
+        source[i]      = 2 * i + 1;
+        destination[i] = distinct ? 2 * i : source[i];
+    }
+    const float eps = 1.0e-6F;
+
+    DeviceBuffer d_key = to_device(key), d_value = to_device(value), d_weight = to_device(weight);
+    DeviceBuffer d_source = to_device(source), d_destination = to_device(destination);
+    const auto as_float = [](const std::vector<std::uint16_t>& v) {
+        std::vector<float> f(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) { f[i] = bf16_to_f32(v[i]); }
+        return f;
+    };
+    const DType norm_type = fp32_norms ? DType::FP32 : DType::BF16;
+    DeviceBuffer d_key_norm =
+        fp32_norms ? to_device(as_float(key_norm_bits)) : to_device(key_norm_bits);
+    DeviceBuffer d_query_norm =
+        fp32_norms ? to_device(as_float(query_norm_bits)) : to_device(query_norm_bits);
+    DeviceBuffer d_conv_norm =
+        fp32_norms ? to_device(as_float(conv_norm_bits)) : to_device(conv_norm_bits);
+
+    const auto launch = [&](bool fused, GuardedDeviceBuffer& d_residual, GuardedDeviceBuffer& d_states,
+                            GuardedDeviceBuffer& d_gated, GuardedDeviceBuffer& d_normalized) {
+        const auto W32 = static_cast<std::int32_t>(W);
+        Tensor t_key(d_key.p, DType::BF16, {W32, columns});
+        Tensor t_value(d_value.p, DType::BF16, {static_cast<std::int32_t>(hidden), columns});
+        Tensor t_residual(d_residual.data(), DType::BF16, {W32, columns});
+        Tensor t_key_norm(d_key_norm.p, norm_type, {W32});
+        Tensor t_query_norm(d_query_norm.p, norm_type, {W32});
+        Tensor t_conv_norm(d_conv_norm.p, norm_type, {W32});
+        Tensor t_weight(d_weight.p, DType::BF16, {W32, taps});
+        Tensor t_states(d_states.data(), DType::BF16, {W32, span, slots});
+        Tensor t_source(d_source.p, DType::I32, {sequences});
+        Tensor t_destination(d_destination.p, DType::I32, {sequences});
+        Tensor t_gated(d_gated.data(), DType::BF16, {W32, columns});
+        Tensor t_normalized(d_normalized.data(), DType::BF16, {W32, columns});
+        if (fused) {
+            ops::ple_gate_conv_inject(t_key, t_value, t_residual, t_key_norm, t_query_norm, t_conv_norm, streams, eps,
+                                      t_weight, dilation, t_states, t_source, t_destination, t_gated, t_normalized,
+                                      nullptr);
+        } else {
+            ops::ple_gate(t_key, t_value, t_residual, t_key_norm, t_query_norm, t_conv_norm, streams, eps, t_gated,
+                          t_normalized, nullptr);
+            ops::ple_conv_inject(t_gated, t_normalized, t_weight, dilation, t_states, t_source, t_destination,
+                                 t_residual, nullptr);
+        }
+        cuda_synchronize();
+    };
+    const auto fresh_residual = [&] {
+        GuardedDeviceBuffer buffer(residual.size() * 2);
+        buffer.copy_from_host(residual.data(), residual.size() * 2);
+        return buffer;
+    };
+    const auto fresh_states = [&] {
+        GuardedDeviceBuffer buffer(states.size() * 2);
+        buffer.copy_from_host(states.data(), states.size() * 2);
+        return buffer;
+    };
+    const auto fresh_scratch = [&] {
+        GuardedDeviceBuffer buffer(W * columns * 2);
+        buffer.fill(0xFF);
+        return buffer;
+    };
+
+    auto res_composed = fresh_residual(), states_composed = fresh_states(), gated_composed = fresh_scratch(),
+         normalized_composed = fresh_scratch();
+    launch(false, res_composed, states_composed, gated_composed, normalized_composed);
+
+    auto res_fused = fresh_residual(), states_fused = fresh_states(), gated_fused = fresh_scratch(),
+         normalized_fused = fresh_scratch();
+    launch(true, res_fused, states_fused, gated_fused, normalized_fused);
+
+    g_failures += verify_exact((label + " residual == composed").c_str(),
+                               from_device<std::uint16_t>(res_fused.data(), residual.size()),
+                               from_device<std::uint16_t>(res_composed.data(), residual.size()));
+    g_failures += verify_exact((label + " states == composed").c_str(),
+                               from_device<std::uint16_t>(states_fused.data(), states.size()),
+                               from_device<std::uint16_t>(states_composed.data(), states.size()));
+
+    // The fused kernel never materializes the convolution inputs; the composed fallback always does.
+    const bool expect_fused = width == 1 && hidden % 8 == 0 && span >= 1 && span <= 16;
+    const auto untouched = [](GuardedDeviceBuffer& buffer, std::size_t count) {
+        const auto words = from_device<std::uint16_t>(buffer.data(), count);
+        return std::all_of(words.begin(), words.end(), [](std::uint16_t w) { return w == 0xFFFFU; });
+    };
+    expect(untouched(gated_fused, W * columns) == expect_fused,
+           label + (expect_fused ? " keeps gated unwritten (fused route)" : " writes gated (composed fallback)"));
+    expect(untouched(normalized_fused, W * columns) == expect_fused, label + " normalized matches the route");
+    g_failures += gated_fused.verify_guards(label + " gated");
+    g_failures += normalized_fused.verify_guards(label + " normalized");
+    g_failures += states_fused.verify_guards(label + " states");
+    g_failures += res_fused.verify_guards(label + " residual");
+
+    // End-to-end FP64 oracle: the gate in FP64, each output rounded once to BF16, the convolution
+    // over those rounded values, the residual updated once.
+    std::vector<std::uint16_t> gated_bits(W * columns), normalized_bits(W * columns);
+    for (int t = 0; t < columns; ++t) {
+        for (int s = 0; s < streams; ++s) {
+            const std::size_t base = static_cast<std::size_t>(t) * W + static_cast<std::size_t>(s) * hidden;
+            double key_sq = 0, query_sq = 0;
+            for (int d = 0; d < hidden; ++d) {
+                key_sq += std::pow(bf16_value(key[base + d]), 2);
+                query_sq += std::pow(bf16_value(residual[base + d]), 2);
+            }
+            const double key_inv   = 1.0 / std::sqrt(key_sq / hidden + eps);
+            const double query_inv = 1.0 / std::sqrt(query_sq / hidden + eps);
+            double dot = 0;
+            for (int d = 0; d < hidden; ++d) {
+                const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+                dot += bf16_value(key[base + d]) * key_inv * (1.0 + bf16_value(key_norm_bits[c])) *
+                       bf16_value(residual[base + d]) * query_inv * (1.0 + bf16_value(query_norm_bits[c]));
+            }
+            double g = dot / std::sqrt(static_cast<double>(hidden));
+            g        = std::copysign(std::sqrt(std::max(std::abs(g), 1.0e-6)), g);
+            const double gate = 1.0 / (1.0 + std::exp(-g));
+            double gated_sq   = 0;
+            for (int d = 0; d < hidden; ++d) {
+                const double v = gate * bf16_value(value[static_cast<std::size_t>(t) * hidden + d]);
+                gated_bits[base + d] = bf16_of(v);
+                gated_sq += v * v;
+            }
+            const double gated_inv = 1.0 / std::sqrt(gated_sq / hidden + eps);
+            for (int d = 0; d < hidden; ++d) {
+                const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+                const double v      = gate * bf16_value(value[static_cast<std::size_t>(t) * hidden + d]);
+                normalized_bits[base + d] = bf16_of(v * gated_inv * (1.0 + bf16_value(conv_norm_bits[c])));
+            }
+        }
+    }
+    const auto history = [&](int sequence, int channel, int index) -> double {
+        if (index < span) {
+            return bf16_value(states[(static_cast<std::size_t>(source[sequence]) * span + index) * W + channel]);
+        }
+        return bf16_value(normalized_bits[(static_cast<std::size_t>(sequence) * width + (index - span)) * W + channel]);
+    };
+    std::vector<double> want_residual(residual.size());
+    for (int sequence = 0; sequence < sequences; ++sequence) {
+        for (int local = 0; local < width; ++local) {
+            for (int c = 0; c < static_cast<int>(W); ++c) {
+                double acc = 0;
+                for (int j = 0; j < taps; ++j) {
+                    acc += bf16_value(weight[static_cast<std::size_t>(j) * W + c]) *
+                           history(sequence, c, span + local - (taps - 1 - j) * dilation);
+                }
+                const std::size_t i = (static_cast<std::size_t>(sequence) * width + local) * W + c;
+                want_residual[i] =
+                    bf16_value(residual[i]) + bf16_value(gated_bits[i]) + acc / (1.0 + std::exp(-acc));
+            }
+        }
+    }
+    g_failures += verify_pointwise(label + " residual vs FP64", from_device_bf16(res_fused.data(), residual.size()),
+                                   want_residual, kOneRounding);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(ple) {
@@ -316,6 +500,18 @@ INFERNIX_OP_TEST(ple) {
         // the folded limit keeps the separate shift, and another dilation checks the tap mapping.
         test_conv(300, 3, 4, 2, 1, true, false, 242U);
         test_conv(300, 6, 4, 2, 1, true, true, 243U);
+        // ple_gate_conv_inject: Qwen3.8-Flash-Next's decode geometry (four streams of 2,560, four
+        // taps, dilation 3: span 9) in place and moved, with BF16 and FP32 norms, and two
+        // sequences; the folded span edge (16); and the composed fallbacks (a past-limit span, an
+        // unaligned hidden, a chunk wider than one column).
+        test_gate_conv(4, 2560, 4, 3, 1, 1, false, false, 300U);
+        test_gate_conv(4, 2560, 4, 3, 1, 1, true, false, 301U);
+        test_gate_conv(4, 2560, 4, 3, 1, 1, false, true, 302U);
+        test_gate_conv(4, 2560, 4, 3, 2, 1, true, false, 303U);
+        test_gate_conv(4, 2048, 5, 4, 1, 1, false, false, 304U);
+        test_gate_conv(4, 2048, 6, 4, 1, 1, false, false, 305U);
+        test_gate_conv(2, 300, 4, 3, 2, 1, false, false, 306U);
+        test_gate_conv(4, 2048, 4, 3, 2, 2, false, true, 307U);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

@@ -59,6 +59,19 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream);
 
+/// ple_gate immediately followed by ple_conv_inject, fused into one kernel when the geometry is a
+/// decode column per sequence (one column each, so width == 1) with a state update, an aligned
+/// 8-element-vectorizable gate and convolution, and a history span within the folded limit: the
+/// gated and normalized values then stay in registers between the two stages and never reach
+/// global memory. The fused result is bitwise-identical to the composed pair; any other geometry
+/// (or an invalid one, which throws) takes exactly the composed ple_gate + ple_conv_inject, for
+/// which gated and normalized are the scratch (and must satisfy ple_gate's contract).
+void ple_gate_conv_inject(const Tensor& key, const Tensor& value, Tensor& residual,
+                          const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
+                          std::int32_t streams, float eps, const Tensor& weight, std::int32_t dilation,
+                          Tensor& states, const Tensor& source_slots, const Tensor& destination_slots,
+                          Tensor& gated, Tensor& normalized, cudaStream_t stream);
+
 /// Commits the first commit_columns[b] (I32 [B], each in [0, W]) of row b's verified columns to
 /// slot slots[b] (I32 [B]): the history becomes the trailing span columns of the old history
 /// followed by normalized[:, 0:n, b] (normalized: BF16 [C, W, B], the conv inputs ple_gate

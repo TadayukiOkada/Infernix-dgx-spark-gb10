@@ -564,7 +564,8 @@ Tensor Forward::ple_embedding(const PleParameters& p, const ForwardBatch& batch)
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0];
     if (const NgramRowGate* gate = batch.ngram_gate) {
-        // ple_embed is a plain launch (no PDL), so stream order holds it behind the copy.
+        // The upload never triggers dependents early, so even where ple_embed is a programmatic
+        // dependent it still starts only once the copy has completed.
         upload_pinned_when(batch.ngram_rows.data, gate->pinned_rows, batch.ngram_rows.bytes(), gate->ready,
                            gate->expected, gate->wait_stats, gate->wait_row, s);
     }
@@ -615,14 +616,18 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
         key   = kv.slice(0, 0, W);
         value = kv.slice(0, W, H);
     }
+    // The decode gate + convolution fuse into one kernel (ple_gate_conv_inject) and keep the
+    // convolution inputs in registers; these buffers serve only the geometries that fall back to
+    // the composed pair (and the verification call, whose convolution inputs the replay records
+    // commit).
     Tensor gated      = work_.alloc(DType::BF16, {W, T});
     // A verification call records the convolution inputs for its commit and leaves the history.
     Tensor normalized = batch.verify != nullptr ? batch.verify->ple_inputs.view({W, T})
                                                 : work_.alloc(DType::BF16, {W, T});
-    ops::ple_gate(key, value, residual, p.key_norm, p.query_norm, p.conv_norm, dim(config_.hc.streams),
-                  config_.rms_norm_eps, gated, normalized, s);
-    ops::ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), state_.ple_conv,
-                         batch.slots, batch.verify != nullptr ? Tensor{} : batch.slots, residual, s);
+    ops::ple_gate_conv_inject(key, value, residual, p.key_norm, p.query_norm, p.conv_norm,
+                              dim(config_.hc.streams), config_.rms_norm_eps, p.convolution,
+                              dim(config_.ple.conv_dilation), state_.ple_conv, batch.slots,
+                              batch.verify != nullptr ? Tensor{} : batch.slots, gated, normalized, s);
 }
 
 Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {

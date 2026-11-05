@@ -1,5 +1,7 @@
 #include "infernix/ops/ple.h"
 
+#include "core/pdl.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -53,6 +55,33 @@ bool aligned(const void* p) {
     return reinterpret_cast<std::uintptr_t>(p) % Alignment == 0;
 }
 
+// The gate geometry ple_gate and ple_gate_conv_inject share: everything the kernels index except
+// the gated/normalized outputs, which only the composed route materializes.
+struct GateGeometry {
+    int hidden, width, columns, key_stride, value_stride;
+    DType norm;
+};
+
+GateGeometry gate_geometry(const Tensor& key, const Tensor& value, const Tensor& residual,
+                           const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
+                           std::int32_t streams, float eps, int width, int columns) {
+    require(column_strided_2d(key, DType::BF16) && column_strided_2d(value, DType::BF16),
+            "gate requires column-strided 2D BF16 key and value tensors");
+    require(contiguous(residual, DType::BF16), "gate requires contiguous BF16 tensors");
+    const DType norm = key_norm.dtype;
+    require((norm == DType::BF16 || norm == DType::FP32) && contiguous(key_norm, norm) &&
+                contiguous(query_norm, norm) && contiguous(conv_norm, norm),
+            "gate norms must be contiguous, all BF16 or all FP32");
+    require(streams > 0 && width % streams == 0, "gate width must hold whole streams");
+    const int hidden = width / streams;
+    require(value.ne[0] == hidden && value.ne[1] == columns && residual.ne[0] == width &&
+                residual.ne[1] == columns && key_norm.numel() == width && query_norm.numel() == width &&
+                conv_norm.numel() == width && columns > 0 && eps > 0,
+            "gate shapes disagree");
+    return {hidden, width, columns, static_cast<int>(key.nb[1] / static_cast<std::int64_t>(sizeof(bf16))),
+            static_cast<int>(value.nb[1] / static_cast<std::int64_t>(sizeof(bf16))), norm};
+}
+
 __device__ __forceinline__ float sigmoidf(float x) { return 1.0F / (1.0F + expf(-x)); }
 
 // One block reduction per barrier pair. The two operands of the gate's key/query statistics share
@@ -87,6 +116,7 @@ __device__ __forceinline__ float2 block_sum2(float a, float b, float2* scratch) 
 
 __global__ void embed_kernel(const std::uint8_t* __restrict__ rows, const bf16* __restrict__ scale,
                              int elements, bf16* __restrict__ out) {
+    pdl::enter();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (i >= elements) { return; }
@@ -153,6 +183,7 @@ template <bool VectorStore>
 __global__ void __launch_bounds__(kThreads)
     embed_nvfp4_kernel(const std::uint8_t* __restrict__ rows, const float* __restrict__ multiplier, int row_bytes,
                        int heads, int width, int columns, int tasks_per_cta, std::uint16_t* __restrict__ out) {
+    pdl::enter();
     const int t      = blockIdx.y;
     const int blocks = width / 16;
     const int tasks  = heads * blocks;
@@ -260,6 +291,7 @@ __global__ void __launch_bounds__(kGateMaxThreads)
                 const Norm* __restrict__ query_norm, const Norm* __restrict__ conv_norm, int hidden,
                 int width, int key_stride, int value_stride, float eps, bf16* __restrict__ gated,
                 bf16* __restrict__ normalized) {
+    pdl::enter();
     __shared__ float2 scratch[kGateMaxThreads / 32];
     const int s = blockIdx.x, t = blockIdx.y;
     const std::size_t base     = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
@@ -324,6 +356,138 @@ __global__ void __launch_bounds__(kGateMaxThreads)
 #pragma unroll
         for (int j = 0; j < V; ++j) { out[j] = (gate * vf[i][j]) * gated_inv * (1.0F + cn[j]); }
         store_bf16x<V>(normalized + base + d, out);
+    }
+}
+
+// The fused decode gate + state convolution (one column per sequence, an in-place or moved state
+// update): one CTA per (stream, sequence). The convolution is channel-independent and its channels
+// are exactly the gate's, so each thread folds the convolution of its own 8 channels into the
+// gate's registers: the gated and normalized values are rounded to BF16 exactly as gate_kernel
+// stores them, stay unpacked only into floats, and never reach global memory. The history shift is
+// streamed through one uint4 in increasing order (as state_kernel does), so an in-place update
+// (source == destination) never reads an element it already overwrote and the register array never
+// grows with SPAN. The accumulation order (history taps ascending, then the latest column), the
+// rounding boundaries and the residual expression are conv_state_vec8_kernel's, so the result is
+// bitwise-identical to the composed gate + conv_state pair.
+template <class Norm, int SPAN>
+__global__ void __launch_bounds__(kGateMaxThreads)
+    gate_conv_vec8_kernel(const bf16* __restrict__ key, const bf16* __restrict__ value,
+                          bf16* __restrict__ residual, const Norm* __restrict__ key_norm,
+                          const Norm* __restrict__ query_norm, const Norm* __restrict__ conv_norm,
+                          int hidden, int width, int key_stride, int value_stride, float eps,
+                          const bf16* __restrict__ weight, int taps, int dilation, bf16* states,
+                          const std::int32_t* __restrict__ source_slots,
+                          const std::int32_t* __restrict__ destination_slots) {
+    pdl::enter();
+    __shared__ float2 scratch[kGateMaxThreads / 32];
+    const int s = blockIdx.x, t = blockIdx.y;
+    const std::size_t base     = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
+    const std::size_t key_base = static_cast<std::size_t>(t) * key_stride + static_cast<std::size_t>(s) * hidden;
+    const std::size_t val_base = static_cast<std::size_t>(t) * value_stride;
+    const int d                 = threadIdx.x * 8;
+    const bool active           = d < hidden;
+    float kf[8], qf[8], vf[8];
+    float key_sq = 0.0F, query_sq = 0.0F;
+    if (active) {
+        load_bf16x<8>(key + key_base + d, kf);
+        load_bf16x<8>(residual + base + d, qf);
+        load_bf16x<8>(value + val_base + d, vf);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            key_sq += kf[j] * kf[j];
+            query_sq += qf[j] * qf[j];
+        }
+    }
+    const float2 squares = block_sum2(key_sq, query_sq, scratch);
+    const float key_inv   = rsqrtf(squares.x / static_cast<float>(hidden) + eps);
+    const float query_inv = rsqrtf(squares.y / static_cast<float>(hidden) + eps);
+    float dot = 0.0F;
+    if (active) {
+        const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+        float kn[8], qn[8];
+        load_normx<Norm, 8>(key_norm + c, kn);
+        load_normx<Norm, 8>(query_norm + c, qn);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            dot += (kf[j] * key_inv * (1.0F + kn[j])) * (qf[j] * query_inv * (1.0F + qn[j]));
+        }
+    }
+    float g = block_sum(dot, scratch) / sqrtf(static_cast<float>(hidden));
+    g       = copysignf(sqrtf(fmaxf(fabsf(g), 1.0e-6F)), g);
+    const float gate = sigmoidf(g);
+    float gated_sq   = 0.0F;
+    if (active) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float v = gate * vf[j];
+            gated_sq += v * v;
+        }
+    }
+    const float gated_inv = rsqrtf(block_sum(gated_sq, scratch) / static_cast<float>(hidden) + eps);
+    uint4 gated_bits = make_uint4(0U, 0U, 0U, 0U), norm_bits = make_uint4(0U, 0U, 0U, 0U);
+    if (active) {
+        const std::size_t c = static_cast<std::size_t>(s) * hidden + d;
+        float cn[8];
+        load_normx<Norm, 8>(conv_norm + c, cn);
+        union { uint4 bits; __nv_bfloat162 half[4]; } gb, nb;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 scaled = make_float2(gate * vf[2 * j], gate * vf[2 * j + 1]);
+            const float2 norm   = make_float2(scaled.x * gated_inv * (1.0F + cn[2 * j]),
+                                              scaled.y * gated_inv * (1.0F + cn[2 * j + 1]));
+            gb.half[j]          = __floats2bfloat162_rn(scaled.x, scaled.y);
+            nb.half[j]          = __floats2bfloat162_rn(norm.x, norm.y);
+        }
+        gated_bits = gb.bits;
+        norm_bits  = nb.bits;
+    }
+    if (active) {
+        const std::size_t channels = static_cast<std::size_t>(width); // the conv's channels are the gate's width
+        const std::size_t words    = channels / 8;                     // uint4-strided history
+        const std::size_t word     = (static_cast<std::size_t>(s) * hidden + d) / 8;
+        const uint4* const history = reinterpret_cast<const uint4*>(states) +
+                                     static_cast<std::size_t>(source_slots[t]) * SPAN * words + word;
+        uint4* const shifted = reinterpret_cast<uint4*>(states) +
+                               static_cast<std::size_t>(destination_slots[t]) * SPAN * words + word;
+        const bf16* const channel = weight + static_cast<std::size_t>(s) * hidden + d;
+        float acc[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+        uint4 v      = history[0];
+#pragma unroll
+        for (int k = 0; k + 1 < SPAN; ++k) {
+            const int tap = k / dilation;
+            if (tap * dilation == k && tap + 1 < taps) {
+                float w[8], x[8];
+                load_bf16x<8>(channel + static_cast<std::size_t>(tap) * channels, w);
+                load_bf16x<8>(reinterpret_cast<const bf16*>(&v), x);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) { acc[u] += w[u] * x[u]; }
+            }
+            const uint4 next = history[static_cast<std::size_t>(k + 1) * words];
+            shifted[static_cast<std::size_t>(k) * words] = next;
+            v                                            = next;
+        }
+        {
+            const int tap = (SPAN - 1) / dilation;
+            if (tap * dilation == SPAN - 1 && tap + 1 < taps) {
+                float w[8], x[8];
+                load_bf16x<8>(channel + static_cast<std::size_t>(tap) * channels, w);
+                load_bf16x<8>(reinterpret_cast<const bf16*>(&v), x);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) { acc[u] += w[u] * x[u]; }
+            }
+            float w[8], x[8];
+            load_bf16x<8>(channel + static_cast<std::size_t>(taps - 1) * channels, w);
+            load_bf16x<8>(reinterpret_cast<const bf16*>(&norm_bits), x);
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { acc[u] += w[u] * x[u]; }
+            shifted[static_cast<std::size_t>(SPAN - 1) * words] = norm_bits;
+        }
+        float g8[8];
+        load_bf16x<8>(reinterpret_cast<const bf16*>(&gated_bits), g8);
+        float r[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) { r[u] = qf[u] + (g8[u] + acc[u] * sigmoidf(acc[u])); }
+        store_bf16x<8>(residual + base + d, r);
     }
 }
 
@@ -408,6 +572,7 @@ __global__ void __launch_bounds__(kThreads)
                      int width, const bf16* __restrict__ states,
                      const std::int32_t* __restrict__ source_slots, int columns,
                      bf16* __restrict__ residual) {
+    pdl::enter();
     const int c = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int t = blockIdx.y;
     if (c >= channels || t >= columns) { return; }
@@ -481,6 +646,7 @@ __global__ void __launch_bounds__(kThreads)
                            const bf16* __restrict__ weight, int taps, int dilation, int channels,
                            bf16* __restrict__ states, const std::int32_t* __restrict__ source_slots,
                            const std::int32_t* __restrict__ destination_slots, bf16* __restrict__ residual) {
+    pdl::enter();
     const int c        = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int sequence = blockIdx.y;
     if (c >= channels) { return; }
@@ -552,6 +718,7 @@ __global__ void __launch_bounds__(kThreads)
     state_vec8_kernel(const bf16* __restrict__ normalized, int span, int channels, int width, int sequences,
                       bf16* __restrict__ states, const std::int32_t* __restrict__ source_slots,
                       const std::int32_t* __restrict__ destination_slots) {
+    pdl::enter();
     const int c        = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int sequence = blockIdx.y;
     if (c >= channels || sequence >= sequences) { return; }
@@ -623,11 +790,11 @@ void launch_embed_nvfp4(const std::uint8_t* rows, const float* multiplier, int r
     if (columns < kEmbedSpreadColumns && tasks > kEmbedCtaTasks) { tasks_per_cta = kEmbedCtaTasks; }
     const dim3 grid((tasks + tasks_per_cta - 1) / tasks_per_cta, columns);
     if (aligned<16>(out)) {
-        embed_nvfp4_kernel<true><<<grid, tasks_per_cta, 0, stream>>>(rows, multiplier, row_bytes, heads, width,
-                                                                     columns, tasks_per_cta, out);
+        (void)pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(tasks_per_cta), 0, stream}, embed_nvfp4_kernel<true>,
+                                   rows, multiplier, row_bytes, heads, width, columns, tasks_per_cta, out);
     } else {
-        embed_nvfp4_kernel<false><<<grid, tasks_per_cta, 0, stream>>>(rows, multiplier, row_bytes, heads, width,
-                                                                      columns, tasks_per_cta, out);
+        (void)pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(tasks_per_cta), 0, stream}, embed_nvfp4_kernel<false>,
+                                   rows, multiplier, row_bytes, heads, width, columns, tasks_per_cta, out);
     }
 }
 
@@ -657,8 +824,9 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
     const int elements = row_bytes * heads;
     require(scale.numel() == 1 && out.ne[0] == elements && out.ne[1] == columns,
             "embed shapes disagree");
-    embed_kernel<<<dim3((elements + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const std::uint8_t*>(rows.data), static_cast<const bf16*>(scale.data), elements,
+    (void)pdl::launch_consumer(
+        pdl::LaunchConfig{dim3((elements + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
+        embed_kernel, static_cast<const std::uint8_t*>(rows.data), static_cast<const bf16*>(scale.data), elements,
         static_cast<bf16*>(out.data));
     check_launch("embed");
 }
@@ -680,25 +848,16 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
               const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
               std::int32_t streams, float eps, Tensor& gated, Tensor& normalized,
               cudaStream_t stream) {
-    require(column_strided_2d(key, DType::BF16) && column_strided_2d(value, DType::BF16),
-            "gate requires column-strided 2D BF16 key and value tensors");
-    for (const Tensor* t : {&residual, static_cast<const Tensor*>(&gated), static_cast<const Tensor*>(&normalized)}) {
-        require(contiguous(*t, DType::BF16), "gate requires contiguous BF16 tensors");
-    }
-    const DType norm = key_norm.dtype;
-    require((norm == DType::BF16 || norm == DType::FP32) && contiguous(key_norm, norm) &&
-                contiguous(query_norm, norm) && contiguous(conv_norm, norm),
-            "gate norms must be contiguous, all BF16 or all FP32");
     const int width = key.ne[0], columns = key.ne[1];
-    require(streams > 0 && width % streams == 0, "gate width must hold whole streams");
-    const int hidden = width / streams;
-    require(value.ne[0] == hidden && value.ne[1] == columns && residual.ne[0] == width &&
-                residual.ne[1] == columns && key_norm.numel() == width && query_norm.numel() == width &&
-                conv_norm.numel() == width && gated.ne[0] == width && gated.ne[1] == columns &&
-                normalized.ne[0] == width && normalized.ne[1] == columns && columns > 0 && eps > 0,
-            "gate shapes disagree");
-    const int key_stride   = static_cast<int>(key.nb[1] / static_cast<std::int64_t>(sizeof(bf16)));
-    const int value_stride = static_cast<int>(value.nb[1] / static_cast<std::int64_t>(sizeof(bf16)));
+    const GateGeometry geometry =
+        gate_geometry(key, value, residual, key_norm, query_norm, conv_norm, streams, eps, width, columns);
+    for (const Tensor* t : {static_cast<const Tensor*>(&gated), static_cast<const Tensor*>(&normalized)}) {
+        require(contiguous(*t, DType::BF16) && t->ne[0] == width && t->ne[1] == columns,
+                "gate requires contiguous BF16 tensors");
+    }
+    const int hidden       = geometry.hidden;
+    const int key_stride   = geometry.key_stride;
+    const int value_stride = geometry.value_stride;
     const auto launch = [&]<class Norm>() {
         const auto* key_p   = static_cast<const bf16*>(key.data);
         const auto* value_p = static_cast<const bf16*>(value.data);
@@ -724,9 +883,11 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
         if (block > kGateMaxThreads) { block = kGateMaxThreads; }
         const int per_thread = (slices + block - 1) / block;
         const auto run = [&]<int V, int K>() {
-            gate_kernel<Norm, V, K><<<grid, block, 0, stream>>>(key_p, value_p, residual_p, key_norm_p,
-                                                                query_norm_p, conv_norm_p, hidden, width, key_stride,
-                                                                value_stride, eps, gated_p, normalized_p);
+            // The vectorized gate is the PLE chain's main path: a programmatic dependent when the
+            // stream captures a graph, an ordinary launch otherwise (pdl::launch_consumer).
+            (void)pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(block), 0, stream}, gate_kernel<Norm, V, K>,
+                                       key_p, value_p, residual_p, key_norm_p, query_norm_p, conv_norm_p, hidden,
+                                       width, key_stride, value_stride, eps, gated_p, normalized_p);
         };
         const auto run_scalar = [&]() {
             gate_kernel_scalar<Norm><<<grid, kThreads, 0, stream>>>(key_p, value_p, residual_p, key_norm_p,
@@ -748,7 +909,7 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
             run_scalar();
         }
     };
-    if (norm == DType::FP32) {
+    if (geometry.norm == DType::FP32) {
         launch.template operator()<float>();
     } else {
         launch.template operator()<bf16>();
@@ -788,9 +949,9 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
         const dim3 grid((tasks + kThreads - 1) / kThreads, sequences);
         const auto run = [&]<int SPAN>() {
             if (vec8) {
-                conv_state_vec8_kernel<SPAN><<<grid, kThreads, 0, stream>>>(
-                    gated_p, normalized_p, weight_p, taps, dilation, channels, states_p, source_p, destination_p,
-                    residual_p);
+                (void)pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(kThreads), 0, stream},
+                                           conv_state_vec8_kernel<SPAN>, gated_p, normalized_p, weight_p, taps,
+                                           dilation, channels, states_p, source_p, destination_p, residual_p);
             } else {
                 conv_state_kernel<SPAN><<<grid, kThreads, 0, stream>>>(
                     gated_p, normalized_p, weight_p, taps, dilation, channels, states_p, source_p, destination_p,
@@ -824,9 +985,10 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
         return;
     }
     if (vec8) {
-        conv_vec8_kernel<<<dim3((channels / 8 + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-            gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, columns,
-            residual_p);
+        (void)pdl::launch_consumer(pdl::LaunchConfig{dim3((channels / 8 + kThreads - 1) / kThreads, columns),
+                                                     dim3(kThreads), 0, stream},
+                                   conv_vec8_kernel, gated_p, normalized_p, weight_p, taps, dilation, span, channels,
+                                   width, states_p, source_p, columns, residual_p);
     } else {
         conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
             gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, columns,
@@ -835,13 +997,99 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
     check_launch("conv");
     if (!update) { return; }
     if (vec8) {
-        state_vec8_kernel<<<dim3((channels / 8 + kThreads - 1) / kThreads, sequences), kThreads, 0, stream>>>(
-            normalized_p, span, channels, width, sequences, states_p, source_p, destination_p);
+        (void)pdl::launch_consumer(pdl::LaunchConfig{dim3((channels / 8 + kThreads - 1) / kThreads, sequences),
+                                                     dim3(kThreads), 0, stream},
+                                   state_vec8_kernel, normalized_p, span, channels, width, sequences, states_p,
+                                   source_p, destination_p);
     } else {
         state_kernel<<<dim3((channels + kThreads - 1) / kThreads, sequences), kThreads, 0, stream>>>(
             normalized_p, span, channels, width, sequences, states_p, source_p, destination_p);
     }
     check_launch("state");
+}
+
+void ple_gate_conv_inject(const Tensor& key, const Tensor& value, Tensor& residual,
+                          const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
+                          std::int32_t streams, float eps, const Tensor& weight, std::int32_t dilation,
+                          Tensor& states, const Tensor& source_slots, const Tensor& destination_slots,
+                          Tensor& gated, Tensor& normalized, cudaStream_t stream) {
+    const int width   = key.ne[0], columns = key.ne[1];
+    const int taps    = weight.ne[1];
+    const int span    = (taps - 1) * static_cast<int>(dilation);
+    const bool update = destination_slots.data != nullptr;
+    // The fused kernel's preconditions, everything the composed pair would validate except the
+    // scratch it does not use; an unmet condition (or an invalid shape, which throws below or in
+    // the composed fallback) leaves the exact composed route.
+    const bool fused =
+        update && source_slots.data != nullptr && contiguous(source_slots, DType::I32) &&
+        contiguous(destination_slots, DType::I32) && source_slots.ne[0] == columns &&
+        destination_slots.ne[0] == columns && taps > 1 && span >= 1 && span <= kFusedConvMaxSpan &&
+        dilation > 0 && contiguous(weight, DType::BF16) && weight.ne[0] == width &&
+        contiguous(states, DType::BF16) && states.ne[0] == width && states.ne[1] == span;
+    if (fused) {
+        const GateGeometry geometry =
+            gate_geometry(key, value, residual, key_norm, query_norm, conv_norm, streams, eps, width, columns);
+        const auto* key_p    = static_cast<const bf16*>(key.data);
+        const auto* value_p  = static_cast<const bf16*>(value.data);
+        auto* residual_p     = static_cast<bf16*>(residual.data);
+        const auto* weight_p = static_cast<const bf16*>(weight.data);
+        auto* states_p       = static_cast<bf16*>(states.data);
+        const auto* source_p = static_cast<const std::int32_t*>(source_slots.data);
+        const auto* dest_p   = static_cast<const std::int32_t*>(destination_slots.data);
+        const bool vector8   = geometry.hidden % 8 == 0 && geometry.key_stride % 8 == 0 &&
+                              geometry.value_stride % 8 == 0 && geometry.hidden <= kGateMaxThreads * 8 &&
+                              aligned<16>(key_p) && aligned<16>(value_p) && aligned<16>(residual_p) &&
+                              aligned<16>(weight_p) && aligned<16>(states_p) && aligned<16>(key_norm.data) &&
+                              aligned<16>(query_norm.data) && aligned<16>(conv_norm.data);
+        if (vector8) {
+            const auto launch = [&]<class Norm>() {
+                const auto* key_norm_p   = static_cast<const Norm*>(key_norm.data);
+                const auto* query_norm_p = static_cast<const Norm*>(query_norm.data);
+                const auto* conv_norm_p  = static_cast<const Norm*>(conv_norm.data);
+                int block = ((geometry.hidden / 8 + 31) / 32) * 32;
+                if (block > kGateMaxThreads) { block = kGateMaxThreads; }
+                const pdl::LaunchConfig cfg{dim3(streams, columns), dim3(block), 0, stream};
+                const auto run = [&]<int SPAN>() {
+                    (void)pdl::launch_consumer(cfg, gate_conv_vec8_kernel<Norm, SPAN>, key_p, value_p, residual_p,
+                                               key_norm_p, query_norm_p, conv_norm_p, geometry.hidden, width,
+                                               geometry.key_stride, geometry.value_stride, eps, weight_p, taps,
+                                               static_cast<int>(dilation), states_p, source_p, dest_p);
+                };
+                switch (span) {
+#define INFERNIX_PLE_GATE_CONV(n)                                                                            \
+    case n:                                                                                                  \
+        run.template operator()<n>();                                                                        \
+        break;
+                    INFERNIX_PLE_GATE_CONV(1)
+                    INFERNIX_PLE_GATE_CONV(2)
+                    INFERNIX_PLE_GATE_CONV(3)
+                    INFERNIX_PLE_GATE_CONV(4)
+                    INFERNIX_PLE_GATE_CONV(5)
+                    INFERNIX_PLE_GATE_CONV(6)
+                    INFERNIX_PLE_GATE_CONV(7)
+                    INFERNIX_PLE_GATE_CONV(8)
+                    INFERNIX_PLE_GATE_CONV(9)
+                    INFERNIX_PLE_GATE_CONV(10)
+                    INFERNIX_PLE_GATE_CONV(11)
+                    INFERNIX_PLE_GATE_CONV(12)
+                    INFERNIX_PLE_GATE_CONV(13)
+                    INFERNIX_PLE_GATE_CONV(14)
+                    INFERNIX_PLE_GATE_CONV(15)
+                    INFERNIX_PLE_GATE_CONV(16)
+#undef INFERNIX_PLE_GATE_CONV
+                }
+            };
+            if (geometry.norm == DType::FP32) {
+                launch.template operator()<float>();
+            } else {
+                launch.template operator()<bf16>();
+            }
+            check_launch("gate conv");
+            return;
+        }
+    }
+    ple_gate(key, value, residual, key_norm, query_norm, conv_norm, streams, eps, gated, normalized, stream);
+    ple_conv_inject(gated, normalized, weight, dilation, states, source_slots, destination_slots, residual, stream);
 }
 
 void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Tensor& states,

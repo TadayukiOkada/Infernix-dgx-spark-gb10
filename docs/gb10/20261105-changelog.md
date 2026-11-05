@@ -637,3 +637,129 @@ and 2-stage / 2-CTA-per-SM `context_kv_grouped_kernel`) on NVIDIA GB10 (`sm_121a
   and the crossover was last certified whole-mixer on 2026-10-30.
 - PDL consumers only take effect under CUDA graph capture (eager streams stay serialized), so the
   bench's graph and the engine's captured rounds see the overlap; eager fallback paths do not.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T7: Decode `ple_gate` + `ple_conv_inject` fused into one bitwise-identical kernel at one column per sequence; PDL consumers on every PLE kernel
+
+## 1. Accounting
+
+- Base commit: `15e8257a0` (`dev-rebased-20261028`). Rebuild count: 4 single-invocation Ninja builds
+  (serve + `infernix_ple_test` + `infernix_bench` share one device link). Header edit touched the
+  consuming `.cu` files (CUDA depfiles are dead in `build-native`).
+- Files (4 M, +503/−41): `include/infernix/ops/ple.h` (+13, new `ple_gate_conv_inject` contract),
+  `src/ops/ple/ple.cu` (+320/−41, fused kernel + PDL), `src/models/qwen4_exp/execution/forward.cpp`
+  (one op call replaces two), `tests/ops/test_ple.cpp` (+196, fused-vs-composed exactness + oracle).
+- `tools/cuda_stack/cuda_stack_allowlist.json`: unchanged (no spill removed or added;
+  `infernix_cuda_stack_check` passes on the unchanged allowlist).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **The doc's `48×` per forward is wrong — PLE runs on a single layer.** `ple_layer_ids` resolves
+  to one layer and `load.cpp` binds the PLE weights only `if (i == c.ple.layer)`; the nsys trace
+  shows exactly one `gate + conv_state` pair per decode forward, not 48. The fusion therefore saves
+  **one** launch and ~140 KiB of `gated`/`normalized`/`residual` round-trip per decode step, not
+  48× — which bounds the E2E effect to sub-noise at this resolution (§4/§5).
+- **`pdl::exit()` does not exist.** `src/core/pdl.cuh` (not `ops/common/pdl.cuh`) exposes
+  `pdl::launch_consumer` + `pdl::enter()`; `enter()` itself is the full protocol (conditional
+  early `trigger_dependents()` when `2*grid` fits the SMs, then `wait_for_dependencies()`).
+- **The described kernel geometries were stale**: `gate_kernel` launches `round32(hidden/8)`
+  threads capped at 1024 (not `block(128)`), and `conv_state_vec8_kernel`'s grid is per channel
+  word (not `grid(5, sequences)`). The doc's quoted gate math also omits the signed-sqrt
+  (`copysignf(sqrt(max(|g|,1e-6)),g)`), the `sigmoidf(g)·value`, and the second RMSNorm; the
+  implementation follows the actual code, and the fusion is bitwise-identical to it (§3).
+- **Test-target corrections**: the doc's `infernix_ops_norm_elementwise_test` and `ple_test.cpp`
+  do not exist; the PLE suite is `tests/ops/test_ple.cpp` → ctest `infernix_ple_test`.
+- **Why the fusion can be bitwise-exact**: the conv is 100 % channel-independent, so each gate
+  thread's 8-channel slice owns its full conv column. Keeping the `store_bf16x<8>`
+  (`__floats2bfloat162_rn`) pair-rounding boundaries, the ascending-tap accumulation order, and
+  `qf + (gated + acc·sigmoidf(acc))` makes the fused kernel's bits equal the composed pair's by
+  construction — verified exact, not bounded (§4).
+- **Register strategy**: the history shift streams through one live `uint4` in ascending order
+  (each slot written once after its tap) instead of a `past[SPAN]` register array, so registers
+  stay 60–64 for every `SPAN ≤ 16` under `__launch_bounds__(1024)`; `states` is deliberately not
+  `__restrict__` to preserve the in-place `src == dst` slot load/store order.
+
+## 3. Subsystem breakdown
+
+- `ple.cu`: new `gate_conv_vec8_kernel<Norm, SPAN>` (grid `(streams, columns)`, block
+  `round32(hidden/8)` cap 1024) — gate section identical to `gate_kernel<Norm,8,1>`, packs
+  `gated`/`normalized` as `uint4` in registers, folds the depthwise causal conv + SiLU + state
+  shift + residual inject. New entry `ple_gate_conv_inject`: strict fused admission (one column
+  per sequence, `update == true`, I32 contiguous slots, `taps > 1`, `span ∈ [1,16]`, contiguous
+  BF16 weight/states, `hidden % 8 == 0`, 16-byte-aligned operands, `hidden ≤ 8192`); otherwise it
+  composes exactly `ple_gate` + `ple_conv_inject`, so `gated`/`normalized` are scratch on the
+  fallback only. Shared `gate_geometry()` validator now serves both entries. PDL: `pdl::enter()`
+  at the top of `embed_kernel`, `embed_nvfp4_kernel`, `gate_kernel`, `conv_vec8_kernel`,
+  `conv_state_vec8_kernel`, `state_vec8_kernel`; `pdl::launch_consumer` on the embed, conv,
+  state, vector-gate and fused launches (the scalar gate fallback and eager streams stay plain
+  serialized launches).
+- `ple.h`: `ple_gate_conv_inject` declaration with the fused/fallback contract in the docstring.
+- `forward.cpp`: `Forward::ple` makes the single op call (verify rounds pass a null destination
+  slot set, unchanged semantics); `gated`/`normalized` stay allocated as fallback scratch;
+  `ple_embedding`'s upload comment records that the copy never triggers dependents early.
+- `test_ple.cpp`: composed-run vs fused-entry-run on identical copies — `residual` and `states`
+  compared **exact**; 0xFF-sentinel checks prove the fused route never writes `gated`/`normalized`
+  (and the fallback does); end-to-end FP64 oracle (gate in FP64 → once-rounded BF16 intermediates
+  → conv → residual) at `{1e-6, 1/128}`. Eight cases: production shape, FP32 norms, 2 sequences,
+  `SPAN=16` fused edge, `span=20` fallback, `hidden % 8 ≠ 0` fallback, `width=2` fallback.
+
+## 4. Verification
+
+- CTest on the final binaries, 6/6 pass: `infernix_cuda_stack_check`, `infernix_ple_test`,
+  `infernix_ple_nvfp4_test`, `infernix_ple_embed_test`, `infernix_speculative_state_ops_test`,
+  `infernix_lossless_ops_test` (no `--parallel`, per the single-GPU numerical-failure rule).
+- `cuobjdump --dump-resource-usage` on `infernix-serve`: fused family (2 norms × SPAN 1..16, 32
+  instances) `REG:60..64, STACK:0, LOCAL:0`; existing families unchanged (`gate_kernel<bf16,8,1>`
+  `REG:62`, `conv_state_vec8_kernel<9>` `REG:84`); allowlist untouched; `git diff --check` clean.
+- nsys (`--cuda-graph-trace=node`, plain mode, pp512/tg64, demangled match verified nonzero):
+  decode PLE launches `gate_kernel<bf16,8,1>` ×132 + `conv_state_vec8_kernel<9>` ×132 →
+  `gate_conv_vec8_kernel<bf16,9>` ×132; total PLE launches 548 → 416; the prefill pair
+  (`2×gate + 2×conv_vec8 + 2×state_vec8`) is code-unchanged in both binaries.
+- Model-level output equality: MTP acceptance is bit-identical across all six baseline and six
+  candidate runs (0.9821 mixed, 0.7309 decode-only) — the fused route cannot shift a token.
+- E2E A/B (`run_kv_matrix_bench.sh` with `BENCH_BIN`, nvfp4 artifact + int8 KV, plain + MTP,
+  pp8192/tg512 matrix), freshly HEAD-built baseline binary vs candidate, 3 interleaved rounds —
+  rounds 1–2 candidate-second, round 3 candidate-first; medians (spread = own-arm round-to-round):
+
+| test | decode base | decode cand | Δ | prefill base | prefill cand | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| mtp/tg512 | 75.4 (0.30 %) | 75.3 (0.50 %) | −0.04 % | — | — | — |
+| mtp/pp8192+tg512 | 120.4 (0.37 %) | 120.1 (0.25 %) | −0.25 % | 3916.6 (1.13 %) | 3916.9 (0.47 %) | +0.01 % |
+| mtp/pp8192 | — | — | — | 3938.1 (0.76 %) | 3937.0 (0.47 %) | −0.03 % |
+| plain/tg512 | 48.2 (0.63 %) | 48.1 (0.46 %) | −0.24 % | — | — | — |
+| plain/pp8192+tg512 | 47.1 (0.58 %) | 47.0 (0.54 %) | −0.33 % | 3955.4 (1.02 %) | 3953.6 (0.27 %) | −0.04 % |
+| plain/pp8192 | — | — | — | 3972.6 (0.95 %) | 3970.3 (0.33 %) | −0.06 % |
+
+## 5. Regressions & adverse results (all found, all disclosed)
+
+- **The per-kernel µs comparison regresses and is not a work regression**: the fused kernel's mean
+  duration is 19.53 µs vs the composed pair's 11.23 µs. Under node-level graph tracing a PDL
+  consumer's duration includes its `griddepcontrol.wait`, so the fused kernel absorbs the wait the
+  pair split across two launches; the E2E t/s medians, not these durations, are the adjudicator.
+- **No measurable E2E gain; decode medians are slightly negative (−0.04..−0.33 %)**: the point
+  estimates are smaller than the same-arm spread (0.25–1.13 %) and their sign tracks run order —
+  rounds 1–2 (candidate second) were negative on every test, round 3 (candidate first) flipped
+  prefill positive (+0.32..+0.67 %) and decode to −0.15..+0.25 %. Reading: within measurement
+  resolution in both directions; the doc's expected gain was premised on 48×/forward (§2) and the
+  single-layer reality puts one saved launch (~1–2 µs of graph gap per decode step) below the
+  bench's noise floor. Disclosed rather than argued away: an E2E improvement was **not** measured.
+- **Register cost of fusion**: one kernel now carries gate+conv at `REG:60..64` where the split
+  kernels ran 62/84; no spill was introduced and no occupancy decision changes at these grids
+  (decode fused grid is 4 CTAs), but the fused band cannot take a wider vector without re-checking
+  the 1024-thread register cap.
+- **`ctest --parallel` numerical failures and the `--decode-widths` real-artifact variant were
+  not used as evidence** (both fail on HEAD too); the exact composed-vs-fused equality test and
+  the identical acceptance rates carry the correctness claim instead.
+
+## 6. Accepted gaps / follow-ups
+
+- Fusion is admitted only at one column per sequence with `span ≤ 16` and aligned vec8 geometry;
+  verify widths, `span > 16`, unaligned and `hidden % 8 ≠ 0` shapes keep the composed pair (which
+  still gains the PDL consumers). The `SPAN > 16` fused band was cut for register-headroom risk,
+  not correctness.
+- The scalar gate fallback stays a plain launch (no PDL): its shapes are degenerate edges where
+  the protocol's SM-fit condition would rarely trigger anyway.
+- PDL overlap exists only under graph capture; eager fallback rounds stay serialized.
+- `gated`/`normalized` scratch remains allocated in `Forward::ple` because the fallback route
+  writes it; dropping it requires removing the fallback, which the admission band forbids.
+- The task doc's remaining PLE launch budget (`ple_embed` + `ple_proj` linear per step, single
+  layer) is unchanged here; any further decode-step saving needs those, not the gate/conv pair.
