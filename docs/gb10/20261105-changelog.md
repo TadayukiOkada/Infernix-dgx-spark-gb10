@@ -189,3 +189,82 @@ and 2-stage / 2-CTA-per-SM `context_kv_grouped_kernel`) on NVIDIA GB10 (`sm_121a
 - The 122B geometry qualifies for both mechanisms (gate/up 216 KiB, down 72 KiB with even `kKTiles` = 8): correctness is covered by the passing `qwen3_5_122b` and `a4_residual_122b` oracle tests, but no 122B artifact exists on this host, so its performance is unmeasured.
 - `WarpTile64` (mean ≥ 512 columns/expert) inherits both mechanisms under the same constexpr gates but is not reached by this artifact's prefill chunks (≤160 columns/expert); its E2E effect is unmeasured.
 - The gate/up win is wave-local: a larger prefill chunk or a dedicated rasterization (job-major wave assignment across the 96-CTA grid) should convert more of the doc's hypothesized traffic saving; not attempted at T1's scope.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T2: QSA decode attention 2-CTA/SM occupancy (`REG:61..64`), empty-split early exit, 2-token score unrolling with `LDS.64` scale folding, fused register Hadamard query load, and 128-thread `float2` vectorized `merge_kernel`
+
+## 1. Accounting
+
+- **Base commit**: `87652fc1d` (`perf(moe): reorder wide GateUp work units col-tile-inner and deduplicate odd-k_tile scale TMA loads (T1)`).
+- **Modified files**: `src/ops/qsa/qsa.cu` (`M`), `docs/gb10/20261105-changelog.md` (`M`).
+- **Allowlist delta**: none (`STACK:0 LOCAL:0` across all 34 functions in `src/ops/qsa/qsa.cu.o` and on `infernix-serve`; `infernix_cuda_stack_check` passes with no allowlist changes).
+
+## 2. Architectural rationale ("Why" on GB10 `sm_121a`)
+
+1. **Doubling `attention_kernel` occupancy from 1 CTA/SM (`33.3%`, 16 warps/SM) to 2 CTAs/SM (`66.7%`, 32 warps/SM)**:
+   - On GB10 (`sm_121a`, 48 SMs, 65,536 registers/SM, 100 KiB max dynamic shared memory/SM), a `width=8` decode/verification launch with `splits=33` and `kv_heads=2` spawns `33 × 2 × 8 = 528` CTAs of 512 threads (`16` warps/CTA).
+   - Previously, `attention_kernel` used `__launch_bounds__(512, 1)` (`REG: 112..128`), and `AttentionShared<BFloat16, 12, 1>::kBytes` was `81,552 B` (`> 50,176 B`), limiting residency to 1 CTA/SM (`11` waves of 48 CTAs) and leaving each SM with only 16 warps (`1.0` warp/scheduler during `__syncthreads()` phases).
+   - By sharing a single 32 KiB stage plane between `K` and `V` for `BFloat16` (`ShareKV = (Storage == BFloat16 && Stages == 1)`, reducing `BFloat16` dynamic SMEM from `81,552 B` to `48,784 B <= 50,176 B`), keeping unified `[K | V | KScales | VScales]` stages (`<= 49,808 B <= 50,176 B`) for `Int8Group64`, `Fp8E4M3Row256`, `Nvfp4Group16`, and `Fp8KeyNvfp4Value` so both `K` and `V` stream in a single `cp.async` batch overlapped with query load and Hadamard rotation, and setting `__launch_bounds__(kAttentionThreads, AttentionShared<Storage, Group, Stages>::kBytes <= 50176 ? 2 : 1)` (`REG: 61..64`, `STACK: 0`, `LOCAL: 0`), GB10 runs **2 CTAs/SM (`32` warps/SM, `66.7%` occupancy)** across all `Exact=true, Group=12, Stages=1` decode/verification instantiations, cutting wave count from 11 waves to 5.5 waves.
+2. **Eliminating empty-split work (`tiles == 0`)**:
+   - At short contexts (`< 2048`), splits beyond `(attended + 63) / 64` have `begin >= end` (`tiles == 0`). Exiting immediately at the top of `attention_kernel` after writing only `slot[kHeadDim] = -INFINITY` and `slot[kHeadDim + 1] = 0.0F` per head when `splits > 1` skips query global loads, Hadamard rotation, and the 12 KiB partial zero-fill (`-18%` to `-29.5%` faster `attention_us` at `context = 256, 1024`).
+3. **2-token Score-loop unrolling (`j0, j1`), compile-time `((lane & 31) | (32 * r)) >> 6` scale-offset folding (`LDS.64`), and fused register Hadamard query load**:
+   - Processing two tokens (`j0, j1`) per warp per Score-loop iteration loads each query head's `float4` pair (`lo, hi`) from shared memory `qs` once via inline PTX `ld.shared.v4.f32` (`ld_q4`) and dots it against both `k0[0..7]` and `k1[0..7]`, cutting `qs` shared-memory `LDS.128` traffic by 50%.
+   - Changing the key dimension index to `(lane & 31) | (32 * r)` and using unsigned shift (`static_cast<unsigned>(d) >> 6` / `>> 4`) in `KVTile`, combined with hoisting `if (has1)` outside `for (int r = 0; r < 8; ++r)` for non-`kShareKV` storages, allows LLVM KnownBits and CSE to fold `((lane & 31) | (32 * r)) >> 6` to the compile-time constant `r >> 1` (`0, 0, 1, 1, 2, 2, 3, 3`) and vectorize `Int8Group64` key scale loads into a single 64-bit `LDS.64` per token.
+   - For rotated-key formats (`Tile::kRotatedKeys`), loading each query head directly per warp into registers (`float v[8]`), applying `normalized_hadamard_d256_inplace(v, lane)` in registers, and writing `qs` once eliminates two `__syncthreads()` barriers, 8 scalar `STS` instructions, and 2 `LDS.128` instructions per CTA.
+   - Specializing `kSingleTile = (Stages == 1 && !Tile::kVq)` (since `launch_stages` dispatches `Stages = 2` whenever `split_tokens > kTokenTile` for all non-VQ storages), eliminating `is_key` warp divergence in `issue()` when `KC == VC`, and using PTX `mov.u32` for epilogue `%ctaid.x/y/z` and `%tid.x` keep register pressure at `61..64` with **zero `STL`/`LDL` stack spills**.
+4. **128-thread `float2` (`LDG.E.64`) vectorized `merge_kernel` preserving warp-uniform `slot[kHeadDim]` broadcast**:
+   - Consecutive splits `s` of a `(column, head)` in `partial` are separated by `heads * 258 * 4 = 24,768 B`, which is 8-byte aligned (`258 % 2 == 0`). Indexing `s` across lanes causes 32-way uncoalesced 24 KiB strided gather transactions, whereas iterating `s` uniformly across the warp hits 1 L1 broadcast sector per split.
+   - Vectorizing `merge_kernel` to launch `kHeadDim / 2 = 128` threads (`4` warps/CTA instead of `8` warps/CTA), where each thread loads `float2` (`LDG.E.64`) from `slot` and writes `__nv_bfloat162` (`STG.E.32`) to `out`, halves CTA warp count, `slot[kHeadDim]` broadcast loads, and `expf` evaluations while keeping `slot[kHeadDim]` 100% warp-uniform and bit-identical.
+
+## 3. Subsystem breakdown
+
+| Action | File | Mechanism |
+|---|---|---|
+| M | `src/ops/qsa/qsa.cu` | Adds `tiles == 0` early exit in `attention_kernel`; adds `__launch_bounds__(kAttentionThreads, AttentionShared<Storage, Group, Stages>::kBytes <= 50176 ? 2 : 1)` (`REG: 61..64`, `STACK: 0`, `LOCAL: 0`, 2 CTAs/SM); shares a single 32 KiB K/V plane for `BFloat16` (`ShareKV = true`, `48,784 B`) while keeping unified K+V stages (`<= 49,808 B`) for `Int8Group64`/`Fp8`/`Nvfp4`/`K8V4`; fuses query global load and Hadamard rotation in registers for `Tile::kRotatedKeys`; unrolls Score loop by 2 tokens (`j0, j1`) with `ld.shared.v4.f32` (`ld_q4`) and constant-folded unsigned scale shifts (`LDS.64`); specializes `kSingleTile = Stages == 1 && !Tile::kVq` and non-divergent `KC == VC` `cp.async` issue; vectorizes `merge_kernel` to 128 threads with `float2` (`LDG.E.64`) loads and `__nv_bfloat162` stores. |
+
+## 4. Verification & benchmark results
+
+- **Tests**: `ctest --test-dir build-native -R "infernix_cuda_stack_check|infernix_qsa" --output-on-failure` — **10/10 passed (100%)**:
+  - `infernix_cuda_stack_check` (Passed)
+  - `infernix_qsa_index_test` (Passed)
+  - `infernix_qsa_bf16_test` (Passed)
+  - `infernix_qsa_int8_test` (Passed)
+  - `infernix_qsa_fp8_test` (Passed)
+  - `infernix_qsa_nvfp4_test` (Passed)
+  - `infernix_qsa_k8v4_test` (Passed)
+  - `infernix_qsa_vq2_test` (Passed)
+  - `infernix_qsa_k4v2_test` (Passed)
+  - `infernix_qsa_select_test` (Passed)
+- **Resources (`cuobjdump -res-usage` & `cuobjdump -sass` on `qsa.cu.o` and `infernix-serve`)**:
+  - All 34 functions in `qsa.cu.o` have `STACK:0 LOCAL:0` and zero `STL`/`LDL` instructions.
+  - Decode/verification `attention_kernel<Storage, 12, true, 1>` (`Storage = BFloat16, Int8Group64, Fp8E4M3Row256, Nvfp4Group16, Fp8KeyNvfp4Value`): `REG: 61..64, STACK: 0, LOCAL: 0`, dynamic SMEM `48,784..49,808 B <= 50,176 B` (2 CTAs/SM, 32 warps/SM, 66.7% occupancy).
+  - `merge_kernel<false>` / `merge_kernel<true>`: `REG: 40, STACK: 0, LOCAL: 0`.
+- **Benchmarks (`./build-native/bench/infernix_qsa_attention_bench --storage int8,bf16 --contexts 2048,8192,32768 --widths 1,8,16,64`, 3-round interleaved A/B medians, cold L2, CUDA Graph)**:
+
+| Storage | Context | Width | Task Baseline `attention_us` | In-Session HEAD `attention_us` (3-rd median) | Optimized `attention_us` (R1 / R2 / R3 → **median**) | vs Task Baseline | vs In-Session HEAD |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `int8` | `2048` | `1` | `26.82` | `29.79` | `27.55 / 28.70 / 27.65` → **`27.65`** | `+3.1%` (within drift) | **-7.2%** |
+| `int8` | `2048` | `8` | `124.26` | `110.88` | `92.13 / 110.56 / 94.34` → **`94.34`** | **-24.1%** | **-14.9%** |
+| `int8` | `8192` | `1` | `29.41` | `30.72` | `26.72 / 27.65 / 26.75` → **`26.75`** | **-9.0%** | **-12.9%** |
+| **`int8`** | **`8192`** | **`8`** | **`124.86`** | **`118.85`** | `95.10 / 98.08 / 98.18` → **`98.08`** (mean **`97.12`**) | **-21.4%** (**-22.2%** mean) | **-17.5%** |
+| `int8` | `32768` | `1` | `31.94` | `32.64` | `26.91 / 28.77 / 29.25` → **`28.77`** | **-9.9%** | **-11.9%** |
+| `int8` | `32768` | `8` | `141.79` | `129.50` | `100.42 / 100.70 / 101.18` → **`100.70`** | **-29.0%** | **-22.2%** |
+| `bf16` | `2048` | `1` | `26.53` | `35.81` | `27.65 / 29.50 / 26.62` → **`27.65`** | `+4.2%` (R3 `26.62`, `+0.3%`) | **-22.8%** |
+| `bf16` | `2048` | `8` | `122.02` | `108.51` | `88.51 / 89.34 / 89.06` → **`89.06`** | **-27.0%** | **-17.9%** |
+| `bf16` | `8192` | `1` | `27.36` | `31.74` | `25.54 / 26.78 / 26.59` → **`26.59`** | **-2.8%** | **-16.2%** |
+| **`bf16`** | **`8192`** | **`8`** | **`123.90`** | **`116.00`** | `93.18 / 97.18 / 97.95` → **`97.18`** (mean **`96.10`**) | **-21.6%** (**-22.4%** mean) | **-16.2%** |
+| `bf16` | `32768` | `1` | `29.66` | `33.82` | `28.93 / 28.77 / 27.65` → **`28.77`** | **-3.0%** | **-14.9%** |
+| `bf16` | `32768` | `8` | `151.14` | `136.16` | `122.75 / 123.74 / 125.44` → **`123.74`** | **-18.1%** | **-9.1%** |
+
+- **Short-context empty-split verification (`--storage int8,bf16 --contexts 256,1024 --widths 1,8`)**:
+  - `int8` `context=256`: `w1` `14.30 -> 10.27 us` (**-28.2%**), `w8` `49.06 -> 34.59 us` (**-29.5%**).
+  - `int8` `context=1024`: `w1` `20.67 -> 18.05 us` (**-12.7%**), `w8` `79.81 -> 60.38 us` (**-24.3%**).
+  - `bf16` `context=256`: `w1` `12.42 -> 10.14 us` (**-18.4%**), `w8` `44.38 -> 32.32 us` (**-27.2%**).
+  - `bf16` `context=1024`: `w1` `22.66 -> 18.43 us` (**-18.7%**), `w8` `73.73 -> 57.34 us` (**-22.2%**).
+
+## 5. Rejected approaches & resolved regressions
+
+- **Cross-lane strided stats gather in `merge_kernel` (`base[lane * stride + kHeadDim]`)**: Parallelizing the split stats read across `lane < splits` caused 32 lanes in warp 0 to gather across 32 distinct `24,768 B` pages simultaneously (32 uncoalesced L1 sector requests instead of 1 warp-uniform L1 broadcast sector), regressing `width=1` by `+3..+7 us`. Replaced with the 128-thread (`4`-warp) `float2` vectorized `merge_kernel` that keeps `s` warp-uniform while halving CTA warp count and vectorizing row loads/stores.
+- **Sharing K/V SMEM plane on `Int8Group64` (`ShareKV = true` for `Int8Group64`)**: While `ShareKV = true` is required for `BFloat16` to fit below `50,176 B` (`81,552 B -> 48,784 B`), `Int8Group64`'s separate K and V planes already fit inside `49,808 B <= 50,176 B` at 2 CTAs/SM; serializing V `cp.async` behind the Score loop on `Int8Group64` added ~`6 us` at `width=8, context=8192`. Keeping `ShareKV` enabled only for `BFloat16` (`Stages == 1`) gives both `BFloat16` and `Int8Group64` 2 CTAs/SM while allowing `Int8Group64` to overlap both K and V `cp.async` with query load and Hadamard rotation.
+- **Compiler register spills at 64 regs/thread (`__launch_bounds__(512, 2)`)**: Naive 2-CTA/SM bounds initially caused `4..16 B` scalar spills in `Exact=true` instantiations due to LLVM IndVarSimplify expanding `n` into `end - begin` across the kernel and keeping `blockIdx.x/y/z` live until the epilogue. Fixed to `0` spills across all 34 functions using `kSingleTile`, `asm("" : "+r"(n))`, and epilogue PTX `mov.u32` reads of `%ctaid.x/y/z` and `%tid.x`.

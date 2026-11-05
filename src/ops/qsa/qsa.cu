@@ -322,22 +322,24 @@ __device__ __forceinline__ void scatter_head_sums(const float (&part)[Group], in
     }
 }
 
-// One stage of attended tokens in shared memory, gathered by cp.async from each token's page space:
-// planes [K rows | V rows | K scales | V scales] of kTokenTile tokens each, in the paged planes' own
-// byte layout (paged_kv_storage_layout). A storage's key() and value() decode cell (j, d) to
-// exactly its represented value in FP32: every code times its stored scale is exact in FP32.
-template <int KeyBytes, int ValueBytes, int KeyScaleBytes, int ValueScaleBytes>
+// One stage of attended tokens in shared memory for non-VQ storages, gathered by cp.async from each
+// token's page space: four planes [K rows | V rows | K scales | V scales] of kTokenTile tokens each, in
+// the paged planes' own byte layout (paged_kv_storage_layout). When ShareKV is true (BFloat16 1-stage),
+// K and V share a single 32 KiB plane sequentially so two CTAs fit per SM on GB10 (<= 50,176 B/CTA).
+template <int KeyBytes, int ValueBytes, int KeyScaleBytes, int ValueScaleBytes, bool ShareKV = false>
 struct StagePlanes {
     static constexpr int kKeyBytes        = KeyBytes;
     static constexpr int kValueBytes      = ValueBytes;
     static constexpr int kKeyScaleBytes   = KeyScaleBytes;
     static constexpr int kValueScaleBytes = ValueScaleBytes;
     static constexpr bool kVq             = false;
-    static constexpr int kValues          = kTokenTile * KeyBytes;
+    static constexpr bool kShareKV        = ShareKV;
+    static constexpr int kValues          = ShareKV ? 0 : kTokenTile * KeyBytes;
     static constexpr int kKeyScales       = kValues + kTokenTile * ValueBytes;
-    static constexpr int kValueScales     = kKeyScales + kTokenTile * KeyScaleBytes;
+    static constexpr int kValueScales     = kKeyScales + (ShareKV ? 0 : kTokenTile * KeyScaleBytes);
     static constexpr int kStageBytes      = kValueScales + kTokenTile * ValueScaleBytes;
-    static_assert(KeyBytes % 16 == 0 && ValueBytes % 16 == 0 && kKeyScales % 16 == 0 && kValueScales % 16 == 0);
+    static_assert(KeyBytes % 16 == 0 && ValueBytes % 16 == 0 && kKeyScales % 16 == 0 &&
+                  kKeyScaleBytes >= 0 && kValueScaleBytes >= 0);
     __device__ static const unsigned char* key_row(const unsigned char* stage, int j) { return stage + j * KeyBytes; }
     __device__ static const unsigned char* value_row(const unsigned char* stage, int j) {
         return stage + kValues + j * ValueBytes;
@@ -349,6 +351,10 @@ struct StagePlanes {
         return stage + kValueScales + j * ValueScaleBytes;
     }
 };
+
+__device__ __forceinline__ float bf16_at(const unsigned char* p, int i) {
+    return __bfloat162float(reinterpret_cast<const bf16*>(p)[i]);
+}
 
 __device__ __forceinline__ float fp16_at(const unsigned char* p, int i) {
     return __half2float(reinterpret_cast<const __half*>(p)[i]);
@@ -363,7 +369,7 @@ __device__ __forceinline__ float e4m3_at(const unsigned char* p, int i) {
 // E2M1 element d of a packed row (dimension 2j in the low nibble of byte j).
 __device__ __forceinline__ float e2m1_at(const unsigned char* p, int d) {
     __nv_fp4_e2m1 v;
-    v.__x = static_cast<__nv_fp4_storage_t>((p[d >> 1] >> (4 * (d & 1))) & 0xFU);
+    v.__x = static_cast<__nv_fp4_storage_t>((p[static_cast<unsigned>(d) >> 1] >> (4 * (d & 1))) & 0xFU);
     return static_cast<float>(v);
 }
 
@@ -372,39 +378,40 @@ __device__ __forceinline__ float fp8_row_cell(const unsigned char* row, const un
     return e4m3_at(row, d) * fp16_at(scale, 0);
 }
 __device__ __forceinline__ float nvfp4_cell(const unsigned char* row, const unsigned char* scales, int d) {
-    return e2m1_at(row, d) * e4m3_at(scales, d / 16);
+    return e2m1_at(row, d) * e4m3_at(scales, static_cast<unsigned>(d) >> 4);
 }
 
-template <KvCacheStorage Storage>
+template <KvCacheStorage Storage, int Stages = 2>
 struct KVTile;
 
-// BF16 keys, FP16 values.
-template <>
-struct KVTile<KvCacheStorage::BFloat16> : StagePlanes<kHeadDim * 2, kHeadDim * 2, 0, 0> {
+// BF16 keys, FP16 values. Share K and V plane so 1-stage fits 2 CTAs/SM in 99 KiB SMEM.
+template <int Stages>
+struct KVTile<KvCacheStorage::BFloat16, Stages> : StagePlanes<kHeadDim * 2, kHeadDim * 2, 0, 0, true> {
+    using Base = StagePlanes<kHeadDim * 2, kHeadDim * 2, 0, 0, true>;
     static constexpr bool kRotatedKeys = false, kRotatedValues = false;
-    __device__ static float key(const unsigned char* stage, int j, int d) {
-        return __bfloat162float(reinterpret_cast<const bf16*>(key_row(stage, j))[d]);
+    __device__ static float key(const unsigned char* stage, int j, int d) { return bf16_at(Base::key_row(stage, j), d); }
+    __device__ static float value(const unsigned char* stage, int j, int d) {
+        return fp16_at(Base::value_row(stage, j), d);
     }
-    __device__ static float value(const unsigned char* stage, int j, int d) { return fp16_at(value_row(stage, j), d); }
 };
 
 // INT8 codes with one FP16 scale per 64; keys rotated.
-template <>
-struct KVTile<KvCacheStorage::Int8Group64> : StagePlanes<kHeadDim, kHeadDim, 8, 8> {
+template <int Stages>
+struct KVTile<KvCacheStorage::Int8Group64, Stages> : StagePlanes<kHeadDim, kHeadDim, 8, 8> {
     static constexpr bool kRotatedKeys = true, kRotatedValues = false;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(key_row(stage, j))[d]) *
-               fp16_at(key_scales(stage, j), d / 64);
+               fp16_at(key_scales(stage, j), static_cast<unsigned>(d) >> 6);
     }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(value_row(stage, j))[d]) *
-               fp16_at(value_scales(stage, j), d / 64);
+               fp16_at(value_scales(stage, j), static_cast<unsigned>(d) >> 6);
     }
 };
 
 // FP8 E4M3 rows with an FP16 row scale; keys rotated.
-template <>
-struct KVTile<KvCacheStorage::Fp8E4M3Row256> : StagePlanes<kHeadDim, kHeadDim, 2, 2> {
+template <int Stages>
+struct KVTile<KvCacheStorage::Fp8E4M3Row256, Stages> : StagePlanes<kHeadDim, kHeadDim, 2, 2> {
     static constexpr bool kRotatedKeys = true, kRotatedValues = false;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return fp8_row_cell(key_row(stage, j), key_scales(stage, j), d);
@@ -415,8 +422,8 @@ struct KVTile<KvCacheStorage::Fp8E4M3Row256> : StagePlanes<kHeadDim, kHeadDim, 2
 };
 
 // NVFP4 keys and values, both rotated.
-template <>
-struct KVTile<KvCacheStorage::Nvfp4Group16> : StagePlanes<kHeadDim / 2, kHeadDim / 2, 16, 16> {
+template <int Stages>
+struct KVTile<KvCacheStorage::Nvfp4Group16, Stages> : StagePlanes<kHeadDim / 2, kHeadDim / 2, 16, 16> {
     static constexpr bool kRotatedKeys = true, kRotatedValues = true;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return nvfp4_cell(key_row(stage, j), key_scales(stage, j), d);
@@ -427,8 +434,8 @@ struct KVTile<KvCacheStorage::Nvfp4Group16> : StagePlanes<kHeadDim / 2, kHeadDim
 };
 
 // FP8 keys, NVFP4 values, both rotated.
-template <>
-struct KVTile<KvCacheStorage::Fp8KeyNvfp4Value> : StagePlanes<kHeadDim, kHeadDim / 2, 2, 16> {
+template <int Stages>
+struct KVTile<KvCacheStorage::Fp8KeyNvfp4Value, Stages> : StagePlanes<kHeadDim, kHeadDim / 2, 2, 16> {
     static constexpr bool kRotatedKeys = true, kRotatedValues = true;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return fp8_row_cell(key_row(stage, j), key_scales(stage, j), d);
@@ -448,33 +455,50 @@ struct KVTile<KvCacheStorage::Fp8KeyNvfp4Value> : StagePlanes<kHeadDim, kHeadDim
 enum class VqKey : unsigned char { Vq2, Q4 };
 
 template <VqKey Key>
-struct VqTile : StagePlanes<kHeadDim, kHeadDim, 8, 8> {
-    using Base                              = StagePlanes<kHeadDim, kHeadDim, 8, 8>;
+struct VqTile {
+    static constexpr int kKeyBytes          = kHeadDim;
+    static constexpr int kValueBytes        = kHeadDim;
+    static constexpr int kKeyScaleBytes     = 8;
+    static constexpr int kValueScaleBytes   = 8;
     static constexpr bool kVq               = true;
+    static constexpr bool kShareKV          = false;
     static constexpr bool kRotatedKeys      = true, kRotatedValues = true;
     static constexpr VqKey kKey             = Key;
+    static constexpr int kValues            = kTokenTile * kKeyBytes;
+    static constexpr int kKeyScales         = kValues + kTokenTile * kValueBytes;
+    static constexpr int kValueScales       = kKeyScales + kTokenTile * kKeyScaleBytes;
     static constexpr int kKeyCodeBytes      = Key == VqKey::Vq2 ? kKVCacheVq2CodeBytes : kKVCacheQ4CodeBytes;
     static constexpr int kValueCodeBytes    = kKVCacheVq2CodeBytes;
-    static constexpr int kKeyCodes          = Base::kStageBytes;
+    static constexpr int kKeyCodes          = kValueScales + kTokenTile * kValueScaleBytes;
     static constexpr int kValueCodes        = kKeyCodes + kTokenTile * kKeyCodeBytes;
     static constexpr int kCodeScales        = kValueCodes + kTokenTile * kValueCodeBytes; // [token][role] FP16
     static constexpr int kTags              = kCodeScales + kTokenTile * 4;               // [token][role] I32
     static constexpr int kKeep              = kTags + kTokenTile * 8;                     // [token][role] u8
     static constexpr int kStageBytes        = kKeep + kTokenTile * 2;
+    __device__ static const unsigned char* key_row(const unsigned char* stage, int j) { return stage + j * kKeyBytes; }
+    __device__ static const unsigned char* value_row(const unsigned char* stage, int j) {
+        return stage + kValues + j * kValueBytes;
+    }
+    __device__ static const unsigned char* key_scales(const unsigned char* stage, int j) {
+        return stage + kKeyScales + j * kKeyScaleBytes;
+    }
+    __device__ static const unsigned char* value_scales(const unsigned char* stage, int j) {
+        return stage + kValueScales + j * kValueScaleBytes;
+    }
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(key_row(stage, j))[d]) *
-               fp16_at(key_scales(stage, j), d / 64);
+               fp16_at(key_scales(stage, j), static_cast<unsigned>(d) >> 6);
     }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(value_row(stage, j))[d]) *
-               fp16_at(value_scales(stage, j), d / 64);
+               fp16_at(value_scales(stage, j), static_cast<unsigned>(d) >> 6);
     }
 };
 
-template <>
-struct KVTile<KvCacheStorage::Vq2> : VqTile<VqKey::Vq2> {};
-template <>
-struct KVTile<KvCacheStorage::Q4KeyVq2Value> : VqTile<VqKey::Q4> {};
+template <int Stages>
+struct KVTile<KvCacheStorage::Vq2, Stages> : VqTile<VqKey::Vq2> {};
+template <int Stages>
+struct KVTile<KvCacheStorage::Q4KeyVq2Value, Stages> : VqTile<VqKey::Q4> {};
 
 // Copies one scale row of `Bytes` (2: a plain load, which cp.async cannot do; 8 or 16: cp.async).
 template <int Bytes>
@@ -491,7 +515,7 @@ __device__ __forceinline__ void copy_scales(unsigned char* dst, const unsigned c
 // token/page-id slot per stage.
 template <KvCacheStorage Storage, int Group, int Stages>
 struct AttentionShared {
-    using Tile                           = KVTile<Storage>;
+    using Tile                           = KVTile<Storage, Stages>;
     static constexpr std::size_t kStage  = Tile::kStageBytes;
     static constexpr std::size_t kQ      = Stages * kStage;
     static constexpr std::size_t kProbs  = kQ + sizeof(float) * Group * kHeadDim;
@@ -521,26 +545,42 @@ constexpr int kAttentionWarps   = kAttentionThreads / 32;
 // order over r and the butterfly, the tile's online-softmax update (an exact maximum, then l summed
 // serially in token order) and the in-order value fold, under the fixed split partition.
 template <KvCacheStorage Storage, int Group, bool Exact, int Stages>
-__global__ void __launch_bounds__(kAttentionThreads, 1)
+__global__ void __launch_bounds__(kAttentionThreads,
+                                  AttentionShared<Storage, Group, Stages>::kBytes <= 50176 ? 2 : 1)
     attention_kernel(const bf16* __restrict__ q, int heads, int kv_heads, PagedKVLayerView kv, QsaPageSpaces spaces,
                      const std::int32_t* __restrict__ tables, int table_stride,
                      const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                      int width, int ratio, const std::int32_t* __restrict__ selected,
                      const std::int32_t* __restrict__ counts, int top_blocks, int splits, float scale,
                      float* __restrict__ partial, bf16* __restrict__ out, detail::QsaVqWindow vq) {
-    using Tile   = KVTile<Storage>;
+    using Tile   = KVTile<Storage, Stages>;
     using Shared = AttentionShared<Storage, Group, Stages>;
     static_assert(Group % 2 == 0, "two threads per dimension split the heads");
     constexpr int Half = Group / 2;
     pdl::enter();
     const int split = blockIdx.x, kv_head = blockIdx.y, t = blockIdx.z;
-    const int group = Exact ? Group : heads / kv_heads;
+    const int group = (!Tile::kRotatedValues && Exact) ? Group : heads / kv_heads;
     const int p = positions[t];
     const int count = counts[t];
     const int total = attended_count(count, ratio, p);
     const int per_split = (total + splits - 1) / splits;
     const int begin = split * per_split, end = min(total, begin + per_split);
     const int tiles = begin < end ? (end - begin + kTokenTile - 1) / kTokenTile : 0;
+    if (tiles == 0) {
+        if (splits == 1) {
+            for (int i = threadIdx.x; i < group * kHeadDim; i += kAttentionThreads) {
+                const int h = i / kHeadDim, d = i % kHeadDim;
+                out[(static_cast<std::size_t>(t) * heads + kv_head * group + h) * kHeadDim + d] =
+                    __float2bfloat16_rn(0.0F);
+            }
+        } else if (threadIdx.x < group) {
+            const int head = kv_head * group + threadIdx.x;
+            float* slot = partial + ((static_cast<std::size_t>(t) * splits + split) * heads + head) * (kHeadDim + 2);
+            slot[kHeadDim]     = -INFINITY;
+            slot[kHeadDim + 1] = 0.0F;
+        }
+        return;
+    }
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t / width]) * table_stride;
     const std::int32_t* list  = selected + static_cast<std::size_t>(t) * top_blocks;
 
@@ -631,133 +671,170 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             cp_async<16>(smem + Shared::kCodebook + 16 * i, g_kv_cache_vq2_codebook + 16 * i);
         }
     }
-    // Gathers the K/V rows and scales of tile i's tokens (slot `buf`) into stage s.
+    // Byte offset of token j's row of `bytes` in its page's plane.
+    const auto offset = [&](int buf, int j, int page, int bytes) {
+        return (static_cast<std::size_t>(kv_head + kv_heads * page) * kPagedKVPageSize +
+                (tokens[buf][j] & kPagedKVPageMask)) *
+               bytes;
+    };
+    // Gathers the K and V rows and scales of tile i's tokens (slot `buf`) into stage s.
     const auto issue = [&](int i, int buf, int s) {
         unsigned char* stage = smem + s * Shared::kStage;
         const int n          = min(kTokenTile, end - (begin + i * kTokenTile));
         if constexpr (Tile::kVq) {
             vq_issue(stage, buf, n);
             cp_commit();
-            return;
-        }
-        constexpr int KC = Tile::kKeyBytes / 16, VC = Tile::kValueBytes / 16;
-        // Byte offset of token j's row of `bytes` in its page's plane.
-        const auto offset = [&](int j, int page, int bytes) {
-            return (static_cast<std::size_t>(kv_head + kv_heads * page) * kPagedKVPageSize +
-                    (tokens[buf][j] & kPagedKVPageMask)) *
-                   bytes;
-        };
-        for (int c = threadIdx.x; c < n * (KC + VC); c += kAttentionThreads) {
-            const int j = c / (KC + VC), r = c % (KC + VC);
-            const bool is_key = r < KC;
-            const int chunk   = is_key ? r : r - KC;
-            int page;
-            const void* base = is_key ? detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k,
-                                                                ids[buf][j], page)
-                                      : detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v,
-                                                                ids[buf][j], page);
-            unsigned char* dst = is_key ? stage + j * Tile::kKeyBytes : stage + Tile::kValues + j * Tile::kValueBytes;
-            cp_async<16, Cache::cg>(dst + 16 * chunk, static_cast<const unsigned char*>(base) +
-                                                          offset(j, page, is_key ? Tile::kKeyBytes : Tile::kValueBytes) +
-                                                          16 * chunk);
-        }
-        if constexpr (Tile::kKeyScaleBytes > 2) {
-            if (const int j = threadIdx.x; j < n) {
+        } else if constexpr (Tile::kShareKV) {
+            constexpr int KC = Tile::kKeyBytes / 16;
+            for (int c = threadIdx.x; c < n * KC; c += kAttentionThreads) {
+                const int j = c / KC, chunk = c % KC;
                 int page;
-                const void* base = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
-                                                           spaces.lent_k_scale, ids[buf][j], page);
-                copy_scales<Tile::kKeyScaleBytes>(stage + Tile::kKeyScales + j * Tile::kKeyScaleBytes,
-                                                  static_cast<const unsigned char*>(base) +
-                                                      offset(j, page, Tile::kKeyScaleBytes));
+                const void* base = detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k,
+                                                           ids[buf][j], page);
+                cp_async<16, Cache::cg>(stage + j * Tile::kKeyBytes + 16 * chunk,
+                                        static_cast<const unsigned char*>(base) + offset(buf, j, page, Tile::kKeyBytes) +
+                                            16 * chunk);
+            }
+            cp_commit();
+        } else {
+            constexpr int KC = Tile::kKeyBytes / 16, VC = Tile::kValueBytes / 16;
+            if constexpr (KC == VC) {
+                for (int c = threadIdx.x; c < n * KC; c += kAttentionThreads) {
+                    const int j = c / KC, chunk = c % KC;
+                    const int id = ids[buf][j];
+                    int k_page, v_page;
+                    const void* k_base = detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k,
+                                                                 spaces.lent_k, id, k_page);
+                    const void* v_base = detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v,
+                                                                 spaces.lent_v, id, v_page);
+                    cp_async<16, Cache::cg>(stage + j * Tile::kKeyBytes + 16 * chunk,
+                                            static_cast<const unsigned char*>(k_base) +
+                                                offset(buf, j, k_page, Tile::kKeyBytes) + 16 * chunk);
+                    cp_async<16, Cache::cg>(stage + Tile::kValues + j * Tile::kValueBytes + 16 * chunk,
+                                            static_cast<const unsigned char*>(v_base) +
+                                                offset(buf, j, v_page, Tile::kValueBytes) + 16 * chunk);
+                }
+            } else {
+                for (int c = threadIdx.x; c < n * (KC + VC); c += kAttentionThreads) {
+                    const int j = c / (KC + VC), r = c % (KC + VC);
+                    const bool is_key = r < KC;
+                    const int chunk   = is_key ? r : r - KC;
+                    int page;
+                    const void* base = is_key ? detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k,
+                                                                        spaces.lent_k, ids[buf][j], page)
+                                              : detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v,
+                                                                        spaces.lent_v, ids[buf][j], page);
+                    const int bytes = is_key ? Tile::kKeyBytes : Tile::kValueBytes;
+                    cp_async<16, Cache::cg>(stage + (is_key ? 0 : Tile::kValues) + j * bytes + 16 * chunk,
+                                            static_cast<const unsigned char*>(base) + offset(buf, j, page, bytes) +
+                                                16 * chunk);
+                }
+            }
+            if constexpr (Tile::kKeyScaleBytes > 2) {
+                if (const int j = threadIdx.x; j < n) {
+                    int page;
+                    const void* base = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
+                                                               spaces.lent_k_scale, ids[buf][j], page);
+                    copy_scales<Tile::kKeyScaleBytes>(stage + Tile::kKeyScales + j * Tile::kKeyScaleBytes,
+                                                      static_cast<const unsigned char*>(base) +
+                                                          offset(buf, j, page, Tile::kKeyScaleBytes));
+                }
+            }
+            if constexpr (Tile::kValueScaleBytes > 2) {
+                if (const int j = threadIdx.x - kTokenTile; j >= 0 && j < n) {
+                    int page;
+                    const void* base = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
+                                                               spaces.lent_v_scale, ids[buf][j], page);
+                    copy_scales<Tile::kValueScaleBytes>(stage + Tile::kValueScales + j * Tile::kValueScaleBytes,
+                                                        static_cast<const unsigned char*>(base) +
+                                                            offset(buf, j, page, Tile::kValueScaleBytes));
+                }
+            }
+            cp_commit();
+            if constexpr (Tile::kKeyScaleBytes == 2) {
+                if (const int j = threadIdx.x; j < n) {
+                    int page;
+                    const void* base = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
+                                                               spaces.lent_k_scale, ids[buf][j], page);
+                    copy_scales<2>(stage + Tile::kKeyScales + j * 2,
+                                   static_cast<const unsigned char*>(base) + offset(buf, j, page, 2));
+                }
+            }
+            if constexpr (Tile::kValueScaleBytes == 2) {
+                if (const int j = threadIdx.x - kTokenTile; j >= 0 && j < n) {
+                    int page;
+                    const void* base = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
+                                                               spaces.lent_v_scale, ids[buf][j], page);
+                    copy_scales<2>(stage + Tile::kValueScales + j * 2,
+                                   static_cast<const unsigned char*>(base) + offset(buf, j, page, 2));
+                }
             }
         }
-        if constexpr (Tile::kValueScaleBytes > 2) {
-            constexpr int kVThreadBase = Tile::kKeyScaleBytes > 2 ? kTokenTile : 0;
-            if (const int j = static_cast<int>(threadIdx.x) - kVThreadBase; j >= 0 && j < n) {
+    };
+    const auto issue_shared_v = [&](int n, int buf, int s) {
+        if constexpr (Tile::kShareKV) {
+            unsigned char* stage = smem + s * Shared::kStage;
+            constexpr int VC     = Tile::kValueBytes / 16;
+            for (int c = threadIdx.x; c < n * VC; c += kAttentionThreads) {
+                const int j = c / VC, chunk = c % VC;
                 int page;
-                const void* base = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
-                                                           spaces.lent_v_scale, ids[buf][j], page);
-                copy_scales<Tile::kValueScaleBytes>(stage + Tile::kValueScales + j * Tile::kValueScaleBytes,
-                                                    static_cast<const unsigned char*>(base) +
-                                                        offset(j, page, Tile::kValueScaleBytes));
+                const void* base = detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v,
+                                                           ids[buf][j], page);
+                cp_async<16, Cache::cg>(stage + j * Tile::kValueBytes + 16 * chunk,
+                                        static_cast<const unsigned char*>(base) + offset(buf, j, page, Tile::kValueBytes) +
+                                            16 * chunk);
             }
-        }
-        cp_commit();
-        if constexpr (Tile::kKeyScaleBytes == 2) {
-            if (const int j = threadIdx.x; j < n) {
-                int page;
-                const void* base = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
-                                                           spaces.lent_k_scale, ids[buf][j], page);
-                copy_scales<2>(stage + Tile::kKeyScales + j * 2,
-                               static_cast<const unsigned char*>(base) + offset(j, page, 2));
-            }
-        }
-        if constexpr (Tile::kValueScaleBytes == 2) {
-            constexpr int kVThreadBase = Tile::kKeyScaleBytes == 2 ? kTokenTile : 0;
-            if (const int j = static_cast<int>(threadIdx.x) - kVThreadBase; j >= 0 && j < n) {
-                int page;
-                const void* base = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
-                                                           spaces.lent_v_scale, ids[buf][j], page);
-                copy_scales<2>(stage + Tile::kValueScales + j * 2,
-                               static_cast<const unsigned char*>(base) + offset(j, page, 2));
-            }
+            cp_commit();
         }
     };
 
     // The first tile streams while the query heads load and rotate.
-    if (tiles > 0) {
-        prepare(0, 0);
-        __syncthreads();
-        issue(0, 0, 0);
-    }
-    // The query heads: one 16-byte load of eight elements per thread.
-    for (int i = threadIdx.x; i < group * kHeadDim / 8; i += kAttentionThreads) {
-        const int h = i / (kHeadDim / 8), d0 = 8 * (i % (kHeadDim / 8));
-        const uint4 raw = *reinterpret_cast<const uint4*>(
-            q + (static_cast<std::size_t>(t) * heads + kv_head * group + h) * kHeadDim + d0);
-        const auto* values = reinterpret_cast<const bf16*>(&raw);
-#pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const int d = d0 + e;
-            qs[q_at(h, d & 31, d >> 5)] = __bfloat162float(values[e]);
-        }
-    }
-    if (threadIdx.x < group) {
-        m_run[threadIdx.x] = -INFINITY;
-        l_run[threadIdx.x] = 0.0F;
-    }
+    prepare(0, 0);
     __syncthreads();
+    issue(0, 0, 0);
     if constexpr (Tile::kRotatedKeys) {
-        // Keys are stored in the normalized Hadamard domain; rotate each query head the same way.
+        // Keys are stored in the normalized Hadamard domain; load and rotate each query head in registers.
         for (int h = warp; h < group; h += kAttentionWarps) {
+            const bf16* q_head = q + (static_cast<std::size_t>(t) * heads + kv_head * group + h) * kHeadDim + lane;
             float v[8];
 #pragma unroll
-            for (int r = 0; r < 8; ++r) { v[r] = qs[q_at(h, lane, r)]; }
+            for (int r = 0; r < 8; ++r) { v[r] = __bfloat162float(q_head[32 * r]); }
             normalized_hadamard_d256_inplace(v, lane);
 #pragma unroll
             for (int r = 0; r < 8; ++r) { qs[q_at(h, lane, r)] = v[r]; }
         }
-        __syncthreads();
-    }
-    // Value phase: this thread's dimension and its half of the heads.
-    const int d_own = threadIdx.x % kHeadDim, h_base = (threadIdx.x / kHeadDim) * Half;
-    const auto mine = [&](int i) { return Exact || h_base + i < group; };
-    float acc[Half];
+    } else {
+        // The query heads: one 16-byte load of eight elements per thread.
+        for (int i = threadIdx.x; i < group * kHeadDim / 8; i += kAttentionThreads) {
+            const int h = i / (kHeadDim / 8), d0 = 8 * (i % (kHeadDim / 8));
+            const uint4 raw = *reinterpret_cast<const uint4*>(
+                q + (static_cast<std::size_t>(t) * heads + kv_head * group + h) * kHeadDim + d0);
+            const auto* values = reinterpret_cast<const bf16*>(&raw);
 #pragma unroll
-    for (int i = 0; i < Half; ++i) { acc[i] = 0.0F; }
-    for (int i = 0; i < tiles; ++i) {
-        const int n = min(kTokenTile, end - (begin + i * kTokenTile));
+            for (int e = 0; e < 8; ++e) {
+                const int d = d0 + e;
+                qs[q_at(h, d & 31, d >> 5)] = __bfloat162float(values[e]);
+            }
+        }
+    }
+    float acc[Half];
+    constexpr bool kSingleTile = Stages == 1 && !Tile::kVq;
+    for (int i = 0; i < (kSingleTile ? 1 : tiles); ++i) {
+        int n = kSingleTile ? (end - begin) : min(kTokenTile, end - (begin + i * kTokenTile));
+        asm("" : "+r"(n));
         const int s = Stages == 2 ? i % 2 : 0;
         bool ahead  = false;
-        if (Stages == 1 && i > 0) {
-            prepare(i, 0);
-            __syncthreads();
-            issue(i, 0, 0);
-        } else if (Stages == 2 && i + 1 < tiles) {
-            prepare(i + 1, (i + 1) % 2);
-            __syncthreads();
-            issue(i + 1, (i + 1) % 2, 1 - s);
-            ahead = true;
+        if constexpr (!kSingleTile) {
+            if (Stages == 1 && i > 0) {
+                prepare(i, 0);
+                __syncthreads();
+                issue(i, 0, 0);
+            } else if (Stages == 2 && i + 1 < tiles) {
+                prepare(i + 1, (i + 1) % 2);
+                __syncthreads();
+                issue(i + 1, (i + 1) % 2, 1 - s);
+                ahead = true;
+            }
         }
         if (ahead) {
             cp_wait<1>();
@@ -815,70 +892,133 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             __syncthreads();
         }
         const unsigned char* stage = smem + s * Shared::kStage;
-        // Scores: one warp per token, all query heads of the group.
-        for (int j = warp; j < n; j += kAttentionWarps) {
-            float k[8];
+        const auto ld_q4           = [](const float4* p) {
+            float4 v;
+            asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];"
+                         : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                         : "r"(static_cast<std::uint32_t>(__cvta_generic_to_shared(p))));
+            return v;
+        };
+        // Scores: one warp per token pair, all query heads of the group.
+        for (int j0 = warp * 2; j0 < n; j0 += kAttentionWarps * 2) {
+            const int j1    = j0 + 1;
+            const bool has1 = j1 < n;
+            float k0[8], k1[8];
+            if constexpr (!Tile::kShareKV) {
 #pragma unroll
-            for (int r = 0; r < 8; ++r) { k[r] = Tile::key(stage, j, lane + 32 * r); }
-            float part[Group];
+                for (int r = 0; r < 8; ++r) {
+                    k0[r] = Tile::key(stage, j0, (lane & 31) | (32 * r));
+                    k1[r] = 0.0F;
+                }
+                if (has1) {
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) { k1[r] = Tile::key(stage, j1, (lane & 31) | (32 * r)); }
+                }
+            } else {
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    k0[r] = Tile::key(stage, j0, (lane & 31) | (32 * r));
+                    k1[r] = has1 ? Tile::key(stage, j1, (lane & 31) | (32 * r)) : 0.0F;
+                }
+            }
+            float part0[Group], part1[Group];
 #pragma unroll
             for (int h = 0; h < Group; ++h) {
-                float dot = 0.0F;
-                if (Exact || h < group) {
-                    const float4 lo = reinterpret_cast<const float4*>(qs)[h * 64 + lane];
-                    const float4 hi = reinterpret_cast<const float4*>(qs)[h * 64 + 32 + lane];
+                float dot0 = 0.0F, dot1 = 0.0F;
+                if (h < group) {
+                    const float4 lo   = ld_q4(reinterpret_cast<const float4*>(qs) + h * 64 + lane);
+                    const float4 hi   = ld_q4(reinterpret_cast<const float4*>(qs) + h * 64 + 32 + lane);
                     const float qv[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
 #pragma unroll
-                    for (int r = 0; r < 8; ++r) { dot += qv[r] * k[r]; }
+                    for (int r = 0; r < 8; ++r) {
+                        dot0 += qv[r] * k0[r];
+                        dot1 += qv[r] * k1[r];
+                    }
                 }
-                part[h] = dot;
+                part0[h] = dot0;
+                part1[h] = dot1;
             }
-            scatter_head_sums<Group>(part, group, lane, scale, probs, j);
+            scatter_head_sums<Group>(part0, group, lane, scale, probs, j0);
+            if (has1) { scatter_head_sums<Group>(part1, group, lane, scale, probs, j1); }
         }
         __syncthreads();
+        if constexpr (Tile::kShareKV) { issue_shared_v(n, s, s); }
         // Online softmax per head: the tile's exact maximum, the exponentials in parallel, then l
         // in token order.
         for (int h = warp; h < group; h += kAttentionWarps) {
-            const float a = lane < n ? probs[h][lane] : -INFINITY;
-            const float b = lane + 32 < n ? probs[h][lane + 32] : -INFINITY;
-            const float m = fmaxf(m_run[h], warp_max(fmaxf(a, b)));
+            const float a    = lane < n ? probs[h][lane] : -INFINITY;
+            const float b    = lane + 32 < n ? probs[h][lane + 32] : -INFINITY;
+            const float m_in = (kSingleTile || i == 0) ? -INFINITY : m_run[h];
+            const float m    = fmaxf(m_in, warp_max(fmaxf(a, b)));
             if (lane < n) { probs[h][lane] = expf(a - m); }
             if (lane + 32 < n) { probs[h][lane + 32] = expf(b - m); }
             __syncwarp();
             if (lane == 0) {
-                rescale[h] = expf(m_run[h] - m);
-                m_run[h]   = m;
+                if (!kSingleTile && i > 0) { rescale[h] = expf(m_in - m); }
+                m_run[h] = m;
             }
         }
+        if constexpr (Tile::kShareKV) { cp_wait<0>(); }
         __syncthreads();
-        if (threadIdx.x < group) {
-            const int h = threadIdx.x;
-            float l     = l_run[h] * rescale[h];
-            for (int j = 0; j < n; ++j) { l += probs[h][j]; }
+        int h_tid;
+        asm("mov.u32 %0, %%tid.x;" : "=r"(h_tid));
+        if (h_tid < group) {
+            const int h = h_tid;
+            float l     = (kSingleTile || i == 0) ? 0.0F : l_run[h] * rescale[h];
+            int j       = 0;
+            for (; j + 3 < n; j += 4) {
+                const float4 pr = *reinterpret_cast<const float4*>(&probs[h][j]);
+                l               = (((l + pr.x) + pr.y) + pr.z) + pr.w;
+            }
+            for (; j < n; ++j) { l += probs[h][j]; }
             l_run[h] = l;
         }
+        const int d_own = threadIdx.x % kHeadDim, h_base = (threadIdx.x / kHeadDim) * Half;
+        const auto mine = [&](int u) { return (!Tile::kRotatedValues && Exact) || h_base + u < group; };
 #pragma unroll
-        for (int i = 0; i < Half; ++i) {
-            if (mine(i)) { acc[i] *= rescale[h_base + i]; }
+        for (int u = 0; u < Half; ++u) {
+            if (kSingleTile || i == 0) {
+                acc[u] = 0.0F;
+            } else if (mine(u)) {
+                acc[u] *= rescale[h_base + u];
+            }
         }
         // Values, folded in token order, four tokens' probabilities a load.
-        for (int j0 = 0; j0 < n; j0 += 4) {
+        int j0 = 0;
+        for (; j0 + 3 < n; j0 += 4) {
+            float v[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) { v[u] = Tile::value(stage, j0 + u, d_own); }
+#pragma unroll
+            for (int u = 0; u < Half; ++u) {
+                if (mine(u)) {
+                    const float4 pr = ld_q4(reinterpret_cast<const float4*>(&probs[h_base + u][j0]));
+                    acc[u] += pr.x * v[0];
+                    acc[u] += pr.y * v[1];
+                    acc[u] += pr.z * v[2];
+                    acc[u] += pr.w * v[3];
+                }
+            }
+        }
+        if (j0 < n) {
             float v[4];
 #pragma unroll
             for (int u = 0; u < 4; ++u) { v[u] = j0 + u < n ? Tile::value(stage, j0 + u, d_own) : 0.0F; }
 #pragma unroll
-            for (int i = 0; i < Half; ++i) {
-                if (mine(i)) {
-                    const float4 pr = *reinterpret_cast<const float4*>(&probs[h_base + i][j0]);
-                    acc[i] += pr.x * v[0];
-                    if (j0 + 1 < n) { acc[i] += pr.y * v[1]; }
-                    if (j0 + 2 < n) { acc[i] += pr.z * v[2]; }
-                    if (j0 + 3 < n) { acc[i] += pr.w * v[3]; }
+            for (int u = 0; u < Half; ++u) {
+                if (mine(u)) {
+                    const float4 pr = ld_q4(reinterpret_cast<const float4*>(&probs[h_base + u][j0]));
+                    acc[u] += pr.x * v[0];
+                    if (j0 + 1 < n) { acc[u] += pr.y * v[1]; }
+                    if (j0 + 2 < n) { acc[u] += pr.z * v[2]; }
+                    if (j0 + 3 < n) { acc[u] += pr.w * v[3]; }
                 }
             }
         }
         __syncthreads();
     }
+    const int d_own = threadIdx.x % kHeadDim, h_base = (threadIdx.x / kHeadDim) * Half;
+    const auto mine = [&](int i) { return (!Tile::kRotatedValues && Exact) || h_base + i < group; };
     if constexpr (Tile::kRotatedValues) {
         if (splits == 1) {
             // Values are stored in the normalized Hadamard domain (its own inverse): rotate back when
@@ -905,16 +1045,20 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             }
         }
     }
+    int split_e, kv_head_e, t_e;
+    asm volatile("mov.u32 %0, %%ctaid.x; mov.u32 %1, %%ctaid.y; mov.u32 %2, %%ctaid.z;"
+                 : "=r"(split_e), "=r"(kv_head_e), "=r"(t_e));
 #pragma unroll
     for (int i = 0; i < Half; ++i) {
         if (!mine(i)) { continue; }
-        const int h = h_base + i, head = kv_head * group + h;
+        const int h = h_base + i, head = kv_head_e * group + h;
         if (splits == 1) {
             const float l = l_run[h];
-            out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d_own] =
+            out[(static_cast<std::size_t>(t_e) * heads + head) * kHeadDim + d_own] =
                 __float2bfloat16_rn(l > 0.0F ? acc[i] / l : 0.0F);
         } else {
-            float* slot = partial + ((static_cast<std::size_t>(t) * splits + split) * heads + head) * (kHeadDim + 2);
+            float* slot =
+                partial + ((static_cast<std::size_t>(t_e) * splits + split_e) * heads + head) * (kHeadDim + 2);
             slot[d_own] = acc[i];
             if (d_own == 0) {
                 slot[kHeadDim]     = m_run[h];
@@ -922,7 +1066,6 @@ __global__ void __launch_bounds__(kAttentionThreads, 1)
             }
         }
     }
-    if constexpr (Tile::kVq) { cp_wait<0>(); } // the codebook copy of a split without tiles
 }
 
 template <bool RotateValues>
@@ -933,21 +1076,25 @@ __global__ void merge_kernel(const float* __restrict__ partial, int heads, int s
     for (int s = 0; s < splits; ++s) {
         m = fmaxf(m, partial[((static_cast<std::size_t>(t) * splits + s) * heads + head) * (kHeadDim + 2) + kHeadDim]);
     }
-    float l = 0.0F, acc = 0.0F;
+    float l = 0.0F, acc0 = 0.0F, acc1 = 0.0F;
     for (int s = 0; s < splits; ++s) {
         const float* slot = partial + ((static_cast<std::size_t>(t) * splits + s) * heads + head) * (kHeadDim + 2);
         const float ms = slot[kHeadDim];
         if (ms == -INFINITY) { continue; }
-        const float w = expf(ms - m);
+        const float w     = expf(ms - m);
+        const float2 pair = reinterpret_cast<const float2*>(slot)[d];
         l += w * slot[kHeadDim + 1];
-        acc += w * slot[d];
+        acc0 += w * pair.x;
+        acc1 += w * pair.y;
     }
-    const float val = l > 0.0F ? acc / l : 0.0F;
+    const float val0 = l > 0.0F ? acc0 / l : 0.0F;
+    const float val1 = l > 0.0F ? acc1 / l : 0.0F;
     if constexpr (!RotateValues) {
-        out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(val);
+        reinterpret_cast<__nv_bfloat162*>(out + (static_cast<std::size_t>(t) * heads + head) * kHeadDim)[d] =
+            __floats2bfloat162_rn(val0, val1);
     } else {
         __shared__ float smem[kHeadDim];
-        smem[d] = val;
+        reinterpret_cast<float2*>(smem)[d] = make_float2(val0, val1);
         __syncthreads();
         if (d < 32) {
             float v[8];
@@ -1285,7 +1432,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa attention: ") + cudaGetErrorString(error)); }
     };
     // Two stages only where a split holds more than one tile and both fit; one stage otherwise
-    // (BF16's 64 KiB stage, and every decode and verification call).
+    // (BF16's shared K/V stage, and every decode and verification call).
     const auto launch_stages = [&]<KvCacheStorage Storage, int Group, bool Exact>() {
         using One = AttentionShared<Storage, Group, 1>; // two stages add a stage and a token slot
         if constexpr (One::kBytes + One::kStage + sizeof(std::int32_t) * 2 * kTokenTile <= 99 * 1024) {
@@ -1337,12 +1484,12 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
                                    vector_quantized(layer.kv.storage);
         const cudaError_t error =
             rotate_values
-                ? pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel<true>,
-                                       static_cast<const float*>(ws.partial), geometry.heads, splits,
-                                       static_cast<bf16*>(out.data))
-                : pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel<false>,
-                                       static_cast<const float*>(ws.partial), geometry.heads, splits,
-                                       static_cast<bf16*>(out.data));
+                ? pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim / 2), 0, stream},
+                                       merge_kernel<true>, static_cast<const float*>(ws.partial), geometry.heads,
+                                       splits, static_cast<bf16*>(out.data))
+                : pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim / 2), 0, stream},
+                                       merge_kernel<false>, static_cast<const float*>(ws.partial), geometry.heads,
+                                       splits, static_cast<bf16*>(out.data));
         if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa merge: ") + cudaGetErrorString(error)); }
     }
     commit();
