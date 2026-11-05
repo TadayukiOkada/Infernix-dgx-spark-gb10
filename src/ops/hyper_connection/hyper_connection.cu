@@ -243,6 +243,7 @@ __global__ void __launch_bounds__(kVec8Threads) inject_norm_vec8_kernel(const bf
 
 __global__ void gates_kernel(const bf16* __restrict__ z, int rows, int rank, int streams, int columns,
                              bf16* __restrict__ mix, float* __restrict__ inject) {
+    pdl::enter();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (i >= rows || t >= columns) { return; }
@@ -255,8 +256,57 @@ __global__ void gates_kernel(const bf16* __restrict__ z, int rows, int rank, int
     }
 }
 
+// The SiLU half of z in V-element register-cached vectors (one load, one store per 8 or 4 rows); the
+// injection rows stay scalar. Elementwise, so the bits do not depend on V or the thread mapping.
+template <int V>
+__global__ void gates_vec_kernel(const bf16* __restrict__ z, int rows, int rank, int streams,
+                                 bf16* __restrict__ mix, float* __restrict__ inject) {
+    pdl::enter();
+    const int item    = threadIdx.x;
+    const int t       = blockIdx.y;
+    const int vectors = rank / V;
+    if (item < vectors) {
+        unsigned bits[V / 2];
+        if constexpr (V == 8) {
+            const uint4 packed =
+                *reinterpret_cast<const uint4*>(z + static_cast<std::size_t>(t) * rows + item * V);
+            bits[0] = packed.x;
+            bits[1] = packed.y;
+            bits[2] = packed.z;
+            bits[3] = packed.w;
+        } else {
+            const uint2 packed =
+                *reinterpret_cast<const uint2*>(z + static_cast<std::size_t>(t) * rows + item * V);
+            bits[0] = packed.x;
+            bits[1] = packed.y;
+        }
+        unsigned out[V / 2];
+        const float scale = 1.0F / static_cast<float>(streams);
+#pragma unroll
+        for (int g = 0; g < V / 2; ++g) {
+            const __nv_bfloat162 in = *reinterpret_cast<const __nv_bfloat162*>(&bits[g]);
+            const float v0          = __bfloat162float(in.x) * scale;
+            const float v1          = __bfloat162float(in.y) * scale;
+            const __nv_bfloat162 r  = __floats2bfloat162_rn(v0 * sigmoidf(v0), v1 * sigmoidf(v1));
+            out[g]                  = *reinterpret_cast<const unsigned*>(&r);
+        }
+        if constexpr (V == 8) {
+            const uint4 packed{out[0], out[1], out[2], out[3]};
+            *reinterpret_cast<uint4*>(mix + static_cast<std::size_t>(t) * rank + item * V) = packed;
+        } else {
+            const uint2 packed{out[0], out[1]};
+            *reinterpret_cast<uint2*>(mix + static_cast<std::size_t>(t) * rank + item * V) = packed;
+        }
+    } else if (inject != nullptr && item - vectors < streams) {
+        const float scale = 1.0F / static_cast<float>(streams);
+        const float v = __bfloat162float(z[static_cast<std::size_t>(t) * rows + rank + (item - vectors)]) * scale;
+        inject[static_cast<std::size_t>(t) * streams + (item - vectors)] = 2.0F * sigmoidf(v);
+    }
+}
+
 __global__ void collapse_kernel(const bf16* __restrict__ logits, const bf16* __restrict__ normalized,
                                 int hidden, int streams, int columns, bf16* __restrict__ out) {
+    pdl::enter();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
@@ -299,6 +349,7 @@ __global__ void expand_kernel(const bf16* __restrict__ x, int hidden, int stream
 __launch_bounds__(320) __global__ void collapse_vec8_kernel(const bf16* __restrict__ logits,
                                                             const bf16* __restrict__ normalized, int hidden,
                                                             int streams, int columns, bf16* __restrict__ out) {
+    pdl::enter();
     const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
@@ -363,6 +414,10 @@ __launch_bounds__(320) __global__ void expand_vec8_kernel(const bf16* __restrict
 
 bool aligned_16(const void* p) noexcept {
     return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U;
+}
+
+bool aligned_8(const void* p) noexcept {
+    return (reinterpret_cast<std::uintptr_t>(p) & 7U) == 0U;
 }
 
 // out column t (row pitch `pitch` elements) = the mean of the streams, summed in stream order.
@@ -519,10 +574,42 @@ void hyper_connection_gates(const Tensor& z, std::int32_t rank, std::int32_t str
                     inject->ne[1] == columns,
                 "gates inject output must be FP32 [S, T]");
     }
-    gates_kernel<<<dim3((rows + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(z.data), rows, rank, streams, columns, static_cast<bf16*>(mix.data),
-        inject != nullptr ? static_cast<float*>(inject->data) : nullptr);
-    check_launch("gates");
+    // z's column pitch is rank + streams, so Flash-Next's 324-row z admits 4-element vectors, not
+    // 8, whenever the injection rows are present; 8-element vectors need the whole pitch 16-byte
+    // aligned. One CTA per column covers rank / V + streams threads. The vector consumer serves the
+    // verification widths (at most 16 columns, where multi-row verification lands): launched as a
+    // programmatic dependent it overlaps the down projection's tail there, while from 17 columns the
+    // scalar serialized form measured faster in both parts — the early-launched gates' CTAs hold SM
+    // slots ahead of the down projection's later waves, and the one-CTA-per-column grid loses to the
+    // wide scalar grid's latency at prefill widths (infernix_hyper_connection_bench, GB10,
+    // interleaved: T = 32 +1.4% programmatic and +0.8% vector-serialized vs HEAD's scalar serialized).
+    const bf16* zdata     = static_cast<const bf16*>(z.data);
+    bf16* mixdata         = static_cast<bf16*>(mix.data);
+    float* injectdata     = inject != nullptr ? static_cast<float*>(inject->data) : nullptr;
+    const int inject_rows = inject != nullptr ? streams : 0;
+    if (columns <= 16 && rank % 8 == 0 && (inject == nullptr || rows % 8 == 0) && aligned_16(z.data) &&
+        aligned_16(mix.data) && rank / 8 + inject_rows <= 1024) {
+        const dim3 block((rank / 8 + inject_rows + 31) / 32 * 32);
+        if (pdl::launch_consumer({dim3(1, columns), block, 0, stream}, gates_vec_kernel<8>, zdata, rows, rank,
+                                 streams, mixdata, injectdata) != cudaSuccess) {
+            check_launch("gates");
+        }
+        return;
+    }
+    if (columns <= 16 && rank % 4 == 0 && (inject == nullptr || rows % 4 == 0) && aligned_8(z.data) &&
+        aligned_8(mix.data) && rank / 4 + inject_rows <= 1024) {
+        const dim3 block((rank / 4 + inject_rows + 31) / 32 * 32);
+        if (pdl::launch_consumer({dim3(1, columns), block, 0, stream}, gates_vec_kernel<4>, zdata, rows, rank,
+                                 streams, mixdata, injectdata) != cudaSuccess) {
+            check_launch("gates");
+        }
+        return;
+    }
+    if (pdl::launch_with(pdl::Dependency::Serialized,
+                         {dim3((rows + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream}, gates_kernel,
+                         zdata, rows, rank, streams, columns, mixdata, injectdata) != cudaSuccess) {
+        check_launch("gates");
+    }
 }
 
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
@@ -551,19 +638,28 @@ void hc_collapse(const Tensor& u, const Tensor& normalized, std::int32_t streams
     require(width == streams * hidden && normalized.ne[0] == width && normalized.ne[1] == columns &&
                 x.ne[1] == columns && columns > 0,
             "collapse shapes disagree");
+    // The same width rule as the gates: programmatic at the verification widths, serialized from 17
+    // columns where the up projection's grid is multi-wave and the waiting consumer would hold its
+    // later CTAs' SM slots (see hyper_connection_gates).
+    const pdl::Dependency dependency =
+        columns <= 16 ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
     if (hidden % 8 == 0 && aligned_16(u.data) && aligned_16(normalized.data) && aligned_16(x.data)) {
         const int vec_elems = hidden / 8;
         const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
-        collapse_vec8_kernel<<<dim3((vec_elems + threads - 1) / threads, columns), threads, 0, stream>>>(
-            static_cast<const bf16*>(u.data), static_cast<const bf16*>(normalized.data), hidden, streams, columns,
-            static_cast<bf16*>(x.data));
-        check_launch("collapse");
+        if (pdl::launch_with(dependency, {dim3((vec_elems + threads - 1) / threads, columns), dim3(threads), 0, stream},
+                             collapse_vec8_kernel, static_cast<const bf16*>(u.data),
+                             static_cast<const bf16*>(normalized.data), hidden, streams, columns,
+                             static_cast<bf16*>(x.data)) != cudaSuccess) {
+            check_launch("collapse");
+        }
         return;
     }
-    collapse_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(u.data), static_cast<const bf16*>(normalized.data), hidden, streams, columns,
-        static_cast<bf16*>(x.data));
-    check_launch("collapse");
+    if (pdl::launch_with(dependency, {dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
+                         collapse_kernel, static_cast<const bf16*>(u.data),
+                         static_cast<const bf16*>(normalized.data), hidden, streams, columns,
+                         static_cast<bf16*>(x.data)) != cudaSuccess) {
+        check_launch("collapse");
+    }
 }
 
 } // namespace detail

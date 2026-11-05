@@ -8,10 +8,11 @@
 //   inject = 2 sigmoid(z[rank:] / S); u = W_up m; x = (1/S) sum_s sigmoid(u[sH + d]) Rn[sH + d].
 //
 // Cases: Flash-Next's geometry (S = 4, H = 2560, rank 320) with and without injects at T = 1, 4, 5,
-// 8, 9, 16 (T = 1 the fused route, 4..16 the composed route since the 2026-10-30 GB10 crossover) and
+// 8, 9, 16 (T = 1 the fused route, 4 the composed mix since the 2026-10-30 GB10 crossover and 5..16
+// the composed route with the fused 16-token up + collapse since the 2026-11-05 GB10 retune) and
 // 17, 64, 96, 97, 129, 193 (the composed route; with Q8 weights and
-// more than 96 columns its up projection and collapse run as one kernel, whose tile changes at 129
-// columns and leaves partial token tiles at 97, 129 and 193); column invariance: each column of a
+// from 5 columns its up projection and collapse run as one kernel, whose tile changes at 17, 49 and
+// 129 columns and leaves partial token tiles at 5, 17, 97, 129 and 193); column invariance: each column of a
 // 3-column fused call is bit-identical to that column alone, and within one composed width tier
 // each column of a 9-column call equals it in the 16-column call (across tiers the composed route's
 // bits differ by measurement, so none is asserted there); one graph-captured call bit-identical to
@@ -21,9 +22,12 @@
 // composed route rounds Rn, z, m and u to BF16, so its bound is 2^-5 |ref| + 2^-6 rms(ref) and
 // injects to 2^-7 relative + 2^-9.
 //
-// The up projection and collapse of more than 96 columns run as one kernel for a Q8 W_up; it claims the
-// bits of the separate linear and collapse, so it is compared with them exactly at T = 97, 128, 129, 192,
-// 256, 300 and 1025 (each tile width, full and partial token tiles). A BF16 W_up takes the separate steps.
+// The up projection and collapse from 5 columns run as one kernel for a Q8 W_up. Where the separate
+// linear takes an MMA schedule it claims that route's bits exactly, so it is compared bit for bit at
+// T = 16, 97, 128, 129, 192, 256, 300 and 1025 (each tile width, full and partial token tiles); at
+// T = 5 the separate linear takes the narrow-width K-split schedule, whose accumulation order
+// differs, so T = 5 stays on the FP64-oracle bound above (measured 2026-11-05: 3882/12800 BF16
+// values differ there, all within that bound). A BF16 W_up takes the separate steps.
 
 #include "infernix/ops/hyper_connection.h"
 #include "ops/op_family.h"
@@ -356,7 +360,7 @@ void up_collapse_bit_identity(Codec codec, cudaStream_t stream) {
     constexpr int kMaxTokens = 1025;
     infernix::WorkspaceArena ws(std::max<std::size_t>(infernix::ops::linear_workspace_capacity_bytes(
         p.up_w.qtype, p.up_w.n, p.up_w.k, infernix::ops::LinearPolicy::A16Only, 1, kMaxTokens), 256));
-    for (const int T : {97, 128, 129, 192, 256, 300, kMaxTokens}) {
+    for (const int T : {16, 97, 128, 129, 192, 256, 300, kMaxTokens}) {
         const std::string label = tag + " T=" + std::to_string(T);
         if (!infernix::ops::detail::hc_up_collapse_supported(p.up_w, kH, kS, T)) {
             check(false, label + ": the fused route serves this call");
@@ -500,7 +504,8 @@ INFERNIX_OP_TEST(hyper_connection) {
             }
             check(same, tag + ": each column of a 3-column fused call equals that column alone");
             // Column invariance of the composed route within one linear width tier: each column of
-            // a 9-column call equals it in the 16-column call (both capacity-16 schedules). Across
+            // a 9-column call equals it in the 16-column call (both take the fused 16-token
+            // up + collapse tile). Across
             // tiers the bits differ by measurement (5 vs 16 differs for both codecs; q8 but not BF16
             // keeps the bits across 16 -> 17), so no cross-tier equality is asserted - the composed
             // route never promised it, and neither did the 17-column prefill before this retune.

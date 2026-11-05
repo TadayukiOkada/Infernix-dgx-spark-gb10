@@ -114,12 +114,12 @@ void launch(const Tensor& m, const Weight& up, const Tensor& normalized, Tensor&
 
 bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams,
                               std::int32_t columns) noexcept {
-    // From 17 columns, fuse up + collapse so u stays in shared memory instead of round-tripping
-    // [streams * hidden, T] through global memory. The boundary is measured, not the fused route's:
-    // at 4..16 columns (the composed mix since the 2026-10-30 GB10 retune) the separate linear and
-    // collapse beat this route's 64-row tile by 2..4 % at 5 and 9..16, and it only wins at 6..8,
-    // so the fusion keeps starting at 17 (infernix_hyper_connection_bench, GB10, interleaved).
-    if (streams != kStreams || hidden <= 0 || hidden % 16 != 0 || columns <= 16 || up.qdata == nullptr ||
+    // From 5 columns, fuse up + collapse so u stays in shared memory instead of round-tripping
+    // [streams * hidden, T] through global memory. The composed mix keeps 1..4 (its own fused route);
+    // 5..16 take the 16-token tile, whose measured win over the separate linear and collapse is what
+    // moved the boundary from 17 (where the 48-token tile lost 2..4 % at 5 and 9..16 in the
+    // 2026-10-30 GB10 retune) down to the fused mix's edge (infernix_hyper_connection_bench, GB10).
+    if (streams != kStreams || hidden <= 0 || hidden % 16 != 0 || columns <= 4 || up.qdata == nullptr ||
         up.n != streams * hidden) {
         return false;
     }
@@ -137,6 +137,11 @@ void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized,
     // Tiles by width from the GB10 sweep (whole mixer, Q8 layers); every tile gives the same bits.
     // The BF16 fused route was removed once the admission above became Q8-only (upstream 2026-10-28).
     const int hidden = x.ne[0];
+    // The linear family's measured argmin for this shape at 9..32 columns rides the same tile: the
+    // 32-row K64 one, whose unpredicated K and 4 CTAs/SM the fused route needs to keep its bandwidth.
+    // The 64-row K128 tile of the 17..48 band runs ~180 GB/s here and loses even to the composed
+    // pair it replaces (infernix_hyper_connection_bench, GB10, 2026-11-05).
+    if (T <= 16) return launch<q8_instances::MmaR32T16>(m, up, normalized, x, stream);
     if (T <= 48) return launch<q8_instances::MmaR64x16T48K128A1>(m, up, normalized, x, stream);
     if (T <= 128) {
         if (hidden % 32 == 0) {

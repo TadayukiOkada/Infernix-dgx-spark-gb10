@@ -531,3 +531,109 @@ and 2-stage / 2-CTA-per-SM `context_kv_grouped_kernel`) on NVIDIA GB10 (`sm_121a
   `group ≥ 3` dispatch band (`prepare_head_kernel` retained for `group ≤ 2`).
 - **2-CTA/SM `prepare_group_kernel` (`SHARED:38912, REG:118`) and 1-CTA/SM Exact `chunk_recurrence_kernel<64>` (`SHARED:61952`) initially left Exact T=512/T=2048 at +0.7 %/+1.2 %** — resolved in review by unioning `QkChunk` with 4-warp control staging (`SHARED:16896, REG:64`, 4 CTAs/SM), staging 16-row warp-disjoint Exact snapshots in `RecurrenceShared<64, false>` (`SHARED:33280, REG:128, STACK:0`, 2 CTAs/SM), and walking `prepare_group_kernel` chunks in LIFO order when `chunks > 64`. Both `T=512` (`−12.4 %` vs task baseline, `−9.8 %` vs fresh HEAD) and `T=2048` (`−10.0 %` vs task baseline, `−8.3 %` vs fresh HEAD) now exceed the `≥ 8 %` acceptance threshold across both Exact and `Fp16Accumulate` routes.
 - **2-half (64-row) Exact snapshot staging initially spilled 8 B (`STACK:8`) on `chunk_recurrence_kernel<64, false>` during `nvlink`** — caught by `infernix_cuda_stack_check`; resolved by switching to 16-row (`kChunkSize`) loop-invariant snapshot offsets per `mi` step, restoring `REG:128, STACK:0, LOCAL:0` on all `chunk_recurrence_kernel` instances.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-05 — T6: Fused `hc_up_collapse` extended to T = 5..16 on the `MmaR32T16` tile; `uint2`/`uint4` register-cached `gates_kernel` with PDL; PDL on both collapse kernels
+
+## 1. Accounting
+
+- Base commit: `d01af0ec6` (`dev-rebased-20261028`). Rebuild count: 6 single-invocation Ninja builds
+  (serve + projection test + HC bench share one device link).
+- Files: `src/ops/hyper_connection/hyper_connection_up_collapse.cu` (M),
+  `src/ops/hyper_connection/hyper_connection.cu` (M), `tests/ops/test_hyper_connection.cpp` (M).
+- `tools/cuda_stack/cuda_stack_allowlist.json`: unchanged (no spill removed or added;
+  `infernix_cuda_stack_check` passes on the unchanged allowlist).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **The doc's `Bf16MmaSchedule<64, 16, 16, 64, 2, 2>` is stale**: the fused up + collapse route has
+  been Q8-only since upstream 2026-10-28; the schedule class is `Q8A16MmaSchedule`.
+- **The doc's 64-row 16-column tile measured as a regression, the linear family's own tile wins**:
+  `Q8A16MmaSchedule<64, 16, 128, 16, 8, 1, 2>` (predicated K at `up.k = 320 < padded 384`, 160 CTAs)
+  runs ~180 GB/s and made T = 5..16 +0.8..+2.7 % *worse* than the composed route it replaced. The
+  published Q8 table's argmin for this shape at 9..32 columns — `q8_instances::MmaR32T16`
+  (`<32, 16, 64, 16, 8, 2, 4>`: `BlockK = 64` divides `k = 320` so the K loop is unpredicated,
+  320 CTAs, 4 CTAs/SM) — holds ~215 GB/s fused and is what shipped. The fused epilogue admits it:
+  `Features = 32 / 4 = 8`, `Quads = 2`, all `uint2` epilogue accesses stay 8-byte aligned.
+- **`gates_kernel`'s described shape was stale**: at HEAD it was already a single-pass elementwise
+  SiLU/inject kernel — no sum-of-squares, no second read of `z`. The stale parts were the scalar
+  16-bit accesses and the raw launch, both replaced.
+- **The `uint4` premise missed z's pitch**: `z` is `[rank + streams, T]`, so Flash-Next's column
+  pitch is 324 rows = 648 bytes — 8-byte aligned but *not* 16-byte, so per-column `uint4` loads are
+  misaligned on every odd column. Shipped: `uint4` when the whole pitch is 16-byte aligned
+  (`rows % 8 == 0`, e.g. no-inject calls), `uint2` when it is 8-byte aligned (`rows % 4 == 0`, the
+  injection geometry). Elementwise, so the bits are independent of the vector width.
+- **The `collapse_kernel` scalar premise was stale**: `collapse_vec8_kernel` already existed and was
+  the dispatched path; what it lacked was the PDL consumer protocol, which it now has.
+- **The time-attribution premise was wrong and it bounds the gain**: the doc attributed the T = 5..16
+  46.9–48.9 µs to the 5-kernel route's launch count and the `u` round-trip. The published kernel
+  table plus the interleaved A/B attribute it to the two projections' weight streaming: down
+  (`N = 324, K = 10240`, `sliced_r16_t8_w8_s2_m3`) ≈ 22–24.5 µs at ~60 % of the read ceiling, up ≈
+  20 µs at ~92 %, with the composed `collapse` + `u` round-trip worth only ~3 µs. Fusing recovers
+  that ~3 µs plus ~1 µs of scheduling; the remaining 15 % lives in the down projection's dispatch —
+  the linear family's `n324/n320_k10240` tables, outside T6's affected-file scope.
+
+## 3. Subsystem breakdown
+
+- `hyper_connection_up_collapse.cu`: `hc_up_collapse_supported` admits `columns >= 5` (was 17); the
+  T ≤ 16 band dispatches `q8_instances::MmaR32T16` with the existing `HcCollapseEpilogue` (bit-
+  identical collapse in the MMA epilogue, §19.3.23); the boundary comments record the measurements.
+- `hyper_connection.cu`: `gates_vec_kernel<V>` (V = 8/4) — one `uint4`/`uint2` load and store per 8/4
+  rows for the SiLU half, scalar for the `streams` injection rows, `pdl::enter()`; dispatch picks
+  V = 8 → V = 4 → scalar on the pitch alignment. The vector consumer and both collapse kernels are
+  launched `Programmatic` at columns ≤ 16 and `Serialized` from 17: measured at T = 32, the
+  early-launched consumer's CTAs hold SM slots ahead of the multi-wave down/up projection's later
+  waves (+1.4 % programmatic, +0.8 % vector-serialized, vs HEAD's scalar serialized).
+- `tests/ops/test_hyper_connection.cpp`: header comments match the new route; the fused-vs-composed
+  bit-identity loop adds T = 16 (passes exactly); T = 5 is documented as oracle-bounded rather than
+  bit-identical because the separate `linear` at 5 columns takes the narrow-width K-split schedule
+  (measured 3882/12800 BF16 values differ, all inside the FP64-oracle bound).
+
+## 4. Verification
+
+- `infernix_hyper_connection_test` and `infernix_cuda_stack_check`: pass 100 % (CTest 323/28).
+- `cuobjdump --dump-resource-usage` on `infernix-serve`: `gates_vec_kernel<4>` REG:28, `<8>` REG:30,
+  `STACK:0 LOCAL:0` both; no touched kernel spills; allowlist unchanged.
+- Interleaved A/B (HEAD binary vs new binary, 3 rounds, `infernix_hyper_connection_bench`, Q8,
+  graph of 48 distinct-weight calls; per-round spread ≤ 1 µs):
+
+| T | 5 | 6 | 8 | 12 | 16 | 32 | 64 | 128 | 512 | 2048 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HEAD µs | 47.11 | 47.67 | 48.25 | 46.43 | 46.80 | 48.51 | 53.24 | 85.94 | 253.29 | 973.37 |
+| new µs | 44.99 | 44.82 | 44.91 | 45.02 | 45.30 | 48.58 | 53.22 | 85.79 | 254.02 | 972.99 |
+| Δ | −4.5 % | −6.0 % | −6.9 % | −3.0 % | −3.2 % | +0.1 % | −0.0 % | −0.2 % | +0.3 % | −0.0 % |
+
+- Output bits: T = 12/16 fnv1a identical to HEAD (fused tile == linear route, K-order invariant);
+  T = 5..8 move to the fused MMA bits (oracle-bounded, see §2/test header).
+- BF16-codec spot A/B (2 rounds, the route where the PDL collapse consumer is live): T = 8 +0.2 %,
+  T = 16 +1.1 %, T = 32 +5.1 %, T = 512 +0.3 % — see §5.
+
+## 5. Regressions & adverse results (all found, all disclosed)
+
+- **Interim `Q8A16MmaSchedule<64, 16, 128, ...>` fused tile: +0.8..+2.7 % at T = 5..16** vs HEAD —
+  the doc's proposed tile; fixed by switching to `MmaR32T16` (§2).
+- **Programmatic gates at T = 32: +1.4 % (3/3 rounds)** — consumer-before-producer's-second-wave SM
+  starvation; fixed by the `columns <= 16` programmatic gate.
+- **Vectorized gates (serialized) at T = 32: +0.8 % (3/3 rounds)** — one-CTA-per-column grid loses
+  to the wide scalar grid at prefill widths; fixed by restricting the vector paths to columns ≤ 16.
+- **BF16-codec spot deltas +0.2/+1.1/+5.1/+0.3 % (T = 8/16/32/512)**: T = 32/512 are
+  code-identical to HEAD after the width gates, so those deltas calibrate the BF16 bench's run
+  scatter (T = 8 rounds spanned 71.5..76.9 µs, ±7 %); T = 16's +1.1 % is inside that scatter but
+  was measured with only 2 rounds — unresolved at this resolution, disclosed.
+- **T = 5..8 output bits move** (3882/12800 at T = 5) — the fused MMA replaces the narrow-width
+  K-split linear's accumulation order; within the composed route's FP64-oracle bound, pinned by the
+  mix oracle test and the T = 16 exact bit-identity.
+- **The acceptance bar was not met**: −3.0..−6.9 % measured against the required ≥ 15 % at
+  T = 5..16. Root cause in §2; §6 states what would close it.
+- Q8 T = 32..2048: −0.2..+0.3 % — within the HEAD binary's own run-to-run spread.
+
+## 6. Accepted gaps / follow-ups
+
+- The T = 5..16 mixer is now 4 kernels at ~45 µs; the remaining gap to the fused route's shape is
+  the down projection (`n324/n320_k10240` at 5..16 columns, ~60 % of the read ceiling) — a linear
+  dispatch-table question outside T6's files, and the only measured path to the doc's 15 %.
+- The 17..48 band still rides `MmaR64x16T48K128A1` (~180 GB/s class) although the linear table's
+  R32 tiles beat it at this shape through 48 columns; a band retune (R32T16 to 32, R32T24 to 48)
+  is a measured candidate follow-up, not shipped here because T6's acceptance sweep starts at 32
+  and the crossover was last certified whole-mixer on 2026-10-30.
+- PDL consumers only take effect under CUDA graph capture (eager streams stay serialized), so the
+  bench's graph and the engine's captured rounds see the overlap; eager fallback paths do not.
