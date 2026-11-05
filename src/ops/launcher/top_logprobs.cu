@@ -18,11 +18,21 @@ void top_logprobs_launch(const Tensor& logits, std::int32_t valid_rows, Tensor& 
     const auto launch  = [&](const auto* values) {
         auto* const top_ids = static_cast<std::int32_t*>(ids.data);
         auto* const top     = static_cast<float*>(output.data);
+        const bool wide     = valid_rows >= kTopLogprobsWideMinRows;
         if (count == 1) {
-            top_logprobs_one_kernel<kTopLogprobsSerialBlock><<<columns, kTopLogprobsSerialBlock, 0, stream>>>(
-                values, top_ids, top, valid_rows, logits.ne[0]);
+            if (wide) {
+                top_logprobs_one_kernel<kTopLogprobsSerialWideBlock>
+                    <<<columns, kTopLogprobsSerialWideBlock, 0, stream>>>(values, top_ids, top, valid_rows,
+                                                                          logits.ne[0]);
+            } else {
+                top_logprobs_one_kernel<kTopLogprobsSerialBlock><<<columns, kTopLogprobsSerialBlock, 0, stream>>>(
+                    values, top_ids, top, valid_rows, logits.ne[0]);
+            }
         } else if (select) {
             top_logprobs_select_kernel<kTopLogprobsBlock><<<columns, kTopLogprobsBlock, 0, stream>>>(
+                values, top_ids, top, valid_rows, logits.ne[0], count);
+        } else if (wide) {
+            top_logprobs_kernel<kTopLogprobsSerialWideBlock><<<columns, kTopLogprobsSerialWideBlock, 0, stream>>>(
                 values, top_ids, top, valid_rows, logits.ne[0], count);
         } else {
             top_logprobs_kernel<kTopLogprobsSerialBlock><<<columns, kTopLogprobsSerialBlock, 0, stream>>>(

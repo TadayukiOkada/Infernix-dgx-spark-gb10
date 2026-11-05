@@ -8,15 +8,18 @@ concurrent batch prefill completion before decode interleaving, optimal N-gram c
 (`best_copy_length`) and tile-aware MTP draft length scoring, `-rdc=true` static `.shared` memory bloat
 elimination across `infernix_ops`, single-stage tall LM-head projection (`SingleStage` + wide router MMA),
 removal of redundant MTP verification argmax calls, right-sized L1/shared memory carveouts (`down_kernel_a16`,
-`qsa_score_kernel` BF16 `uint2` query staging, `route_dispatch_plan_kernel` shared union), and 128-bit
-(`uint4`) coalesced vectorization across MoE combine, HyperConnection, QSA tail/key-pool, and PLE causal
-conv/state kernels on NVIDIA GB10 (`sm_121a`).
+`qsa_score_kernel` BF16 `uint2` query staging, `route_dispatch_plan_kernel` shared union, GDN
+`recurrent_record_conv_kernel` `RecordConvShared` tile shrinking), MTP `resident_moe` `down_kernel` launch
+bounds, `top_logprobs` 1024-thread wide CTA and `key > k3` fast guard, 8-thread parallel `NgramVolume`
+cache-hit gather and cache-line-disjoint `insert_cache` for prefill chunks, and 128-bit (`uint4`) coalesced
+vectorization across MoE combine, HyperConnection, QSA tail/key-pool, and PLE causal conv/state kernels on
+NVIDIA GB10 (`sm_121a`).
 
 ## Commit range & accounting
 
 - **Base commit (`origin/main`)**: `68c54356fd490ab329bd1475d48957f886bb7dd1`
 - **Previous HEAD**: `fbbc1c763` (`perf(gb10): optimize Qwen4Exp MoE staging, multi-row N-gram/MTP speculation, and 32-col LM head`)
-- **Delta in this milestone**: 21 code files changed (+1 changelog file = 22 files total), 895 code insertions(+), 162 code deletions(-) (excluding `cuda-kernel-toolkit/`, which is an integrated toolkit and intentionally excluded from file-by-file enumeration).
+- **Delta in this milestone**: 25 code files changed (+1 changelog file = 26 files total), 974 code insertions(+), 185 code deletions(-) (excluding `cuda-kernel-toolkit/`, which is an integrated toolkit and intentionally excluded from file-by-file enumeration).
 
 ## Why (GB10 hardware invariants)
 
@@ -31,9 +34,12 @@ conv/state kernels on NVIDIA GB10 (`sm_121a`).
 4. **Relocatable device code (`-rdc=true`) `.weak .shared` deduplication, L1/Shared SRAM carveout, & 48-SM CTA occupancy**:
    - Because `infernix_ops` compiles with `-rdc=true`, `nvlink` merges any `static __shared__` buffers from inline header templates (`cub::BlockReduce` in `argmax.cuh`, `target_logprobs.cuh`, `token_constraint.cuh`, `top_logprobs.cuh`) into every translation unit's static `.shared` reservation (`50,240..66,809` B/CTA), throttling occupancy across unrelated kernels. Moving those reductions to dynamic shared memory (`extern __shared__ __align__(16) char`) drops static shared memory to `1,132..17,493` B/CTA.
    - Switching `projection_tall_kernel` from `MultiStage` (`32,768` B shared, 3 CTAs/SM) to `SingleStage` (`16,384` B shared, 6 CTAs/SM on GB10's 100 KiB/SM budget) doubles CTA residency on the `248,320 × 2,560` Q6_K LM head.
-   - On GB10 (`sm_121a`, 128 KiB combined L1/Shared SRAM per SM), forcing `cudaSharedmemCarveoutMaxShared` (`100 KiB` shared / `28 KiB` L1) on `down_kernel_a16` (where `FlashNext` uses only `6.5 KiB` dynamic shared memory per CTA) wasted up to `68 KiB` of L1 cache per SM across all 40 MoE layers; removing that unconditional carveout on `down_kernel_a16`, halving `qsa_score_kernel` static `.shared` from `33,856 B` (`float4 qs`) to `17,472 B` (`uint2` packed BF16 `qs`, freeing `36 KiB` L1/SM at 2 CTAs/SM), and placing `route_dispatch_plan_kernel`'s three sequential phases (`RouteDispatchSmallShared`, `CpuPlanShared`, `FetchPlanShared`) into a `union` (`41,140 B -> 22,928 B`) maximize L1 data cache residency.
-5. **128-bit (`uint4`) coalesced vectorization across residual/state/combine bandwidth-bound kernels**:
+   - On GB10 (`sm_121a`, 128 KiB combined L1/Shared SRAM per SM), forcing `cudaSharedmemCarveoutMaxShared` (`100 KiB` shared / `28 KiB` L1) on `down_kernel_a16` (where `FlashNext` uses only `6.5 KiB` dynamic shared memory per CTA) wasted up to `68 KiB` of L1 cache per SM across all 40 MoE layers; removing that unconditional carveout on `down_kernel_a16`, halving `qsa_score_kernel` static `.shared` from `33,856 B` (`float4 qs`) to `17,472 B` (`uint2` packed BF16 `qs`, freeing `36 KiB` L1/SM at 2 CTAs/SM), placing `route_dispatch_plan_kernel`'s three sequential phases (`RouteDispatchSmallShared`, `CpuPlanShared`, `FetchPlanShared`) into a `union` (`41,140 B -> 22,928 B`), and shrinking `RecordConvShared::value` in `recurrent_record_conv_kernel` from `[16][128]` to `[16][16]` (`kBlockDv = 16`, cutting static `.shared` from `13,440 B` to `9,856 B` so all 5 CTAs/SM fit inside `49.3 KiB <= 64 KiB` without triggering a 99 KiB shared-memory carveout) maximize L1 data cache residency.
+5. **128-bit (`uint4`) coalesced vectorization, wide `top_logprobs`, MTP `resident_moe` occupancy, & parallel `NgramVolume` cache gather/insert**:
    - Scalar `bf16` (16-bit) per-thread loops in `moe_combine`, `moe_combine_inject`, `hyper_connection_*`, `qsa_pool_keys`, `qsa_commit_tails`, `ple_conv_inject`, and `ple_conv_commit` generated uncoalesced 2-byte/4-byte sector requests on GB10's LPDDR5X/L2 hierarchy and launched 8× too many CTAs (`320` CTAs/token instead of `40` CTAs/token for `hidden = 2560`). Vectorizing all aligned `hidden % 8 == 0` paths to 128-bit (`uint4` = 8 `bf16`s per thread) turns every warp memory transaction into a single coalesced 128-byte cache-line access and cuts CTA waves 8×.
+   - In `resident_moe.cu`, adding `__launch_bounds__(kThreads, 5)` to `down_kernel` drops `down_kernel<Q8>` from `83` registers (2 CTAs/SM, 33% occupancy) to `48` registers (5 CTAs/SM, 83% occupancy) with zero spills.
+   - In `top_logprobs.cuh` and `top_logprobs.cu`, replacing the tautological `if (key < ~0ULL)` check with `if (key > k3)` and launching a 1024-thread CTA (`kTopLogprobsSerialWideBlock = 1024`) when `valid_rows >= 4096` cuts per-thread loop iterations 4× (`970 -> 242` for `248,320` vocab rows).
+   - In `ngram_volume.h` and `ngram_volume.cpp`, parallelizing cache-hit gathering and cache-line-disjoint `insert_cache` (`((set_of(r) >> 6U) % n_threads) == t`) across the 8-thread `ReaderPool` for prefill calls (`rows.size() >= 2048`) eliminates single-threaded `23.6 MiB` random host copies before `publish_pinned_word` releases the GPU at layer 1.
 
 ## Subsystem breakdown
 
@@ -50,15 +56,18 @@ conv/state kernels on NVIDIA GB10 (`sm_121a`).
 |---|---|---|
 | M | `src/models/qwen4_exp/program/mtp_gating.h` | Adds `best_copy_length(copies, copy_accept, copy_cost)` to truncate N-gram copy proposals to the expected-speedup-maximizing prefix length $k$; charges `tile_cost = min(width_cost, 0.10f)` for $k \le 3$ inside `draft_length_at` so 1–3 MTP drafts share the 4-column hardware tile cost without getting trapped at `K = 2` under sampled decode. |
 | M | `src/models/qwen4_exp/program/program_impl.h` | Sets `.served_columns = options_.device_experts ? 0U : 8U` in `ProgramImpl::call_cost()` to stop `split_prefill_call` from splitting device-resident MoE prefill chunks; enables `rows_behind` prefill PLE overlap when `options_.device_experts == true`; applies `best_copy_length` to single-row and multi-row N-gram proposals under `--draft-tokens auto`; tunes GB10 width costs (`kWidthCost = 0.18`, `kPairWidthCost = 0.16`, `kMultiRowWidthCost = 0.16`, `kPairMaxDrafts = 3`). |
+| M | `src/models/qwen4_exp/program/ngram_volume.h`, `src/models/qwen4_exp/program/ngram_volume.cpp` | Parallelizes volume-mode cache lookup/hit gathering and cache-line-disjoint `insert_cache` (`((set_of(r) >> 6U) % n_threads) == t`) across `kReadThreads = 8` threads for prefill chunks (`kParallelGatherRows = 2048`), preserving bit-identical cache state. |
 | M | `src/models/qwen4_exp/execution/forward.cpp` | Removes redundant `ops::argmax` launch in `Forward::step_mtp` when `draft_out != nullptr` is already populated by `sample_mtp_draft_column` or greedy selection, and uses `Scratch::top_logprobs_bytes(1, 1)` for single-token argmax workspace. |
 
 ### 3. Ops & kernels (`src/ops/`)
 
 | Action | File | Mechanism |
 |---|---|---|
-| M | `src/ops/kernel/argmax.cuh`, `src/ops/kernel/target_logprobs.cuh`, `src/ops/kernel/token_constraint.cuh`, `src/ops/kernel/top_logprobs.cuh`, `src/ops/launcher/top_logprobs.cu` | Replaces `static __shared__ typename BlockReduce::TempStorage` in header-defined kernels with dynamic shared memory (`extern __shared__ __align__(16) char`), reducing `-rdc=true` static `.shared` reservations across `infernix_ops` from `50–66 KiB` to `1.1–17.5 KiB`; adds `top_logprobs_one_kernel` fast path for `k == 1` greedy selection. |
+| M | `src/ops/kernel/argmax.cuh`, `src/ops/kernel/target_logprobs.cuh`, `src/ops/kernel/token_constraint.cuh`, `src/ops/kernel/top_logprobs.cuh`, `src/ops/launcher/top_logprobs.cu` | Replaces `static __shared__ typename BlockReduce::TempStorage` in header-defined kernels with dynamic shared memory (`extern __shared__ __align__(16) char`), reducing `-rdc=true` static `.shared` reservations across `infernix_ops` from `50–66 KiB` to `1.1–17.5 KiB`; adds `top_logprobs_one_kernel`, `key > k3` fast guard, and 1024-thread wide CTA (`valid_rows >= 4096`). |
 | M | `src/ops/projection_fp32/projection_fp32.cu`, `src/ops/projection_fp32/projection_fp32_mma.h`, `src/ops/projection_fp32/projection_fp32_mma.cu` | Switches `projection_tall_kernel` (`kCols = 8, 12, 16, 24, 32`) from `MultiStage` (`32 KiB` shared, 3 CTAs/SM) to `SingleStage` (`16 KiB` shared, 6 CTAs/SM); dispatches `columns = 9..16` router projections (`rows = 512, K = 2560`) through `launch_router_mma_wide<16>` (8 CTAs × 4 warps = 32 warps vs 16 warps). |
 | M | `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` | Adds 128-bit (`uint4`) coalesced `combine_vec8_kernel` and `combine_inject_vec8_kernel`; unifies sequential shared-memory structs in `route_dispatch_plan_kernel` into `union RouteDispatchPlanShared` (`41,140 B -> 22,928 B`); removes unconditional `cudaSharedmemCarveoutMaxShared` override from `down_kernel_a16` to preserve L1 cache during narrow `W4A16` MoE down-projections. |
+| M | `src/ops/linear_attention/gated_delta_net/recurrent.cuh` | Shrinks `RecordConvShared::value` from `[16][128]` (`4,096 B`) to `[16][16]` (`kBlockDv = 16`, `512 B`), reducing `recurrent_record_conv_kernel` static `.shared` from `13,440 B` to `9,856 B` (`REG: 85`) so all 5 CTAs/SM fit inside `49.3 KiB <= 64 KiB` without triggering a 99 KiB shared-memory carveout. |
+| M | `src/ops/resident_moe/resident_moe.cu` | Adds `__launch_bounds__(kThreads, 5)` to `down_kernel`, reducing `down_kernel<Q8>` from `83` registers (33% occupancy) to `48` registers (83% occupancy) with zero spills. |
 | M | `src/ops/hyper_connection/hyper_connection.cu` | Adds 128-bit (`uint4`) coalesced `norm_vec8_kernel`, `inject_norm_vec8_kernel`, `collapse_vec8_kernel`, `inject_vec8_kernel`, `expand_vec8_kernel`, and `stream_mean_vec8_kernel` across all 4-stream HyperConnection operations. |
 | M | `src/ops/qsa/qsa_select.cu`, `src/ops/qsa/qsa.cu` | Stages queries in `qsa_score_kernel` as packed BF16 `uint2` instead of `float4`, halving static `.shared` per CTA from `33,856 B` to `17,472 B` (`+36 KiB` L1 cache/SM at 2 CTAs/SM); adds 128-bit (`uint4`) coalesced `tail_vec8_kernel` (`qsa_pool_keys`) and `commit_tail_vec8_kernel` (`qsa_commit_tails`). |
 | M | `src/ops/ple/ple.cu` | Adds 128-bit (`uint4`) coalesced `conv_vec8_kernel`, `conv_state_vec8_kernel`, `state_vec8_kernel`, and `commit_vec8_kernel` for `ple_conv_inject` and `ple_conv_commit`. |

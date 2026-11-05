@@ -513,8 +513,8 @@ struct RecordConvAccess {
 struct RecordConvShared {
     __nv_bfloat16 query[kRecordConvMaxWidth][kStateDim];
     __nv_bfloat16 key[kRecordConvMaxWidth][kStateDim];
-    // Only the CTA's state tile's rows are evaluated; the full head width keeps RecordAccess's indexing.
-    __nv_bfloat16 value[kRecordConvMaxWidth][kStateDim];
+    // Only the CTA's 16 state-tile rows (kBlockDv) are evaluated and read by this CTA.
+    __nv_bfloat16 value[kRecordConvMaxWidth][kBlockDv];
     float g[kRecordConvMaxWidth];
     float beta[kRecordConvMaxWidth];
 };
@@ -530,9 +530,9 @@ struct RecordConvSharedAccess {
         return shared.key[token];
     }
 
-    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates&,
+    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
                                                               std::int32_t token) const {
-        return shared.value[token];
+        return shared.value[token] - coord.state_tile * kBlockDv;
     }
 
     __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates&, std::int32_t token) const {
@@ -889,7 +889,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 5)
     const std::int64_t key_channels          = static_cast<std::int64_t>(record.heads.H_qk) * kStateDim;
     const std::int64_t qc = static_cast<std::int64_t>(coord.qk_head) * kStateDim + thread;
     const std::int64_t kc = key_channels + qc;
-    const int value_row   = coord.state_tile * kBlockDv + thread % kBlockDv;
+    const int value_local_row = thread % kBlockDv;
+    const int value_row       = coord.state_tile * kBlockDv + value_local_row;
     const std::int64_t vc = 2 * key_channels + static_cast<std::int64_t>(coord.value_head) * kStateDim + value_row;
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     // As in recurrent_record_kernel; the convolution history likewise was last written by the preceding fold.
@@ -925,7 +926,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 5)
                     : source == -2 ? vch.s1
                                    : vch.s2;
         }
-        shared.value[column][value_row] = conv_column(vch, in[0], in[1], in[2], in[3]);
+        shared.value[column][value_local_row] = conv_column(vch, in[0], in[1], in[2], in[3]);
     }
     const int gate_column = thread - (kNumWarps - 1) * kWarpSize;
     if (gate_column >= 0 && gate_column < width) {

@@ -17,8 +17,10 @@
 
 namespace infernix::ops {
 
-inline constexpr int kTopLogprobsBlock       = 256;
-inline constexpr int kTopLogprobsSerialBlock = 256;
+inline constexpr int kTopLogprobsBlock           = 256;
+inline constexpr int kTopLogprobsSerialBlock     = 256;
+inline constexpr int kTopLogprobsSerialWideBlock = 1024;
+inline constexpr int kTopLogprobsWideMinRows     = 4096;
 // Largest K the K-pass selection serves: the sampled-draft (4) and DFlash2 candidate (16) heads
 // stay on it until the radix selection is timed at their shapes.
 inline constexpr int kTopLogprobsSerialMaximum = 16;
@@ -129,7 +131,7 @@ __launch_bounds__(BlockSize) __global__
         local_max = new_max;
         local_sum += expf(value - local_max);
         const unsigned long long key = top_logprobs_key(value, row);
-        if (key < ~0ULL) {
+        if (key > k3) {
             if (key > k0) {
                 k3 = k2;
                 k2 = k1;
@@ -142,7 +144,7 @@ __launch_bounds__(BlockSize) __global__
             } else if (key > k2) {
                 k3 = k2;
                 k2 = key;
-            } else if (key > k3) {
+            } else {
                 k3 = key;
             }
         }

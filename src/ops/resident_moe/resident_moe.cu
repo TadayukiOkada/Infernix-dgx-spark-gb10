@@ -199,7 +199,7 @@ __global__ void __launch_bounds__(kThreads, 5)
 }
 
 template <class Codec>
-__global__ void __launch_bounds__(kThreads)
+__global__ void __launch_bounds__(kThreads, 5)
     down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int top_k, int hidden,
                 int intermediate, Bank bank, bf16* __restrict__ out) {
     extern __shared__ __align__(16) float hs[]; // bank.padded_k floats, swizzled

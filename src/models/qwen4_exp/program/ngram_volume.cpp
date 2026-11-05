@@ -302,14 +302,45 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         return;
     }
     misses_.clear();
-    for (std::size_t i = 0; i < rows.size(); ++i) {
-        if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
-        const std::size_t slot = find_slot(rows[i]);
-        if (slot != std::numeric_limits<std::size_t>::max()) {
-            std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
-            ++counters_.hits;
-        } else {
-            misses_.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
+    if (parallel_gather_ && rows.size() >= kParallelGatherRows) {
+        std::array<std::vector<std::uint64_t>, kReadThreads> local_misses;
+        std::array<std::uint64_t, kReadThreads> local_hits{};
+        pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+            const std::size_t lo = rows.size() * t / n_threads;
+            const std::size_t hi = rows.size() * (t + 1) / n_threads;
+            auto& my_misses      = local_misses[t];
+            std::uint64_t hits   = 0;
+            for (std::size_t i = lo; i < hi; ++i) {
+                if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
+                const std::size_t slot = find_slot(rows[i]);
+                if (slot != std::numeric_limits<std::size_t>::max()) {
+                    std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
+                    ++hits;
+                } else {
+                    my_misses.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
+                }
+            }
+            local_hits[t] = hits;
+        });
+        std::size_t total_misses = 0;
+        for (std::size_t t = 0; t < kReadThreads; ++t) {
+            counters_.hits += local_hits[t];
+            total_misses += local_misses[t].size();
+        }
+        misses_.reserve(total_misses);
+        for (std::size_t t = 0; t < kReadThreads; ++t) {
+            misses_.insert(misses_.end(), local_misses[t].begin(), local_misses[t].end());
+        }
+    } else {
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
+            const std::size_t slot = find_slot(rows[i]);
+            if (slot != std::numeric_limits<std::size_t>::max()) {
+                std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
+                ++counters_.hits;
+            } else {
+                misses_.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
+            }
         }
     }
     counters_.rows += rows.size();
@@ -361,9 +392,21 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
                     }
                 });
         });
-        for (const std::uint64_t miss : misses_) {
-            const auto i = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
-            insert_cache(rows[i], out.data() + i * row_bytes, row_bytes);
+        if (parallel_gather_ && misses_.size() >= kParallelGatherRows) {
+            pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+                for (const std::uint64_t miss : misses_) {
+                    const auto i          = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
+                    const std::uint32_t r = rows[i];
+                    if (((set_of(r) >> 6U) % n_threads) == t) {
+                        insert_cache(r, out.data() + i * row_bytes, row_bytes);
+                    }
+                }
+            });
+        } else {
+            for (const std::uint64_t miss : misses_) {
+                const auto i = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
+                insert_cache(rows[i], out.data() + i * row_bytes, row_bytes);
+            }
         }
         counters_.reads += blocks;
         counters_.read_ns += static_cast<std::uint64_t>(
