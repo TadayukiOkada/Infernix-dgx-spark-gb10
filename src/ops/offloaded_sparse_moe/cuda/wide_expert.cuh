@@ -222,6 +222,46 @@ __device__ __forceinline__ void rg16_fragments(const std::uint8_t* units, int gr
     scale_hi = __byte_perm(__byte_perm(t0, t2, select), __byte_perm(t1, t3, select), 0x5410);
 }
 
+// The work-unit mapping of grouped_kernel. A job's column tiles are contiguous in the pass's
+// (job, column) list, so its unit span is [first, first + job_tiles) * kRowBlocks and the mapping
+// enumerates it (row_block, t_local) with t_local innermost: adjacent CTAs of a multi-column-tile
+// job then read the same 128-row weight block at the same time (one fetch feeds every column tile,
+// instead of every tile streaming the block again). The job's tile span is found by two binary
+// searches of the job-sorted list; probe = tile_begin + w / kRowBlocks is a tile of the job owning
+// w because every job contributes whole kRowBlocks-sized unit spans.
+//
+// ColTileInner is false for the small weight blocks (kKTiles * kRowGroups * kUnitRunBytes below
+// 64 KiB), where the old (tile-outer, row-block-inner) mapping stays: Flash-Next's down matrix
+// (45 KiB of weight per unit, 5 K tiles) gained nothing from the new order and measured 0.6-1.1 %
+// slower on it (two A/B passes, against ~1 % run-to-run noise), while its gate/up matrix (90 KiB a
+// unit, 10 K tiles) measured 4-5 % faster on it (pp8192 prefill, 2026-11-05).
+template <bool ColTileInner>
+__device__ __forceinline__ void map_work_unit(const Call& call, int tile_begin, int tile_end, int w, int kRowBlocks,
+                                              int& tile, int& row_block) {
+    if constexpr (!ColTileInner) {
+        tile      = tile_begin + w / kRowBlocks;
+        row_block = w % kRowBlocks;
+        return;
+    }
+    const int probe = tile_begin + w / kRowBlocks;
+    const int job   = __ldg(&call.tiles[2 * probe]);
+    int lo = tile_begin, hi = tile_end; // the job's first tile
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (__ldg(&call.tiles[2 * mid]) < job) { lo = mid + 1; } else { hi = mid; }
+    }
+    const int first = lo;
+    lo = first;
+    hi = tile_end; // one past the job's last tile
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (__ldg(&call.tiles[2 * mid]) == job) { lo = mid + 1; } else { hi = mid; }
+    }
+    const int unit = w - (first - tile_begin) * kRowBlocks; // [0, (lo - first) * kRowBlocks)
+    row_block      = unit / (lo - first);
+    tile           = first + unit % (lo - first);
+}
+
 template <Matrix M, class Epilogue, class S = Schedule, class G = FlashNextExperts>
 __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kernel(
 #ifdef _WIN32
@@ -248,8 +288,25 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
     extern __shared__ __align__(1024) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Storage<S>*>(shared_bytes);
     const int tile_begin = call.pass_tiles[pass];
-    const int work       = (call.pass_tiles[pass + 1] - tile_begin) * kRowBlocks;
+    const int tile_end   = call.pass_tiles[pass + 1];
+    const int work       = (tile_end - tile_begin) * kRowBlocks;
     if (static_cast<int>(blockIdx.x) >= work) { return; }
+    // The 16-byte scale box of the TMA map covers the (2m, 2m + 1) K-tile pair, so an odd k_tile's
+    // load is the even one's duplicate. The odd tile instead reads the box from the even tile's
+    // stage, whose a_scales array stays intact across the odd tile's consumer phase: a later scale
+    // write needs that stage's empty barrier, which the consumer only releases after the odd tile
+    // (k_tile + 2's refill touches the stage's codes and units, disjoint arrays, and with an even
+    // kKTiles and an odd stage count (>= 3) it is itself an odd-parity k_tile that loads no scales).
+    // kKTiles even also aligns the global stage counter's parity with the k_tile's, so a pair never
+    // straddles two work tiles.
+    constexpr bool kScalesDedupe = kKTiles % 2 == 0 && S::kStages >= 3 && S::kStages % 2 == 1;
+    constexpr std::uint32_t kScaleStageBytes =
+        static_cast<std::uint32_t>(S::kTerms) * S::kBlockTokens * S::kScaleWordsPerRow * 4U;
+    // The column-tile-inner work mapping where its weight block is big enough to pay for itself
+    // (map_work_unit's comment; the 64 KiB threshold splits Flash-Next's measured 90 KiB gate/up
+    // win from its 45 KiB down loss).
+    constexpr bool kColTileInner = static_cast<std::uint64_t>(kKTiles) * S::kRowGroups * S::kUnitRunBytes >=
+                                   (1ULL << 16);
 
     if (threadIdx.x == 0) {
 #pragma unroll
@@ -273,7 +330,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
             int it = 0;
 #pragma unroll 1
             for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
-                const int tile = tile_begin + w / kRowBlocks, row_block = w % kRowBlocks;
+                int tile = 0, row_block = 0;
+                map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, row_block);
                 const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
                 const int row = call.dispatch.offsets[call.dispatch.jobs[job]] + column;
                 const std::uint8_t* matrix = call.job_records[job] + Shape::kOffset +
@@ -282,15 +340,20 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
 #pragma unroll 1
                 for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++it) {
                     const int stage = it % S::kStages;
+                    const bool skip_scales = kScalesDedupe && (k_tile & 1) != 0;
                     cta_mbarrier_wait(&shared.empty[stage], 1U ^ ((static_cast<unsigned>(it) / S::kStages) & 1U));
-                    cta_mbarrier_arrive_expect_tx(&shared.full[stage], S::kStageBytes);
+                    cta_mbarrier_arrive_expect_tx(&shared.full[stage],
+                                                  S::kStageBytes - (skip_scales ? kScaleStageBytes : 0U));
 #pragma unroll
                     for (int term = 0; term < S::kTerms; ++term) {
                         detail::nvfp4_tma_load_2d(shared.a_codes[stage][term], codes_map[term],
                                                   k_tile * S::kCodeRowBytes, row, &shared.full[stage]);
-                        // A 16-byte scale box covers two K tiles; each tile loads its own copy.
-                        detail::nvfp4_tma_load_2d(shared.a_scales[stage][term], scales_map[term], (k_tile / 2) * 16,
-                                                  row, &shared.full[stage]);
+                        // A 16-byte scale box covers two K tiles; with the deduplication the odd
+                        // tile reads the even one's staged copy (its stage holds no scale box).
+                        if (!skip_scales) {
+                            detail::nvfp4_tma_load_2d(shared.a_scales[stage][term], scales_map[term], (k_tile / 2) * 16,
+                                                      row, &shared.full[stage]);
+                        }
                     }
 #pragma unroll
                     for (int g = 0; g < S::kRowGroups; ++g) {
@@ -322,8 +385,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
     int it = 0;
 #pragma unroll 1
     for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
-        const int tile = tile_begin + w / kRowBlocks;
-        ctx.row_block  = w % kRowBlocks;
+        int tile = 0;
+        map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, ctx.row_block);
         const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
         ctx.expert    = call.dispatch.jobs[job];
         const int begin = call.dispatch.offsets[ctx.expert];
@@ -340,6 +403,10 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
 #pragma unroll 1
         for (int k_tile = 0; k_tile < kKTiles; ++k_tile, ++it) {
             const int stage = it % S::kStages;
+            // With the deduplication an odd k_tile reads its scales from the even tile's stage (the
+            // same 16-byte box, staged one stage back); the word index below is unchanged.
+            const int scales_stage =
+                kScalesDedupe && (k_tile & 1) != 0 ? (it + S::kStages - 1) % S::kStages : stage;
             cta_mbarrier_wait(&shared.full[stage], (static_cast<unsigned>(it) / S::kStages) & 1U);
 #pragma unroll
             for (int local_k64 = 0; local_k64 < S::kK64PerStage; ++local_k64) {
@@ -367,8 +434,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
                         ldmatrix_x4(a_fragments[0], a_fragments[1], a_fragments[2], a_fragments[3],
                                     smem_addr(shared.a_codes[stage][term] + row * S::kCodeRowBytes + physical_byte));
                         const int scale_row = ctx.warp_m * S::kWarpTokens + mma_m * 16 + sfa_row;
-                        const unsigned a_scale = shared.a_scales[stage][term][scale_row * S::kScaleWordsPerRow +
-                                                                              (k_tile & 1) * 2 + local_k64];
+                        const unsigned a_scale = shared.a_scales[scales_stage][term][scale_row * S::kScaleWordsPerRow +
+                                                                                    (k_tile & 1) * 2 + local_k64];
 #pragma unroll
                         for (int r = 0; r < S::kMmaRows; ++r) {
                             mma_nvfp4_e4m3(acc[mma_m][r][0], acc[mma_m][r][1], acc[mma_m][r][2], acc[mma_m][r][3],
