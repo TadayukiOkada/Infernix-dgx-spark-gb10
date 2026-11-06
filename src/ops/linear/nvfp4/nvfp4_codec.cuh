@@ -49,6 +49,74 @@ __device__ __forceinline__ __half2 decode_nvfp4_e4m3_f16x2(std::uint8_t storage)
     return out.h2;
 }
 
+__device__ __forceinline__ std::uint32_t nvfp4_e4m3_f16x2_bits(std::uint8_t storage) {
+    union {
+        __half2 h2;
+        std::uint32_t bits;
+    } out{decode_nvfp4_e4m3_f16x2(storage)};
+    return out.bits;
+}
+
+// One cvt.rn.f16x2.e4m3x2 decodes two E4M3 scale bytes, then each half is broadcast back into a
+// full f16x2 multiplier. A widened MMA A-fragment register shares its scale with a sibling
+// register, so a caller that widens a weight-row pair per k-step spends one conversion
+// instruction per two registers instead of one per register.
+__device__ __forceinline__ void nvfp4_unpack_two_scales_f16x2(std::uint8_t s0, std::uint8_t s1,
+                                                               std::uint32_t& s0_f16x2,
+                                                               std::uint32_t& s1_f16x2) {
+    const std::uint16_t scale_pair =
+        static_cast<std::uint16_t>(s0) | (static_cast<std::uint16_t>(s1) << 8);
+    std::uint32_t both;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(both) : "h"(scale_pair));
+    s0_f16x2 = __byte_perm(both, both, 0x1010);
+    s1_f16x2 = __byte_perm(both, both, 0x3232);
+}
+
+// The widening of nvfp4_scaled_pair_bf16 with the E4M3 -> f16x2 conversion hoisted to the caller:
+// `scale_f16x2` comes from nvfp4_e4m3_f16x2_bits or nvfp4_unpack_two_scales_f16x2. Bit-identical to
+// the raw-scale form because E2M1 times a finite E4M3 scale is exact in FP16, so only the final
+// BF16 pack rounds.
+__device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16_f16scale(std::uint8_t code,
+                                                                    std::uint32_t scale_f16x2) {
+    union {
+        __nv_bfloat162 pair;
+        unsigned bits;
+    } result;
+    const float2 product =
+        __half22float2(__hmul2(decode_nvfp4_e2m1x2_f16(code),
+                               *reinterpret_cast<const __half2*>(&scale_f16x2)));
+    result.pair = __floats2bfloat162_rn(product.x, product.y);
+    return result.bits;
+}
+
+// The two-pair form of nvfp4_scaled_pair_bf16_f16scale: one multiplier for both output registers.
+__device__ __forceinline__ void nvfp4_scaled_two_pairs_bf16_f16scale(std::uint8_t code0,
+                                                                     std::uint8_t code1,
+                                                                     std::uint32_t scale_f16x2,
+                                                                     unsigned& out0, unsigned& out1) {
+    unsigned h0, h1;
+    const unsigned packed_pair = static_cast<unsigned>(code0) | (static_cast<unsigned>(code1) << 8);
+    asm("{\n"
+        ".reg .b8 b0, b1;\n"
+        "mov.b32 {b0, b1, _, _}, %2;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
+        "cvt.rn.f16x2.e2m1x2 %1, b1;\n"
+        "}\n"
+        : "=r"(h0), "=r"(h1)
+        : "r"(packed_pair));
+    const auto mult = *reinterpret_cast<const __half2*>(&scale_f16x2);
+    const float2 prod0 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&h0), mult));
+    const float2 prod1 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&h1), mult));
+    union {
+        __nv_bfloat162 pair;
+        unsigned bits;
+    } r0, r1;
+    r0.pair = __floats2bfloat162_rn(prod0.x, prod0.y);
+    r1.pair = __floats2bfloat162_rn(prod1.x, prod1.y);
+    out0    = r0.bits;
+    out1    = r1.bits;
+}
+
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
 #if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
     // PTX 9.2 exposes native pair widening. E2M1 times a finite E4M3 scale needs
@@ -68,16 +136,7 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
 #else
     // E2M1 times a finite E4M3 scale has at most 6 significand bits and exponent in [-10, +11],
     // so the FP16 pair multiplication is exact before rounding to BF16.
-    const float2 prod =
-        __half22float2(__hmul2(decode_nvfp4_e2m1x2_f16(code), decode_nvfp4_e4m3_f16x2(scale)));
-
-    union {
-        __nv_bfloat162 pair;
-        unsigned bits;
-    } result;
-
-    result.pair = __floats2bfloat162_rn(prod.x, prod.y);
-    return result.bits;
+    return nvfp4_scaled_pair_bf16_f16scale(code, nvfp4_e4m3_f16x2_bits(scale));
 #endif
 }
 
@@ -100,27 +159,7 @@ __device__ __forceinline__ void nvfp4_scaled_two_pairs_bf16(std::uint8_t code0, 
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(out0) : "r"(values0), "r"(multiplier));
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(out1) : "r"(values1), "r"(multiplier));
 #else
-    const __half2 mult = decode_nvfp4_e4m3_f16x2(scale);
-    unsigned h0, h1;
-    const unsigned packed_pair = static_cast<unsigned>(code0) | (static_cast<unsigned>(code1) << 8);
-    asm("{\n"
-        ".reg .b8 b0, b1;\n"
-        "mov.b32 {b0, b1, _, _}, %2;\n"
-        "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
-        "cvt.rn.f16x2.e2m1x2 %1, b1;\n"
-        "}\n"
-        : "=r"(h0), "=r"(h1)
-        : "r"(packed_pair));
-    const float2 prod0 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&h0), mult));
-    const float2 prod1 = __half22float2(__hmul2(*reinterpret_cast<const __half2*>(&h1), mult));
-    union {
-        __nv_bfloat162 pair;
-        unsigned bits;
-    } r0, r1;
-    r0.pair = __floats2bfloat162_rn(prod0.x, prod0.y);
-    r1.pair = __floats2bfloat162_rn(prod1.x, prod1.y);
-    out0    = r0.bits;
-    out1    = r1.bits;
+    nvfp4_scaled_two_pairs_bf16_f16scale(code0, code1, nvfp4_e4m3_f16x2_bits(scale), out0, out1);
 #endif
 }
 

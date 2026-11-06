@@ -106,15 +106,19 @@ __device__ __forceinline__ void nvfp4_a16_slice_ring_compute_stage(
                 const int word            = 2 * (step & 1);
                 const std::uint8_t scale0 = nvfp4_ring_byte(scale_words[mi][0], step);
                 const std::uint8_t scale1 = nvfp4_ring_byte(scale_words[mi][1], step);
+                // The two rows' scales share one cvt.rn.f16x2.e4m3x2; each half feeds two of the
+                // four fragment registers, so the stage spends one conversion per row pair.
+                std::uint32_t mult0, mult1;
+                nvfp4_unpack_two_scales_f16x2(scale0, scale1, mult0, mult1);
                 // a0..a3: rows g and g+8 at k 2*lid, then at k 2*lid + 8 (the sliced tile's order).
-                a[mi][0] = nvfp4_scaled_pair_bf16(
-                    nvfp4_ring_byte(nvfp4_ring_word(top, word), lid), scale0);
-                a[mi][1] = nvfp4_scaled_pair_bf16(
-                    nvfp4_ring_byte(nvfp4_ring_word(bottom, word), lid), scale1);
-                a[mi][2] = nvfp4_scaled_pair_bf16(
-                    nvfp4_ring_byte(nvfp4_ring_word(top, word + 1), lid), scale0);
-                a[mi][3] = nvfp4_scaled_pair_bf16(
-                    nvfp4_ring_byte(nvfp4_ring_word(bottom, word + 1), lid), scale1);
+                a[mi][0] = nvfp4_scaled_pair_bf16_f16scale(
+                    nvfp4_ring_byte(nvfp4_ring_word(top, word), lid), mult0);
+                a[mi][1] = nvfp4_scaled_pair_bf16_f16scale(
+                    nvfp4_ring_byte(nvfp4_ring_word(bottom, word), lid), mult1);
+                a[mi][2] = nvfp4_scaled_pair_bf16_f16scale(
+                    nvfp4_ring_byte(nvfp4_ring_word(top, word + 1), lid), mult0);
+                a[mi][3] = nvfp4_scaled_pair_bf16_f16scale(
+                    nvfp4_ring_byte(nvfp4_ring_word(bottom, word + 1), lid), mult1);
             }
             unsigned b[NT][2];
 #pragma unroll

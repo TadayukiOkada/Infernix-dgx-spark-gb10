@@ -447,3 +447,153 @@ arms) and reducing register pressure from `REG:124` to `REG:112` (`STACK:0 LOCAL
 - `a4` K=6144 `T=256` measured the narrow tile ~1.6% ahead in the candidate sweep, but the shared
   predicate (fit on the standalone route) selects wide there; kept the predicate rather than a
   per-op exception, since a 1.6% point is inside the sweep's pass-to-pass spread.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T4 (nvfp4): Hoist the `e4m3 -> f16x2` scale conversion out of the A16 MMA widening helpers
+
+## 1. Accounting
+
+- Base commit: `5bf4703c3` (`dev-rebased-20261028`, clean worktree at start).
+- Modified (`M`): `src/ops/linear/nvfp4/nvfp4_codec.cuh`,
+  `src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh`,
+  `src/ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh`.
+- Inspected and left unchanged (`-`): `src/ops/linear/nvfp4/nvfp4_a16_mma.cuh` (its
+  `nvfp4_scaled_oct_bf16` call already spends one scale conversion per 8 codes),
+  `src/ops/offloaded_sparse_moe/cuda/narrow_a16_mma.cuh` and
+  `src/ops/resident_moe/resident_moe.cu` (they contain none of the symbols the task names and do
+  not decode an NVFP4 E4M3 scale in any inner loop — §2), `src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh`
+  (one FP32 `decode_nvfp4_e4m3` per scale group, nothing shared).
+- `tools/cuda_stack/cuda_stack_allowlist.json`: no delta. `STACK`/`LOCAL` stayed 0 on all 223
+  `nvfp4_a16*` instances, so there is nothing to ratchet down.
+- Rebuilds: 4 `ninja` invocations (1 aborted on a doc-named target that does not exist, 1 failed on
+  my own `"h"` asm-constraint error, 1 complete 65/65 sharing one device link, 1 final 77/77 after
+  routing the pair helper through the existing `decode_nvfp4_e2m1x2_f16` instead of duplicating its
+  inline asm). The rebuilt binary's per-symbol SASS counts are identical to the measured candidate
+  below, so every measurement here was taken on equivalent code. Consuming `.cu` files were touched
+  before each build (dead CUDA depfiles).
+
+## 2. Task-premise corrections / Architectural rationale
+
+Held:
+
+- CUDA 13.0 (`nvcc V13.0.88`) `ptxas -arch=sm_121a` has no `cvt.rn.bf16x2.e2m1x2`, so every A16
+  widening compiles the FP16 path — the redundant `F2FP.F16.E4M3.UNPACK_B` the task describes is
+  really there.
+- `cvt.rn.f16x2.e4m3x2` decodes two E4M3 bytes per instruction, so a weight-row pair's two scales
+  genuinely can share one conversion, and the result is bit-identical: each byte converts
+  independently, and E2M1 × a finite E4M3 scale is exact in FP16, so only the final BF16 pack
+  rounds, exactly as in the old per-use form.
+
+Corrected by measurement:
+
+- Four of the five named call-site symbols do not exist in this tree (`load_nvfp4_a_frag_direct`,
+  `load_b_scaled_pairs`, `load_nvfp4_oct_bf16`, and the `pack_same_low16_u32` helper). The only
+  callers of the widening helpers in the whole `src/` tree are the three sites in §3.
+- Root-cause item 1 is already implemented upstream of this change: `nvfp4_scaled_oct_bf16`
+  converts its scale once per 8 codes, so `nvfp4_a16_mma_kernel` spends exactly 4
+  `F2FP.F16.E4M3` per widen body, one per *distinct* scale byte. There is no redundancy there to
+  remove, and that kernel's SASS is identical before and after (F2FP 4, PRMT 1, 888 instructions).
+  The doc's "4x reduction inside `nvfp4_a16_mma_kernel`" is therefore unreachable.
+- The achievable dedup is 2x, not 4x, at the two reachable kernels: the sliced-K tile converts one
+  scale per row per k-step (packing the row pair halves it: 160 → 80), and the slice-ring tile
+  converts one per fragment register where four registers carry two distinct scales (8 → 4).
+- The dedup is partly paid back in `PRMT`: duplicating each converted half into a full `f16x2`
+  multiplier costs one `PRMT` per multiplier, so the sliced-K kernel trades 80 `F2FP` for 160
+  `PRMT` (6480 → 6384 total instructions, −1.5%) and the ring kernel trades 4 for 8 (total
+  unchanged at 792). Net instruction savings are ~1%, which is why no wall-clock gain follows on
+  routes that already sit at the weight-streaming floor.
+
+## 3. Subsystem breakdown
+
+- `src/ops/linear/nvfp4/nvfp4_codec.cuh` (`M`): added
+  `nvfp4_e4m3_f16x2_bits` (register view of the existing decode),
+  `nvfp4_unpack_two_scales_f16x2` (one `cvt.rn.f16x2.e4m3x2` over `s0 | s1 << 8`, halves broadcast
+  with `__byte_perm(both, both, 0x1010 / 0x3232)`), `nvfp4_scaled_pair_bf16_f16scale` and
+  `nvfp4_scaled_two_pairs_bf16_f16scale`, which take the pre-converted multiplier (the pair form
+  widens through the existing `decode_nvfp4_e2m1x2_f16`, so no FP16 widening asm is duplicated).
+  The byte-taking `nvfp4_scaled_pair_bf16` / `nvfp4_scaled_two_pairs_bf16` `#else` bodies now delegate
+  to those forms, so the FP16 widening exists once in the file; their CUDA 13.2+ native branches
+  are untouched (§6).
+- `src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh` (`M`): `load_two_pairs` takes a
+  `std::uint32_t` multiplier register, and one `nvfp4_unpack_two_scales_f16x2` per
+  `(row tile, k_step)` converts `s_top` and `s_bot` together.
+- `src/ops/linear/nvfp4/nvfp4_a16_slice_ring_mma.cuh` (`M`): the four A-fragment registers of a
+  `(row pair, step)` use the two multipliers from one conversion instead of four conversions.
+
+## 4. Verification
+
+Per-symbol SASS (`cuobjdump -sass -fun <exact symbol>`, `K=5120` instances, `infernix-serve`;
+baseline is a copy of the HEAD-linked binary):
+
+| kernel | `F2FP.F16.E4M3` | `PRMT` | total instructions |
+|---|---|---|---|
+| `nvfp4_a16_sliced_k_mma_kernel` | 160 → **80** | 0 → 160 | 6480 → 6384 |
+| `nvfp4_a16_slice_ring_mma_kernel` | 8 → **4** | 0 → 8 | 792 → 792 |
+| `nvfp4_a16_mma_kernel` (unchanged code) | 4 → 4 | 1 → 1 | 888 → 888 |
+
+- Resources: all 223 shared `nvfp4_a16*` instances have `STACK:0 LOCAL:0` in both binaries, so the
+  spill ratchet is untouched and no allowlist entry was added, raised, or lowered. `REG` fell in 15
+  instances (e.g. 128→121, 115→111, 87→80) and rose in 11 (+2…+5); recomputing the register-limited
+  CTAs/SM with GB10's 8-register warp rounding shows no instance changes occupancy (96→99 at 256
+  threads stays 2 CTAs/SM, 98→103 at 128 threads stays 4), and dynamic SMEM is unchanged.
+- Oracle/contract tests, serial: `ctest -R
+  "linear_nvfp4_a16|linear_nvfp4_a4|nvfp4_a16_slice_ring|linear_add_nvfp4|linear_swiglu_nvfp4|resident_moe|offloaded_moe_cuda|offloaded_moe_wide|attn_input_proj|attn_input_proj_fused_rmsnorm|gdn_input_proj|kv_cache_append_nvfp4|qsa_nvfp4|softmax_attention_nvfp4|ple_nvfp4|lossless|cuda_stack_check"`
+  → **24/24 passed, 0 failed** (312.6 s on the measured binary, re-run 315.3 s / 24/24 on the final
+  binary), including `infernix_cuda_stack_check` and
+  `infernix_nvfp4_a16_slice_ring_test`, which checks the ring tile against the sliced tile bit for
+  bit. Four real-artifact `*_lossless_real_test` members skipped (artifact env unset), as on HEAD.
+- Benchmarks (cold-L2, baseline binary copied once, arms interleaved; the doc's
+  `--tokens` flag does not exist — these benches take `--t-sweep`/`--sweep`):
+  `infernix_nvfp4_linear_add_bench --policy a16`, `T = 2,4,8,16,32`, 3 rounds —
+  K=6144: −0.27 / 0.00 / 0.00 / −1.52 / +2.38 %; K=17408: +0.18 / 0.00 / −0.57 / +0.17 / +0.78 %.
+  Focused 4-round pass with alternating arm order (the bands this edit can reach, T ≤ 32):
+
+| route | mean Δ | median Δ | worst point |
+|---|---|---|---|
+| Linear NVFP4 a16 `[5120, 17408]` | −0.02% | +0.02% | +2.38% (T=22) |
+| Linear NVFP4 a16 `[16384, 2560]` | −0.63% | −0.44% | −3.52% (T=26) |
+| fused `linear_add` a16 `[5120, 17408]` | +0.43% | +0.34% | +1.44% (T=32) |
+
+## 5. Regressions & adverse results
+
+- **The throughput acceptance bar is not met.** No route measured faster by more than its own
+  round-to-round spread. The reachable A16 decode bands are weight-streaming bound (`[5120,
+  17408] T=8` runs at 82.5% of its memory floor and 91.6% `READ_%`; `[5120, 6144] T=2` at
+  248 GB/s of the ~273 GB/s UMA peak), so removing conversion instructions cannot show up in wall
+  time. Disposition: shipped as an instruction-count/pressure improvement with the perf bar
+  explicitly unmet, not as a speedup.
+- **A first wide sweep reported large apparent regressions that are not real.** Grouping each
+  arm's runs per round (instead of alternating per round) produced +8.5% (T=32), +21.4% (T=38),
+  +23.1% (T=44), +16.4% (T=68) and −24.1% (T=104) on `[5120, 17408]`, and −22.8% (T=98), −22.5%
+  (T=128) on `[16384, 2560]`. Those token counts dispatch `nvfp4_linear_a16_mma` / `a4` routes
+  whose SASS is identical in both binaries (the published dispatch bands `T 33-64`, `T 65-96` are
+  the unmodified `mma` schedules), and the same points swung in both directions between passes with
+  baseline round spreads up to 48%. Re-measured with alternating order the reachable bands are
+  within ±2.4% and the unmodified bands were dropped. Disposition: measurement-protocol artifact,
+  disclosed rather than deleted.
+- **One small adverse point remains unexplained**: `T=22` on `[5120, 17408]` measured +2.38% with a
+  0.9%/1.8% round spread in the alternating pass, i.e. it exceeds its own spread. No mechanism is
+  known (no spill, no occupancy change, one fewer instruction on the path); the neighbouring
+  `T=20`/`T=24` points measured −1.07%/−1.43%. Left unresolved, not dismissed as noise — the
+  route-boundary padding quantum is the nearest candidate and would need a per-token sweep to test.
+- No new spills, no occupancy loss, no numerical change, no interface or memory change; the
+  24-test oracle set is bit-identical to HEAD.
+
+## 6. Accepted gaps / follow-ups
+
+- The byte-taking `nvfp4_scaled_pair_bf16` / `nvfp4_scaled_two_pairs_bf16` now have no callers at
+  all in `src/`. They are kept because they carry the CUDA 13.2+ native `cvt.rn.bf16x2.e2m1x2` path
+  that this toolchain cannot compile or test; deleting them would silently downgrade a future CUDA
+  13.2 build. A 13.2 build should re-express the migrated callers natively and drop them then.
+- The new `*_f16scale` helpers are unconditional FP16 arithmetic (as `nvfp4_scaled_oct_bf16`
+  already was). On a future 13.2 toolchain the two migrated MMA callers would forgo the native
+  instruction while staying bit-exact; that is the accepted cost of a single FP16 implementation.
+- The doc's `nvfp4_scaled_oct_bf16_f16scale` was not added: no caller shares an 8-code multiplier,
+  so it would be dead code, and routing `nvfp4_scaled_oct_bf16` through it would replace its
+  single 4-byte `mov.b32` unpack with three byte shifts.
+- No end-to-end (`run_kv_matrix_bench.sh` / serve) A/B was run. The edit touches two kernels that
+  the op-level benches measure directly, both at the streaming floor, and the fused production
+  route over them (`linear_add --policy a16`) was measured at +0.43% mean.
+- If a future task moves the A16 decode routes off the bandwidth floor, re-measure here first: the
+  dedup's headroom is real but small (−1.5% instructions), and it is paid for in `PRMT`.
