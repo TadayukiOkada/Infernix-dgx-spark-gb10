@@ -994,3 +994,138 @@ except one row discussed in §5.4.
 6. **No `ncu` trace of the reordered kernel.** The A/B plus the fixture-size arithmetic in §2.7
    answered the geometry question (why 122B gains and Flash-Next does not); a counter-level trace
    would refine the mechanism without changing any shipped decision.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T1 (nvfp4): Single-pass lane-parity W4A4 narrow `gate_up_kernel` scan + 2-column pair weight reuse under split input scales
+
+Scope: task T1 from `docs/tasks/20261106-nvfp4-performance-tasks.md` on GB10 (`sm_121a`): in the
+narrow W4A4 `gate_up_kernel` (device-resident `moe_experts`), replace the redundant two-pass
+parity loop (one quantize + full weight scan per gate/up scale, half of each pass's rows
+discarded) with a single pass whose lanes select their rows' nibble half and scale by lane
+parity, and enable the 2-column pair weight-reuse loop when `scales.input_up !=
+scales.input_gate` (previously the pair loop was skipped entirely under split scales).
+
+## 1. Accounting
+
+- **Previous HEAD**: `8884aa82e` (`dev-rebased-20261028`, T5). Worktree at session start held only
+  the untracked task doc.
+- **Files changed**: `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (M), +180 / −26 — the only
+  code file touched. `cuda-kernel-toolkit/` untouched.
+- **Allowlist delta**: none. `gate_up_kernel` was `STACK:0` at baseline and stays `STACK:0
+  LOCAL:0`; `tools/cuda_stack/cuda_stack_allowlist.json` has no entry for it and
+  `check_cuda_stack.py update` was never run (nothing was reduced).
+- **Rebuild count**: multiple single-invocation Ninja builds (fresh HEAD baseline, candidate
+  iterations, bisect variants, final), each after `find src/ops/offloaded_sparse_moe -name '*.cu'
+  -exec touch {} +` (dead CUDA depfiles), sharing the one `-rdc` device link.
+
+## 2. Task-premise corrections / Architectural rationale ("Why" on GB10 `sm_121a`)
+
+1. **The lane-parity invariant held exactly as the doc stated**: `unit_sums` lane `l = 8q + i`
+   sums rows `i` (lo) and `i + 8` (hi) only, and the `shfl_xor` 8/16 butterfly preserves
+   `lane & 7`, so even lanes only ever contribute gate rows (even) and odd lanes only up rows
+   (odd). A per-lane select of `dup[q] >> 4` + `scale1` for odd lanes versus `dup[q]` + `scale`
+   for even lanes therefore computes the same integer partial sums in the same order as the old
+   per-parity passes — bit-exact by construction (all-integer exact arithmetic; the discarded
+   half of each old pass contributed nothing to its own parity's totals).
+2. **The doc's T=1 baseline (103.3 µs) is stale — the ≤95.0 µs bar was already met at HEAD**:
+   the freshly HEAD-built bench measured T=1 split=1 warm 82.5 µs before any change. T=4 (274.9)
+   and T=8 (531.9) baselines reproduced (275.1 / 527.8).
+3. **The doc's CTest name is wrong**: `infernix_offloaded_sparse_moe*` matches nothing; the
+   suite is `infernix_offloaded_moe*` (19 tests) plus `infernix_cuda_stack_check`.
+4. **Full-K pair staging under split scales does not fit SMEM**: a pair needs both columns'
+   160-block ActCodes at once = 2 × 160 × 24 B = 7,680 B, and stage 46,080 + 7,680 + y 128 =
+   53,888 > the 51,200 B per-CTA budget that keeps 2 CTAs/SM (`launch_bounds(256, 2)`). The
+   shipped pair loop therefore stages K in two halves (2 × 80 blocks → 2 × 80 × 24 = 3,840 B,
+   exactly the existing one-column `acts` union), alternating quantize-half/scan-half in the
+   single buffer; 2 CTAs/SM is preserved (§4 resources).
+5. **The pair loop's win is the weight scan, not the quantize**: at split=1 the old code paid
+   2 quantize + 2 full scans per column (parity passes); the pair loop pays 1 quantize share +
+   1 scan per column amortized across 2 columns. The single-pass lane-parity fix alone
+   (bisect without the pair loop) measured T=4 208.4 / T=8 402.8 µs; adding the pair loop took
+   them to 195.8 / 369.1 (§4).
+
+## 3. Subsystem breakdown
+
+- `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu`
+  - `unit_sums<Groups, bool SplitInput = false>`: under `SplitInput`, lane parity selects the
+    nibble pair (`(i & 1) ? (dup[q] >> 4) : dup[q]` masked) and the scale (`scale1`/`scale`)
+    before the e2m1→half2 conversion; non-split path byte-identical instructions.
+  - `quantize_split_codes(...)`: quantizes 1 or 2 columns' blocks into the split ActCodes plane
+    (gate-low/up-high pair packing, `scale`/`scale1` e4m3), warp-balanced over
+    `n × len` blocks; a comment records that a warp-parallel (`quantize_a4_block_warp`-style)
+    variant measured much worse here.
+  - `unit_sums_split_pair<Groups>(...)`: one weight-unit scan per K-half serving both columns;
+    per-column act words/scales read from `acts[c * len + k]` with the same parity select;
+    accumulates `lo/hi[Groups][2]`.
+  - `gate_up_kernel`: new split pair loop (`c += 2`) staging K in halves (`kHalf = 80`) with
+    quantize-half → `stage_wait`/`pdl::trigger_dependents` at half 0 → scan-half; epilogue
+    matches the non-split pair loop (partial cross-warp reduce, swiglu, `quantize_a4_block_warp`
+    into `h_blocks`). The old two-pass parity tail loop is deleted; the single-column tail uses
+    `unit_sums<kGateUpGroups, true>` and writes all 16 interleaved rows in one pass.
+
+## 4. Verification
+
+- **Build**: touch + one `ninja -C build-native -j $(nproc) infernix-serve
+  infernix_ops_offloaded_moe_test infernix_offloaded_moe_decode_bench`.
+- **CTest** (`-R "infernix_offloaded_moe|infernix_cuda_stack_check"`, serial): **20/20 PASS**,
+  including the 102 s `infernix_offloaded_moe_layer_test` CPU-oracle suite (split-scale W4A4
+  geometries) and the stack-spill ratchet gate. The decode bench itself verifies every arm
+  bit-exact against `moe::expert_forward(best_cpu_isa(), ...)` (`exact=yes` on all 12 arms).
+- **Resources** (`cuobjdump --dump-resource-usage build-native/apps/infernix-serve`):
+  `moe_layer.cu` W4A4 `gate_up_kernel` REG 100 → **124** (≤ 128 launch-bounds cap, 2 CTAs/SM
+  kept), STACK:0 LOCAL:0; SMEM union unchanged at 3,840 B (halves reuse the one-column plane).
+  No allowlist change (baseline was already STACK:0; nothing to ratchet down).
+- **Bench** (`infernix_offloaded_moe_decode_bench --repeat 15`, CUDA-graph warm medians, CPU
+  bit-exact verified, seed 20261015; baseline = freshly HEAD-built binary at `8884aa82e`):
+
+  | arm (split=1, warm) | baseline | final | Δ | doc bar | bar |
+  |---|---|---|---|---|---|
+  | T=1 | 82.5 | 81.2 | −1.6 % | ≤ 95.0 µs | **met** (already met at baseline; doc premise 103.3 stale) |
+  | T=4 | 275.1 | 195.8 | **−28.8 %** | ≤ 165.0 µs | **not met** |
+  | T=8 | 527.8 | 369.1 | **−30.1 %** | ≤ 310.0 µs | **not met** |
+
+  split=0 routes unchanged (regression check): T=1 91.7, T=4 148.9 (base 145.8), T=8 273.9
+  (base 271–275) — inside run-to-run spread. Cold arms move with the warm ones.
+  T=1 never enters the pair loop (single column), so its 70.9–87.3 µs spread across this
+  session's runs is thermal drift, not code (precedent: absolute-µs bars drift with thermal
+  state; decisions were taken against freshly built binaries in the same session).
+- **NCU attribution** (synthetic bench fixtures only): split=1 `gate_up_kernel` warm at T=8 is
+  293.4 µs vs 198.8 for split=0 (1.48×), +14.2 M warp instructions, stalls barrier 28.7 % +
+  wait 21.1 %, occupancy 31.8 % (16/48 warps = 2 CTAs/SM), IPC 1.55. The scan's instruction
+  delta versus the non-split pair loop is ≈ +1 LDS + a shift per unit — the residual gap is
+  barrier convoying around the quantize/scan alternation, not added work.
+
+## 5. Regressions & adverse results
+
+1. **The doc's T=4/T=8 bars (−40 % / −41.3 %) are not met**: shipped −28.8 % / −30.1 %. The
+   single-pass lane-parity scan is bit-exact and the pair loop reuses weights as specified;
+   the residual 1.48× split=1/split=0 ratio is barrier serialization that §6 lists as the
+   follow-up. The bar is disclosed unmet, not re-tuned.
+2. **A warp-parallel quantizer variant regressed T=8 split=1 warm 364 → 582 µs** and was
+   reverted; a source comment records the measurement so it is not retried blindly.
+3. **A warp-balanced quantize loop (20 blocks/warp) measured no gain** (T=4 192.0 / T=8 368.7
+   vs 192–195 / 364–369 before it — inside spread); kept as harmless, not claimed as a win.
+4. **REG 100 → 124.** Under the 128 two-CTA cap, STACK/LOCAL 0, occupancy unchanged, and no
+   split=0 arm regressed (§4). Accepted tradeoff.
+5. **The T=1 bar was already met at HEAD** (§2.2): the doc's 103.3 µs baseline did not
+   reproduce (82.5 µs on the fresh baseline binary). Final T=1 is statistically unchanged.
+6. **One ctest invocation ran against stale binaries while a build had failed** and reported
+   passes; disregarded and re-run after the successful build. The §4 results are from the
+   final build.
+7. **Doc CTest-name correction** (§2.3): the acceptance command as written would have matched
+   zero tests; the real family was run.
+
+## 6. Accepted gaps / follow-ups
+
+1. **The T=4/T=8 gap to the bars is barrier-bound and SMEM-boxed.** Full-K pairing is
+   impossible (§2.4); the half-alternation is forced by the single act buffer. Two scoped
+   candidates were not shipped: quarter-K double-buffered act staging (overlaps quantize with
+   scan but adds a barrier — speculative against a barrier-bound kernel) and a 48 B interleaved
+   per-block act layout (merges the pair's two dup LDS + scale reads; the instruction delta it
+   removes is ≈ +1 LDS/unit, below the measured convoy cost). NCU source-page barrier samples
+   attribute to barrier-exit instructions (WARPSYNC/UMOV), not to an identifiable source
+   barrier, so neither candidate had a targeted evidence-based expectation.
+2. **No E2E (`run_kv_matrix_bench.sh`) arm was run for this change**: the named acceptance
+   harness is the op-level decode bench, which verifies every arm bit-exact against the CPU
+   oracle; the narrow split-scale W4A4 route's E2E contribution was not isolated here.
+3. **split=0 pair loop untouched**: the shipped non-split path is instruction-identical to
+   baseline (default template argument); its arms were regression-checked, not re-optimized.

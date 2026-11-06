@@ -999,7 +999,13 @@ __device__ __forceinline__ void reduce_row_sums(std::int64_t (&lo)[Groups][Colum
 // warp + kWarps, ... of every group (the groups of a block share its activation word), the int64
 // sums of rows i and i + 8 per lane, then the four lanes of a row reduced so that lanes 0..15 hold
 // row (lane & 15) of each group.
-template <int Groups>
+//
+// With SplitInput, `acts` holds each block quantized twice: the gate codes in the low nibbles of
+// dup and the up codes in the high nibbles, with their scales in scale and scale1. Rows i and i+8
+// share the parity of i = lane & 7 and the shuffles by 8 and 16 preserve it, so even lanes only
+// ever sum gate (even) rows and odd lanes only ever sum up (odd) rows: each lane reads the nibble
+// pair and the scale of its rows' parity and one pass over the matrix computes all 16 rows.
+template <int Groups, bool SplitInput = false>
 __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes* acts, std::int64_t (&s)[Groups]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int q = lane >> 3, i = lane & 7;
@@ -1008,8 +1014,16 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
     for (int g = 0; g < Groups; ++g) { lo[g] = hi[g] = 0; }
     for (int b = warp; b < blocks; b += kWarps) {
         const ActCodes& a = acts[b];
-        const std::uint32_t act_word = a.dup[q];
-        const std::int32_t sa        = a.scale;
+        std::uint32_t act_word;
+        std::int32_t sa;
+        if constexpr (SplitInput) {
+            const std::uint32_t packed = a.dup[q];
+            act_word                   = dup_nibbles(((i & 1) != 0 ? (packed >> 4) : packed) & 0x0F0F0F0FU);
+            sa                         = (i & 1) != 0 ? a.scale1 : a.scale;
+        } else {
+            act_word = a.dup[q];
+            sa       = a.scale;
+        }
         std::uint32_t ah[4];
         e2m1x2_word_to_half2(act_word, ah);
 #pragma unroll
@@ -1080,6 +1094,49 @@ __device__ void unit_sums_pair(const std::uint8_t* matrix, int blocks, const Act
         }
         s0[g] = (lane & 8) != 0 ? hi0[g] : lo0[g];
         s1[g] = (lane & 8) != 0 ? hi1[g] : lo1[g];
+    }
+}
+
+// unit_sums for two columns with split input scales over blocks [b0, b0 + len) (column c's block b
+// at acts[c * len + b - b0], each column quantized gate-low/up-high as quantize_split_codes
+// stores it), added to lo and hi (rows i and i + 8 of each lane) for reduce_row_sums. As in
+// unit_sums, rows i and i + 8 share the parity of i = lane & 7, so each lane converts only the
+// nibble pair of its rows' parity from each column's word (gate nibbles with scale, up nibbles
+// with scale1): two half2 activation conversions per weight word, one pass over the weights for
+// both columns and both scales.
+template <int Groups>
+__device__ void unit_sums_split_pair(const std::uint8_t* matrix, int blocks, int b0, int len, const ActCodes* acts,
+                                     std::int64_t (&lo)[Groups][2], std::int64_t (&hi)[Groups][2]) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int q = lane >> 3, i = lane & 7;
+    const int shift = (i & 1) != 0 ? 4 : 0; // even lanes take gate nibbles, odd lanes take up nibbles
+    for (int k = warp; k < len; k += kWarps) {
+        const int b = b0 + k;
+        std::uint32_t ah[2][4];
+        std::int32_t sa[2];
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const ActCodes& a = acts[c * len + k];
+            e2m1x2_word_to_half2(dup_nibbles((a.dup[q] >> shift) & 0x0F0F0F0FU), ah[c]);
+            sa[c] = shift != 0 ? a.scale1 : a.scale;
+        }
+#pragma unroll
+        for (int g = 0; g < Groups; ++g) {
+            const std::uint8_t* unit      = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
+            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
+            std::uint32_t wh[4];
+            e2m1x2_word_to_half2(code_word, wh);
+            const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]);
+            const std::int32_t sw_hi = canon::e4m3_scaled(unit[136 + i]);
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                int p_lo, p_hi;
+                unit_shares_half2(wh, ah[c], p_lo, p_hi);
+                // |P_q| <= 576 and Sw < 2^18: P_q * Sw fits int32.
+                lo[g][c] += static_cast<std::int64_t>(p_lo * sw_lo) * sa[c];
+                hi[g][c] += static_cast<std::int64_t>(p_hi * sw_hi) * sa[c];
+            }
+        }
     }
 }
 
@@ -1154,6 +1211,54 @@ __device__ void quantize_pair_codes(const bf16* __restrict__ x, int hidden, cons
         out.scale  = canon::e4m3_scaled(c0.scale_word);
         out.scale1 = canon::e4m3_scaled(c1.scale_word);
         acts[b]    = out;
+    }
+}
+
+// Quantizes blocks [b0, b0 + len) of n <= 2 columns of entry `first` under both the gate and the
+// up input scale into acts: column c's block b at acts[c * len + b - b0], its gate codes in the
+// low nibbles of dup and its up codes in the high nibbles, with the e4m3-scaled scales in scale
+// and scale1 (the ActCodes plane a split-input `unit_sums` and `unit_sums_split_pair` consume).
+// As in quantize_column_codes, each block's sixteen BF16 values arrive as two 16-byte vector
+// loads and every quantized block keeps its bits. The blocks are distributed twenty per warp
+// (not one per thread for the first 160): the quantize is the phase the pair loop's barriers
+// convoy on, and idle warps 5..7 would arrive a full quantize latency early.
+__device__ void quantize_split_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
+                                     int top_k, float gate_scale, float up_scale, int n, int b0, int len,
+                                     ActCodes* acts) {
+    const int warp = static_cast<int>(threadIdx.x) / 32, lane = static_cast<int>(threadIdx.x) % 32;
+    const int total    = n * len;
+    const int per_warp = (total + kWarps - 1) / kWarps;
+    for (int idx = warp * per_warp + lane; idx < warp * per_warp + per_warp && idx < total; idx += 32) {
+        const int c = idx / len;
+        const int t = entries[first + c] / top_k;
+        const auto* source =
+            reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (b0 + idx % len));
+        const uint4 lo = source[0], hi = source[1];
+        const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        std::uint16_t v[16];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
+            v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
+        }
+        const canon::A4Codes g = canon::quantize_a4_codes(v, gate_scale);
+        const canon::A4Codes u = canon::quantize_a4_codes(v, up_scale);
+        ActCodes out;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const std::uint32_t wg = static_cast<std::uint32_t>(g.code[4 * q]) |
+                                     (static_cast<std::uint32_t>(g.code[4 * q + 1]) << 8) |
+                                     (static_cast<std::uint32_t>(g.code[4 * q + 2]) << 16) |
+                                     (static_cast<std::uint32_t>(g.code[4 * q + 3]) << 24);
+            const std::uint32_t wu = static_cast<std::uint32_t>(u.code[4 * q]) |
+                                     (static_cast<std::uint32_t>(u.code[4 * q + 1]) << 8) |
+                                     (static_cast<std::uint32_t>(u.code[4 * q + 2]) << 16) |
+                                     (static_cast<std::uint32_t>(u.code[4 * q + 3]) << 24);
+            out.dup[q] = wg | (wu << 4);
+        }
+        out.scale  = canon::e4m3_scaled(g.scale_word);
+        out.scale1 = canon::e4m3_scaled(u.scale_word);
+        acts[idx]  = out;
     }
 }
 
@@ -1286,39 +1391,88 @@ __global__ void __launch_bounds__(kThreads, 2)
                                        &h_blocks[static_cast<std::size_t>(first + c + col) * kHBlocks + slice]);
             }
         }
-    }
-    for (; c < count; ++c) { // one pass per remaining column of the job
-        // Gate rows are even, up rows odd; with distinct input scales the up rows use their own A4.
-        for (int parity = 0; parity < (split_input ? 2 : 1); ++parity) {
+    } else { // split input scales: pairs still share one weight scan, as the two-term kernels do
+        constexpr int kHalf = moe::kGateUpBlocks / 2;
+        static_assert(moe::kGateUpBlocks == 2 * kHalf, "a split pair stages K in two halves");
+        for (; c + 1 < count; c += 2) {
             __syncthreads();
-            const float input_scale = parity == 0 ? scales.input_gate : scales.input_up;
-            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, input_scale, sm.acts,
-                                  moe::kGateUpBlocks);
-            if (c == 0 && parity == 0) {
-                stage_wait();
-                pdl::trigger_dependents();
+            // Both columns' blocks of one K half at a time: each column quantizes gate-low/up-high
+            // into 80 ActCodes, so the pair's 2 x 80 fit the one-column acts storage and two CTAs
+            // still fit an SM.
+            std::int64_t lo[kGateUpGroups][2] = {}, hi[kGateUpGroups][2] = {};
+            for (int half = 0; half < 2; ++half) {
+                if (half > 0) { __syncthreads(); } // every warp has read the first half's activations
+                quantize_split_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate,
+                                     scales.input_up, 2, half * kHalf, kHalf, sm.acts);
+                if (half == 0) {
+                    stage_wait();
+                    pdl::trigger_dependents();
+                }
+                __syncthreads();
+                unit_sums_split_pair<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, half * kHalf, kHalf, sm.acts, lo, hi);
             }
-            __syncthreads();
-            std::int64_t s[kGateUpGroups];
-            unit_sums<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
+            std::int64_t s[kGateUpGroups][2];
+            reduce_row_sums<kGateUpGroups, 2>(lo, hi, s);
             __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
-            if (warp > 0 && lane < 16) {
+            if (lane < 16) {
 #pragma unroll
-                for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp - 1][0][g * 16 + lane] = s[g]; }
-            }
-            __syncthreads();
-            if (warp == 0) {
-                const int row   = lane;
-                const bool gate = (row & 1) == 0;
-                if (!split_input || gate == (parity == 0)) {
-                    std::int64_t total = row < 16 ? s[0] : s[1];
-#pragma unroll
-                    for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][0][row]; }
-                    sm.y[0][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+                for (int g = 0; g < kGateUpGroups; ++g) {
+                    if (warp > 0) { sm.partial[warp - 1][0][g * 16 + lane] = s[g][0]; }
+                    if (warp != 1) { sm.partial[warp == 0 ? 0 : warp - 1][1][g * 16 + lane] = s[g][1]; }
                 }
             }
+            __syncthreads();
+            if (warp < 2) {
+                const int col      = warp;
+                const int row      = lane;
+                const bool gate    = (row & 1) == 0;
+                std::int64_t total = col == 0 ? (row < 16 ? s[0][0] : s[1][0]) : (row < 16 ? s[0][1] : s[1][1]);
+#pragma unroll
+                for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][col][row]; }
+                sm.y[col][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+                __syncwarp();
+                const std::uint16_t h_val =
+                    lane < 16 ? canon::swiglu_bf16(sm.y[col][2 * lane], sm.y[col][2 * lane + 1]) : 0;
+                quantize_a4_block_warp(h_val, scales.input_down,
+                                       &h_blocks[static_cast<std::size_t>(first + c + col) * kHBlocks + slice]);
+            }
         }
+    }
+    for (; c < count; ++c) { // one pass per remaining column of the job
+        // Gate rows are even, up rows odd; with distinct input scales one scan computes both, each
+        // lane reading the nibble pair and scale of its rows' parity (unit_sums SplitInput).
+        __syncthreads();
+        if (split_input) {
+            quantize_split_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, scales.input_up, 1,
+                                 0, moe::kGateUpBlocks, sm.acts);
+        } else {
+            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts,
+                                  moe::kGateUpBlocks);
+        }
+        if (c == 0) {
+            stage_wait();
+            pdl::trigger_dependents();
+        }
+        __syncthreads();
+        std::int64_t s[kGateUpGroups];
+        if (split_input) {
+            unit_sums<kGateUpGroups, true>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
+        } else {
+            unit_sums<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
+        }
+        __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
+        if (warp > 0 && lane < 16) {
+#pragma unroll
+            for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp - 1][0][g * 16 + lane] = s[g]; }
+        }
+        __syncthreads();
         if (warp == 0) {
+            const int row   = lane;
+            const bool gate = (row & 1) == 0;
+            std::int64_t total = row < 16 ? s[0] : s[1];
+#pragma unroll
+            for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][0][row]; }
+            sm.y[0][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
             __syncwarp();
             const std::uint16_t h_val =
                 lane < 16 ? canon::swiglu_bf16(sm.y[0][2 * lane], sm.y[0][2 * lane + 1]) : 0;
