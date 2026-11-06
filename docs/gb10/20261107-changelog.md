@@ -1322,3 +1322,121 @@ run of both binaries.
   regressed against it, same disposition as T8.
 - The bench's default `--profile all` now runs four profiles (~25 s longer); the new profile's
   weight fixture is 763 MB.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T10 (nvfp4): `resident_moe_nvfp4_kernel` SMEM shrink + BF16 down-accumulation — **premise falsified, no code changed**
+
+## 1. Accounting
+
+- Base commit: `544f48aa7` (HEAD, clean tree). No compilation was performed — the task names no
+  code that exists, so there was nothing to edit (see §2); all evidence below is read or measured
+  against the already-built HEAD binaries.
+- Modified files: `docs/gb10/20261107-changelog.md` (`M`, this section).
+- `src/ops/resident_moe/resident_moe.cu`: unchanged. `src/ops/linear/nvfp4/nvfp4_codec.cuh`:
+  unchanged. `tools/cuda_stack/cuda_stack_allowlist.json`: unchanged (no rebuild, no ratchet).
+
+## 2. Task-premise corrections — every named symbol is absent from this tree
+
+`docs/tasks/20261107-nvfp4-performance-tasks.md` §T10 describes a template kernel
+`resident_moe_nvfp4_kernel` at `resident_moe.cu` lines 318–420 with a static `SharedStorage`
+(`float intermediate_s[4096]`, `x_s`, `x_pad_s`, `out_s` = 25,152 B), a GateUp phase using
+`load_nvfp4_oct_bf16` + `mma_sync_m16n8k16_row_col_f32_bf16`, and a Down phase accumulating against
+`nvfp4_scaled_oct_f32`. **None of these exist, and the kernel never existed**:
+
+1. `resident_moe.cu` is **299 lines**. `grep -r 'resident_moe_nvfp4_kernel\|load_nvfp4_oct_bf16'
+   src/` → zero matches, and `git log --all -S 'resident_moe_nvfp4_kernel' -- src/` is **empty on
+   every branch** — this is not a deleted kernel. `load_nvfp4_oct_bf16` was already recorded
+   absent in §T4 of this changelog.
+2. `SharedStorage` / `intermediate_s` / `x_s` / `x_pad_s` / `out_s` do not exist. The shipped
+   design (T7, `docs/gb10/20261101-changelog.md` §T7) stages **only** the swizzled FP32 activation
+   in *dynamic* shared memory sized to the bank's own padded row
+   (`stage_bytes(padded_k)`): 10,240 B for gate_up at H = 2560, 2,560 B for down at I = 640. There
+   is no intermediate buffer at all — gate/up write `h` to global workspace and down re-reads it.
+   `cuobjdump --dump-resource-usage build-native/apps/infernix-serve` shows `SHARED:0` (static) on
+   all six instantiations, so the claimed `SHARED:25152` / 4-CTAs/SM cap does not describe any
+   kernel in the binary.
+3. `nvfp4_scaled_oct_f32`, `nvfp4_scaled_pair_f32` and `mma_sync_m16n8k16_row_col_f32_bf16` do not
+   exist anywhere in `src/` (grep empty). `nvfp4_codec.cuh`'s real `nvfp4_scaled_oct_bf16` already
+   converts its E4M3 scale **once** per 8 codes (§T4 finding), so step 2's dedup has no target;
+   `nvfp4_unpack_two_scales_f16x2` (T4) has no resident-MoE caller because resident MoE has no
+   NVFP4 path.
+4. `resident_moe_experts` accepts **only** row-split `Q2_G64_FP16` / `Q4_G64_FP16` /
+   `Q8_G32_FP16` banks and rejects everything else; there is no NVFP4 codec to shrink or
+   re-widen. Its dimensions are runtime, not template parameters, and it requires
+   `intermediate ≤ 2048` (`kMaxIntermediate`), so the doc's `<2560, 4096>` instantiation is out of
+   range for the Op even hypothetically.
+5. Doc step 1's "raise `__launch_bounds__(kThreads, 4)` to 5": both shipped kernels are **already**
+   `__launch_bounds__(kThreads, 5)` — the clamp shipped in T7 precisely to reclaim the 5th CTA/SM
+   the paired dot had cost.
+6. The call-site claim is the one roughly-true premise: `forward.cpp` does call
+   `ops::resident_moe_experts` at line 1489 (doc says 1487) every drafter step, but what executes
+   is `gate_up_kernel<Codec>` + `down_kernel<Codec>` (Q2/Q4/Q8), whose FP32 dots are deliberate
+   (file header: arithmetic intensity 3.76 FLOP/B, 108.3 µs DRAM floor at the measured 241.2 GB/s
+   vs 126.8 µs measured, FP32 pipe 2.66 % busy). `__nv_bfloat162` down-accumulation cannot beat a
+   DRAM floor on a route whose FP32 pipe is 2.66 % busy and would move the output outside the FP64
+   oracle bound that `infernix_resident_moe_test` enforces.
+
+Because the acceptance criteria name a symbol that cannot appear in `cuobjdump` output and a bench
+arm that cannot exist (`infernix_resident_moe_bench` is Q4/Q8 only, widths T = 1/2/4 — no NVFP4
+arm, no T = 5..8), the task was stopped at premise validation per the workflow's falsification
+rule. No replacement design was invented: the doc's *goals* (≤ 17,472 B SMEM, 5 CTAs/SM, deduped
+scale conversion) are already met or exceeded by the shipped design at every production shape.
+
+## 3. Subsystem breakdown
+
+No file changed action-wise (`M` is this changelog only). Recorded current state of the affected
+subsystem:
+
+| Symbol (`infernix-serve`, HEAD) | REG | STACK | SHARED (static) | LOCAL |
+|---|---|---|---|---|
+| `gate_up_kernel<Q2>` | 40 | 0 | 0 | 0 |
+| `gate_up_kernel<Q4>` | 42 | 0 | 0 | 0 |
+| `gate_up_kernel<Q8>` | 48 | 0 | 0 | 0 |
+| `down_kernel<Q2>` | 44 | 0 | 0 | 0 |
+| `down_kernel<Q4>` | 43 | 0 | 0 | 0 |
+| `down_kernel<Q8>` | 48 | 0 | 0 | 0 |
+
+Dynamic SMEM is per-launch `stage_bytes(padded_k)`; at the drafter shape (H 2560 / I 640) that is
+10,240 B (gate_up) and 2,560 B (down) — both grids hold ≥ 5 CTAs/SM on register budget alone
+(`__launch_bounds__(256, 5)`), i.e. the occupancy target the doc asked for is already the status
+quo, with 2.4× less SMEM than the doc's "after" number.
+
+## 4. Verification
+
+Ran against the unmodified HEAD build (no compile, no link):
+
+- `ctest --test-dir build-native -R "infernix_resident_moe_test|infernix_cuda_stack_check"
+  --output-on-failure` → **2/2 passed** (`infernix_cuda_stack_check` 1.49 s,
+  `infernix_resident_moe_test` 2.93 s).
+- `cuobjdump --dump-resource-usage build-native/apps/infernix-serve` → table above; no
+  `resident_moe_nvfp4_kernel` entry exists to compare against the ≤ 17,472 B bar.
+- `./build-native/bench/infernix_resident_moe_bench` (HEAD, cold-L2, single pass):
+
+  | arm | T=1 | T=2 | T=4 |
+  |---|---|---|---|
+  | q4, E=512, top_k=10, H=2560, I=640 | 130.0 µs (201 GB/s) | 237.3 µs (220 GB/s) | 456.1 µs (229 GB/s) |
+
+  These are the *baseline* (nothing was changed); 201–229 GB/s sits at the file-header DRAM floor's
+  noise band (241.2 GB/s measured ceiling, 108.3 µs T=1 floor).
+
+## 5. Regressions & adverse results
+
+None introduced — zero source, binary, or allowlist changes (verified: `git status` shows only
+this changelog; no compilation ran). The §4 bench numbers are the unchanged HEAD baseline, not a
+post-change measurement, and were compared against nothing. The adverse result of this task is the
+premise failure itself: the named kernel, its resource profile, its codec helpers, and the bench's
+NVFP4/T≤8 arms all do not exist, so the task's acceptance bar is unsatisfiable as written.
+
+## 6. Accepted gaps / follow-ups
+
+- **No NVFP4 resident-MoE kernel was added.** If the intent behind T10 was an NVFP4-weighted
+  resident expert route for the drafter, that is new mathematical-capacity scope (a new codec path
+  through `resident_moe_experts` plus its oracle qualification), not a SMEM shrink of existing
+  code, and needs its own task with a measured case against the Q4 row-split DRAM floor.
+- The drafter shape runs at 201–229 GB/s against the 241.2 GB/s measured floor; the remaining
+  ~5–17 % is the known T7 gap (op is at the memory floor; latency bars expressed above it are
+  unreachable), unchanged by this task.
+- `docs/tasks/20261107-nvfp4-performance-tasks.md` §T10 should be treated as void for this branch;
+  its sibling §T1/§T2 `gate_up_kernel`/`grouped_kernel` names collide with unrelated shipped
+  kernels and its symbol list was evidently generated against a different (non-repo) source.
