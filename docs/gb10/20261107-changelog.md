@@ -1198,3 +1198,127 @@ same process and serves as the drift control):
   because no eager or graph run regressed against it.
 - `forward.cpp` and `nvfp4_gdn_snapshot_small_t.cu` (the doc's target list) were left untouched:
   the title's premise is falsified (§2) and the SmallT kernel already serves `T = 2..16` fused.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T9 (nvfp4): `(group, column)` 2D grid, warp-local `float4` staging, and PDL wiring in `nvfp4_logits_topk_kernel` (the serial-column-loop premise falsified by the cub sort)
+
+## 1. Accounting
+
+- Base commit: `a1db53b3f` (T8 HEAD, `dev-rebased-20261028`).
+- Files changed (2, 61 insertions / 27 deletions):
+  - `src/ops/linear_topk/nvfp4.cu` (`M`) — kernel + launcher.
+  - `bench/ops/linear_topk_bench.cu` (`M`) — new `fp8-f32-122b` profile; the bench had **no**
+    registered profile that executed this kernel, so the task's own verification command could
+    not have measured the change.
+- Stack-spill allowlist: unchanged (kernel is `STACK:0 LOCAL:0` before and after; nothing to
+  ratchet in either direction).
+- Rebuild count: 3 single-invocation Ninja builds (baseline bench with the new profile, then
+  `infernix-serve` + `infernix_ops_sampling_test` + `infernix_linear_topk_bench` twice — the
+  smem-staging variant and the shipped warp-shuffle variant).
+
+## 2. Task-premise corrections / Architectural rationale
+
+Measured on GB10 (`sm_121a`, 48 SMs) at the kernel's only production shapes:
+
+1. **No router use, no 4-CTA idle GPU.** `resolve_profile` registers `linear_topk` only for the
+   248,320/131,072-row vocabulary heads; a `[512, 2560]` MoE router never reaches this kernel
+   (`linear_topk.cpp` throws `unsupported head profile`). The baseline grid is already
+   `producer_groups = 1940` CTAs for `rows = 248,320` — all 48 SMs loaded, not "4 CTAs with
+   91.7 % of the GPU idle".
+2. **The baseline load was one fully-coalesced `LDG.E.32` per thread**, not "4 strided scalar
+   floats" (adjacent thread ↔ adjacent row of a 128-row tile: 128 B per warp, one sector).
+3. **One explicit `__syncthreads()` per column** plus the `cub::BlockMergeSort` internals, not
+   two.
+4. **The doc's `float4` mapping is structurally wrong**: `row_base = blockIdx.x * 128 + lane * 4`
+   with 128 lanes spans 512 rows, but the tile is 128 rows — a 128-row tile holds exactly 32
+   `float4`s. The correct vectorization is warp-local: each warp's 32 rows are eight `float4`s
+   loaded by lanes 0..7 in one `LDG.E.128` and redistributed to the sort's one-row-per-thread
+   layout with four intra-warp `SHFL` (cross-warp register movement is impossible; the smem
+   variant that fixes the doc's mapping costs a barrier — measured, §5.4, rejected).
+5. **The dominant cost is the per-tile `cub::BlockMergeSort`, not the column loop.** The baseline
+   kernel runs 1905 µs at `U = 128` reading 127 MB of logits ≈ 66 GB/s, and the whole shipped
+   package (2D grid + vectorized load + PDL) moves it only −2.1 % (1905 → 1866 µs): spreading
+   the identical per-`(group, column)` sort work over more CTAs cannot beat a sort-throughput
+   bound. The serial loop's latency chain was already hidden by ~16 resident CTAs/SM.
+
+## 3. Subsystem breakdown
+
+- `src/ops/linear_topk/nvfp4.cu`
+  - `nvfp4_logits_topk_kernel` (`M`): 1D grid × serial column loop → `dim3(producer_groups,
+    columns)` (the merge kernel's shape); `column = blockIdx.y`, loop and its per-column
+    `__syncthreads()` removed; `pdl::enter()` at entry; `__launch_bounds__(kThreads)` →
+    `__launch_bounds__(kThreads, 8)`; warp-local `LDG.E.128` staging + four `__shfl_sync` with a
+    uniform `rows % 4 == 0 && tile ⊂ rows` gate and a coalesced scalar tail fallback. The
+    per-column key multiset, sort and publication are unchanged, so the output is identical bits
+    (the route stays reproducible/lossless-clean).
+  - `linear_topk_logits_launch` (`M`): `<<<>>>` → `pdl::launch_with(Dependency::Programmatic, …)`
+    (programmatic only under graph capture; eager stays stream-ordered), 2D grid, `columns`
+    parameter dropped from the kernel.
+- `bench/ops/linear_topk_bench.cu` (`M`): added the `fp8-f32-122b` profile
+  (`[248320, 3072]` `fp8_e4m3fn_row_f32`, the other route through this kernel; the NVFP4 head's
+  `rg16_linear` producer has no bench fixture — §6), included in `--profile all`.
+
+## 4. Verification
+
+- `ctest -R "infernix_linear_topk_test|infernix_cuda_stack_check"`: 2/2 Passed. The oracle test
+  covers the logits route at `H = 3072` for `U = 1..120, 121, 127, 128, 129, 257` against the
+  host FP64 scores, plus graph replay and column invariance.
+- Resources (`cuobjdump --dump-resource-usage` on `infernix-serve`): `REG:23→20 STACK:0→0
+  LOCAL:0→0 SHARED:2056→2056`.
+- SASS (`cuobjdump -sass -fun` on the exact stored symbol): `LDG.E.128` ×1, `SHFL` ×4,
+  `ACQBULK` (the PDL grid-dependency wait) ×1, `BAR.SYNC` 3→2. (PDL launch attribute is
+  host-side; the consumer-side `ACQBULK` is the in-kernel evidence the acceptance asked for.)
+- Kernel-level NSYS medians (`--cuda-graph-trace=node`, `fp8-f32-122b`, n=10/point, single pass):
+
+  | variant | U=1 | U=128 |
+  |---|---|---|
+  | baseline | 17.84 µs | 1905.31 µs |
+  | shipped (2D grid + shuffle `float4` + PDL) | 18.46 µs | 1866.03 µs (−2.1 %) |
+  | rejected smem-staging variant | 18.32 µs | 1848.06 µs |
+
+- Route-level cold-L2 A/B, baseline binary vs candidate, 3 interleaved passes, medians of
+  medians (`fp8-f32-122b`): U=1 +0.03 %, 4 +0.14 %, 16 −0.89 %, 25 0.00 %, 28 −0.16 %, 32
+  −0.23 %, 35 −0.13 %, 38 −0.27 %, 48 −0.36 %, 64 −0.45 %, 96 −0.49 %, 128 −0.60 %.
+- Control profile `q8-full` (identical code path): interleaved U=1 −0.19 %, U=64 +0.99 %,
+  U=120 −0.53 % — noise around zero.
+- Full default bench (`--profile all`, U=1..120, both binaries): completed; its single-pass
+  ordering is drift-contaminated (§5.5) and is not used for any claim.
+
+## 5. Regressions & adverse results
+
+Compared: baseline vs candidate binaries interleaved 3 passes on `fp8-f32-122b` at 12 column
+counts and `q8-full` at 3; NSYS per-kernel traces of both at U=1/128; full-matrix single-pass
+run of both binaries.
+
+1. **Kernel duration at U=1: 17.84 → 18.46 µs (+3.5 %).** Cause: the PDL `ACQBULK` wait is now
+   charged inside the kernel's traced duration (early-launched CTAs idle-wait on the producer).
+   Route-level median is unchanged (+0.03 %, pass spread 2–3 µs). Disposition: accepted — the
+   kernel-level number is an accounting artifact of PDL; the route metric is the observable one.
+2. **Route U=4: +0.14 %** (3236.6 → 3241.1 µs, pass spreads 23.5/50.6 µs). Within spread; no
+   fix attempted (no mechanism distinguishes it from noise). Disposition: accepted as noise.
+3. **Producer kernel at U=128 in the candidate trace: 4295.6 → 4352.8 µs (+1.3 %, single-pass
+   NSYS)** while the interleaved route median at the same width *improves* −0.60 %. Judged
+   trace-ordering noise (not corroborated by the paired route metric); disclosed, unresolved at
+   trace level. Merge (107.6→108.9 µs) and clear (0.93 µs) unchanged.
+4. **The spec-shaped smem-staging `float4` variant regressed U=1 by +2.7 %** (17.84 → 18.32 µs)
+   — the staging barrier. Variant rejected; shipped the barrier-free warp-local variant (§4).
+5. **The single-pass full matrix showed −6.0…−7.8 % at U=25..38 and a +1.04 % mean on the
+   untouched `q8-full` profile.** Both are run-ordering artifacts (candidate ran second, hotter):
+   interleaved, U=25..38 is −0.0…−0.3 % and q8 is −0.19/+0.99/−0.53 %. The large mid-band "win"
+   is not claimed.
+6. No test, tolerance, spill, occupancy (`REG` down, `SHARED` unchanged), or register regression
+   found; the three untouched bench profiles' code paths are bit-identical.
+
+## 6. Accepted gaps / follow-ups
+
+- **The cub sort remains the kernel's floor**: shipped 1866 µs at U=128 (≈29 % of the route)
+  against a ≈465 µs logits-read bandwidth bound. A top-16 selection instead of the full
+  128-element `BlockMergeSort` is the lever with the remaining headroom; it is outside T9's
+  mechanism list and needs its own bit-exactness gate (score-desc/id-asc ties, sentinel).
+- **The NVFP4 head's own route (`rg16_linear` producer) is unmeasured here**: the bench has no
+  `rg16` weight fixture and this host carries no Qwen3.5-122B `.infernix` artifact. The shipped
+  evidence drives the identical kernel and launcher through the `[248320, 3072]`
+  `fp8_e4m3fn_row_f32` A16 route; the producer family differs.
+- **PDL was enabled as specified but not isolated** (no `Serialized` arm timed); no route ever
+  regressed against it, same disposition as T8.
+- The bench's default `--profile all` now runs four profiles (~25 s longer); the new profile's
+  weight fixture is 763 MB.

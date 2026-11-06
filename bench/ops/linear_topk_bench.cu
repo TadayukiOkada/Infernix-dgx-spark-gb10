@@ -1,4 +1,4 @@
-// Public cold-cache benchmark for the three registered linear_topk profiles.
+// Public cold-cache benchmark for the four registered full/optimized linear_topk profiles.
 #include "core/weight.h"
 #include "infernix/ops/linear_topk.h"
 
@@ -26,26 +26,34 @@ namespace {
 enum class Profile {
     Q8,
     Fp8,
+    Fp8F32,
     Q4,
 };
 
 const char* profile_name(Profile profile) {
     if (profile == Profile::Q8) { return "q8-full"; }
     if (profile == Profile::Fp8) { return "fp8-full"; }
+    if (profile == Profile::Fp8F32) { return "fp8-f32-122b"; }
     return "q4-optimized";
 }
 
 void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
-    constexpr std::int32_t kHidden = 5120;
+    // Qwen3.8-27B's heads are 5120-wide; the 122B head profiles (the NVFP4 head's materialized
+    // logits route shares this kernel with the per-row FP32-scaled one) are 3072-wide.
+    const std::int32_t kHidden = profile == Profile::Fp8F32 ? 3072 : 5120;
     constexpr std::int32_t kTopK   = 16;
     const std::int32_t rows        = profile == Profile::Q4 ? 131072 : 248320;
     const QType qtype              = profile == Profile::Q8    ? QType::Q8_G32_FP16
                                      : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16
-                                                               : QType::Q4_G64_FP16;
+                                     : profile == Profile::Fp8F32
+                                         ? QType::FP8_E4M3FN_ROW_F32
+                                         : QType::Q4_G64_FP16;
 
     PackedQuantizedWeight packed = profile == Profile::Fp8
                                        ? make_fp8_weight(rows, kHidden)
-                                       : make_row_split_weight(qtype, rows, kHidden, kHidden, 501U);
+                                       : profile == Profile::Fp8F32
+                                             ? make_fp8_weight(rows, kHidden, 0x51U, 0.05F, true)
+                                             : make_row_split_weight(qtype, rows, kHidden, kHidden, 501U);
     DeviceBuffer hidden          = make_bf16(static_cast<std::size_t>(kHidden) * columns, 101U);
     DeviceBuffer ids(static_cast<std::size_t>(kTopK) * columns * sizeof(std::int32_t));
     DeviceBuffer scores(static_cast<std::size_t>(kTopK) * columns * sizeof(float));
@@ -94,8 +102,9 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
 Profile parse_profile(std::string_view value) {
     if (value == "q8-full") { return Profile::Q8; }
     if (value == "fp8-full") { return Profile::Fp8; }
+    if (value == "fp8-f32-122b") { return Profile::Fp8F32; }
     if (value == "q4-optimized") { return Profile::Q4; }
-    throw std::invalid_argument("profile must be q8-full, fp8-full, or q4-optimized");
+    throw std::invalid_argument("profile must be q8-full, fp8-full, fp8-f32-122b or q4-optimized");
 }
 
 } // namespace
@@ -114,8 +123,8 @@ int main(int argc, char** argv) {
             const std::string flag = argv[i];
             if (flag == "--help") {
                 std::printf(
-                    "usage: %s [--profile all|q8-full|fp8-full|q4-optimized] [--columns U,...] "
-                    "[--warmup N] [--repeat N]\n",
+                    "usage: %s [--profile all|q8-full|fp8-full|fp8-f32-122b|q4-optimized] "
+                    "[--columns U,...] [--warmup N] [--repeat N]\n",
                     argv[0]);
                 return 0;
             }
@@ -144,7 +153,7 @@ int main(int argc, char** argv) {
         if (warmup < 0 || repeat < 1) throw std::invalid_argument("invalid timing counts");
         std::vector<Profile> profiles;
         if (profile == "all")
-            profiles = {Profile::Q8, Profile::Fp8, Profile::Q4};
+            profiles = {Profile::Q8, Profile::Fp8, Profile::Fp8F32, Profile::Q4};
         else
             profiles = {parse_profile(profile)};
         std::puts(
