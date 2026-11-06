@@ -509,7 +509,7 @@ int run_geometry(int layers, int hidden, double theta) {
     // Batched ngram copy rounds append up to 64 columns per request; with the per-request
     // count pattern below they reach every route's largest scratch for each batch size.
     std::vector<int> batched_widths = widths;
-    batched_widths.insert(batched_widths.end(), {17, 24, 32, 48, 64});
+    batched_widths.insert(batched_widths.end(), {17, 21, 24, 32, 48, 64});
     for (int width : batched_widths)
         for (int batch = 1; batch <= 8; ++batch) {
             std::vector<int> counts(batch), slots(batch), positions(width * batch, -12345);

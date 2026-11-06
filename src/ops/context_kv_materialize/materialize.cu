@@ -88,18 +88,30 @@ union alignas(16) MaterializeStorage {
     float scores[Columns][Rows];
 };
 
-template <int Hidden, int Rows, int Columns, int BlockK, int ColumnWarps>
+// LdgCodes selects the raw-code staging mechanism: cp.async groups win through four column
+// blocks per grid, while LDG->register decode (the codes plane never touches shared memory)
+// wins for single-CTA column blocks and five-plus column waves where the async group cannot
+// hide the global latency behind one MMA phase. Measured 2026-11-06 on GB10: LDG +8..11% at
+// 129..192 columns, LDG -8..-9% at >=512 columns versus the cp.async Fused64 instantiation.
+// TailScales groups the scale-plane stage with the activation instead of the codes: it wins
+// -1.5..-4.4% at two column blocks and costs +3..5% from three up (cp.async path only).
+template <int Hidden, int Rows, int Columns, int BlockK, int ColumnWarps, bool LdgCodes,
+          bool TailScales>
 __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mma_kernel(
     const __nv_bfloat16* hidden, const int* positions, const int* counts, const int* slots,
-    DeviceLayers layers, float* key_scratch, int width, int batch, int min_count, int max_count) {
+    DeviceLayers layers, float* __restrict__ key_scratch, int width, int batch, int min_count,
+    int max_count) {
     constexpr int kBlockRows = Rows, kBlockK = BlockK;
     constexpr int kBlockColumns = Columns;
     constexpr int kColumnWarps  = ColumnWarps;
     constexpr int kWarps = Rows / 16 * kColumnWarps, kThreads = kWarps * 32;
     constexpr int kWarpColumns = Columns / kColumnWarps, kTokenMmas = kWarpColumns / 8;
     constexpr int kKTiles = Hidden / kBlockK;
-    static_assert((Rows == 64 || Rows == 128) && Columns % (8 * ColumnWarps) == 0);
+    static_assert((Rows == kHeadDim || Rows == kHeadDim / 2) && Columns % (8 * ColumnWarps) == 0);
     static_assert(Hidden % kBlockK == 0 && kThreads <= 1024);
+    static_assert(!LdgCodes || TailScales);
+    constexpr int kCodeChunks = kBlockRows * (kBlockK / 16);
+    constexpr int kChunksPerThread = (kCodeChunks + kThreads - 1) / kThreads;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int warp_row = warp / kColumnWarps, warp_col = warp % kColumnWarps;
     const int gid = lane >> 2, lid = lane & 3;
@@ -149,6 +161,26 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                     weight_codes + static_cast<std::int64_t>(row_begin + local_row) * Hidden +
                         k_begin + chunk * 16);
             }
+        };
+
+        const auto load_codes = [&](int k_tile, uint4 (&chunks)[kChunksPerThread]) {
+            const int k_begin = k_tile * kBlockK;
+#pragma unroll
+            for (int part = 0; part < kChunksPerThread; ++part) {
+                const int item = tid + part * kThreads;
+                if (item < kCodeChunks) {
+                    const int local_row = item / (kBlockK / 16);
+                    const int chunk     = item - local_row * (kBlockK / 16);
+                    chunks[part]        = __ldg(reinterpret_cast<const uint4*>(
+                        weight_codes +
+                            static_cast<std::int64_t>(row_begin + local_row) * Hidden + k_begin +
+                            chunk * 16));
+                }
+            }
+        };
+
+        const auto stage_scales = [&](int k_tile) {
+            const int k_begin = k_tile * kBlockK;
             for (int local_row = tid; local_row < kBlockRows; local_row += kThreads) {
                 const std::int64_t group =
                     static_cast<std::int64_t>(row_begin + local_row) * (Hidden / 32) + k_begin / 32;
@@ -157,8 +189,6 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
             }
         };
 
-        // Signed Q8 codes are exactly representable in BF16. Apply the exact stored FP16
-        // scale in FP32 after each 32-wide MMA group; never round a scaled weight to BF16.
         const auto decode_signed_codes = [&]() {
             constexpr int kChunksPerRow = kBlockK / 8;
             for (int item = tid; item < kBlockRows * kChunksPerRow; item += kThreads) {
@@ -179,18 +209,56 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
             }
         };
 
+        const auto decode_registered_codes = [&](const uint4 (&chunks)[kChunksPerThread]) {
+#pragma unroll
+            for (int part = 0; part < kChunksPerThread; ++part) {
+                const int item = tid + part * kThreads;
+                if (item < kCodeChunks) {
+                    const int row   = item / (kBlockK / 16);
+                    const int chunk = item - row * (kBlockK / 16);
+                    const int col   = chunk * 16;
+                    Bf16x8 decoded[2];
+#pragma unroll
+                    for (int pair = 0; pair < 8; ++pair) {
+                        const unsigned word =
+                            (pair < 2   ? chunks[part].x
+                             : pair < 4 ? chunks[part].y
+                             : pair < 6 ? chunks[part].z
+                                        : chunks[part].w)
+                            >> ((pair & 1) * 16);
+                        const int q0 = static_cast<int>(static_cast<std::int8_t>(word & 0xffu));
+                        const int q1 =
+                            static_cast<int>(static_cast<std::int8_t>((word >> 8) & 0xffu));
+                        decoded[pair >> 2].pair[pair & 3] = __floats2bfloat162_rn(
+                            static_cast<float>(q0), static_cast<float>(q1));
+                    }
+                    store_vec(&mainloop.code_values[row][swizzle_128(row, col)], decoded[0].raw);
+                    store_vec(&mainloop.code_values[row][swizzle_128(row, col + 8)],
+                              decoded[1].raw);
+                }
+            }
+        };
+
         stage_activation(0);
-        stage_weight(0);
+        if constexpr (!LdgCodes) stage_weight(0);
+        stage_scales(0);
         cp_commit();
+        uint4 codes[kChunksPerThread];
+        if constexpr (LdgCodes) load_codes(0, codes);
 
 #pragma unroll 1
         for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
             cp_wait<0>();
             __syncthreads();
-            decode_signed_codes();
-            __syncthreads();
+            if constexpr (LdgCodes) {
+                decode_registered_codes(codes);
+            } else {
+                decode_signed_codes();
+                // The cp.async path needs this barrier before staging the next tile's raw
+                // codes over the plane the decode loop just read.
+                __syncthreads();
+            }
 
-            // Capture scales before the next async weight stage reuses their shared plane.
             float top_scales[kBlockK / 32], bottom_scales[kBlockK / 32];
 #pragma unroll
             for (int g = 0; g < kBlockK / 32; ++g) {
@@ -202,8 +270,12 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
             __syncthreads();
             const int next = k_tile + 1;
             if (next < kKTiles) {
-                stage_weight(next);
-                cp_commit();
+                if constexpr (LdgCodes) load_codes(next, codes);
+                else {
+                    stage_weight(next);
+                    if constexpr (!TailScales) stage_scales(next);
+                    cp_commit();
+                }
             }
 
             const auto load_fragments = [&](int k_step, unsigned(&a)[4],
@@ -258,6 +330,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
             if (next < kKTiles) {
                 __syncthreads();
                 stage_activation(next);
+                if constexpr (TailScales) stage_scales(next);
                 cp_commit();
             }
         }
@@ -286,10 +359,12 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
         const int request       = column / width;
         const int count         = counts[request];
         if (count < min_count || count > max_count || column % width >= count) continue;
-        if constexpr (Rows == 128) {
+        // Rows = kHeadDim CTAs own a whole Key head, so RMSNorm + RoPE fuse here; half-height
+        // CTAs defer the Key transform to context_kv_key_post_kernel through the FP32 scratch.
+        if constexpr (Rows == kHeadDim) {
             if (!value) {
-                store_key_head(storage.scores[local], layers, layer, positions, slots, column, width,
-                               row_begin / 128);
+                store_key_head(storage.scores[local], layers, layer, positions, slots, column,
+                               width, row_begin / kHeadDim);
                 continue;
             }
         }
@@ -309,15 +384,17 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
     }
 }
 
-template <int Hidden, int Rows, int Columns, int BlockK, int ColumnWarps>
+template <int Hidden, int Rows, int Columns, int BlockK, int ColumnWarps, bool LdgCodes,
+          bool TailScales>
 void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts, const Tensor& slots,
                 DeviceLayers layers, ContextKVMaterializeExecutionEnvelope envelope,
                 const Tensor& scratch, cudaStream_t stream) {
     constexpr int bytes = sizeof(MaterializeStorage<Rows, Columns, BlockK>);
     if constexpr (bytes > 48 * 1024)
-        CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-    context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps>
+        CUDA_CHECK(cudaFuncSetAttribute(
+            context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps, LdgCodes, TailScales>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    context_kv_mma_kernel<Hidden, Rows, Columns, BlockK, ColumnWarps, LdgCodes, TailScales>
         <<<dim3(1024 / Rows, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 2 * layers.count),
            Rows / 16 * ColumnWarps * 32, bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
@@ -457,7 +534,8 @@ DeviceLayers make_device_layers(std::span<const ContextKVMaterializeLayerView> l
     return result;
 }
 
-// The route's projection kernel; false when it also stored the keys (Fused64).
+// The route's projection kernel; false when it also stored the keys (every Rows = kHeadDim
+// fused MMA route).
 template <int H>
 bool launch_projection(const Tensor& context, const Tensor& positions, const Tensor& counts,
                        const Tensor& state_slots, const DeviceLayers& device_layers,
@@ -475,25 +553,29 @@ bool launch_projection(const Tensor& context, const Tensor& positions, const Ten
                               key_scratch, stream);
         return true;
     case Route::Mma32:
-        launch_mma<H, 64, 32, 128, 2>(context, positions, counts, state_slots, device_layers,
-                                      envelope, key_scratch, stream);
+        launch_mma<H, 64, 32, 128, 2, false, true>(
+            context, positions, counts, state_slots, device_layers, envelope, key_scratch, stream);
         return true;
     case Route::Mma80:
-        launch_mma<H, 64, 80, 128, 5>(context, positions, counts, state_slots, device_layers,
-                                      envelope, key_scratch, stream);
-        return true;
-    case Route::Mma96:
-        launch_mma<H, 64, 96, 128, 6>(context, positions, counts, state_slots, device_layers,
-                                      envelope, key_scratch, stream);
-        return true;
-    case Route::Fused64:
-        launch_mma<H, 128, 64, 128, 2>(context, positions, counts, state_slots, device_layers,
-                                       envelope, key_scratch, stream);
+        launch_mma<H, 128, 80, 64, 2, true, true>(
+            context, positions, counts, state_slots, device_layers, envelope, key_scratch, stream);
         return false;
-    case Route::Mma64:
-        launch_mma<H, 64, 64, 64, 2>(context, positions, counts, state_slots, device_layers,
-                                     envelope, key_scratch, stream);
-        return true;
+    case Route::Mma96:
+        launch_mma<H, 128, 96, 64, 2, true, true>(
+            context, positions, counts, state_slots, device_layers, envelope, key_scratch, stream);
+        return false;
+    case Route::Fused64:
+        launch_mma<H, 128, 64, 128, 2, false, true>(
+            context, positions, counts, state_slots, device_layers, envelope, key_scratch, stream);
+        return false;
+    case Route::Fused64Mid:
+        launch_mma<H, 128, 64, 128, 2, false, false>(
+            context, positions, counts, state_slots, device_layers, envelope, key_scratch, stream);
+        return false;
+    case Route::Fused64Wide:
+        launch_mma<H, 128, 64, 128, 2, true, true>(
+            context, positions, counts, state_slots, device_layers, envelope, key_scratch, stream);
+        return false;
     }
     throw std::logic_error("context_kv_materialize: invalid route");
 }
