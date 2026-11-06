@@ -717,7 +717,10 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, policy, workspace, nullptr);
     cuda_synchronize();
 
-    const bool a4                       = policy == ops::LinearPolicy::AllowA4;
+    // The A4 criterion applies wherever the run takes the one-term A4 lane: the AllowA4 and
+    // AllowA4Residual Uses (no 2-term profile registered here) from T >= 17.
+    const bool a4 =
+        (ops::allows_a4(policy) || ops::allows_a4_residual(policy)) && tokens >= 17;
     const ReductionCriterion& criterion = a4 ? kGdnInputProjA4Tolerance : kGdnInputProjA16Tolerance;
     const std::string suffix =
         std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
@@ -761,7 +764,13 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA8);
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_case(parent, 16, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
+    // The A4 residual Use: no 2-term profile is registered for this projection, so it falls back
+    // to the A16 verification band (T <= 16) and to the one-term A4 lane from prefill widths.
+    failures += run_nvfp4_case(parent, 16, ops::LinearPolicy::AllowA4Residual);
+    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4Residual);
+    failures += run_nvfp4_case(parent, 128, ops::LinearPolicy::AllowA4Residual);
     // GB10 A4 retune band edges: 32/33 (M32N64 -> M64N128), 64/65 (M64N128 -> pipelined),
     // 128 (pipelined fills exactly one 128-wide tile; the pipelined->TMA crossover is at 128/129,
     // pinned by the bench candidate sweep since T=129 activations are tiny near-cancellations whose

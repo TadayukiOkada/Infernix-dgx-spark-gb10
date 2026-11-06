@@ -397,17 +397,26 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     const auto qw = rows(physical, 0, 6144), kw = rows(physical, 6144, 1024);
     const auto gw = rows(physical, 7168, 6144), vw = rows(physical, 13312, 1024);
     const auto divisor      = parent.view().input_scale_divisor;
-    const float unused_step = ops::allows_a4(policy) ? 0.0F : 1.0F;
+    // The one-term A4 lane (and the A4 residual Use that falls back to it) quantizes the shared
+    // activation once and requires identical activation divisors; A16-only Uses vary them.
+    const float unused_step = ops::allows_a4(policy) || ops::allows_a4_residual(policy)
+                                  ? 0.0F
+                                  : 1.0F;
     const auto auxiliary    = [&](int index) -> std::optional<float> {
         return omit_divisors ? std::nullopt : std::optional(divisor + index * unused_step);
     };
-    // A column-invariant Use is an A16 preparation whose execution policy the Model sets.
+    // A column-invariant or A4 residual Use is an A16/A4 preparation whose execution policy the
+    // Model sets (prepare's intersection accepts only the one-term policies).
     const ops::LinearPolicy use =
-        ops::column_invariant(policy) ? ops::LinearPolicy::A16Only : policy;
+        ops::column_invariant(policy)     ? ops::LinearPolicy::A16Only
+        : ops::allows_a4_residual(policy) ? ops::LinearPolicy::AllowA4
+                                          : policy;
     auto prepared = std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
         {qw, use, auxiliary(0)}, {kw, use, auxiliary(1)}, {gw, use, auxiliary(2)},
         {vw, use, auxiliary(3)}));
-    if (ops::column_invariant(policy)) { prepared.policy = policy; }
+    if (ops::column_invariant(policy) || ops::allows_a4_residual(policy)) {
+        prepared.policy = policy;
+    }
     if (policy == ops::LinearPolicy::AllowA8) {
         const auto mixed =
             std::get<ops::SingleProjectionWeight>(ops::prepare_attn_input_proj_weights(
@@ -425,7 +434,10 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
     constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
     int failures                       = 0;
-    const bool a4                      = policy == ops::LinearPolicy::AllowA4;
+    // The A4 criterion applies wherever the run takes the one-term A4 lane: the AllowA4 and
+    // AllowA4Residual Uses (no 2-term profile registered here) from T >= 17.
+    const bool a4 =
+        (ops::allows_a4(policy) || ops::allows_a4_residual(policy)) && tokens >= 17;
     const ReductionCriterion& criterion =
         a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
     const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
@@ -439,6 +451,10 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
                               activation, kHidden, tokens, criterion, sample_count);
     failures += verify_output("attn value" + suffix, value, parent.host, kValueBegin, kKvRows,
                               activation, kHidden, tokens, criterion, sample_count);
+    if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+        std::cerr << "attn workspace" << suffix << ": query/execution high-water mismatch\n";
+        ++failures;
+    }
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("attn parent" + suffix);
     return failures;
@@ -465,7 +481,13 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8, true);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_target_case(parent, 16, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
+    // The A4 residual Use: no 2-term profile is registered for this projection, so it falls back
+    // to the A16 verification band (T <= 16) and to the one-term A4 lane from prefill widths.
+    failures += run_nvfp4_target_case(parent, 16, ops::LinearPolicy::AllowA4Residual);
+    failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4Residual);
+    failures += run_nvfp4_target_case(parent, 128, ops::LinearPolicy::AllowA4Residual);
     // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
     // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
     // single real token, which is the emptiest grid this route ever runs.

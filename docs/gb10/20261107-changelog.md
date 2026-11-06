@@ -903,3 +903,132 @@ same process and serves as the drift control):
 - `tools/cuda_stack/check_cuda_stack.py update` also dropped one stale pre-existing key
   (`projection_tall_kernel<TallQ8>`); a future allowlist refresh should re-key such stale entries
   deliberately rather than as a side effect.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T7 (nvfp4): `attn_input_proj` A16→A4 hand-over moved 4→17 (draft-vs-verify activation parity at MTP/DFlash2 widths) and `AllowA4Residual` fallback fixed in the `attn_input_proj`/`gdn_input_proj` planners
+
+## 1. Accounting
+
+- Base commit: `ead81ce45` (branch `dev-rebased-20261028`, HEAD at task start). Work left
+  uncommitted for the Antigravity review.
+- Files changed (4, +55/−13):
+  - `M src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp` — `resolve_route` gate + residual fix
+  - `M src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp` — residual fix (gate unchanged)
+  - `M tests/ops/test_attn_input_proj.cpp` — residual-Use helper handling, A4 criterion gated on `T>=17`, workspace high-water check, + 4 new cases (`AllowA4` T=16, `AllowA4Residual` T=16/17/128)
+  - `M tests/ops/test_gdn_input_proj.cpp` — A4 criterion gated on `T>=17` + 4 new cases (`AllowA4` T=16, `AllowA4Residual` T=16/17/128)
+- Spill allowlist: untouched (no CUDA translation unit changed; `infernix_cuda_stack_check` green).
+- Rebuilds: 3 Ninja invocations (baseline target check — already current, 14-edge candidate build
+  sharing one device link, 1-edge attn-test rebuild after the first CTest failure).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- The doc's symbols `select_nvfp4_attn_input_route`/`select_nvfp4_gdn_input_route` do not exist;
+  the planners' real symbol is the file-local `resolve_route`. The named test files
+  `tests/ops/attn_input_proj_test.cu`/`gdn_input_proj_test.cu` are `tests/ops/test_attn_input_proj.cpp`
+  /`test_gdn_input_proj.cpp`.
+- The cited `infernix_linear_bench` numbers at `[13952, 2560]` (80.9–82.9 µs, 91–92 % DRAM) are not
+  this planner's op. `[13952, 2560]` is the six-output fused variant, which the wrapper sends to
+  `launch_nvfp4_n13952_k2560_split` (and whose capacity carve-out already keeps A16 through T=64).
+  The two modified planners serve the K=5120 fused shapes `[14336, 5120]`/`[16384, 5120]`; there the
+  A16 lane measures 179–181 µs at T=5..16 (≈227–231 GB/s ≈ 82–84 % of the ~273 GB/s LPDDR5X
+  ceiling). 80.9 µs would require ~512 GB/s on a 41.5 MB parent and cannot transfer; the ≥90 % bar
+  was not attainable and the claim is reported at the measured value.
+- The 2026-10-31 T7 note "the Attn A4 gate at 4 is already optimal" is superseded: today's
+  interleaved 3-pass cold A/B on the fused op (forced A16 vs the production A4 lane) shows A16
+  ahead by 1.0–4.1 % across the whole T=4..16 band and behind by 2.8–5.5 % from T=17, so the
+  hand-over moved to 17. The GDN boundary stays at 16 (re-confirmed: T=4..16 tie within ±0.6 %,
+  T=17..24 A16 +7.1..+9.2 % slower).
+- Step 1's "`kMaxTokens` template cap in `nvfp4_attn_input_decode.cu`" does not exist:
+  `Nvfp4ScheduleInstance`'s `Capacity` defaults to 0 and `nvfp4_attn_input_a16_launch` already
+  dispatches the `<16,8,2,2>` RowTiles-2 sliced-K tile over the whole T=2..16 band (shipped
+  2026-10-31). No kernel change was needed.
+- Step 2's "whenever a caller passes `LinearPolicy::AllowA4Residual`": no production caller does
+  for these projections (`limit_precision` passes `a4_residual_here=false` for attn/gdn, and
+  `common_policy` rejects residual Uses at projection prepare). The fix aligns the planners with
+  the public wrappers' `validate_policy`, which already accepts the residual Use as an execution
+  policy; it is a contract fix, not a live-behavior change.
+- `nvfp4_linear_swiglu_plan.cpp`/`nvfp4_linear_add_plan.cpp` (in the doc's target list) already
+  split `allows_a8_residual` (→ A16) from `allows_a4_residual` (→ registered 2-term route); no
+  change was required there.
+
+## 3. Subsystem breakdown
+
+- `nvfp4_attn_input_plan.cpp` (`M`): `resolve_route` hand-over `tokens >= 4` → `tokens >= 17`;
+  `AllowA4Residual` now joins the token ladder (A16 T≤16, one-term A4 T≥17) instead of being
+  forced to A16 at prefill widths; `AllowA8Residual` stays A16 (no 4-bit activation permission);
+  throw only when neither `allows_a4` nor `allows_a4_residual`. The workspace capacity function
+  tracks `resolve_route`, so a residual Use at T≥17 now declares the one-term A4 capacity.
+- `nvfp4_gdn_input_plan.cpp` (`M`): same residual split (`allows_residual` → `allows_a8_residual`
+  in the A16 branch; `allows_a4 || allows_a4_residual` in the ladder branch). The 16/17 boundary
+  and its 2026-10-31 evidence comment stand.
+- `test_attn_input_proj.cpp` (`M`): A4 criterion applies when the one-term lane actually runs
+  (`AllowA4` and `AllowA4Residual` from `T>=17`, enforcing `kAttnInputProjA16Tolerance` and zero
+  workspace usage across `T<=16`); workspace query/execution high-water check added to
+  `run_nvfp4_target_case`; residual Uses prepare with `AllowA4` and then set the
+  execution policy (mirroring the invariant-Use pattern, since `common_policy` intersects only the
+  one-term policies); residual Uses pass identical activation divisors (the shared-activation
+  quantizer requirement); new cases `AllowA4` T=16 and `AllowA4Residual` T=16 (A16 band), T=17/128 (A4 lane).
+- `test_gdn_input_proj.cpp` (`M`): same `T>=17` criterion predicate; new cases `AllowA4` T=16 and
+  `AllowA4Residual` T=16/17/128.
+
+## 4. Verification
+
+- Premise A/B (baseline HEAD binaries, `--nvfp4-policy a16` vs `a4`, cold, warmup 5 / repeat 30,
+  median of 3 interleaved passes, µs):
+  - attn [14336,5120]: T=4 −3.15 %, T=5 −3.33 %, T=6 −4.05 %, T=8 −2.72 %, T=10 −2.73 %,
+    T=12 −1.05 %, T=14 −2.73 %, T=16 −3.30 % (A16 ahead); T=17 +4.42 %, T=20 +2.80 %,
+    T=24 +5.45 % (A16 behind) → hand-over 17.
+  - gdn [16384,5120]: T=4..16 |Δ| ≤ 0.6 %; T=17 +7.08 %, T=20 +7.58 %, T=24 +9.21 % (A16 behind)
+    → boundary 16 unchanged.
+- Post-change production-route A/B (baseline vs candidate binaries interleaved, `a4` policy):
+  attn T=4..16 −2.2..−3.8 %, T=17..24 ≤ +0.1 %; gdn all widths within run drift (route unchanged).
+  Reverse-order control at unchanged widths: T=1 +0.01 %, T=2 +0.00 %, T=3 +0.28 %.
+- Candidate verification-band DRAM efficiency: 41,482,240 B / ≈181–183 µs ≈ 226–229 GB/s ≈ 83 % of
+  ~273 GB/s (task's ≥90 % bar came from the other shape; see §5/§6).
+- CTest (`-R "infernix_attn_input_proj|infernix_gdn_input_proj|infernix_cuda_stack_check"`, serial):
+  `infernix_cuda_stack_check` 1.48 s Passed; `infernix_attn_input_proj_test` 24.6 s Passed;
+  `infernix_attn_input_proj_fused_rmsnorm_test` skip-77; `infernix_gdn_input_proj_test` 10.1 s
+  Passed; `infernix_gdn_input_proj_conv_snapshot_test` 27.4 s Passed;
+  `infernix_gdn_input_proj_conv_record_test` 8.3 s Passed. 5 passed + 1 skipped, 0 failed.
+  (First run failed: the attn helper threw "invalid projection activation policy" from prepare's
+  `common_policy`; fixed by the prepare-with-AllowA4-then-set-execution-policy pattern.)
+- No CUDA source changed: per-symbol resources identical, allowlist unchanged, nothing to ratchet
+  down. `git diff --check` clean.
+
+## 5. Regressions & adverse results
+
+1. Apparent attn T=1..3 regression (+0.6..+1.2 %) in the first post-change pass: those widths run
+   the identical A16 route in both binaries. A reverse-order pass (candidate first) measured
+   +0.01/+0.00/+0.28 % while the gate band still showed −3.2/−3.3 %, so the positive deltas were
+   base-first run-order/thermal drift, not a regression. Disposition: resolved (no change).
+2. Apparent gdn T=1..16 +0.02..+1.4 % in the same first pass: same order pattern, and the gdn
+   candidate's AllowA4 route table is byte-identical to baseline (only the residual branch
+   changed, which the `a4` policy never takes). Disposition: not a regression; same control.
+3. Numerical semantics under `AllowA4` at T=4..16 (27B-class `[14336,5120]` artifacts): outputs
+   switch from the one-term A4 lane to the exact A16 lane, so the live kernel set of that
+   configuration changes and the band's bits move to the A16 route's (closer to the oracle; the
+   A4-criterion oracle tests pass and the band is now draft(T=1)-consistent). This is the task's
+   intended fast-path demotion to a higher-precision route, not a loss.
+4. The task's ≥90 % DRAM-efficiency bar is not met at the verification band: measured ≈83 %
+   (179–183 µs vs the ≈152 µs weight-stream floor). The bar was inherited from the `[13952,2560]`
+   plain-Linear bench and does not transfer to the 41.5 MB fused op. Disposition: accepted; the
+   −2.2..−3.8 % relative win against the previous production route is the supported claim.
+5. End-to-end MTP/DFlash2 acceptance rate could not be measured: every local NVFP4 artifact is
+   Qwen3.8-Flash-Next (hidden 2560), whose attn/GDN projections dispatch through the K=2560 split
+   paths untouched by this task; no hidden-5120 NVFP4 artifact exists on this host. Disposition:
+   unverified (§6).
+
+## 6. Accepted gaps / follow-ups
+
+- The Flash-Next (K=2560) verification-width story lives in the `[13952,2560]`/`[16384,2560]`
+  linear route tables behind `launch_nvfp4_n*_k2560_split`. Its capacity carve-out (no A4 workspace
+  below T=65) suggests A16 already covers T≤64 there, but that path was neither audited nor changed
+  in T7; a follow-up should confirm it if Flash-Next acceptance remains a target.
+- The model-level acceptance-rate improvement promised by the task title is unmeasured on this
+  host (no artifact exercises the modified K=5120 planners); the shipped evidence is op-level
+  latency, route semantics, and oracle tests.
+- `AllowA4Residual` on these two projections still has no production caller; the planner semantics
+  and tests are contract preparation for a residual-qualified artifact or a future
+  `limit_precision` change.
+- The task doc's absolute-µs/DRAM-% baselines should be regenerated from
+  `infernix_attn_input_proj_bench`/`infernix_gdn_input_proj_bench` (the fused ops' own benches) in
+  any follow-up, not from `infernix_linear_bench` on a same-named plain-Linear shape.

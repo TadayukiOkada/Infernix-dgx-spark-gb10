@@ -19,12 +19,14 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
     if (column_invariant(policy)) { return Nvfp4GdnInputRoute::ColumnInvariantA16; }
-    // The residual profiles are registered for the NVFP4 MLP and FP8 projections only.
+    // The residual profiles are registered for the NVFP4 MLP and FP8 projections only; an A4
+    // residual Use falls back to this projection's one-term A4 from prefill widths (A8 residual
+    // has no 4-bit activation permission and stays on A16).
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-        allows_residual(policy)) {
+        allows_a8_residual(policy)) {
         return Nvfp4GdnInputRoute::A16;
     }
-    if (allows_a4(policy)) {
+    if (allows_a4(policy) || allows_a4_residual(policy)) {
         // GB10 (sm_121a, 48 SMs), 2026-10-31 (T7): the A16 dequant tiles stream this projection's
         // 42 MiB parent faster than the A4 lane until its quantizer is amortised. Cold-cache sweep
         // (infernix_gdn_input_proj_bench, warmup 3 / repeat 15): T=1 202.6 us A16 against 212.8
