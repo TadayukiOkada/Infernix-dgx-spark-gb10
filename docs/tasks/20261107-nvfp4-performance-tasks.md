@@ -1,4 +1,4 @@
-# GB10 (`sm_121a`) NVFP4 Performance Optimization Tasks — 2026-11-06
+# GB10 (`sm_121a`) NVFP4 Performance Optimization Tasks — 2026-11-07
 
 > **Hardware Target**: NVIDIA GB10 (`sm_121a`, 48 SMs, 99 KiB SMEM/SM, 65,536 32-bit registers/SM, 24 MiB L2, 128 GiB unified LPDDR5X UMA at ~273 GB/s, 20-core Grace ARMv9.2 CPU, CUDA 13.0 `V13.0.88`).
 >
@@ -7,7 +7,7 @@
 > 2. **Single-Invocation Ninja Build**: Never run concurrent `ninja` processes. Build `infernix-serve`, tests, and benchmark binaries in a single `ninja -C build-native -j "$(nproc)" ...` command to share the ~55.8s `cmake_device_link.o` (`nvlink`) step.
 > 3. **1:1 FP32 Accumulation & Numerical Qualification**: Preserve FP32 Tensor Core accumulation (`mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` and `mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3`) on production routes. Qualify all modified kernels against their independent FP32/FP64 oracles.
 > 4. **One-Way CUDA Stack-Spill Ratchet Gate**: Run `ctest --test-dir build-native -R infernix_cuda_stack_check --output-on-failure` after every build. Never run `check_cuda_stack.py update` to mask newly introduced or increased spills; only run `update` to ratchet [`tools/cuda_stack/cuda_stack_allowlist.json`](file:///opt/etc/Infernix/tools/cuda_stack/cuda_stack_allowlist.json) **downward** when a task reduces or eliminates spills.
-> 5. **Mandatory Changelog Entry**: Every completed task must append its section to [`docs/gb10/20261106-changelog.md`](file:///opt/etc/Infernix/docs/gb10/20261106-changelog.md) with sections `1. Accounting`, `2. Task-premise corrections / Architectural rationale`, `3. Subsystem breakdown`, `4. Verification`, `5. Regressions & adverse results`, and `6. Accepted gaps / follow-ups`.
+> 5. **Mandatory Changelog Entry**: Every completed task must append its section to [`docs/gb10/20261107-changelog.md`](file:///opt/etc/Infernix/docs/gb10/20261107-changelog.md) with sections `1. Accounting`, `2. Task-premise corrections / Architectural rationale`, `3. Subsystem breakdown`, `4. Verification`, `5. Regressions & adverse results`, and `6. Accepted gaps / follow-ups`.
 
 ---
 
@@ -303,7 +303,7 @@ Deep analysis of the NVFP4 route planners across `attn_input_proj`, `gdn_input_p
    - During speculative verification (`T=5` for 4 draft tokens, or `T=8..16` for DFlash2 / multi-lane verify), `tokens <= 4` is false, so `select_nvfp4_attn_input_route` abruptly switches to **1-term 4-bit `FusedA4`** (`E2M1` 4-bit activation quantization without residual second term)!
    - By contrast, [`select_nvfp4_gdn_input_route`](file:///opt/etc/Infernix/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp#L33-L35) stays on `A16` through `tokens <= 16`, and `linear_swiglu` / `linear_add` switch to **2-term `A4Residual`** (`Nvfp4A4Pair`) at `tokens >= 5`!
    - Thus, at `T=5..16`, **`attn_input_proj` is the ONLY dense projection in the model that drops from 16-bit BF16 activations (during `T=1` draft) to 1-term 4-bit E2M1 activations (during `T=5..16` verification)**, injecting 1-term 4-bit activation quantization noise directly into Q, K, V, attention gate, and QSA index keys during verification!
-   - Furthermore, our live `infernix_linear_bench` measurement on GB10 at `[13952, 2560]` (`Qwen3.8-Flash-Next` `attn_input_proj`) shows that at `T=5` (`80.896 us`, `250.4 GB/s`, `91.72% DRAM`) and `T=16` (`82.944 us`, `248.6 GB/s`, `91.06% DRAM`), the `BF16_F32ACC` (`SmallTA16` sliced-K MMA) route ALREADY runs at **91–92% of LPDDR5X DRAM ceiling** (`80.9–82.9 us`, faster than `T=64` `NVFP4_F32ACC` at `97.1 us`)!
+   - Furthermore, our live `infernix_linear_bench` measurement on GB10 at `[13952, 2560]` (`Qwen3.8-Flash-Next` `attn_input_proj`) shows that at `T=5` (`80.896 us`, `250.4 GB/s`, `91.72% DRAM`) and `T=16` (`82.944 us`, `248.6 GB/s`, `91.07% DRAM`), the `BF16_F32ACC` (`SmallTA16` sliced-K MMA) route ALREADY runs at **91–92% of LPDDR5X DRAM ceiling** (`80.9–82.9 us`, faster than `T=64` `NVFP4_F32ACC` at `97.1 us`)!
 2. **Broken `allows_residual(policy)` Handling in `attn_input_proj` and `gdn_input_proj`**:
    - In [`nvfp4_attn_input_plan.cpp`](file:///opt/etc/Infernix/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp#L42-L45) and [`nvfp4_gdn_input_plan.cpp`](file:///opt/etc/Infernix/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp#L23-L26):
      ```cpp
@@ -429,7 +429,7 @@ Every MTP draft step on `Qwen3.8-Flash-Next` (`forward.cpp` line 1487) executes 
    - Furthermore, in the Down phase (`lines 393–414`), `intermediate_s` is read via two `float4` loads (`32 B` per 8 elements) and accumulated with scalar FP32 `fmaf` against `nvfp4_scaled_oct_f32` (which executes 4 separate `nvfp4_scaled_pair_f32` calls per 8 weights!).
 2. **Even Better — Exact FP32 Tensor Core / `HFMA2` Accumulation or Compact Shared Storage**:
    - Notice that in the GateUp phase (`lines 352–385`), `resident_moe_nvfp4_kernel` uses `load_nvfp4_oct_bf16` + `mma_sync_m16n8k16_row_col_f32_bf16` (1:1 FP32 accumulation on Tensor Cores!), where `load_nvfp4_oct_bf16` (`lines 82–97`) converts `gate_scale0`, `up_scale0`, `gate_scale1`, `up_scale1` via **8 separate `cvt_e4m3x2_to_f16x2_bits` calls** per K-step.
-   - And in `SharedStorage`, `x_s` (`5,120 B`) and `x_pad_s` (`2,560 B`) = `7,680 B` are **dead after the GateUp phase (`line 391` `__syncthreads()`)**! Overlapping `intermediate_s` with `(x_s + x_pad_s)` via a `union` inside `SharedStorage` immediately shrinks `sizeof(SharedStorage)` from **`25,152 B` (`24.56 KiB`) to `17,472 B` (`17.06 KiB`)**, raising SMEM occupancy from **4 CTAs/SM to 5 CTAs/SM (`+25%` occupancy)** without changing a single bit of `float intermediate_s[IntermediateSize]`!
+   - And in `SharedStorage`, `x_s` (`5,120 B`) and `x_pad_s` (`2,560 B`) = `7,680 B` are **dead after the GateUp phase (`line 391` `__syncthreads()`)**! Overlapping `intermediate_s` with `(x_s + x_pad_s)` via a `union` inside `SharedStorage` immediately shrinks `sizeof(SharedStorage)` from **`25,152 B` (`24.56 KiB`) to `17,472 B` (`17.07 KiB`)**, raising SMEM occupancy from **4 CTAs/SM to 5 CTAs/SM (`+25%` occupancy)** without changing a single bit of `float intermediate_s[IntermediateSize]`!
    - In addition, replacing the 4-call `nvfp4_scaled_pair_f32` chain in `nvfp4_scaled_oct_f32` (`nvfp4_codec.cuh` lines 110–125) so `scale` is converted **once** per 8 weights instead of 4 times eliminates 3 redundant `F2FP` scale conversions per 8 weights in the Down loop!
 
 #### Required Implementation Steps
