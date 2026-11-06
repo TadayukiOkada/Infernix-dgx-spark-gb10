@@ -304,3 +304,146 @@ arms) and reducing register pressure from `REG:124` to `REG:112` (`STACK:0 LOCAL
   K-step pipeline, and the `ctx.col_base` / `ctx.live_tiles` epilogue bounds in
   `src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh` and `tests/ops/test_offloaded_moe_wide.cu`, while
   retaining the 2-CTA/SM `__launch_bounds__(S::kThreads, S::kMinBlocksPerSm)` (`kMinBlocksPerSm = 2`).
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T3 (nvfp4): `linear_add` A4/A4R schedule-cliff fixes (`T=33..64`, `T=129..287`) + shared 48-SM narrow TMA token-tile selection in `linear_add`/`linear_swiglu`
+
+## 1. Accounting
+
+- Base commit: `f690e70e9` (branch `dev-rebased-20261028`, clean tree at start).
+- Files changed (all `M`):
+  - `src/ops/linear_add/nvfp4/nvfp4_linear_add_a4.cu` — `uses_tma` 288→129, resident tile removed,
+    narrow/wide TMA + `Tiled128`/`Tiled256` quantizer selection, residual band split at 33.
+  - `src/ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma.cu` / `..._a4_tma_launch.h` — added
+    `launch_nvfp4_a4_tma_linear_add_narrow` (`Nvfp4A4TmaMmaSchedule<128, 4, 1, weight-L2-128B>`).
+  - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma.cu` / `..._a4_tma_launch.h` — added
+    `launch_nvfp4_linear_swiglu_a4_tma_narrow` (same 128-token/4-stage/128-row shape, SwiGLU epilogue).
+  - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp` — `TmaFusedA4` threshold lowered
+    from `136` to `129` (`> M128N128::kBlockTokens`) and route now picks the token tile (and
+    matching scale layout) through the shared predicate.
+  - `src/ops/linear/nvfp4/nvfp4_a4_plan.h` — received `nvfp4_a4_prefer_narrow_token_tile` (moved).
+  - `src/ops/linear/nvfp4/nvfp4_launch.cuh` — gave up that predicate (kept its route-table use).
+  - `tests/ops/linear_add/test_nvfp4.cpp` — added `AllowA4` coverage at `T=256, 257, 384, 385`
+    (with CUDA-Graph replay at `257`) to exercise `launch_nvfp4_a4_tma_linear_add_narrow` (`Tiled128`).
+  - `docs/gb10/20261107-changelog.md` — this section.
+- `tools/cuda_stack/cuda_stack_allowlist.json`: no delta (no allowlisted symbol touched; the removed
+  resident instantiation and the two new narrow kernels are all `STACK 0`/`LOCAL 0`).
+- Rebuild: one `cmake --build build-native` invocation, 343 steps (full `src/ops` CUDA recompile
+  because `nvfp4_a4_plan.h`/`nvfp4_launch.cuh` are consumed by 25 files across `linear/nvfp4`,
+  `linear/nvfp4/shapes`, `linear_add`, `linear_swiglu`, `attn_input_proj`, `gdn_input_proj`).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- The task's verification flags are wrong for both benches: there is no `--tokens`; the token list
+  flag is `--t-sweep`, and the add bench additionally requires `--n 5120 --k 6144|17408`.
+- The task's `linear_swiglu` file references do not match the code: `nvfp4_linear_swiglu_a4.cu` has
+  no `uses_tma`/`launch_problem` TMA gate and *already* dispatched `ResidualM64N128` for `33..64`;
+  the 1-term SwiGLU TMA entry is `resolve_route(policy, tokens >= 129) -> TmaFusedA4` in
+  `nvfp4_linear_swiglu_plan.cpp` (lowered from `136` to `129`, eliminating the 2-tile `M128N128`
+  cliff at `T=129..135`: `917.3–920.4 us -> 539.5–548.9 us`, `-41.2%` / `1.70x`), which is also
+  where the selector was wired. The `T=33..64` residual
+  cliff existed only in `linear_add`, whose `launch_residual_problem` sent `17..64` to
+  `ResidualM32N64` (`kBlockTokens = 32`): from 33 tokens its second token tile re-streamed the
+  49.0 MiB weight panel past the 24 MiB L2 from LPDDR5X.
+- The template spelling `Nvfp4A4TmaMmaSchedule<128, 128, 128, 2>` in the task does not exist; the
+  narrow tile the standalone route validates is
+  `Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaWeightCodeL2_128B>` (128-token tile, 128-row weight
+  panel, four 128-K stages, 1 CTA/SM; `kScaleLayout` is `Tiled128` by construction).
+- At `N=34816` (SwiGLU gate_up, 100.1 MiB panel) the predicate's wave condition (12 vs 7/8·12) and
+  its 52 MiB extra-traffic bound both decline the narrow tile at every `T >= 129`, so the SwiGLU
+  wiring is provably inert today; it keeps the one shared predicate authoritative instead of a
+  per-op copy (measured: swiglu a4 unchanged within noise above 136, §4).
+- The in-code claim "resident still wins at 256" (the old 288 boundary) was the RTX 5090 fit; the
+  GB10 candidate sweep puts TMA ahead at every width from 129 (`--variants`, cold L2, quantize
+  included): K=6144 113.7/127.0/140.3 us TMA vs 140.4/155.6/200.8 resident at T=129/256/287;
+  K=17408 314.8/340.0/371.7 vs 473.1/511.0/730.2. The narrow/wide *ordering* of the sweep points
+  matched `nvfp4_a4_prefer_narrow_token_tile` at all seven probed widths.
+
+## 3. Subsystem breakdown
+
+- `ops/linear/nvfp4` (`M`): `nvfp4_a4_prefer_narrow_token_tile` moved verbatim from
+  `nvfp4_launch.cuh` into the host-safe `nvfp4_a4_plan.h` so the plan `.cpp` files (no CUDA headers)
+  can drive quantizer layout and launcher from one predicate; `nvfp4_launch.cuh` reaches it through
+  its existing include, so the standalone shape tables are unchanged.
+- `ops/linear_add/nvfp4` (`M`): `uses_tma(tokens) = tokens >= 129`; `M128N128Resident` and its dead
+  `129..` band removed from `launch_problem` (TMA owns 129+); `nvfp4_linear_add_a4_launch` selects
+  `Tiled128`+`launch_nvfp4_a4_tma_linear_add_narrow` when the predicate fires (both Ks at `257..383`,
+  K=6144 additionally at `513..640`) and `Tiled256`+the existing wide launcher otherwise;
+  `launch_residual_problem` gained `ResidualM64N128` for `33..64` (RowMajor planes, matching the
+  swiglu ladder), keeping `ResidualM32N64` up to 32 where its 160-CTA single tile still wins.
+- `ops/linear_swiglu/nvfp4` (`M`): narrow 1-term TMA launcher instantiated; `TmaFusedA4` entry
+  lowered from `tokens >= 136` to `tokens >= 129` (`> M128N128::kBlockTokens`) and route resolves
+  the predicate and passes the matching layout to quantizer and launcher. Residual route untouched
+  (`T >= 97` TMA, `33..64` already `ResidualM64N128`).
+- `tests/ops/linear_add/test_nvfp4.cpp` (`M`): added `AllowA4` test points at `T=256, 257, 384, 385`
+  (with CUDA-Graph replay at `T=257`) to exercise the narrow 128-token TMA (`Tiled128`) route and
+  its transitions to/from wide 256-token TMA (`Tiled256`).
+
+## 4. Verification
+
+- Build: single invocation, `BUILD_EXIT 0`, zero warnings in the touched files.
+- CTest (serial): `infernix_linear_add_nvfp4_test` Passed (2.41 s), `infernix_linear_swiglu_nvfp4_test`
+  Passed (10.65 s), `infernix_cuda_stack_check` Passed (1.48 s). The add suite covers T=33/64 (new
+  residual tile), T=129/256/257/384/385 (wide/narrow TMA on both `AllowA4` and `AllowA4Residual`,
+  with 257 replayed under CUDA Graphs on both policies) and 1023/1024/1025.
+- Production-route A/B (before/after HEAD binaries, interleaved, cold L2, quantizer included,
+  warmup 3 / repeat 10, median of 3 passes; µs):
+
+| route | T | K=6144 before | after | Δ | K=17408 before | after | Δ |
+|---|---|---|---|---|---|---|---|
+| a4r | 16 | 88.1 | 88.1 | 0 | 230.4 | 228.4 | −0.9% |
+| a4r | 32 | 88.0 | 90.1 | +2.4%¹ | 241.7 | 242.8 | +0.5%¹ |
+| a4r | 33 | 107.5 | 90.1 | **−16.2%** | 461.8 | 247.8 | **−46.3%** |
+| a4r | 48 | 111.6 | 90.7 | **−18.7%** | 464.9 | 251.9 | **−45.8%** |
+| a4r | 64 | 111.6 | 94.2 | **−15.6%** | 480.3 | 257.0 | **−46.5%** |
+| a4r | 65 | 105.5 | 103.5 | −1.9% | 291.8 | 290.8 | −0.4% |
+| a4r | 128 | 111.6 | 111.6 | 0 | 311.3 | 314.5 | +1.0%¹ |
+| a4r | 256 | 133.1 | 136.2 | +2.3%¹ | 386.0 | 389.3 | +0.8%¹ |
+| a4r | 512 | 250.9 | 254.0 | +1.3%¹ | 650.0 | 649.9 | 0 |
+| a4 | 64 | 92.2 | 92.2 | 0 | 248.8 | 249.5 | +0.3%¹ |
+| a4 | 128 | 100.4 | 99.3 | −1.0% | 267.3 | 268.2 | +0.3%¹ |
+| a4 | 256 | 158.7 | 123.9 | **−21.9%** | 505.9 | 338.8 | **−33.0%** |
+| a4 | 288 | 142.8 | 134.1 | −6.1% (narrow) | 373.7 | 365.6 | −2.2% (narrow) |
+| a4 | 384 | 152.6 | 147.5 | −3.4% (narrow edge) | 399.4 | 395.3 | −1.0% |
+| a4 | 512 | 167.0 | 166.9 | 0 | 444.2 | 441.3 | −0.6% |
+| a4 | 640 | 223.2 | 212.5 | −4.8% (narrow) | 564.2 | 555.2 | −1.6% |
+| a4 | 768 | 245.9 | 240.5 | −2.2% | 601.1 | 609.8 | +1.4%¹ |
+| a4 | 1024 | 328.7 | 322.3 | −2.0% | 803.8 | 798.7 | −0.6% |
+| a4 | 2048 | 590.8 | 587.7 | −0.5% | 1584.1 | 1576.0 | −0.5% |
+
+  swiglu a4 (N=34816, K=5120): `T=129..135` drops from `917.3–920.4 us` to `539.5–548.9 us` (**−41.2% / 1.70x**); T=128/256/384/512/640/768/2048 all within ±0.4% except T=512 +4.8%¹ (§5).
+  `¹` = route byte-identical in before/after; see §5 for the noise disposition.
+- Acceptance: a4r `T=33..64` K=17408 −46% (≥44% bar met, 1.86x); absolute `<= 245 us` bar missed by
+  2.8..12 µs at T=48/64 (251.9/257.0) — the doc's own baseline (424..442 µs) also measured 8% higher
+  here (461.8..480.3), consistent with thermal drift of absolute µs bars; the relative bar is the
+  meaningful one. a4 `T=256`: K=17408 505.9→338.8 (≤390 ✓, −33% ≥20% ✓); K=6144 158.7→123.9
+  (≤135 ✓, −21.9% ✓).
+
+## 5. Regressions & adverse results
+
+- swiglu a4 `T=512` +4.8% in the first 3-pass matrix: not reproduced by a 5-pass reversed-order
+  recheck (after median 622.4 vs before 625.5, distributions identical; the route is byte-identical
+  code — predicate declines the narrow tile at every served width). Disposition: measurement-order
+  artifact of the first matrix (the `after` arm always ran later within each pass); no regression.
+- `a4r` K=6144 `T=32/256/512` +2.4/+2.3/+1.3% and `a4` K=17408 `T=64/128/768` ≤+1.4%: every one of
+  these cells runs byte-identical code in both binaries. The reversed-order 5-pass recheck gave
+  +0.2%/+3.0%/+0.4% with heavily overlapping distributions (T=256: after {132.1..140.3} vs before
+  {133.3..137.2}; pooled mean Δ +1.8%, within the pooled spread, t≈1.6). Single-pass outliers of
+  comparable size appeared on both sides (before-arm spikes: 800.0 µs at a4 K17408 T=768 pass 2,
+  881.9 µs at swiglu-after recheck pass). Disposition: pass-to-pass noise on unchanged routes; no
+  mechanism exists for a change in them; not hidden but not dismissed by fiat — the data is above.
+- Absolute acceptance bar `a4r T<=245 us` at K=17408: missed by ≤12 µs (247.8..257.0 vs 245) while
+  the relative ≥44% bar passes; the doc's baseline for the same cell measured 8% high here.
+  Disposition: accepted; the shipped candidate (`ResidualM64N128`) is the measured argmin of the
+  seven-candidate panel at these widths (next-best `a4r_tma128_r128_s3` is +15..20% behind).
+
+## 6. Accepted gaps / follow-ups
+
+- End-to-end (KV-matrix / serve) A/B was not run: the claim scope is the two op-level production
+  benches, and the wide-T arms (T=1024/2048, unchanged wide route) measured ≤0.6% drift. A prefill
+  E2E pass is the natural next check when this branch is next benchmarked end-to-end.
+- The swiglu narrow launcher is instantiated but inert at the only registered geometry (N=34816);
+  it becomes live automatically if a lower-row-count gate_up geometry is registered. The predicate
+  itself is unmodified from its 161-point validation.
+- `a4` K=6144 `T=256` measured the narrow tile ~1.6% ahead in the candidate sweep, but the shared
+  predicate (fit on the standalone route) selects wide there; kept the predicate rather than a
+  per-op exception, since a 1.6% point is inside the sweep's pass-to-pass spread.

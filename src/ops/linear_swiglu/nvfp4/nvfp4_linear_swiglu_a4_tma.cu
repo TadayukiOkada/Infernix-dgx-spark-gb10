@@ -11,6 +11,19 @@ void launch_nvfp4_linear_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* 
                                SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
 }
 
+// The same 1-term SwiGLU GEMM on a 128-token tile with 4 stages (the shape the standalone narrow
+// prefill entry runs). The gate_up panel is 100 MiB, so nvfp4_a4_prefer_narrow_token_tile's wave
+// and weight-traffic conditions decline it at every width this route serves today; the selector
+// stays shared with the other A4 prefill routes so a shape with fewer row tiles gets the fill
+// without a per-op copy of the rule.
+void launch_nvfp4_linear_swiglu_a4_tma_narrow(const Nvfp4A4Operands& p, __nv_bfloat16* output,
+                                              cudaStream_t stream) {
+    using S = Nvfp4ScheduleInstance<
+        Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaWeightCodeL2_128B>, 5120>;
+    launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{output, p.rows / 2},
+                               SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
+}
+
 void launch_nvfp4_linear_swiglu_a4_residual_tma(const Nvfp4A4Operands& p, __nv_bfloat16* output,
                                                 cudaStream_t stream) {
     // The 128-token tile with a 128-row weight panel (three 128-K stages, one CTA per SM) is the

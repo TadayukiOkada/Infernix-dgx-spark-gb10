@@ -46,9 +46,9 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     // This route dispatches its own fused kernel rather than a Linear shape's, so it carries its
     // own condition; the call site below forces the matching scale layout.
     // GB10 (sm_121a, 48 SMs): the resident M128N128 tile falls off a cliff once the wave spills
-    // past what it can hide (914 us at 136 tokens vs 467 at 128), while the TMA path holds at
-    // ~540. Cold-weight sweeps put the crossover at 128 -> 136 tokens; the RTX 5090 fit had 256.
-    if (tokens >= 136) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
+    // past its 128-token block (917 us at 129 tokens vs 472 at 128), while the TMA path holds at
+    // ~539. Cold-weight sweeps put the crossover at 128 -> 129 tokens; the RTX 5090 fit had 256.
+    if (tokens >= 129) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
     return Nvfp4LinearSwiGluRoute::FusedA4;
 }
 
@@ -112,10 +112,24 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::TmaFusedA4: {
         auto scope                     = workspace.scope();
         const Nvfp4A4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
-        launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled256, stream);
-        launch_nvfp4_linear_swiglu_a4_tma(
-            nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled256),
-            static_cast<__nv_bfloat16*>(out.data), stream);
+        // The shared 48-SM wave-fill rule picks the token tile; the quantizer writes the scale
+        // layout that tile reads. At this 100 MiB gate_up panel the rule's weight-traffic
+        // condition declines the 128-token tile at every width the route serves today, but the
+        // decision stays in the one predicate the other A4 prefill routes share.
+        const bool narrow =
+            nvfp4_a4_prefer_narrow_token_tile(Nvfp4N34816K5120::kOutputRows,
+                                              Nvfp4N34816K5120::kInputRows, x.ne[1]);
+        const auto layout = narrow ? Nvfp4ScaleLayout::Tiled128 : Nvfp4ScaleLayout::Tiled256;
+        launch_nvfp4_a4_quantize(x, weight, scratch, layout, stream);
+        if (narrow) {
+            launch_nvfp4_linear_swiglu_a4_tma_narrow(
+                nvfp4_a4_operands(weight, scratch, x.ne[1], layout),
+                static_cast<__nv_bfloat16*>(out.data), stream);
+        } else {
+            launch_nvfp4_linear_swiglu_a4_tma(
+                nvfp4_a4_operands(weight, scratch, x.ne[1], layout),
+                static_cast<__nv_bfloat16*>(out.data), stream);
+        }
         return;
     }
     }

@@ -23,6 +23,29 @@ void launch_nvfp4_a4_tma_linear_add(const Nvfp4A4Operands& p, __nv_bfloat16* res
 }
 
 namespace {
+// The 1-term GEMM on a 128-token tile instead of the 256-token one: the same 128-row weight panel
+// and the same K order, with 4 stages to keep the producer ahead at 1 CTA/SM (the shape the
+// standalone narrow prefill entry runs; see nvfp4_a4_prefer_narrow_token_tile for the widths).
+template <int K>
+void launch_narrow(const Nvfp4A4Operands& p, __nv_bfloat16* y, cudaStream_t stream) {
+    using S = Nvfp4ScheduleInstance<
+        Nvfp4A4TmaMmaSchedule<128, 4, 1, kNvfp4A4TmaWeightCodeL2_128B>, K>;
+    launch_nvfp4_a4_tma_mma<S>(p, LinearBf16Output{y, p.rows},
+                               LinearResidualAddEpilogue{{y, p.rows}}, stream);
+}
+} // namespace
+
+void launch_nvfp4_a4_tma_linear_add_narrow(const Nvfp4A4Operands& p, __nv_bfloat16* residual,
+                                           cudaStream_t stream) {
+    if (p.k == 6144)
+        launch_narrow<6144>(p, residual, stream);
+    else if (p.k == 17408)
+        launch_narrow<17408>(p, residual, stream);
+    else
+        throw std::invalid_argument("NVFP4 narrow-token TMA linear_add: unsupported K");
+}
+
+namespace {
 // The 128-token tile with a 128-row weight panel, three 128-K stages, one CTA per SM -- the shape
 // the standalone pair route's grid heuristic picks for this row count and the one that wins every
 // round width this lane serves on GB10 (cold weight, quantize included): 103 against 126 us at 65

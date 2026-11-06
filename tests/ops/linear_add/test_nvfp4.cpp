@@ -132,9 +132,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{96, ops::LinearPolicy::AllowA4},
         Invocation{128, ops::LinearPolicy::AllowA4},
         Invocation{129, ops::LinearPolicy::AllowA4},
-        // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
-        // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
-        // single real token, which is the emptiest grid this route ever runs.
+        // 256..385 straddle the 48-SM narrow 128-token TMA selector (Tiled256 at 129..256 and
+        // 385..512, Tiled128 narrow TMA at 257..384 for both K=6144 and K=17408).
+        Invocation{256, ops::LinearPolicy::AllowA4},
+        Invocation{257, ops::LinearPolicy::AllowA4},
+        Invocation{384, ops::LinearPolicy::AllowA4},
+        Invocation{385, ops::LinearPolicy::AllowA4},
+        // 1023, 1024 and 1025 straddle the four-tile wide TMA boundary.
         Invocation{1023, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
@@ -208,7 +212,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
         if (invocation.tokens == 128 ||
-            (invocation.policy == ops::LinearPolicy::AllowA4Residual &&
+            ((invocation.policy == ops::LinearPolicy::AllowA4 ||
+              invocation.policy == ops::LinearPolicy::AllowA4Residual) &&
              invocation.tokens == 257)) {
             cudaStream_t stream;
             cudaGraph_t graph;
