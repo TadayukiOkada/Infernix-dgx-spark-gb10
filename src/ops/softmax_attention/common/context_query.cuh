@@ -18,6 +18,8 @@ inline constexpr int kContextQueryQHeads   = 32;
 inline constexpr int kContextQueryKVHeads  = 8;
 inline constexpr int kContextQueryGroup    = 4;
 inline constexpr int kContextQueryMaxSplit = 85;
+// One warp merges one (query head, token) row, so a reduce CTA runs this many rows.
+inline constexpr int kContextQueryReduceWarps = 4;
 
 __device__ __forceinline__ int context_query_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -66,6 +68,16 @@ __device__ __forceinline__ void context_query_row_to_qt(int row, int kv_head, in
     const int q_local = row - token * kContextQueryGroup;
     q_head            = kv_head * kContextQueryGroup + q_local;
 }
+
+// On GB10 a split-KV CTA reserves 2 * KeyBlock * 128 * 2 bytes of dynamic SMEM (16 KiB at
+// KeyBlock = 32, 32 KiB at 64), so registers, not SMEM, cap residency at 65,536 regs/SM.
+// KeyBlock = 32 leaves SMEM slack, so clamping to 168 (4-warp) / 170 (<=3-warp) registers buys
+// 3-4 CTAs/SM with zero spills; a 128-CTA T=16 split grid then runs as one wave on 48 SMs.
+// A KeyBlock = 64 CTA holds 32 KiB, so a third resident CTA would need <= 170 registers, which
+// ptxas only reaches by spilling (measured STACK 40-72 B) -- that route keeps its 2-CTA bound.
+template <int WarpsPerCta, int KeyBlock>
+inline constexpr int kContextQueryMinBlocksPerSm =
+    KeyBlock != 32 ? 2 : (WarpsPerCta <= 3 ? 4 : 3);
 
 template <typename ContextPolicy, int KeyBlock, int Threads>
 __device__ __forceinline__ void
@@ -508,17 +520,31 @@ __device__ __forceinline__ void context_query_split_partial_body(
     }
 }
 
-template <int Tokens, int KeyBlock>
+// Merges the split-KV partials for WarpsPerBlock (query head, token) rows per CTA: one warp owns a
+// row and each lane takes four consecutive head dimensions. The row statistics need only warp
+// collectives, so the merge has no block barrier and no 128-thread shared-memory tree, and each
+// split's rescale weight is computed once and reused by its four output dimensions.
+template <typename Partial, int Tokens, int KeyBlock, int WarpsPerBlock, int MaxSplits>
 __device__ __forceinline__ void
-context_query_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
+context_query_reduce_body(const Partial* __restrict__ partial_acc,
                           const float* __restrict__ partial_m, const float* __restrict__ partial_l,
                           int length, int context_count,
                           const std::int32_t* __restrict__ valid_columns, int max_context,
                           int split_capacity, __nv_bfloat16* __restrict__ out) {
-    const int q_head = static_cast<int>(blockIdx.x);
-    const int token  = static_cast<int>(blockIdx.y);
-    const int batch  = static_cast<int>(blockIdx.z);
-    const int tid    = static_cast<int>(threadIdx.x);
+    static_assert(std::is_same_v<Partial, float> || std::is_same_v<Partial, __nv_bfloat16>);
+    static_assert(WarpsPerBlock >= 1 && WarpsPerBlock <= 8);
+    static_assert(kContextQueryHeadDim == 4 * 32, "one warp covers a head at four dimensions/lane");
+    constexpr unsigned Mask = 0xffffffffu;
+    __shared__ float weights[WarpsPerBlock][MaxSplits];
+
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int batch      = static_cast<int>(blockIdx.z);
+    const int output_row = static_cast<int>(blockIdx.x) * WarpsPerBlock + warp;
+    const int token      = output_row / kContextQueryQHeads;
+    const int q_head     = output_row - token * kContextQueryQHeads;
+    if (warp >= WarpsPerBlock || token >= Tokens) { return; }
+
     constexpr std::int64_t QueryElements =
         static_cast<std::int64_t>(kContextQueryHeadDim) * kContextQueryQHeads * Tokens;
     constexpr std::int64_t StatElements = static_cast<std::int64_t>(kContextQueryQHeads) * Tokens;
@@ -526,57 +552,60 @@ context_query_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
     partial_m += StatElements * split_capacity * batch;
     partial_l += StatElements * split_capacity * batch;
     out += QueryElements * batch;
-    if (q_head >= kContextQueryQHeads || token >= Tokens) { return; }
+
+    const int d0             = lane * 4;
+    const std::int64_t out_i = context_query_q_index(q_head, d0, token);
     if (length < 0 || length > max_context || token >= valid_columns[batch]) {
-        if (tid < kContextQueryHeadDim) {
-            out[context_query_q_index(q_head, tid, token)] = __float2bfloat16(0.0f);
-        }
+        store_vec(&out[out_i], make_uint2(0U, 0U));
         return;
     }
 
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
-    __shared__ float reduce[128];
 
     float local_m = -CUDART_INF_F;
-    for (int split = tid; split < active_splits; split += blockDim.x) {
+    for (int split = lane; split < active_splits; split += 32) {
         local_m = fmaxf(local_m, partial_m[context_query_stat_index<Tokens>(q_head, token, split)]);
     }
-    reduce[tid] = local_m;
-    __syncthreads();
-    for (int stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
-        __syncthreads();
-    }
-    const float global_m = reduce[0];
-    __syncthreads();
+    const float global_m = warp_max<32>(local_m, Mask);
 
     float local_l = 0.0f;
-    for (int split = tid; split < active_splits; split += blockDim.x) {
-        const auto idx = context_query_stat_index<Tokens>(q_head, token, split);
-        local_l += partial_l[idx] * expf(partial_m[idx] - global_m);
+    for (int split = lane; split < active_splits; split += 32) {
+        const auto stat      = context_query_stat_index<Tokens>(q_head, token, split);
+        const float weight   = expf(partial_m[stat] - global_m);
+        weights[warp][split] = weight;
+        local_l += partial_l[stat] * weight;
     }
-    reduce[tid] = local_l;
-    __syncthreads();
-    for (int stride = 64; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
-        __syncthreads();
-    }
-    const float global_l = reduce[0];
+    const float global_l = warp_sum<32>(local_l, Mask);
+    __syncwarp(Mask);
 
-    if (tid < kContextQueryHeadDim) {
-        float numerator = 0.0f;
-        for (int split = 0; split < active_splits; ++split) {
-            const auto stat    = context_query_stat_index<Tokens>(q_head, token, split);
-            const float weight = expf(partial_m[stat] - global_m);
-            numerator +=
-                __bfloat162float(
-                    partial_acc[context_query_partial_index<Tokens>(q_head, tid, token, split)]) *
-                weight;
+    float numerator[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int split = 0; split < active_splits; ++split) {
+        const float weight = weights[warp][split];
+        const auto src     = context_query_partial_index<Tokens>(q_head, d0, token, split);
+        if constexpr (std::is_same_v<Partial, float>) {
+            const float4 value = load_vec<float4>(&partial_acc[src]);
+            numerator[0] += value.x * weight;
+            numerator[1] += value.y * weight;
+            numerator[2] += value.z * weight;
+            numerator[3] += value.w * weight;
+        } else {
+            float value[4];
+            load_bf16x4(value, &partial_acc[src]);
+            numerator[0] += value[0] * weight;
+            numerator[1] += value[1] * weight;
+            numerator[2] += value[2] * weight;
+            numerator[3] += value[3] * weight;
         }
-        const float value = global_l > 0.0f ? numerator / global_l : 0.0f;
-        out[context_query_q_index(q_head, tid, token)] = __float2bfloat16(value);
     }
+
+    if (global_l <= 0.0f) {
+        store_vec(&out[out_i], make_uint2(0U, 0U));
+        return;
+    }
+    const std::uint32_t lo = pack_bf16x2(numerator[0] / global_l, numerator[1] / global_l);
+    const std::uint32_t hi = pack_bf16x2(numerator[2] / global_l, numerator[3] / global_l);
+    store_vec(&out[out_i], make_uint2(lo, hi));
 }
 
 } // namespace infernix::ops

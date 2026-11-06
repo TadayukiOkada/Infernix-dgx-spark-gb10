@@ -157,15 +157,18 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
-            const dim3 reduce_grid(kContextQueryQHeads, Tokens, q.ne[3]);
-            context_attention_reduce_kernel<Tokens, KeyBlock><<<reduce_grid, 128, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(context_lengths.data),
-                static_cast<const std::int32_t*>(valid_columns.data),
-                context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity,
-                static_cast<__nv_bfloat16*>(out.data));
+            constexpr int Rows        = kContextQueryQHeads * Tokens;
+            constexpr int ReduceWarps = kContextQueryReduceWarps;
+            const dim3 reduce_grid((Rows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
+            context_attention_reduce_kernel<Tokens, KeyBlock>
+                <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(partial_acc.data),
+                    static_cast<const float*>(partial_m.data),
+                    static_cast<const float*>(partial_l.data),
+                    static_cast<const std::int32_t*>(context_lengths.data),
+                    static_cast<const std::int32_t*>(valid_columns.data),
+                    context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity,
+                    static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
         };
         if (plan.key_block == 32) {

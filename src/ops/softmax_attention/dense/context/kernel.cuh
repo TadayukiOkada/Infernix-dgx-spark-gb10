@@ -68,14 +68,16 @@ struct ContextAttentionPolicy {
 };
 
 template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
-__launch_bounds__(WarpsPerCta * 32, 2) __global__ void context_attention_split_partial_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
-    const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
-    const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
-    const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
-    const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
-    int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
-    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+__launch_bounds__(WarpsPerCta * 32, kContextQueryMinBlocksPerSm<WarpsPerCta, KeyBlock>) __global__
+    void context_attention_split_partial_kernel(
+        const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
+        const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
+        const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
+        const __nv_bfloat16* __restrict__ context_k, const __half* __restrict__ context_v,
+        const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
+        int max_context, int split_capacity, float scale,
+        __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
+        float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     const int batch = static_cast<int>(blockIdx.z);
     ContextAttentionPolicy policy{
         .block_table = block_tables + static_cast<std::int64_t>(logical_pages) * table_rows[batch],
@@ -98,8 +100,10 @@ __launch_bounds__(128, 2) __global__
                                          int max_context, int split_capacity,
                                          __nv_bfloat16* __restrict__ out) {
     const int length = context_length[static_cast<int>(blockIdx.z)];
-    context_query_reduce_body<Tokens, KeyBlock>(partial_acc, partial_m, partial_l, length, length,
-                                                valid_columns, max_context, split_capacity, out);
+    context_query_reduce_body<__nv_bfloat16, Tokens, KeyBlock, kContextQueryReduceWarps,
+                              kContextQueryMaxSplit>(
+        partial_acc, partial_m, partial_l, length, length, valid_columns, max_context,
+        split_capacity, out);
 }
 
 } // namespace infernix::ops
