@@ -150,28 +150,36 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     }
     __syncthreads();
 
-    const int gid              = lane >> 2;
-    const int lid              = lane & 3;
-    const int a_mat            = lane >> 3;
-    const int a_rin            = lane & 7;
-    const int a_rowoff         = a_rin + ((a_mat & 1) << 3);
-    const int b_rin            = lane & 7;
-    const int b_koff           = ((lane >> 3) & 1) << 3;
-    const int warp_row0        = warp * 16;
-    const float q_scale_r0     = q_scale[warp_row0 + gid];
-    const float q_scale_r1     = q_scale[warp_row0 + gid + 8];
-    const unsigned q_lane_base = smem_addr(q_codes) + (warp_row0 + a_rowoff) * D;
-    const unsigned q_as        = (a_mat >> 1) << 4;
-    const unsigned q_r         = a_rin << 4;
-    const unsigned k_lane_base = smem_addr(k_codes) + b_rin * D + (lane >> 4) * (8 * D);
-    const unsigned k_as        = (b_koff >> 3) << 4;
-    const unsigned k_r         = b_rin << 4;
-    const unsigned v_lane_base = smem_addr(v_f16) + (((lane >> 3) & 1) * 8 + b_rin) * D * 2;
-    const unsigned v_as        = (lane >> 4) << 4;
-    const unsigned v_r         = b_rin << 4;
+    // The FP8/K8V4 routes have registers to spare and keep their per-lane ldmatrix bases and Q
+    // row scales live across the tile loop. The NVFP4-key route is pinned at its
+    // __maxnreg__(255) ceiling and spilled 8 bytes per thread doing the same, so for it each
+    // constant below folds away and the value is materialized at its single use instead.
+    constexpr bool kHoistPvBases = Pv8 || !Keys::kNvfp4;
+    const int gid       = lane >> 2;
+    const int lid       = lane & 3;
+    const int a_mat     = lane >> 3;
+    const int a_rin     = lane & 7;
+    const int a_rowoff  = Keys::kNvfp4 ? 0 : a_rin + ((a_mat & 1) << 3);
+    const int b_rin     = lane & 7;
+    const int b_koff    = ((lane >> 3) & 1) << 3;
+    const int warp_row0 = warp * 16;
+    const float q_scale_r0 = Keys::kNvfp4 ? 0.0F : q_scale[warp_row0 + gid];
+    const float q_scale_r1 = Keys::kNvfp4 ? 0.0F : q_scale[warp_row0 + gid + 8];
+    const unsigned q_lane_base =
+        Keys::kNvfp4 ? 0u : smem_addr(q_codes) + (warp_row0 + a_rowoff) * D;
+    const unsigned q_as = Keys::kNvfp4 ? 0u : (a_mat >> 1) << 4;
+    const unsigned q_r  = Keys::kNvfp4 ? 0u : a_rin << 4;
+    const unsigned k_lane_base =
+        Keys::kNvfp4 ? 0u : smem_addr(k_codes) + b_rin * D + (lane >> 4) * (8 * D);
+    const unsigned k_as = Keys::kNvfp4 ? 0u : (b_koff >> 3) << 4;
+    const unsigned k_r  = Keys::kNvfp4 ? 0u : b_rin << 4;
+    const unsigned v_lane_base =
+        kHoistPvBases ? smem_addr(v_f16) + (((lane >> 3) & 1) * 8 + b_rin) * D * 2 : 0u;
+    const unsigned v_as = kHoistPvBases ? (lane >> 4) << 4 : 0u;
+    const unsigned v_r  = kHoistPvBases ? b_rin << 4 : 0u;
     // Pv8 x4.trans rows: matrix lane / 8 holds keys 8 (lane / 8) .. +7 of the k32 step.
-    const int v8_key            = ((lane >> 3) << 3) + (lane & 7);
-    const unsigned v8_lane_base = smem_addr(v_e4m3) + v8_key * D;
+    const int v8_key            = Pv8 ? ((lane >> 3) << 3) + (lane & 7) : 0;
+    const unsigned v8_lane_base = Pv8 ? smem_addr(v_e4m3) + v8_key * D : 0u;
     auto issue_kv_scales        = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
         const int page_offset0  = tile_k0 & (kPagedKVPageSize - 1);
@@ -332,8 +340,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             // of the lane's A row ((lane & 1) * 8 + lane / 4) and B key (lane / 4).
             const auto* k_scale_words = reinterpret_cast<const unsigned*>(k_scale_s);
             const auto* q_scale_words = reinterpret_cast<const unsigned*>(q_group_scales);
-            const int a_row           = warp_row0 + a_rowoff;
-            const int sfa_row         = warp_row0 + (((lane & 1) << 3) | gid);
+            const int a_row = warp_row0 + a_rin + ((a_mat & 1) << 3);
+            const int sfa_row = warp_row0 + (((lane & 1) << 3) | gid);
             // Rolled: an unrolled slab loop holds every slab's fragment addresses and loads at
             // once, which spilled 112-176 bytes per thread at 255 registers and took about 5 %
             // longer (3.7 % with 8-bit PV); each slab's 16 MMAs keep the Tensor Cores busy.
@@ -369,12 +377,14 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                     }
                 }
             }
+            const float q_scale_row0 = q_scale[warp_row0 + gid];
+            const float q_scale_row1 = q_scale[warp_row0 + gid + 8];
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                score[nt][0] *= q_scale_r0;
-                score[nt][1] *= q_scale_r0;
-                score[nt][2] *= q_scale_r1;
-                score[nt][3] *= q_scale_r1;
+                score[nt][0] *= q_scale_row0;
+                score[nt][1] *= q_scale_row0;
+                score[nt][2] *= q_scale_row1;
+                score[nt][3] *= q_scale_row1;
             }
         } else {
             // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -607,11 +617,18 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             }
             constexpr int PVHalf  = PVNtPerWarp / 2; // 16 n-tile pairs
             constexpr int PVLoads = PVKs * PVHalf;   // 64 x4.trans loads
-            // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
+            // Swizzled V x4.trans addresses via precomputed per-lane base + immediates. The
+            // register-pinned NVFP4 FP16-PV route rebuilds them per tile instead of carrying them
+            // live across the QK MMA loop.
+            const unsigned pv_lane_base =
+                kHoistPvBases ? v_lane_base
+                              : smem_addr(v_f16) + (((lane >> 3) & 1) * 8 + b_rin) * D * 2;
+            const unsigned pv_as = kHoistPvBases ? v_as : (lane >> 4) << 4;
+            const unsigned pv_r  = kHoistPvBases ? v_r : b_rin << 4;
             unsigned vf[2][4];
             {
                 ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
-                              causal_swizzle_address(v_lane_base, 0u, v_as, v_r));
+                              causal_swizzle_address(pv_lane_base, 0u, pv_as, pv_r));
             }
 #pragma unroll
             for (int li = 0; li < PVLoads; ++li) {
@@ -625,8 +642,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                     const unsigned ckv = static_cast<unsigned>(n2b << 4);
                     ldmatrix_x4_t(
                         vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
-                        causal_swizzle_address(v_lane_base + static_cast<unsigned>(k2 * (16 * D * 2)),
-                                               ckv, v_as, v_r));
+                        causal_swizzle_address(pv_lane_base +
+                                                   static_cast<unsigned>(k2 * (16 * D * 2)),
+                                               ckv, pv_as, pv_r));
                 }
                 mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
                         p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);

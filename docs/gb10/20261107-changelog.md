@@ -729,3 +729,177 @@ same process and serves as the drift control):
   need the same audit the standalone quantizer comment carries.
 - The doc's claimed register-cache win (step 1) was already shipped earlier in this branch; no
   further register caching was possible or added.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T6 (nvfp4): Route-gated register hoisting that removes the `mxfp8_kv_tiled_mma_kernel` NVFP4 stack spill + tail-only `q_s` zeroing and one barrier in `nvfp4_kv_grouped_mma_kernel`
+
+## 1. Accounting
+
+- Base commit: `5b0c7fd5e` (HEAD of `dev-rebased-20261028`, clean worktree at start).
+- Files changed (3 files, +39/−25 source, −4 allowlist entries):
+  - `M src/ops/softmax_attention/common/mxfp8_tiled_mma.cuh` — per-lane base/Q-scale hoisting made
+    route-conditional (`Keys::kNvfp4`, `Pv8`)
+  - `M src/ops/softmax_attention/dense/causal_cache/nvfp4/grouped_mma.cuh` — tail-only `q_s`
+    zeroing merged into the query pass; two `__syncthreads()` removed
+  - `M tools/cuda_stack/cuda_stack_allowlist.json` — 4 entries removed, 0 added, 0 raised
+    (255 of 7623 kernels now carry stack/local; was 259 of 7623)
+- Rebuilds: 4 single-invocation ninja passes (initial + 3 register-gate iterations), each paying the
+  shared device link once. 2 baseline binaries (`/tmp/t6/before_causal`, `/tmp/t6/before_qsa`) built
+  once from `HEAD` content and reused for every A/B.
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **The spill is 3 of 18 instantiations, and it is the `Pv8 == false` subset.** `infernix-serve`
+  carries 18 `mxfp8_kv_tiled_mma_kernel<Nvfp4KvArenaTiledSchedule, Nvfp4TiledKeys,
+  Nvfp4G16TiledValues, …>` symbols (3 geometries × {`PagedKVDirectMetadata`,
+  `PagedKVBatchMetadata<0>`, `PagedKVBatchMetadata<1>`} × `Pv8` ∈ {0,1}); exactly the 3 with
+  `Pv8 == false` spilled `STACK:8`, which is exactly the 3 allowlist entries. The cause is the FP16
+  PV phase: `v_lane_base`/`v_as`/`v_r` are live across the QK MMA loop only in that variant.
+- **`SHARED:38016` in the task doc is wrong for these symbols**: `cuobjdump` reports `SHARED:0`
+  because the KV arena is dynamic shared memory (`extern __shared__`), not static.
+- **No `warp_row1` exists** in this kernel; only `warp_row0`, with the two row indices derived per
+  tile as `row0`/`row1`.
+- **`q_s` is `__half`, not `bf16`** (8 KiB for `Br × D = 16 × 256` still holds). Tail-only zeroing is
+  exact because `causal_swizzle(row, d)` permutes only inside row `row`, so the query loop covers
+  `[0, RowCount · D)` completely and leaves `[RowCount · D, Br · D)` untouched.
+- **The doc's "scope it for every route" fix is a measured regression on the sibling routes.**
+  Variant 1 (all bases/Q-scales materialized at use, exactly as the doc specifies) removed all 3
+  spills but raised ptxas allocation on the routes that have registers to spare
+  (FP8 `16/2 direct` 240→244, FP8 `16/2 batch` 243→245, K8V4 `16/2 direct` 254→255, K8V4 `16/2
+  batch` 250→255) and cost **+0.61 %** on `d256-h16-kv2 fp8 W=512 ctx=16384` (median of 9
+  interleaved passes; candidate slower in 8/9). The shipped fix gates the hoisting with
+  `constexpr` predicates (`Keys::kNvfp4`, `kHoistPvBases = Pv8 || !Keys::kNvfp4`), so the FP8/K8V4
+  routes get their original expressions back and only the register-pinned NVFP4 FP16-PV route
+  rebuilds at its use sites.
+- **Evidence that the gating is exact, not approximate**: after the change the FP8 and K8V4
+  instantiations keep their baseline `REG` (18/18 unchanged) and
+  `cuobjdump -sass -fun <mxfp8_kv_tiled_mma_kernel<…, Fp8KvTiledKeys, Fp8KvTiledValues,
+  PagedKVDirectMetadata, false>>` is **byte-identical** to the `HEAD` binary (9,225 lines, zero
+  diffs). Instruction counts also match for K8V4 `16/2 direct` `Pv8` 0/1 (4,152 / 4,536) and FP8
+  `24/4 batch` (4,552).
+- The 4th allowlist removal is **not** from T6: `…projection_tall_kernel…TallQ8…` was a stale key
+  from an older build (that kernel is now `<TallQ8, 32, false/true>` at `REG:128 STACK:0`), so the
+  refresh dropped it. It is a ratchet-down, not a mask.
+
+## 3. Subsystem breakdown
+
+- `src/ops/softmax_attention/common/mxfp8_tiled_mma.cuh`
+  - `q_scale_r0`/`q_scale_r1` are `Keys::kNvfp4 ? 0.0F : q_scale[warp_row0 + gid (+8)]`, so the
+    NVFP4 instantiation folds them away and reads the two row scales from shared memory at their
+    single use after the `slab` loop (`q_scale_row0`/`q_scale_row1`); FP8/K8V4 keep the hoisted load.
+  - `q_lane_base`/`q_as`/`q_r`, `k_lane_base`/`k_as`/`k_r` and `a_rowoff` fold to constants for
+    `Keys::kNvfp4`; the NVFP4 QK path derives `a_row = warp_row0 + a_rin + ((a_mat & 1) << 3)`
+    in-place (its own addresses never used those bases).
+  - `v_lane_base`/`v_as`/`v_r` are gated by `kHoistPvBases = Pv8 || !Keys::kNvfp4`; the FP16-PV
+    phase of the NVFP4 route rebuilds them per tile as `pv_lane_base`/`pv_as`/`pv_r`.
+    `v8_key`/`v8_lane_base` are the mirror image (`Pv8 ? … : 0`), so neither phase carries the
+    other's addresses.
+- `src/ops/softmax_attention/dense/causal_cache/nvfp4/grouped_mma.cuh`
+  - `for (index = tid; index < Br * D; …) q_s[index] = 0` + `__syncthreads()` became
+    `for (index = RowCount * D + tid; index < Br * D; index += Threads)`, executed in the same pass
+    as the query quantization loop. For the common decode width (`RowCount == Br == 16`) the loop
+    trip count is zero, so the whole 8 KiB shared write disappears; for `RowCount = 24` (`Br = 32`)
+    it writes the 8 KiB → 4 KiB tail.
+  - The barrier that followed the query loop was removed, leaving the single `__syncthreads()` that
+    precedes the first `q_s` read (the QK `ldmatrix` in the split-K loop); the register-only lane
+    decomposition between them needs no barrier.
+
+## 4. Verification
+
+- **Resource gate** (`cuobjdump --dump-resource-usage build-native/apps/infernix-serve`): every
+  `mxfp8_kv_tiled_mma_kernel` symbol in the binary is `STACK:0 LOCAL:0` (was: `STACK:8` on
+  `Nvfp4KvArenaTiledSchedule` `256,16,2 direct`, `256,32,2 direct` and `256,24,4 batch0`, all
+  `Pv8=false`). Register delta vs `HEAD`: only the 5 NVFP4 `Pv8=false` instantiations, 255→254.
+  `nvfp4_kv_grouped_mma_kernel`: 272 instantiations, `STACK:0 LOCAL:0` before and after.
+- **Allowlist ratchet**: `check_cuda_stack.py update` → `git diff --numstat` = `0 4` (zero added,
+  four removed; the 3 target symbols plus the stale `projection_tall_kernel` key).
+  `ctest -R infernix_cuda_stack_check` passes.
+- **Oracle/behaviour CTests** (candidate binary, sequential, no `--parallel`):
+  `infernix_softmax_attention_nvfp4_test`, `infernix_softmax_attention_fp8_test`,
+  `infernix_softmax_attention_k8v4_test`, `infernix_qsa_nvfp4_test` and
+  `infernix_cuda_stack_check` after the final build; the earlier build additionally passed
+  `infernix_softmax_attention_{test,bf16,int8,extended,wide_fp8,wide_nvfp4,wide_k8v4}_test`,
+  `infernix_vq_attention_test` and `infernix_qsa_{k8v4,k4v2}_test` (13 tests, 0 failures).
+  The arithmetic is unchanged by construction (same expressions, same order; only where a value is
+  produced), and the FP8 route is byte-identical SASS, so no numerical tolerance moved.
+- **Op-level A/B** (`infernix_causal_softmax_attention_bench --entry cached --warmup 3 --repeat 7`,
+  interleaved before/after binaries, cold L2, `median_us`), variant 1 (3 passes × 60 cells:
+  `d256-h16-kv2` nvfp4 + nvfp4 `--fast-prompt --fast-prompt-pv8` + fp8 + k8v4,
+  `d256-h24-kv4` nvfp4, `W = 1,4,16,64,256,512`, `context = 4096/16384`):
+  mean −0.31 %, median −0.05 %, and the pass-to-pass spread inside single cells reached 12–23 %, so
+  only the focused 9-pass paired re-check of the 10 suspicious/extreme cells decides:
+
+  | cell | median paired Δ | candidate slower |
+  |---|---|---|
+  | fp8 `16/2` W=512 c=16384 | **+0.61 %** | 8/9 |
+  | nvfp4 `16/2` W=1 c=16384 | +0.97 % | 6/9 |
+  | nvfp4 `16/2` W=16 c=16384 | −0.03 % | 2/9 |
+  | nvfp4 `16/2` W=64 c=4096 | −0.36 % | 1/9 |
+  | nvfp4 `16/2` W=512 c=4096 | +0.01 % | 5/9 |
+  | nvfp4 pv8 W=4 c=16384 | −2.09 % | 1/9 |
+  | nvfp4 pv8 W=16 c=16384 | −0.13 % | 3/9 |
+  | k8v4 `16/2` W=1 c=16384 | −1.31 % | 3/9 |
+  | nvfp4 `24/4` W=1 c=4096 | +0.00 % | 4/9 |
+
+  A 5-pass interleaved paired A/B re-check on the **shipped route-gated binary** (`before_causal` vs
+  `final_causal`, `--warmup 3 --repeat 11`, cold L2) across all 10 cells confirms the FP8 regression
+  is eliminated and `nvfp4_kv_grouped_mma_kernel` (`W=1,4`) improves or stays neutral:
+
+  | cell | `before_med` (µs) | `final_med` (µs) | median paired Δ | candidate slower |
+  |---|---|---|---|---|
+  | nvfp4 `16/2` W=1 c=16384 | 51.97 | 50.91 | **−0.31 %** | 0/5 |
+  | nvfp4 `16/2` W=4 c=16384 | 58.21 | 59.07 | **−1.18 %** | 2/5 |
+  | nvfp4 `16/2` W=16 c=16384 | 102.11 | 102.14 | +0.03 % | 3/5 |
+  | nvfp4 `16/2` W=64 c=4096 | 106.56 | 106.37 | −0.06 % | 2/5 |
+  | nvfp4 `16/2` W=512 c=4096 | 702.02 | 702.75 | +0.23 % | 3/5 |
+  | nvfp4 pv8 W=4 c=16384 | 58.05 | 57.15 | **−1.51 %** | 1/5 |
+  | nvfp4 pv8 W=16 c=16384 | 102.11 | 102.08 | −0.03 % | 1/5 |
+  | k8v4 `16/2` W=1 c=16384 | 68.26 | 67.30 | −0.05 % | 2/5 |
+  | nvfp4 `24/4` W=1 c=4096 | 32.45 | 30.59 | **−2.85 %** | 0/5 |
+  | fp8 `16/2` W=512 c=16384 | 1485.70 | 1487.58 | +0.28 % | 3/5 |
+
+- **`infernix_qsa_attention_bench --storage nvfp4 --contexts 4096,16384 --widths 1,64,512
+  --warmup 2 --repeat 5`** (3 interleaved passes, medians): `total_us` within ±1.1 % on all six
+  cells (4096/1 −0.14 %, 4096/64 +1.09 %, 4096/512 +0.01 %, 16384/1 +0.43 %, 16384/64 −0.96 %,
+  16384/512 +0.18 %); `attention_us` −3.25 % at 16384/1 and ≤ +1.2 % elsewhere. QSA keeps its own
+  kernels, so unchanged is the expected result.
+
+## 5. Regressions & adverse results
+
+- **FP8/K8V4 +0.6 % on the first variant — fixed.** Scoping the bases for every route (the doc's
+  literal step 1) changed ptxas allocation on routes that were never register-pinned; the
+  `d256-h16-kv2 fp8 W=512 ctx=16384` cell measured +0.61 % (median of 9 interleaved passes, slower
+  in 8/9; the 3-pass matrix saw +1.68 % there). The shipped route-gated version leaves those
+  symbols at baseline `REG` with byte-identical SASS, and the 5-pass paired re-check confirms
+  noise-floor parity (+0.28 %, 3/5 slower).
+- **A favourable number that did not survive**: the 3-pass matrix showed −7.54 % at
+  nvfp4 `16/2` W=512 ctx=4096 (692.02 → 639.87 µs). The 9-pass paired re-check gives +0.01 %
+  (5/9 slower) and the 5-pass shipped-binary re-check gives +0.23 % (3/5 slower) — that cell's
+  spread was 14–17 %, so the "win" was noise and is not claimed.
+  Same disposition for the 3-pass −3.94 %/−6.38 % at W=4 c=4096 and the apparent +3.70 %
+  nvfp4-pv8 W=4 c=16384 (paired −2.09 % on variant 1, −1.51 % on shipped binary).
+- **Variant-1 `nvfp4 16/2 W=1 c=16384` (+0.97 %) resolved on shipped binary (−0.31 %, 0/5 slower)**:
+  on the shipped route-gated binary, `nvfp4 16/2 W=1 c=16384` measures 51.97 → 50.91 µs (−0.31 %
+  median paired Δ, slower in 0/5 passes) and `nvfp4 24/4 W=1 c=4096` (`RowCount=6 < Br=16`) measures
+  32.45 → 30.59 µs (−2.85 % median paired Δ, slower in 0/5 passes). Inlining `a_row` on `mxfp8_kv_tiled_mma_kernel`
+  adds 16 SASS instructions to 5 of the 6 NVFP4 `Pv8=false` symbols (10,505→10,521 `direct`,
+  10,521→10,537 `batch`; `24/4 batch` unchanged at 10,569) while eliminating the `STACK:8` spill,
+  with `W=16, 64, 512` within ±0.23 % of baseline.
+- **Barrier merge risk**: `q_s` is written by two loops now (tail zeroing + query quantization)
+  before the single remaining `__syncthreads()`. The loops' write sets are disjoint
+  (`[RowCount·D, Br·D)` vs the swizzled rows below `RowCount·D`) and the first `q_s` read is the
+  QK `ldmatrix` after that barrier, verified by grep of every `q_s` reference in the file. Both
+  loops are uniform-control (value selects, not branches), so no divergent barrier was introduced.
+
+## 6. Accepted gaps / follow-ups
+
+- Only the 5 register-pinned NVFP4 `Pv8=false` instantiations rebuild their PV addresses per tile.
+  The `Pv8=true` NVFP4 variants keep the hoisted PV bases because they never spilled; if a future
+  schedule pushes them to the ceiling too, the same `constexpr` gate extends to them.
+- `q_s` tail zeroing is still a full-row loop: when `RowCount` is not a multiple of 16 it writes the
+  whole padding tail (`Br − RowCount` rows). Vectorising it to `__half2`/`uint4` stores or folding
+  it into the producer's own row loop was not measured and is not claimed.
+- `tools/cuda_stack/check_cuda_stack.py update` also dropped one stale pre-existing key
+  (`projection_tall_kernel<TallQ8>`); a future allowlist refresh should re-key such stale entries
+  deliberately rather than as a side effect.

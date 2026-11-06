@@ -178,8 +178,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         __syncthreads();
     }
 
-    for (int index = tid; index < Br * D; index += Threads) { q_s[index] = __float2half_rn(0.0F); }
-    __syncthreads();
+    // The query loop below writes rows [0, RowCount) completely and causal_swizzle keeps each
+    // write inside its own row, so only the padding tail [RowCount * D, Br * D) needs zeroing.
+    // For a full RowCount (the common decode width) that range is empty and nothing is written.
+    for (int index = RowCount * D + tid; index < Br * D; index += Threads) {
+        q_s[index] = __float2half_rn(0.0F);
+    }
 
     for (int row = warp; row < RowCount; row += Wc) {
         int q_head = 0;
@@ -200,7 +204,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             q_s[row * D + causal_swizzle(row, d)] = __float2half_rn(values[r]);
         }
     }
-    __syncthreads();
 
     const int gid         = lane >> 2;
     const int lid         = lane & 3;
