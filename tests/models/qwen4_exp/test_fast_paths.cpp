@@ -117,11 +117,15 @@ int main() {
     selection.paths = {FastPath::GdnConvFused, FastPath::QsaPrepareFused};
     failures += check(selection.request_invariant(), "the fused kernels keep a request invariant");
 
-    // expert-a4-residual acts only on W4A16 experts (recipe C), and routes an expert by its column
-    // count in the call, which batched rounds share between requests.
+    // expert-a4-residual acts only on W4A16 experts (recipe C, NVIDIA FP4-Local and W4Dense with
+    // --a16-experts), and routes an expert by its column count in the call, which batched rounds share
+    // between requests.
     const FastPathConfiguration recipe_c{DenseKernels::Fp8Row, false, KvCacheStorage::Int8Group64};
     failures += check(q::fast_path_applies(FastPath::ExpertA4Residual, recipe_c, options),
                       "expert-a4-residual runs on W4A16 experts");
+    failures += check(q::fast_path_applies(FastPath::ExpertA4Residual,
+                                           {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}, options),
+                      "expert-a4-residual runs on W4Dense's W4A16 experts (task T8, 2026-11-07)");
     failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual, dense8, options),
                       "expert-a4-residual does not apply to W4A4 experts");
     for (const DenseKernels dense : {DenseKernels::Ggml, DenseKernels::Bf16}) {
@@ -139,6 +143,10 @@ int main() {
                               q::fast_path_applies(FastPath::ExpertA4Residual, configuration, options),
                           "expert-a4-residual-3 applies exactly where expert-a4-residual does");
     }
+    // W4Dense registers the two-term pair, not the three-term form (task T8, 2026-11-07).
+    failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual3,
+                                            {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}, options),
+                      "expert-a4-residual-3 stays off W4Dense");
     selection.paths = {FastPath::ExpertA4Residual, FastPath::ExpertA4Residual3};
     failures += check(selection.forward().expert_a4_terms == 3, "expert-a4-residual-3 takes three terms, first");
     failures += check(!selection.request_invariant(), "expert-a4-residual-3 couples a request to its round");
@@ -184,6 +192,10 @@ int main() {
                           "expert-a4-residual is qualified on recipe C with every KV format");
         failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, {DenseKernels::Mxfp8, false, kv}),
                           "expert-a4-residual is qualified on NVIDIA FP4-Local (16-bit experts) with every KV format");
+        failures += check(q::fast_path_qualified(FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, kv}),
+                          "expert-a4-residual is qualified on W4Dense (--a16-experts) with every KV format");
+        failures += check(q::fast_path_qualified(FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, kv}),
+                          "expert-a4-residual-decode is qualified on W4Dense (--a16-experts) with every KV format");
     }
     failures += check(!q::fast_path_applies(FastPath::ExpertA4Residual,
                                             {DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64}, options),
@@ -192,8 +204,9 @@ int main() {
                                               {DenseKernels::Q8, false, KvCacheStorage::Int8Group64}),
                       "expert-a4-residual is qualified only where its kernels were gated and timed");
     // expert-a4-residual-decode, the narrow form (GPU narrow kernels and the CPU engine), serves the same
-    // banks, sets its own flag, couples a request to its round (an expert's route follows its column
-    // count) and is a candidate only: no configuration registers it.
+    // banks, sets its own flag and couples a request to its round (an expert's route follows its column
+    // count). It stays a candidate except on W4Dense, which registers it (task T8, 2026-11-07; its
+    // W4Dense checks are above).
     for (const auto& configuration : {recipe_c, dense8, FastPathConfiguration{DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64},
                                       FastPathConfiguration{DenseKernels::Mxfp8, true, KvCacheStorage::Int8Group64},
                                       FastPathConfiguration{DenseKernels::Ggml, false, KvCacheStorage::Int8Group64}}) {
@@ -340,11 +353,9 @@ int main() {
     // W4Dense (NVFP4 dense, both expert activation precisions, every KV format): q8-sliced-k routes
     // the artifact's Q8 weights (its NVFP4 problems ignore the flag) and dflash2-pairs joins the
     // owner's every-configuration registration; both are registered. gdn-conv-fused's [16384,2560]
-    // NVFP4 route is implemented (it applies, so --fast-path can run it) but measured no faster than
-    // the composed decode route on GB10 - after the T6 row-scratch and T3 register prefetches (the
-    // latter drops the GEMV's shared line and its barrier for a further 0.4 .. 1.2 us at B = 1) it is
-    // 3.0 us per call ahead of the composed route at the Op level and +0.02 .. +0.03 tok/s, a tie, on
-    // the artifact's plain decode over six alternating rounds (2026-11-01), so it registers nowhere.
+    // NVFP4 route is registered on both expert precisions by the owner's commit 98aff48b0
+    // (2026-11-05); its GB10 measurements through 2026-11-01 had it at an Op-level tie and an E2E
+    // -0.2 .. +0.03 tok/s against the composed decode route.
     // The fused
     // convolution is per column and keeps a request invariant;
     // q8-sliced-k and dflash2-pairs couple a request to its round, which the reproducible route
@@ -355,8 +366,8 @@ int main() {
                               KvCacheStorage::Q4KeyVq2Value}) {
             const FastPathConfiguration w4dense{DenseKernels::Nvfp4, a4, kv};
             failures += check(q::fast_path_applies(FastPath::GdnConvFused, w4dense, options) &&
-                                  !q::fast_path_qualified(FastPath::GdnConvFused, w4dense),
-                              "gdn-conv-fused's NVFP4 route is an unqualified candidate (measured a tie)");
+                                  q::fast_path_qualified(FastPath::GdnConvFused, w4dense),
+                              "gdn-conv-fused's NVFP4 route is registered by the owner (98aff48b0)");
             failures += check(q::fast_path_applies(FastPath::Q8SlicedK, w4dense, options) &&
                                   q::fast_path_qualified(FastPath::Q8SlicedK, w4dense),
                               "q8-sliced-k applies and is registered on W4Dense (its Q8 weights)");

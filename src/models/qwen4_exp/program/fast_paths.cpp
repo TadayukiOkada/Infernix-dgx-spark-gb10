@@ -569,12 +569,10 @@ constexpr std::array kQualified{
     // measured on it here: c = 2 pair rounds 6/723 -> 136/4, decode 35.4 -> 71.8 tok/s, 2.0x plain).
     // q8-sliced-k takes the flag on the artifact's 303 Q8 weights (shared expert, hyper-connections,
     // MTP drafters, LM head; the NVFP4 problems ignore it, its T=1 problems tie the exact route at
-    // the Op level). Neither reads the KV format. gdn-conv-fused's NVFP4 route is implemented but
-    // registers nothing here: still slower than the composed decode route on this artifact after the
-    // T6 epilogue prefetch (2026-10-31, W4Dense plain decode, --fast-path gdn-conv-fused against the
-    // default, 2 rounds each: -0.11 .. -0.19 tok/s on every test, i.e. -0.2 .. -0.4 %, from 46.0;
-    // -3.7 % before T6 removed 3.0 .. 5.9 us/layer call from the fused launch).
-    // The two paths' model-quality joint gate on this artifact is the recorded follow-up.
+    // the Op level). Neither reads the KV format. gdn-conv-fused's NVFP4 route is registered on both
+    // expert precisions by the owner's commit 98aff48b0 (2026-11-05); its GB10 measurements through
+    // 2026-11-01 had it at an Op-level tie and an E2E -0.2 .. +0.03 tok/s against the composed
+    // decode route (the T6 row-scratch, T3 register prefetch and T8 conv-post entries).
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::DFlash2Pairs, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
@@ -631,6 +629,30 @@ constexpr std::array kQualified{
     Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::GdnConvFused, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
+    // W4Dense with --a16-experts (task T8, 2026-11-07): the two-term expert-a4-residual pair, wide and
+    // narrow. Its kernels are recipe C's gated ones on the same NVFP4 W4A16 expert planes - the gates
+    // are bank-based (model-quality.md 6.7: "artifacts with NVFP4 W4A16 experts") and the dense kind
+    // does not enter them, so recipe C's quality verdicts carry and the KV format joins from those
+    // increments (6.1, step 3). The wide route is the measured-faster one there (+2.0 % MTP decode on
+    // the same bank class); the narrow route's speed against the replaced W8A8 decode route is
+    // measurable only on an --a16-experts W4Dense artifact, which the GB10 host lacks as of
+    // 2026-11-07 (its W4Dense artifact stores 4-bit activation scales, so it selects the a4
+    // configuration) - the recorded follow-up is that A/B on such an artifact (docs/gb10/
+    // 20261107-changelog.md, T8).
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ExpertA4Residual, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -757,13 +779,19 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Q8SlicedK:
     case FastPath::GdnConvFused:
         return configuration.dense == DenseKernels::Q8 || configuration.dense == DenseKernels::Nvfp4;
-    // The wide route of NVFP4 W4A16 experts: recipe C's weight-only export (FP8-row dense) and NVIDIA
-    // FP4-Local's banks at their default 16-bit activations (MXFP8 dense). GGUF and block-FP8 experts
-    // also take 16-bit activations but have no such kernel.
+    // The wide route of NVFP4 W4A16 experts: recipe C's weight-only export (FP8-row dense), NVIDIA
+    // FP4-Local's banks at their default 16-bit activations (MXFP8 dense) and W4Dense with
+    // --a16-experts (its expert banks are the same NVFP4_MUL planes recipe C's gates ran on). GGUF and
+    // block-FP8 experts also take 16-bit activations but have no such kernel.
     // Its narrow form (decode and verification widths, GPU kernels and CPU engine) serves the same banks.
     case FastPath::ExpertA4Residual:
-    case FastPath::ExpertA4Residual3:
     case FastPath::ExpertA4ResidualDecode:
+        return !configuration.a4_experts &&
+               (configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8 ||
+                configuration.dense == DenseKernels::Nvfp4);
+    // Its more precise three-term form stays on the two gated configurations; W4Dense registers the
+    // two-term pair, not this one (task T8, 2026-11-07).
+    case FastPath::ExpertA4Residual3:
         return !configuration.a4_experts &&
                (configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8);
     // The GGUF imports' dense projections (ops::ggml_linear's BF16 prefill tiles).

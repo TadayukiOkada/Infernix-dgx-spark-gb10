@@ -1032,3 +1032,169 @@ same process and serves as the drift control):
 - The task doc's absolute-µs/DRAM-% baselines should be regenerated from
   `infernix_attn_input_proj_bench`/`infernix_gdn_input_proj_bench` (the fused ops' own benches) in
   any follow-up, not from `infernix_linear_bench` on a same-named plain-Linear shape.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T8 (nvfp4): `ExpertA4Residual`/`ExpertA4ResidualDecode` qualified on `DenseKernels::Nvfp4` (W4Dense, `--a16-experts`) and the NVFP4 GDN conv-post kernel sized to its token tiles with PDL (the multi-row `Forward::gdn` snapshot premise falsified)
+
+## 1. Accounting
+
+- Base commit: `025b192cf` (branch `dev-rebased-20261028`, HEAD at task start). Work left
+  uncommitted for the Antigravity review.
+- Files changed (3, +130/−46):
+  - `M src/models/qwen4_exp/program/fast_paths.cpp` — `fast_path_applies` split (`ExpertA4Residual`
+    + `ExpertA4ResidualDecode` gain `DenseKernels::Nvfp4`; `ExpertA4Residual3` stays on
+    `Fp8Row`/`Mxfp8`), `kQualified` + 14 entries (`{Nvfp4, false}` × every KV × the two paths),
+    the stale W4Dense block comment rewritten to the shipped table.
+  - `M src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu` — `nvfp4_gdn_conv_post_kernel`
+    templated over `WarpsPerCta ∈ {1, 4, 8, 32}` and sized by the token-tile count; the 7 × 32
+    shared tap loads spread across the whole CTA; `pdl::enter()` + programmatic dependent launch.
+  - `M tests/models/qwen4_exp/test_fast_paths.cpp` — 8 new checks (W4Dense applies/qualified for
+    the two paths, residual-3 excluded), two stale comments corrected, and the stale
+    "gdn-conv-fused is an unqualified candidate" check flipped to the owner's registration.
+- Spill allowlist: untouched (`nvfp4_gdn_conv_post_kernel` instantiations are `STACK:0 LOCAL:0`
+  before and after; the `update` run wrote no diff). `infernix_cuda_stack_check` green.
+- Rebuilds: 4 Ninja invocations (1 HEAD baseline for the A/B binaries, 1 fifteen-edge candidate
+  sharing one device link, 2 single-edge relinks after test/comment edits).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **The title's `Forward::gdn` change is invalid and no `forward.cpp` change was made.**
+  `batch.width` is the tokens-per-sequence dimension and the lanes are `batch` (1..8), so
+  `decode = batch.verify == nullptr && batch.width <= 1` already covers every decode, multi-lane
+  included — a B = 2..8 decode round runs the fused `gdn_input_proj_conv_snapshot` routes form
+  (W=1, B=1..8 → `launch_nvfp4_n16384_k2560_conv_snapshot`), not the composed pair the doc
+  describes. A `verify == nullptr, width > 1` call is a single-sequence prefill chunk (the branch
+  throws for `batch != 1`) and stays composed by design; a multi-row snapshot across lanes would
+  advance one sequence's `conv_state` through other lanes' tokens, which is semantically wrong.
+  The doc's own "Required Implementation Steps" omitted the `forward.cpp` change it titled.
+- The doc's claim that `Forward::gdn` lines 697–708 call `ops::gdn_input_proj_conv_record` under
+  verification is false for Qwen4Exp: its verification conv runs inside
+  `gated_delta_net_replay_record_conv` (width ≤ `kGdnReplayConvMaxWidth`) or through
+  `causal_conv1d_silu_from_states_split`; the record public Op is the Qwen3.5 route.
+- The post-kernel's idle-warp defect is real but the doc's band is wrong: `T = 2..16` under the
+  A16 policy is the fused `SmallTFusedA16` SIMT kernel, not the post kernel. The post kernel runs
+  on the Materialized schedules — A16 `T = 17..64`, the A4 policy from `T = 4`, and the
+  column-invariant/batched compositions — where the retired 32-warp CTA covered at most 8 token
+  tiles and left 24–31 warps idle. The fix sizes the CTA to the tile count (1 warp through `T = 8`,
+  4 through `T = 32`, 8 through `T = 64`, 32 above — the doc's 4/8 split at 32 leaves three of
+  four warps idle at `T ≤ 8`, so the 1-warp tier was added and measured). Per-lane arithmetic and
+  the tile decomposition are unchanged, so the outputs are bit-identical; the `bool Record`
+  template the doc suggested is already the `Publish` policy parameter.
+- The doc's verification command names the wrong bench: `infernix_gdn_input_proj_bench` is the
+  projection-only contract bench and has no fused/composed arm; the fused route is
+  `infernix_gdn_input_proj_conv_snapshot_bench`. Its absolute baselines (113.0 … 178.7 µs at
+  `T = 2..32`) match no arm of either binary on this host (the `nvfp4` fixture's fused rows
+  measured 214–237 µs at the HEAD binary; the `nvfp4-flash` fixture refuses `T > 1` snapshots) —
+  consistent with T7's note that these bars need regeneration. Acceptance was therefore taken as
+  candidate-against-HEAD-binary A/B on the fused Op, not the doc's absolute µs.
+- The doc's "update the comment at line 573 to match the table" exposed a stale contract: the
+  owner's commit `98aff48b0` (2026-11-05) had registered `GdnConvFused` on `Nvfp4` (both expert
+  precisions, every KV) while the table's own block comment still said it "registers nothing" and
+  `test_fast_paths.cpp` still asserted it was an unqualified candidate — the test failed 14
+  assertions at HEAD before this task. The comment and the check were brought to the shipped
+  table; the owner's registration stands.
+- **The registered configuration cannot execute on this host.** `a16_experts` comes from the
+  artifact (config.cpp: experts stored without activation scales, or an a4-optional artifact run
+  without `--expert-a4-activations`); this host's W4Dense artifact stores 4-bit activation scales,
+  so it selects `{Nvfp4, true}` and the new `{Nvfp4, false}` qualifications change nothing here.
+  The doc's "`--a16-experts`" is a conversion/load-time property, not a runtime CLI flag. The
+  quality evidence carries from recipe C's gates, which are bank-based ("artifacts with NVFP4
+  W4A16 experts", model-quality.md 6.7) on the same NVFP4 planes; the speed evidence for the
+  narrow route against the replaced W8A8 decode route cannot be produced here (§5/§6).
+
+## 3. Subsystem breakdown
+
+- `fast_paths.cpp` (`M`): `fast_path_applies(ExpertA4Residual/ExpertA4ResidualDecode)` now
+  `!a4_experts && (Fp8Row || Mxfp8 || Nvfp4)`; `ExpertA4Residual3` keeps the old pair (two terms
+  pass everywhere they are run, so the precise form stays an unregistered candidate). `kQualified`
+  gains `ExpertA4Residual` and `ExpertA4ResidualDecode` on `{Nvfp4, false}` × 7 KV formats with a
+  comment carrying the evidence and the unmeasured narrow-speed follow-up. Selecting the narrow
+  path flips `a8_activation_routes`' `nvfp4_experts` off (its own `!expert_a4_narrow` term), so
+  the configuration's experts move from the W8A8 route to `NarrowA16::kA4Residual` (GPU and CPU)
+  and `WideA16::kA4Residual` — the replacement the task specified.
+- `nvfp4_gdn_snapshot_post.cu` (`M`): one instantiation per size tier shared by both `Publish`
+  policies; the launcher dispatches on `ceil(T / 8)` tiles. The `warp == 0` serial fill of
+  `initial[3][32] + weight[4][32]` became a whole-CTA strided fill (value index = part × 32 +
+  column, consecutive threads on consecutive channels of one tap). `infernix::pdl::enter()` is the
+  kernel's first statement (no read before it) and both launchers use
+  `pdl::launch_with(Dependency::Programmatic, …)` — active only under CUDA-graph capture, where it
+  overlaps this grid's launch with the projection's CTA drain; eager launches serialize as before.
+- `tests` (`M`): W4Dense registration matrix (+4 qualified, +1 applies, +1 residual-3-excluded),
+  the residual-decode "no configuration registers it" comment scoped to W4Dense, and the
+  gdn-conv-fused check aligned to `98aff48b0`.
+
+## 4. Verification
+
+- Resources (`cuobjdump --dump-resource-usage`): 8 instantiations (`{1,4,8,32} × {NoHistory,
+  SnapshotHistory}`) at `REG 40–44 STACK:0 SHARED:1920 LOCAL:0` (baseline: the two `<32, 8>`
+  forms at `REG 42/44 STACK:0 LOCAL:0`). Allowlist: zero new entries, zero removals;
+  `infernix_cuda_stack_check` Passed.
+- CTest (no `--parallel`, single-GPU host): `infernix_gdn_input_proj_test` (10.4 s),
+  `infernix_gdn_input_proj_conv_snapshot_test` (27.2 s),
+  `infernix_gdn_input_proj_conv_record_test` (8.2 s),
+  `infernix_qwen4_exp_fast_paths_test` and `infernix_cuda_stack_check` — all pass. The two conv
+  tests are the post kernel's numerical oracles (snapshot publish + record, every registered
+  `T`/`B` band including the mixed `valid_columns` prefixes).
+- Op A/B (`infernix_gdn_input_proj_conv_snapshot_bench --format nvfp4`, cold, 25 reps, 2
+  alternating passes, best-of-2 medians; best-of-2 because host contention skews single GB10
+  runs):
+
+  | band | forms × executions | baseline → candidate | Δ |
+  |---|---|---|---|
+  | a4 `T = 4/8/16/32` | snapshot+record × graph+eager | 218.9–237.4 → 207.7–222.0 µs | −9.0 … −17.4 µs (−4.1 … −7.7 %) |
+  | a16 `T = 17/32/64` | snapshot+record × graph+eager | 245.8–380.7 → 235.3–366.4 µs | −10.2 … −20.9 µs (−2.8 … −5.6 %) |
+  | a4 `T = 2` (fused SIMT, control) | all four | 214.9–215.7 → 213.7–215.1 µs | −1.2 … 0.0 µs (tie) |
+
+  Eager improves as much as graph, so the win is the warp sizing and the distributed fill; the
+  PDL wiring's graph-launch overlap is an addition, not the measured source, and eager (where PDL
+  is inert) carries no regression.
+- E2E regression on W4Dense (the unchanged `{Nvfp4, true}` configuration): 4 alternating
+  baseline/candidate passes of `infernix_bench -pg 2048,128 -r 2`: prefill 2960.3 → 2968.2 t/s
+  (+0.27 %), decode 47.76 → 47.34 out t/s (−0.87 %, §5). The selected fast-path list, the
+  prefill signature, and an 8.37 MB expert route trace (all bytes but one header timestamp qword
+  pair) are identical between the binaries.
+
+## 5. Regressions & adverse results
+
+1. **E2E decode −0.87 % on W4Dense** (4 alternating passes, pp2048+tg128, r = 2: base
+   47.84/48.09/47.08/48.02, candidate 47.39/47.33/47.39/47.24 out t/s; means 47.76 vs 47.34,
+   Welch t ≈ −1.8, distributions overlap). No functional difference exists on this configuration:
+   the selection log is identical, the route traces are byte-identical except one header timestamp
+   pair, and nothing in the diff executes on its routes (the conv-post kernel is not called by
+   Qwen4Exp's Forward; the new qualifications require `a4_experts == false`, which this artifact
+   does not select). The candidate's spread (0.15) is smaller than the baseline's (1.01) and the
+   baseline's own worst pass undercuts every candidate run, so no mechanism is known; consistent
+   with binary-layout/thermal variance on this host. Disposition: **unresolved, disclosed** — the
+   task's own configuration (where the diff *does* run) has no local artifact to measure.
+2. **One A/B pass outlier**: snapshot-eager a16 `T = 17` candidate pass 1 read 318.4 µs against
+   its own pass 2 at 241.5 (baseline 253.8/257.9). The remaining 63 pairs are monotone within
+   their bands; best-of-2 keeps the point at −4.8 %. Disposition: single-run host-contention
+   spike, disclosed (the known GB10 host-contention effect).
+3. **The task's fused-latency bar could not be reproduced or evaluated as written** (premise §2):
+   its named bench has no fused arm and its µs numbers match no arm of either binary. The shipped
+   evidence is the HEAD-binary A/B above; `fused` vs `composed` was not re-derived because the
+   bench offers no composed arm and the projection row of
+   `infernix_gdn_input_proj_bench --format nvfp4 --nvfp4-policy a4` (194.6 µs at `T = 8`) is a
+   different fixture's projection-only contract, not this route's composed pair.
+4. **`T = 2..3` under the a4 policy do not improve** (−0.5 %…0 %, within noise): they are the
+   unchanged fused SIMT path, and the doc's expectation of post-kernel gains there does not hold
+   (the kernel does not run at those widths). Disposition: accepted, control bands tie.
+5. The `infernix_qwen4_exp_fast_paths_test` failure found at HEAD (14 gdn-conv-fused assertions,
+   stale against the owner's `98aff48b0`) was **fixed** here by aligning the check and both stale
+   comments to the shipped table — not by reverting the registration.
+
+## 6. Accepted gaps / follow-ups
+
+- **The `{Nvfp4, false}` registration's speed gate is unmeasured on this host.** The narrow
+  (decode/verification) route replaces the W8A8 expert route the owner adopted 2026-10-27; the
+  wide route's speed is the gated one (+2.0 % MTP decode on the same bank class,
+  model-quality.md 6.7), the narrow route's verdict against A8 needs an `--a16-experts` W4Dense
+  artifact (experts stored without activation scales), which this host does not carry as of
+  2026-11-07. The registration follows the task's explicit instruction; the follow-up is the E2E
+  A/B on such an artifact, and the `kQualified` comment records exactly this.
+- The W4Dense E2E −0.87 % decode difference is unattributed (§5.1); the route traces prove the
+  executed routes are identical, not the timing.
+- PDL overlap was shipped as specified but not isolated from the warp-sizing win (eager, where
+  PDL is inert, already captures the full gain); no serialized-dependency variant was timed
+  because no eager or graph run regressed against it.
+- `forward.cpp` and `nvfp4_gdn_snapshot_small_t.cu` (the doc's target list) were left untouched:
+  the title's premise is falsified (§2) and the SmallT kernel already serves `T = 2..16` fused.
