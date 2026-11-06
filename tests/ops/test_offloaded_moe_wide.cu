@@ -212,7 +212,8 @@ Error error_against(const std::uint16_t* y, const std::vector<double>& reference
 // ------------------------------------------------------------------------------------ probes
 
 // Writes each valid FP32 accumulator unscaled: probe[(first + column) * rows + row]. T: the warp's
-// 16-column MMA tiles (2: wide::Schedule; 4: wide::WarpTile64).
+// 16-column MMA tiles (2: wide::Schedule; 4: wide::WarpTile64), from the warp's column base and
+// live-tile count (the two column warps split the token tile's live MMA tiles evenly).
 struct ProbeEpilogue {
     float* probe;
     int rows;
@@ -222,9 +223,10 @@ struct ProbeEpilogue {
         using S = wide::Schedule;
 #pragma unroll
         for (int m = 0; m < T; ++m) {
+            if (m >= ctx.live_tiles) { break; } // the probe writes exactly the warp's live tiles
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.col_base + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 float* out = probe + static_cast<std::size_t>(ctx.first + column) * rows + ctx.row_block * S::kBlockRows;
 #pragma unroll

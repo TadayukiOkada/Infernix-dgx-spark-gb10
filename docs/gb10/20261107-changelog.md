@@ -140,3 +140,167 @@ arms) and reducing register pressure from `REG:124` to `REG:112` (`STACK:0 LOCAL
 - Preserve the single-pass `unit_sums<Groups, true>`, `quantize_split_block_from_f32` (`cvt.rn.satfinite.e2m1x2.f32` +
   4-ULP boundary-guarded reciprocal), `quantize_split_pair_half`, and `unit_sums_split_pair_half`
   (`acts[2 * db + (i & 1)]`) in `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu`.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-07 — T2: Double-buffered `ldmatrix_x4` A-fragments and even MMA-tile split across the column warps in wide NVFP4 MoE `grouped_kernel`
+
+## 1. Accounting
+
+- Base commit: `c0a43a61f` (branch `dev-rebased-20261028`).
+- Modified: `src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh` (`M`) — `grouped_kernel` consumer
+  loop, `TileContext`, and the four `grouped_kernel` epilogues;
+  `tests/ops/test_offloaded_moe_wide.cu` (`M`) — the accumulator-dump `ProbeEpilogue` moved to the
+  new `col_base`/`live_tiles` contract (it is a `TileContext` consumer of `grouped_kernel`).
+- `tools/cuda_stack/cuda_stack_allowlist.json`: unchanged (zero new spills, zero eliminated — every
+  `grouped_kernel` instantiation was and stays `STACK:0 LOCAL:0`).
+- Rebuilds: one shared-device-link `ninja` pass per candidate iteration (targets
+  `infernix-serve infernix_ops_offloaded_moe_test infernix_offloaded_moe_wide_bench`), plus one
+  per-object `wide_expert.cu.o` compile check.
+
+## 2. Task-premise corrections / Architectural rationale
+
+1. **`__launch_bounds__` already exists; step 1.3 rejected.** `grouped_kernel` is declared
+   `__global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm)` — `(288, 2)` for `Schedule`,
+   `(160, 2)` for `WarpTile64`. The task's "NO `__launch_bounds__` at line 317" and its
+   `REG:174`/`REG:168`/`SHARED:43008`/`SHARED:50176` resource block do not match this tree:
+   `cuobjdump --dump-resource-usage` on the HEAD bench binary gives `REG:96 STACK:0`
+   (`<GateUp, GateUpEpilogue, Schedule>`), `REG:95 STACK:0` (`<Down, DownEpilogue, Schedule>`) and
+   `REG:136`/`REG:144 STACK:0` for the two `WarpTile64` instantiations (shared is opt-in dynamic,
+   hence `SHARED:0` in the static attribute dump). Adding `__launch_bounds__(kThreads, 1)` would
+   have been actively harmful: it lifts the register cap from 112 to 224 and the kernel is
+   deliberately built for 2 CTAs/SM (43,056 B of shared fit two CTAs; the register file would not
+   at >112 registers), so ptxas would have traded the second resident CTA for registers.
+2. **The bench widths run the 8-consumer-warp `Schedule`, not `WarpTile64`.** `wide_t64` admits
+   `WarpTile64` at `mean_job_columns >= kWarpTile64MinColumns` (512) and the bench's
+   `mean_job_columns` is `entries / max_jobs` = 20 at T=1024 and 80 at T=4096 (512 experts, top-10).
+   So the idle-upper-warp case the task describes is live on both claimed widths.
+3. **Step 2's mechanism does not exist in this tree and cannot be added at its stated cost.** The
+   current `GateUpEpilogue` has no `sm.epilogue` staging, no `__syncthreads()`, and no
+   `if (mma_warp_m <= live_mma)` gate — it gates per column (`column >= ctx.columns`). Moving the
+   lower warp's accumulators to shared memory so the upper warp takes half the epilogue would need
+   8–16 KB of staging on top of the 43,008 B pipeline, past the ~49.2 KB per-CTA budget for
+   2 CTAs/SM. The implemented equivalent keeps everything in registers: the two column warps split
+   the token tile's live 16-column MMA tiles evenly (`col_base`/`live_tiles`), so the upper warp
+   takes over columns 16..31 including their whole K loop and epilogue whenever the tile has ≤ 32
+   columns, and every column's MMA chain (K order, A rows, B fragments, scale words) is exactly the
+   chain the lower warp used to run. All four epilogues write exactly the warp's live tiles, which
+   also removes the two-warp double store the split would otherwise create (caught by the bench's
+   FNV-1a output hash before any timing was claimed).
+4. **Double-buffering is limited to the one-term schedule.** `grouped_kernel` is shared with the
+   two/three-term A4-residual schedules; a `[2][kTerms][kMmaTokens][4]` fragment buffer would keep
+   the next K step's fragments of every term live together — the exact condition the existing
+   term-loop comment records as spilling at the 2-CTA 112-register cap. `if constexpr` keeps the
+   residual schedules on the inline path (their instantiations stayed `REG:92..96 STACK:0`).
+5. **Measured baseline differs slightly from the task table.** `infernix_offloaded_moe_wide_bench`
+   on HEAD: T=1024 frames 8382.1 µs (11.0 TF/s), T=4096 frames 8819.0 µs (45.7 TF/s) (task doc:
+   8199.6/8282.2 µs). The staged-placement arms (~23.3/23.8 ms) are bound by the host→device
+   record staging copy, not by `grouped_kernel`.
+
+## 3. Subsystem breakdown
+
+- `src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh` (`M`):
+  - `TileContext`: added `col_base` (warp's first live 16-column MMA tile's column) and
+    `live_tiles`; the accumulator-layout comment now reads `col_base + m * 16 + ...`.
+  - `grouped_kernel` consumer prologue: with `kSkipIdleColumns` and two column warps, the tile's
+    `total = ceil(columns / 16)` live MMA tiles are split `ceil(total / 2)` / the rest — identical
+    to the old mapping for 33..64 columns, and for ≤ 32 columns the upper warp now takes columns
+    16..31 instead of idling. Other schedules keep the old per-warp formula.
+  - `grouped_kernel` K-tile loop: the `rg16_fragments` decode was factored into `load_b_step`; for
+    `kTerms == 1` the A fragments and stage scales live in `a_fragments[2][kMmaTokens][4]` /
+    `a_step_scales[2][kMmaTokens]`, slot 0 is preloaded after the stage's `mbarrier` wait and the
+    next 64-wide step's slot is prefetched before the current step's OMMA block (the
+    `nvfp4_a4_tma_kernel` pattern), so `LDSM`/`LDS` latency overlaps the tensor pipe. Multi-term
+    schedules keep the inline term-loop loads.
+  - Epilogues (`GateUpEpilogue`, `DownEpilogue`, `GateUpEpilogueResidual`, `DownEpilogueResidual`):
+    columns map from `ctx.col_base`; the `m` loop breaks at `ctx.live_tiles`; the epilogue call
+    gate became `ctx.col_base < ctx.columns`.
+- `tests/ops/test_offloaded_moe_wide.cu` (`M`): `ProbeEpilogue` (the test's accumulator dump) uses
+  the same contract — `ctx.col_base` column mapping and the `ctx.live_tiles` break — so the C1/C3
+  accumulator probes address the columns their warp actually computed.
+
+## 4. Verification
+
+- Resources (`cuobjdump --dump-resource-usage` on the bench binary, all `grouped_kernel`
+  instantiations): `STACK:0 LOCAL:0` everywhere; `Schedule` W4A4 `REG:96` (unchanged), A4-residual
+  `REG:94..96` (unchanged), `WarpTile64` W4A4 `REG:136→166`/`144→163` within the `(160,2)` 200-register
+  cap (2 CTAs × 160 threads × 166 = 53,120 ≤ 65,536 registers), `WarpTile64` residual `REG:128..146`.
+- Bitwise: `infernix_offloaded_moe_wide_bench` FNV-1a output hashes equal the HEAD baseline in all
+  24 A/B runs (T=64/256/1024/4096 × frames/staged × 3 passes × both arms); the wide oracle test's
+  per-configuration worst-case errors equal HEAD's to the digit.
+- CTest: `-R "infernix_offloaded_moe"` (the task's `infernix_offloaded_sparse_moe` regex matches no
+  registered CTest name; the family is `infernix_offloaded_moe*`) — 19/19 passed, 243.5 s
+  sequential; `infernix_cuda_stack_check` passed (allowlist unchanged; no ratchet-down applied —
+  no spills were eliminated). The first suite run failed `infernix_offloaded_moe_wide_test` (6
+  checks) because the test's own `ProbeEpilogue` still used the old column mapping; the HEAD binary
+  passes that test, so this was the change's contract break, fixed in the test together with the
+  kernel (§3) — the rerun is the 19/19 above.
+- A/B wall time, interleaved HEAD/candidate binaries, frames placement:
+
+  | arm | HEAD medians (µs) | candidate medians (µs) | delta |
+  |---|---|---|---|
+  | T=1024 (3 passes × 10) | 8420.9 / 8432.0 / 8326.4 | 8373.0 / 8334.8 / 8333.8 | −0.6% |
+  | T=4096 (3 passes × 10) | 8956.4 / 8891.4 / 9328.6 | 9432.8 / 8911.3 / 8921.1 | −0.4% |
+  | T=1024 (4 iters × 20) | 8334.8 / 8355.3 / 8297.9 / 8367.2 | 8610.7 / 8314.3 / 8317.5 / 8335.8 | −0.2% (per-iteration medians) |
+  | T=4096 (4 iters × 20) | 8950.6 / 8976.5 / 8746.0 / 8753.2 | 8693.1 / 8848.1 / 8762.0 / 8747.8 | −1.1% (arm means 8856.6→8762.8) |
+
+  Staged-placement arms (host-staging-copy bound) and T=64/256 moved within ±1.2% in either
+  direction.
+- nsys per-launch kernel time (8 calls, 64 launches per arm, frames):
+
+  | width | kernel | HEAD mean/median (µs) | candidate mean/median (µs) | delta |
+  |---|---|---|---|---|
+  | T=4096 | gate/up grouped | 670.4 / 649.1 | 614.1 / 604.4 | −8.4% / −6.9% |
+  | T=4096 | down grouped | 407.4 / 387.2 | 374.0 / 368.0 | −8.2% / −5.0% |
+  | T=1024 | gate/up grouped | 402.1 / 386.7 | 406.4 / 384.5 | +1.1% / −0.6% |
+  | T=1024 | down grouped | 208.6 / 202.5 | 204.6 / 196.8 | −1.9% / −2.8% |
+
+  At T=4096 the call is ~97% `grouped_kernel` (0 narrow experts), so the kernel-level −8% is the
+  honest Op-level result of this change; it converts to only ~−1% at the call median because the
+  per-call wall is dominated by the DRAM streaming state the consumer-side levers do not change
+  (grouped busy 8.62 → 7.90 ms/call while the call means moved 8857 → 8763 µs).
+
+## 5. Regressions & adverse results
+
+- **Acceptance bar not met (adverse result, not a regression):** the required ≥5% bench latency
+  improvement at T=1024 and T=4096 was not achieved — −0.2..−0.6% (T=1024) and −0.4..−1.1%
+  (T=4096) at the call median, despite the kernel itself being ~8% faster at T=4096. Disposition:
+  the shipped levers are bit-exact, spill-free, and never slower at the kernel level; the doc's
+  stall model (consumer LDS latency + idle warps causing the 59%-of-floor gap) does not carry to
+  call latency on this bench, where the same bytes must still stream from DRAM.
+- T=1024 gate/up grouped per-launch mean +1.1% in the nsys pair (402.1→406.4 µs; median −0.6%);
+  the wall medians moved −0.2%. The split duplicates the `rg16_fragments` B-decode on the
+  previously idle upper warp — extra SIMT work that only pays off when the consumer, not the DRAM
+  stream, is binding. Disposition: disclosed; within single-trace variance, not reproduced at the
+  wall.
+- One T=1024 wall iteration measured 8610.7 µs (+3.3% against its paired 8334.8 µs HEAD run); the
+  other three iterations were −0.5% / +0.2% / −0.4%. Disposition: unexplained single-pass outlier,
+  disclosed with the full 4-iteration pair rather than re-run until favorable.
+- `WarpTile64` instantiations carry +27/+19 registers (to 163..166, `STACK:0`, within the 200-reg
+  2-CTA cap); no bench-reachable route exercises them, so no performance regression is measured
+  for them (§6).
+
+## 6. Accepted gaps / follow-ups
+
+- Experts with ≤ 16 columns still leave the upper warp idle: a 16-column MMA tile is the smallest
+  bit-exact unit, and splitting below it would need accumulator staging the shared-memory budget
+  cannot hold.
+- The two/three-term A4-residual schedules did not get the double buffer (register cap, §2.4); they
+  did get the column split.
+- The `WarpTile64` instantiations carry the double buffer too and grew to 163..166 registers
+  (within cap, `STACK:0`); the bench cannot route them (`mean_job_columns` would need ≥ 512, i.e.
+  T ≥ 26,215 tokens), so their performance change is unmeasured here — covered only for
+  correctness by the CTest selection.
+- The task's E2E `pp8192` attribution (457 ms over 47 layers) was not re-measured; acceptance was
+  evaluated on the task's own bench command.
+- The kernel-level −8% at T=4096 converts to only ~−1% at the call median; closing the remaining
+  50%-of-DRAM-floor gap needs producer-side work (bulk-copy DRAM efficiency across 512 × 2.4 MiB
+  records), which is outside T2's two consumer-side mechanisms.
+
+## 7. Rebase conflict resolution policy
+
+- Preserve `TileContext::col_base` / `TileContext::live_tiles`, the `S::kWarpsTokens == 2` even MMA-tile
+  split, the `S::kTerms == 1` double-buffered `a_fragments[2][S::kMmaTokens][4]` / `a_step_scales[2][S::kMmaTokens]`
+  K-step pipeline, and the `ctx.col_base` / `ctx.live_tiles` epilogue bounds in
+  `src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh` and `tests/ops/test_offloaded_moe_wide.cu`, while
+  retaining the 2-CTA/SM `__launch_bounds__(S::kThreads, S::kMinBlocksPerSm)` (`kMinBlocksPerSm = 2`).

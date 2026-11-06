@@ -166,10 +166,13 @@ struct TileContext {
     int warp_n;    // 32-row quarter of the block
     int group;     // lane / 4
     int tig;       // lane % 4
+    int col_base;  // column of the warp's first live 16-column MMA tile (the two column warps split
+                   // the tile's live tiles evenly, so this is not always warp_m * kWarpTokens)
+    int live_tiles; // the warp's live MMA tiles at col_base (the epilogues write exactly these)
 };
 
 // Accumulator acc[m][r][v] of a consumer thread holds column
-//   warp_m * 32 + m * 16 + group + (v >= 2 ? 8 : 0)
+//   col_base + m * 16 + group + (v >= 2 ? 8 : 0)
 // of the tile and matrix row
 //   row_block * 128 + tile_row(warp_n, r, tig) + (v & 1).
 // Rows 2i and 2i + 1 are therefore gate_i and up_i of the gate/up matrix in the same thread.
@@ -392,12 +395,27 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
         const int begin = call.dispatch.offsets[ctx.expert];
         ctx.first       = begin + column;
         ctx.columns     = min(S::kBlockTokens, call.dispatch.offsets[ctx.expert + 1] - ctx.first);
-        // The warp's 16-column MMA tiles that hold a valid column (warp-uniform): all of them, or with
-        // kSkipIdleColumns those before the tile's last valid column. A skipped tile's accumulators stay
-        // zero and its columns are never written (the epilogues stop at ctx.columns).
-        const int live_mma = S::kSkipIdleColumns
-                                 ? min(max(ctx.columns - ctx.warp_m * S::kWarpTokens + 15, 0) / 16, S::kMmaTokens)
-                                 : S::kMmaTokens;
+        // The warp's 16-column MMA tiles that hold a valid column (warp-uniform), starting at the
+        // warp's column base. A skipped tile's accumulators stay zero and its columns are never
+        // written (the epilogues stop at ctx.columns). With two column warps the live tiles are
+        // split evenly between them: an expert of at most 32 columns used to leave the upper warp
+        // idle while the lower one ran both tiles' K loops and epilogues; now each warp takes one
+        // tile, and the upper warp's MMA chain per column is exactly the chain the lower one used
+        // to run (same K order, same A rows, same B fragments), so every output bit is unchanged.
+        int col_base = ctx.warp_m * S::kWarpTokens;
+        int live_mma = S::kMmaTokens;
+        if constexpr (S::kSkipIdleColumns) {
+            if constexpr (S::kWarpsTokens == 2) {
+                const int total = (ctx.columns + 15) / 16; // the tile's live MMA tiles: 1..4
+                const int split = (total + 1) / 2;         // the lower column warp's share: 1..2
+                col_base = ctx.warp_m == 0 ? 0 : split * 16;
+                live_mma = ctx.warp_m == 0 ? min(total, split) : max(total - split, 0);
+            } else {
+                live_mma = min(max(ctx.columns - col_base + 15, 0) / 16, S::kMmaTokens);
+            }
+        }
+        ctx.col_base = col_base;
+        ctx.live_tiles = live_mma;
 
         AccumulatorsOf<S> acc = {};
 #pragma unroll 1
@@ -408,11 +426,9 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
             const int scales_stage =
                 kScalesDedupe && (k_tile & 1) != 0 ? (it + S::kStages - 1) % S::kStages : stage;
             cta_mbarrier_wait(&shared.full[stage], (static_cast<unsigned>(it) / S::kStages) & 1U);
-#pragma unroll
-            for (int local_k64 = 0; local_k64 < S::kK64PerStage; ++local_k64) {
-                if (live_mma == 0) { break; } // an idle warp only releases the stage
-                unsigned b_fragments[S::kMmaRows][2];
-                unsigned b_scales[S::kMmaRows];
+            unsigned b_fragments[S::kMmaRows][2];
+            unsigned b_scales[S::kMmaRows];
+            const auto load_b_step = [&](int local_k64) {
 #pragma unroll
                 for (int g = 0; g < S::kMmaRows / 2; ++g) {
                     const std::uint8_t* units = shared.b_units[stage] + (2 * ctx.warp_n + g) * S::kUnitRunBytes +
@@ -420,27 +436,81 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
                     rg16_fragments(units, ctx.group, ctx.tig, b_fragments[2 * g], b_fragments[2 * g + 1],
                                    b_scales[2 * g], b_scales[2 * g + 1]);
                 }
-                // The three-term residual schedule at the 96-register cap spills when all three
-                // terms' fragments stay live together.
-#pragma unroll (S::kTerms == 3 ? 1 : S::kTerms)
-                for (int term = 0; term < S::kTerms; ++term) {
+            };
+            if constexpr (S::kTerms == 1) {
+                // The A fragments of one 64-wide K step, double-buffered across the stage's two
+                // steps (nvfp4_a4_tma_kernel's pattern): the next step's ldmatrix and scale reads
+                // are issued before the current step's OMMA block, so their shared-memory latency
+                // overlaps the tensor pipe instead of standing in front of every mma_m's four
+                // multiplies. Only the one-term schedule takes this: with two or three terms the
+                // next step's fragments of every term would stay live together and the two-CTA
+                // 112-register cap spills (the term-loop comment below).
+                unsigned a_fragments[2][S::kMmaTokens][4];
+                unsigned a_step_scales[2][S::kMmaTokens];
+                const auto load_a_step = [&](int slot, int local_k64) {
 #pragma unroll
                     for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
                         if (mma_m >= live_mma) { continue; }
-                        unsigned a_fragments[4];
-                        const int row          = ctx.warp_m * S::kWarpTokens + mma_m * 16 + a_row_offset;
-                        const int logical_byte = local_k64 * 32 + a_column_byte;
+                        const int row           = col_base + mma_m * 16 + a_row_offset;
+                        const int logical_byte  = local_k64 * 32 + a_column_byte;
                         const int physical_byte = ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
-                        ldmatrix_x4(a_fragments[0], a_fragments[1], a_fragments[2], a_fragments[3],
-                                    smem_addr(shared.a_codes[stage][term] + row * S::kCodeRowBytes + physical_byte));
-                        const int scale_row = ctx.warp_m * S::kWarpTokens + mma_m * 16 + sfa_row;
-                        const unsigned a_scale = shared.a_scales[scales_stage][term][scale_row * S::kScaleWordsPerRow +
-                                                                                    (k_tile & 1) * 2 + local_k64];
+                        ldmatrix_x4(a_fragments[slot][mma_m][0], a_fragments[slot][mma_m][1],
+                                    a_fragments[slot][mma_m][2], a_fragments[slot][mma_m][3],
+                                    smem_addr(shared.a_codes[stage][0] + row * S::kCodeRowBytes + physical_byte));
+                        const int scale_row = col_base + mma_m * 16 + sfa_row;
+                        a_step_scales[slot][mma_m] =
+                            shared.a_scales[scales_stage][0][scale_row * S::kScaleWordsPerRow + (k_tile & 1) * 2 +
+                                                           local_k64];
+                    }
+                };
+                if (live_mma != 0) { load_a_step(0, 0); }
+#pragma unroll
+                for (int local_k64 = 0; local_k64 < S::kK64PerStage; ++local_k64) {
+                    if (live_mma == 0) { break; } // an idle warp only releases the stage
+                    load_b_step(local_k64);
+                    if (local_k64 + 1 < S::kK64PerStage) { load_a_step((local_k64 + 1) & 1, local_k64 + 1); }
+#pragma unroll
+                    for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
+                        if (mma_m >= live_mma) { continue; }
 #pragma unroll
                         for (int r = 0; r < S::kMmaRows; ++r) {
                             mma_nvfp4_e4m3(acc[mma_m][r][0], acc[mma_m][r][1], acc[mma_m][r][2], acc[mma_m][r][3],
-                                           a_fragments[0], a_fragments[1], a_fragments[2], a_fragments[3],
-                                           b_fragments[r][0], b_fragments[r][1], a_scale, b_scales[r]);
+                                           a_fragments[local_k64 & 1][mma_m][0], a_fragments[local_k64 & 1][mma_m][1],
+                                           a_fragments[local_k64 & 1][mma_m][2], a_fragments[local_k64 & 1][mma_m][3],
+                                           b_fragments[r][0], b_fragments[r][1], a_step_scales[local_k64 & 1][mma_m],
+                                           b_scales[r]);
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int local_k64 = 0; local_k64 < S::kK64PerStage; ++local_k64) {
+                    if (live_mma == 0) { break; } // an idle warp only releases the stage
+                    load_b_step(local_k64);
+                    // The three-term residual schedule at the two-CTA 112-register cap spills when
+                    // all three terms' fragments stay live together, so its A fragments stay
+                    // inline in the term loop.
+#pragma unroll (S::kTerms == 3 ? 1 : S::kTerms)
+                    for (int term = 0; term < S::kTerms; ++term) {
+#pragma unroll
+                        for (int mma_m = 0; mma_m < S::kMmaTokens; ++mma_m) {
+                            if (mma_m >= live_mma) { continue; }
+                            unsigned a_fragments[4];
+                            const int row           = col_base + mma_m * 16 + a_row_offset;
+                            const int logical_byte  = local_k64 * 32 + a_column_byte;
+                            const int physical_byte = ((logical_byte >> 4) ^ ((row >> 1) & 3)) * 16 + (logical_byte & 15);
+                            ldmatrix_x4(a_fragments[0], a_fragments[1], a_fragments[2], a_fragments[3],
+                                        smem_addr(shared.a_codes[stage][term] + row * S::kCodeRowBytes + physical_byte));
+                            const int scale_row = col_base + mma_m * 16 + sfa_row;
+                            const unsigned a_scale =
+                                shared.a_scales[scales_stage][term][scale_row * S::kScaleWordsPerRow +
+                                                                    (k_tile & 1) * 2 + local_k64];
+#pragma unroll
+                            for (int r = 0; r < S::kMmaRows; ++r) {
+                                mma_nvfp4_e4m3(acc[mma_m][r][0], acc[mma_m][r][1], acc[mma_m][r][2], acc[mma_m][r][3],
+                                               a_fragments[0], a_fragments[1], a_fragments[2], a_fragments[3],
+                                               b_fragments[r][0], b_fragments[r][1], a_scale, b_scales[r]);
+                            }
                         }
                     }
                 }
@@ -450,7 +520,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
             if (lane == 0) { cta_mbarrier_arrive(&shared.empty[stage]); }
         }
         // Registers and global memory only, so the producer already fills the next tile's stages.
-        if (S::kTerms > 1 || ctx.warp_m * S::kWarpTokens < ctx.columns) { epilogue(acc, ctx); }
+        if (S::kTerms > 1 || ctx.col_base < ctx.columns) { epilogue(acc, ctx); }
     }
 }
 
@@ -460,7 +530,8 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
 // four lanes of a group hold the 16 intermediates of one h block for a column (lane tig: block
 // elements tig, 4 + tig, 8 + tig, 12 + tig), so the block maximum and the code bytes are formed
 // with two shuffles each, and lane tig owns code bytes tig and 4 + tig of the plane layout.
-// Every epilogue takes a warp's T 16-column MMA tiles (T = 2: Schedule's; 4: WarpTile64's).
+// Every epilogue takes a warp's T 16-column MMA tiles from the warp's column base (T = 2: Schedule's;
+// 4: WarpTile64's).
 struct GateUpEpilogue {
     const ExpertScales* scales;
     std::uint8_t* h_plane;
@@ -473,9 +544,10 @@ struct GateUpEpilogue {
         const int position    = plane_block(block);
 #pragma unroll
         for (int m = 0; m < T; ++m) {
+            if (m >= ctx.live_tiles) { break; } // the epilogue writes exactly the warp's live tiles
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column    = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
+                const int column    = ctx.col_base + m * 16 + ctx.group + 8 * half;
                 const unsigned mask = __ballot_sync(0xFFFFFFFFU, column < ctx.columns);
                 if (column >= ctx.columns) { continue; }
                 std::uint16_t h[S::kMmaRows];
@@ -531,9 +603,10 @@ struct DownEpilogue {
         const float alpha = scales[ctx.expert].alpha_down;
 #pragma unroll
         for (int m = 0; m < T; ++m) {
+            if (m >= ctx.live_tiles) { break; } // the epilogue writes exactly the warp's live tiles
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.col_base + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * kHidden +
                                      ctx.row_block * S::kBlockRows;
@@ -567,9 +640,10 @@ struct GateUpEpilogueResidual {
         const ExpertScales sc = scales[ctx.expert];
 #pragma unroll
         for (int m = 0; m < T; ++m) {
+            if (m >= ctx.live_tiles) { break; } // the epilogue writes exactly the warp's live tiles
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.col_base + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 const int entry = ctx.first + column;
                 const float rs  = x_row_scale[entry_column(entries[entry], top_k, shared_first)];
@@ -602,9 +676,10 @@ struct DownEpilogueResidual {
         const float alpha = scales[ctx.expert].alpha_down;
 #pragma unroll
         for (int m = 0; m < T; ++m) {
+            if (m >= ctx.live_tiles) { break; } // the epilogue writes exactly the warp's live tiles
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
-                const int column = ctx.warp_m * 16 * T + m * 16 + ctx.group + 8 * half;
+                const int column = ctx.col_base + m * 16 + ctx.group + 8 * half;
                 if (column >= ctx.columns) { continue; }
                 const float rs     = h_row_scale[ctx.first + column];
                 std::uint16_t* out = outputs + static_cast<std::size_t>(entries[ctx.first + column]) * G::kHidden +
