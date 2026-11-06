@@ -525,3 +525,201 @@ the HEAD-built `infernix_bench`:
   the op bench alone cannot separate them.
 - **Empty `SlidingWindowContextPolicy::prime()` hook retained**: the interface requires it because
   `ContextAttentionPolicy::prime` is live (block-table preload), so there is no dead hook to drop.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T4: Remove the FP32 head buffer and full-vocabulary cast from `Forward::mtp_block`; route the unscreened MTP draft head through `ops::linear` BF16
+
+Scope: task T4 from `docs/tasks/20261106-performance-optimization-tasks.md` on GB10 (`sm_121a`):
+stop the unscreened `Forward::mtp_block` draft head from always allocating FP32 `[rows, T]` logits and
+casting the whole vocabulary down to BF16, and consider `ops::linear_topk` (or a direct BF16
+`Forward::project()`) as the fused replacement.
+
+## 1. Accounting
+
+- **Base commit**: `34751c38e` (`dev-rebased-20261028`, T3). Worktree was clean at session start.
+- **Files changed** (all `M`, 3 files, +63 / −19):
+  `src/models/qwen4_exp/execution/forward.cpp` (+47 / −6),
+  `src/models/qwen4_exp/execution/forward.h` (+4 / −0),
+  `src/models/qwen4_exp/execution/forward_lossless.cpp` (+12 / −13, a move, no body change).
+  `src/models/qwen4_exp/execution/dflash2.cpp` was audited and **not** changed (§2.3).
+- **Allowlist delta**: none. No `.cu`/`.cuh` was touched, so no stored symbol changed its
+  `REG`/`STACK`/`LOCAL`; `infernix_cuda_stack_check` passes against the unchanged
+  `tools/cuda_stack/cuda_stack_allowlist.json` and the one-way ratchet was never run.
+- **Rebuild count**: 2 single-invocation Ninja builds (candidate with the fused route, final after the
+  fused route was removed), each sharing the `-rdc` device link; plus the 4 test-binary targets the
+  gate runs, built in one further invocation.
+
+## 2. Task-premise corrections / Architectural rationale ("Why" on GB10 `sm_121a`)
+
+1. **The names in the task text are not this tree's.** `Forward::mtp_block` has no `p_.lossless` and
+   no `out.logits`; the live flags are `config_.lossless` and the `MtpCall` buffers. The doc's
+   `sampled` / `greedy` booleans are `call.sample_configs != nullptr` and
+   `call.draft_logprobs.data != nullptr`. The gate below uses the real names.
+2. **There is no FP32 → BF16 → FP32 round-trip.** The base code formed FP32 logits
+   (`ops::projection_fp32` over the head's rows) and cast them once to BF16
+   (`ops::cast_fp32_to_bf16`), and every consumer read BF16 — nothing went back to FP32. What was
+   actually redundant is the `[rows, T]` FP32 buffer plus the whole-vocabulary cast kernel: the draft
+   head's consumers (`ops::argmax`, `ops::top_logprobs`, `ops::speculative_sample_sparse_drafts`)
+   only *select* from these rows, so the FP32 resolution was destroyed by the cast before its first
+   read. `Forward::logits` was also not part of this — it still forms FP32 logits on every route.
+3. **`dflash2.cpp` has no such round-trip to remove.** Its non-fused `head_candidates` runs
+   `ops::projection_fp32` and hands the FP32 logits straight to `ops::top_logprobs` (no BF16 consumer),
+   and its fused route already calls `ops::linear_topk` whenever `config_.fused_head` is planned. No
+   change was needed or made there.
+4. **`ops::linear_topk` structurally cannot serve most of the MTP head routes.** Its scores are the raw
+   top-K logits; `call.sample_configs` and `call.draft_logprobs` need log-probabilities
+   (`logit − logsumexp` over the full row), which the Op never forms. Only the pure-argmax route
+   (`call.draft_logprobs.data == nullptr`, `call.sample_configs == nullptr`) was a candidate.
+5. **The Flash-Next proposal head has no `ops::linear` BF16 schedule.** `src/ops/linear/q4/q4_dispatch.cpp`
+   registers `n = 131072` only at the `k` it was tuned at (2048, 3072, 5120); the Q4_G64_FP16
+   `[131072, 2560]` proposal head is at none of them, so it cannot take the direct-BF16 route either.
+   `ops::linear_column_invariant_route(qtype, n, k)` is used as the public capability predicate, so the
+   gate cannot drift from the dispatch tables it asks about.
+6. **Why the saving is invisible end to end on this host.** At the text head's
+   `V = 248 320` rows and `T = 1`, the removed path is 4 V B written + 4 V B read + 2 V B written =
+   2.5 MB of extra traffic per column ≈ 9 µs at the GB10 UMA rate, inside a draft round that measures
+   41 ms mean (`execution.decode.mean_ms`, `tg384`, `auto` arm) — ≤ 0.03 % of the round, below this
+   host's interleaved-A/B resolution (§5.3). The draft step is CUDA-graph-captured, so the removed
+   kernel launch was not a launch-cost saving either.
+7. **The doc's `infernix_qwen4_exp_mtp_test` / `infernix_linear_topk_test` / `infernix_mtp_pack_test`
+   are CTest case names, not Ninja targets** (the recurring task-doc defect). The real binaries are
+   `infernix_ops_sampling_test`, `infernix_qwen3_5_mtp_draft_policy_test`,
+   `infernix_qwen3_5_mtp_confidence_policy_test` and `infernix_qwen3_5_dflash2_tree_greedy_real_test`;
+   the doc's CTest regex was run as given.
+
+## 3. Subsystem breakdown
+
+- `src/models/qwen4_exp/execution/forward.h` (`M`) — declares `bf16_rows(const Tensor&)` at namespace
+  scope: a BF16 `[K, N]` tensor of `N` rows as a native `Weight [N, K]` view of the same memory.
+- `src/models/qwen4_exp/execution/forward_lossless.cpp` (`M`) — that helper's definition moves out of
+  the anonymous namespace to namespace scope (byte-identical body); the anonymous namespace now opens
+  after it. No lossless behaviour, arithmetic or route changes.
+- `src/models/qwen4_exp/execution/forward.cpp` (`M`)
+  - `text_head_bf16()` (`A`) — the text head's rows projected straight to BF16: `ops::ggml_linear` for
+    a GGUF import, `ops::linear` with the Q8 head's own policy for a Q8 head, `ops::linear` with
+    `A16Only` over `bf16_rows(output_head)` for a BF16 head. Mirrors `text_head_logits`'s three-way
+    head selection, `dense_routes()` passed through.
+  - `linear_projects_head_rows()` (`A`) — whether `ops::linear` has a schedule for a draft head's rows
+    (§2.5); a GGUF-import head is not a Linear route and stays on the FP32 projection.
+  - `Forward::mtp_block`'s unscreened head section (`M`) — the FP32 buffer + cast now run only when
+    `config_.lossless` or the head is one Linear cannot project; otherwise the `[rows_out, T]` BF16
+    tensor is filled by `project()` (proposal head) or `text_head_bf16()` (text head) in one kernel.
+    The screened branch, the sampled-draft chain, the `draft_logprobs` chain, both `argmax` arms and
+    the whole lossless route are untouched.
+
+## 4. Verification
+
+**Build** (final, one Ninja invocation so the `-rdc` device link runs once):
+
+```text
+ninja -C build-native -j "$(nproc)" infernix-serve infernix_ops_linear_test infernix_bench   # EXIT=0
+ninja -C build-native -j "$(nproc)" infernix_qwen3_5_mtp_draft_policy_test \
+      infernix_qwen3_5_mtp_confidence_policy_test infernix_qwen3_5_dflash2_tree_greedy_real_test \
+      infernix_ops_sampling_test                                                             # EXIT=0
+```
+
+**Required CTest gate** — `ctest --test-dir build-native -R "mtp|linear_topk|infernix_cuda_stack_check"
+--output-on-failure` (serial; `--parallel` produces numerical failures on this single-GPU host):
+
+```text
+100% tests passed, 0 tests failed out of 12   (57.5 s)
+The following tests did not run:
+        126 - infernix_qwen3_5_mtp_tree_greedy_real_test       (Skipped)
+        127 - infernix_qwen3_5_mtp_tree_batch_greedy_real_test (Skipped)
+```
+
+`infernix_cuda_stack_check`, `infernix_linear_topk_test`, `infernix_mtp_pack_test`,
+`infernix_mtp_round_test`, both `speculative_mtp_*` one-hot/distribution pairs (FP32 and BF16 logits)
+and the two draft/confidence policy tests all pass. The two real-artifact tree tests skip because their
+artifact environment variables are unset in this shell.
+
+**Real-artifact draft-distribution oracle** — `infernix_qwen4_exp_speculative_sampling_real_test
+--trials 48 --tokens 8` (IQ3_S artifact, `INFERNIX_QWEN4_KV=bf16`, `INFERNIX_EXPERTS_ON_GPU=1`): every
+MTP check passes — one-hot drafts draft (581 drafts / 48 requests) and match plain sampling; sampled
+drafts draft (660 / 48), are both accepted and rejected, match plain sampling, and both greedy prompts
+give the one-hot tokens. The run's only 2 FAILs are the test's own power self-check
+(`plain T 0.8 differs from plain sampling (power)`, least p 0.00238 against
+`alpha = 1e-3/(tokens+1) = 1.11e-4`), which needs the default 2 000 trials and compares two **plain**
+decode arms that never enter `mtp_block`; the same 2 FAILs appeared in the pre-change probe run. The
+process exits 1 on them, so the CTest registration (default trials) was not overridden here.
+
+**End-to-end A/B** — `infernix_bench` HEAD vs patched, round-robin interleaved, 2 passes with the arm
+order reversed in the second, IQ3_S artifact, bf16 KV, `-p 2048 -n 384 -pg '2048,384' -r 2 --warmup 1
+-c 1`, all 16 runs exit 0. `auto` = `--spec mtp --draft-tokens auto --lm-head-draft`,
+`autotext` = `auto` without `--lm-head-draft`, `lmhead4` = `--draft-tokens 4 --lm-head-draft`,
+`texthead` = `--draft-tokens 4`. Note the flag reads backwards from what it does: `--lm-head-draft`
+binds the *optimized proposal head* (`config.proposal_head = optimized`, the Q4 `[131072, 2560]` rows),
+while omitting it drafts with the text head (`proposal_head = full`) — verified from each report's
+`config.proposal_head`. Only `autotext` and `texthead` run the new BF16-direct head; `auto` and
+`lmhead4` run the unchanged FP32 route on the Q4 head and serve as controls.
+
+| arm | decode t/s p1 | decode t/s p2 | decode mean | total t/s mean | rounds / drafted / accepted (both binaries, both passes) |
+|---|---|---|---|---|---|
+| `auto` (control) | 72.55 → 72.57 (+0.03 %) | 72.25 → 72.29 (+0.06 %) | 72.40 → 72.43 (**+0.05 %**) | 72.11 → 72.16 | 224 / 646 / 510 — identical |
+| `autotext` (new) | 67.25 → 67.51 (+0.39 %) | 67.28 → 67.21 (−0.11 %) | 67.26 → 67.36 (**+0.14 %**) | 67.05 → 67.14 | 212 / 640 / 520 — identical |
+| `lmhead4` (control) | 64.53 → 64.73 (+0.32 %) | 64.59 → 64.40 (−0.28 %) | 64.56 → 64.57 (**+0.02 %**) | 64.35 → 64.35 | 250 / 998 / 518 — identical |
+| `texthead` (new) | 59.85 → 60.13 (+0.47 %) | 60.02 → 59.88 (−0.24 %) | 59.94 → 60.00 (**+0.12 %**) | 59.78 → 59.84 | 240 / 958 / 528 — identical |
+
+`pp2048+tg384` decode: `auto` 84.53 → 84.48 (−0.05 %), `autotext` 76.77 → 76.97 (+0.26 %),
+`lmhead4` 79.65 → 79.65 (+0.01 %), `texthead` 73.10 → 73.17 (+0.10 %). Acceptance rate is identical in
+every arm and pass (0.7895 / 0.8125 / 0.5190 / 0.5511 decode, 0.8841 / 0.8957 / 0.7625 / 0.7844 pp+tg).
+`git diff --check` clean.
+
+## 5. Regressions & adverse results
+
+1. **The fused `ops::linear_topk` route was implemented, measured slower, and removed.** On the only
+   route it can serve on this artifact (the Q4_G64_FP16 `[131072, 2560]` head, plain argmax drafts,
+   the `lmhead4`/`fused` arm), the 20-run interleaved A/B of the earlier candidate gave: decode tg384
+   64.55 → 64.30 (−0.40 %; passes −0.14 % and −0.66 %), `pp2048+tg384` decode 79.66 → 78.45
+   (**−1.52 %**; passes −1.36 % and −1.69 %, both passes agreeing), total t/s −1.02 %. Its acceptance
+   also moved on the long-context arm: 0.7625 → 0.7520, drafted 758 → 766, accepted 578 → 576, rounds
+   190 → 192 — the fused Op's top-1 differs from `argmax` of the BF16-cast logits on near-ties, so it
+   is not merely slower but changes the draft. AGENTS.md registers a fast path "only where it is
+   measured faster", so the branch, its `kFusedHeadCandidates` capacity constant and the
+   `linear_topk` include were deleted; the surviving code comments that decision where the route lives.
+   The DFlash2 fused route that already ships (`config_.fused_head`) is untouched and was not measured.
+2. **A real crash the candidate introduced and the smoke test caught.** With the fused branch in place,
+   `--spec mtp --draft-tokens 4 --lm-head-draft` aborted with
+   `qwen4_exp/mtp: argmax: row_ids must be contiguous I32 [physical_rows]` where HEAD succeeded: the
+   fused case wrote `call.drafts` but control still fell through to the downstream
+   `ops::argmax(narrow, head.token_ids, …)` on an unallocated `narrow`. Fixed by making the fused case
+   the head of the selection chain; after the branch was removed the arm was re-run on the final binary
+   and matches HEAD exactly (exit 0, identical rounds/drafted/accepted in both passes).
+3. **The shipped direct-BF16 route is not measurably faster.** Its two arms move +0.14 % and +0.12 %
+   mean decode with the sign flipping between the interleaved passes (+0.39/+0.47 % in pass 1,
+   −0.11/−0.24 % in pass 2), and the two control arms that run *unchanged* head code show the same
+   pass-order pattern (+0.05 %, +0.02 %). The honest reading is: within noise, no measured gain, for the
+   reason quantified in §2.6. It is kept because it is strictly less work (one 2.5 MB-per-column buffer
+   and one whole-vocabulary kernel out of the captured graph), not because it was measured faster.
+4. **Prefill moved −0.38 % … +0.14 % mean across the four arms** (`pp2048`: `auto` −0.33 %,
+   `autotext` −0.17 %, `lmhead4` +0.14 %, `texthead` −0.38 %), with mixed signs across passes and
+   including arms whose head code is byte-identical to HEAD. Prefill never executes `mtp_block`, so
+   this is unattributed host/thermal drift rather than a regression from the change; it is disclosed
+   because it is not explained either.
+5. **The oracle test exits 1 at `--trials 48`** on its own two power self-checks (§4). Not a regression
+   from this change — plain-decode arms only, and the same 2 FAILs appear in the pre-change probe run —
+   but it does mean the fast probe is not a green signal, and the default-trials run (~40× the cost)
+   was not executed here.
+
+## 6. Accepted gaps / follow-ups
+
+- **The Q4_G64_FP16 `[131072, 2560]` proposal head still runs FP32 + cast.** No `ops::linear` BF16
+  schedule exists at that `K` (§2.5); admitting one is a `q4_dispatch` registration/qualification task
+  with its own oracle and A/B, outside this route's contract. Registering `linear_topk` as the MTP
+  replacement is likewise not admissible at the measured result (§5.1).
+- **`config_.lossless` keeps the exact FP32 head rows**, and a GGUF-import head keeps
+  `ops::projection_fp32` (it is not a Linear route). Both were re-verified as live branches, not just
+  asserted.
+- **The sampled / log-probability draft routes on a BF16-projectable head now normalise over BF16
+  logits instead of FP32.** That is a fast path in the numerical-acceptance sense: it changes the
+  softmax normalizer's operand precision, is covered by the real-artifact distribution oracle (all MTP
+  checks pass, greedy drafts bit-identical to the one-hot arm) and by the byte-identical draft counts
+  in both A/B arms, but was not qualified against an FP64 oracle at the Op level.
+- **`Forward::mtp_workspace_bytes` still reserves 6 bytes per vocabulary row** (FP32 + BF16). The FP32
+  route stays live on the same lanes (lossless, Q4, GGUF), so the upper bound is correct; the
+  direct-BF16 lanes over-reserve by 4 bytes/row.
+- **No `nsys`/`ncu` trace of the draft step.** The A/B plus the arithmetic bound in §2.6 answered the
+  question (the removed traffic is ≤ 0.03 % of a draft round); a trace would not change any decision.
+- **`--spec mtp` on a `screen/*` artifact (`screened == true`) is unexercised locally.** No delivered
+  artifact here carries a head screen, so that branch is only shown unchanged by reading, not run.

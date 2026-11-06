@@ -26,20 +26,7 @@
 #include <string>
 
 namespace infernix::models::qwen4_exp::execution {
-namespace {
 
-std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
-
-// The cache form's indexer scores (FP32 [blocks, heads * columns]) are formed this many query columns at a
-// time, bounding them at long contexts.
-constexpr std::int32_t kScoreColumns = 64;
-
-void require(bool condition, const char* message) {
-    if (!condition) { throw std::invalid_argument(std::string("Qwen4Exp lossless: ") + message); }
-}
-
-// A BF16 tensor [K, N] of N rows (one per column: the router, the shared gate's row, the BF16 head, the
-// pooled index keys) as a Weight [N, K].
 Weight bf16_rows(const Tensor& t) {
     Weight w{};
     w.qtype    = QType::BF16;
@@ -52,6 +39,18 @@ Weight bf16_rows(const Tensor& t) {
     w.qdata    = t.data;
     w.payload  = t.data;
     return w;
+}
+
+namespace {
+
+std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
+
+// The cache form's indexer scores (FP32 [blocks, heads * columns]) are formed this many query columns at a
+// time, bounding them at long contexts.
+constexpr std::int32_t kScoreColumns = 64;
+
+void require(bool condition, const char* message) {
+    if (!condition) { throw std::invalid_argument(std::string("Qwen4Exp lossless: ") + message); }
 }
 
 // A GGUF segment as a Weight [rows, K].

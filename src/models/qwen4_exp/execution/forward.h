@@ -32,6 +32,10 @@ namespace infernix::models::qwen4_exp::execution {
 // the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
 inline constexpr std::int32_t kMtpChunkColumns = 512;
 
+// A BF16 tensor [K, N] of N rows (one per column: the router, the shared gate's row, the BF16 head,
+// the pooled index keys) as a native Weight [N, K] view of the same memory.
+[[nodiscard]] Weight bf16_rows(const Tensor& t);
+
 // Program-owned recurrent state of every slot.
 struct ForwardState {
     LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block

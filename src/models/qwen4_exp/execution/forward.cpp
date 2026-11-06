@@ -106,6 +106,30 @@ void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& log
     }
 }
 
+// BF16 logits of the same text-head rows, formed by the projection itself instead of an FP32 pass
+// over the whole vocabulary plus a second kernel casting it down. A draft head's consumers only select
+// from these rows, so the FP32 resolution that projection_fp32 exists to keep is dropped at the row's
+// first read instead of one kernel earlier.
+void text_head_bf16(const Parameters& parameters, const Tensor& x, Tensor& logits, WorkspaceArena& work,
+                    cudaStream_t s, ops::LinearRoutes routes) {
+    if (parameters.output_head_q8 && parameters.output_head_q8->is_ggml()) {
+        ops::ggml_linear(x, parameters.output_head_q8->ggml, logits, nullptr, 0, work, s, routes);
+    } else if (parameters.output_head_q8) {
+        ops::linear(x, parameters.output_head_q8->weight, logits, parameters.output_head_q8->policy, work, s, routes);
+    } else {
+        ops::linear(x, bf16_rows(parameters.output_head), logits, ops::LinearPolicy::A16Only, work, s, routes);
+    }
+}
+
+// Whether Linear runs a draft head's rows to BF16 output. The q4_g64_fp16 proposal head registers the
+// K it was tuned at (2048, 3072, 5120) and no other, so the Flash-Next drafter's 2560-wide head has
+// no Linear schedule and keeps the FP32 projection below.
+bool linear_projects_head_rows(const LinearParameters& rows) {
+    return !rows.is_ggml() &&
+           (rows.weight.qtype != QType::Q4_G64_FP16 ||
+            ops::linear_column_invariant_route(rows.weight.qtype, rows.weight.n, rows.weight.k));
+}
+
 // The screened-lm-head fast path's logits for the columns of x (at most 16): every row from the head's
 // 2-bit screen, and each column's near-best public rows with text_head_logits' bits (a BF16 or Q8 head).
 void screened_text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, WorkspaceArena& work,
@@ -1495,14 +1519,31 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
         Tensor drafts = call.drafts;
         Tensor narrow;
         if (!screened) {
-            Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
-            if (head.rows) {
-                ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
+            // The lossless route keeps its exact FP32 head rows; so does a head Linear cannot project.
+            // Wherever Linear has a schedule the rows reach BF16 in the projection's own rounding: the
+            // draft head's consumers only select from these rows (the FP32 resolution projection_fp32
+            // exists to keep was already gone at the latest possible moment, the cast kernel's BF16
+            // write being the first read of it), so the [rows, T] FP32 buffer and the full-vocabulary
+            // cast round-trip carried nothing. The fused ops::linear_topk was measured on this route
+            // (its q4_g64_fp16 [131072, 2560] head, one column) and is slower end to end; see the T4
+            // section of docs/gb10/20261106-changelog.md.
+            if (config_.lossless || (head.rows && !linear_projects_head_rows(*head.rows))) {
+                Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
+                if (head.rows) {
+                    ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
+                } else {
+                    text_head_logits(parameters_, final_x, head_logits, work_, s);
+                }
+                narrow = work_.alloc(DType::BF16, {rows_out, T});
+                ops::cast_fp32_to_bf16(head_logits, narrow, s);
             } else {
-                text_head_logits(parameters_, final_x, head_logits, work_, s);
+                narrow = work_.alloc(DType::BF16, {rows_out, T});
+                if (head.rows) {
+                    project(final_x, *head.rows, narrow, work_, s, dense_routes());
+                } else {
+                    text_head_bf16(parameters_, final_x, narrow, work_, s, dense_routes());
+                }
             }
-            narrow = work_.alloc(DType::BF16, {rows_out, T});
-            ops::cast_fp32_to_bf16(head_logits, narrow, s);
         }
         if (call.sample_configs != nullptr) {
             // Sampled drafts: the head's top rows, one draw each under the column's sampler; the top
