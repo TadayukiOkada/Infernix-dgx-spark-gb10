@@ -723,3 +723,274 @@ every arm and pass (0.7895 / 0.8125 / 0.5190 / 0.5511 decode, 0.8841 / 0.8957 / 
   question (the removed traffic is ≤ 0.03 % of a draft round); a trace would not change any decision.
 - **`--spec mtp` on a `screen/*` artifact (`screened == true`) is unexercised locally.** No delivered
   artifact here carries a head screen, so that branch is only shown unchanged by reading, not run.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T5: Port `map_work_unit<kColTileInner>` to `grouped_kernel_a16` and `grouped_kernel_a8`, gated out of the dense `rg16_linear` route
+
+Scope: task T5 from `docs/tasks/20261106-performance-optimization-tasks.md` on GB10 (`sm_121a`):
+port the `(job, row_block)`-outer / `col_tile`-inner work-unit traversal of `wide_expert.cuh`'s
+`grouped_kernel` into `grouped_kernel_a16` (`wide_expert_a16.cuh`) and `grouped_kernel_a8`
+(`wide_expert_a8.cuh`), so a wave's CTAs reuse one 128-row GateUp weight block in the 24 MiB L2
+across a job's column tiles instead of streaming it once per tile.
+
+## 1. Accounting
+
+- **Base commit**: `c2899906e` (`dev-rebased-20261028`, T4). Worktree was clean at session start.
+- **Files changed** (all `M`, 3 files, +43 / −8):
+  `src/ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh` (+29 / −4),
+  `src/ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh` (+11 / −4),
+  `src/ops/offloaded_sparse_moe/cuda/rg16_linear.cu` (+3 / −0).
+  `wide_expert.cuh`'s `map_work_unit` was reused unchanged — no edit was needed there.
+- **Allowlist delta**: none. Every `grouped_kernel_a16` / `grouped_kernel_a8` instantiation in
+  `build-native/apps/infernix-serve` keeps `STACK:0 LOCAL:0` at `REG:92…96` (§4), so
+  `tools/cuda_stack/cuda_stack_allowlist.json` is untouched (`git status` clean for that path) and the
+  one-way ratchet was never run — it only goes down, and nothing was eliminated here.
+- **Rebuild count**: 6 single-invocation Ninja builds, each sharing one `-rdc` device link: the
+  candidate port, a HEAD restore that produced the A/B baseline binaries, the candidate restore, the
+  dense-route-gate build (§5.1), a re-sync build after a comment-only header edit, and a final re-sync
+  after that comment's numbers were corrected to the trace-supported ones (§5.1). Every one of them ran
+  `find src/ops/offloaded_sparse_moe -name '*.cu' -exec touch {} +` first, because header edits do not
+  retrigger the CUDA depfiles in this tree; the shipped `infernix-serve`, test and bench binaries
+  postdate every source edit (checked by `stat`).
+
+## 2. Task-premise corrections / Architectural rationale ("Why" on GB10 `sm_121a`)
+
+1. **The GateUp weight block per work unit is 180 KiB, not 90 KiB.** With this tree's schedules
+   (`kUnitsPerKTile = 8`, `kRowGroups = 8`, `kUnitRunBytes = 1,152`), Flash-Next's gate/up pass has
+   `kBlocks = kHidden/16 = 160` → `kKTiles = 20`, so the staged block is
+   `20 × 8 × 1,152 = 184,320 B`. Down has `kBlocks = 40` → `kKTiles = 5` → `45 KiB`. The `64 KiB`
+   gate still splits the two passes exactly as the task intends; only the quoted constant is wrong.
+   `kRowBlocks` is also not the doc's `6`/`12`: gate/up is `80/8 = 10`, down `160/8 = 20`.
+2. **The same gate switches 122B's Down pass ON, which the doc's rationale forbids.** At
+   `H = 3072, I = 1024`, gate/up is `kKTiles = 24` → `216 KiB` and down is `kKTiles = 8` →
+   `72 KiB ≥ 64 KiB`, so `kColTileInner` is `true` for both Qwen3.5-122B passes. The task's
+   "false for 45 KiB Down weight blocks" holds only for Flash-Next's geometry; the measured 122B
+   gains (§4) therefore include a reordered Down pass, which was not isolated per pass (§6).
+3. **The doc's `map_work_unit` signature is not this tree's.** The live helper is
+   `map_work_unit<ColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, row_block)`: it
+   probes `tile_begin + w / kRowBlocks` and finds the job's tile span by two binary searches of the
+   job-sorted `call.tiles` list. Both kernels call it unchanged in the producer (`warp_id == 0`) and
+   consumer loops, which is the port's whole mechanism.
+4. **The doc's `cuobjdump` inventory does not exist in this tree.**
+   `grouped_kernel_a16<128, 384, 5120, 64, 3, true>` and its `REG:116/118/108` are not symbols here —
+   these kernels are templated on a `Shape` type (`A16Matrix<A4Geometry, Matrix>` /
+   `A8Matrix<…>`), and the live set is `ExpertGeometry<2560, 640>` and `ExpertGeometry<3072, 1024>`
+   at `REG:92…96` (§4).
+5. **The doc's CTest and Ninja targets are absent** (the recurring task-doc defect):
+   `infernix_ops_moe_test` is not a target and `ctest -R "offloaded_sparse_moe"` matches 0 tests.
+   The real coverage is `infernix_ops_offloaded_moe_test`, `infernix_ops_projection_test` and
+   `infernix_qwen4_exp_vision_rg16_test`; the run regex became
+   `-R "offloaded_moe|sparse_moe|rg16|infernix_cuda_stack_check"` → 24 tests (§4).
+6. **The doc's bench baselines hold, but only as a baseline.** Its `T = 256/1024/4096` frames of
+   `10542.6 / 14109.0 / 20421.2 µs` (a16) reproduce within ~3 % on this host. Absolute-µs bars drift
+   with thermal state, so acceptance was measured as an interleaved A/B against the HEAD binary
+   rather than against those numbers.
+7. **The thrash premise needs weights that genuinely exceed L2, and the bench fixture only half
+   satisfies it.** `bench/ops/offloaded_moe_wide_bench.cu` builds `kDistinct = 16` random records and
+   repeats them over the experts (`e % kDistinct`), so the distinct weight working set is ≈ 42 MiB at Flash-Next
+   geometry and ≈ 85 MiB at 122B — above the 24 MiB L2 in both cases, but far below a real layer's
+   512 distinct experts. Routing is Zipf-skewed (`1 / (rank + 1)^0.7`), so multi-column-tile jobs do
+   exist at every `T`. Measured consequence: every Flash-Next arm is inside noise, while the 122B
+   arms — the larger working set and the wider `K` — carry the gains (§4).
+8. **For the one dense route that shares `grouped_kernel_a16`, the premise inverts.**
+   `rg16_linear`'s `DenseMatrix` pass holds a single job: the call's columns *are* that job's tile
+   columns, so column-tile-inner order no longer concentrates a wave on one shared weight block — it
+   spreads the wave over the call's tiles and gives up the activation slab they used to share. That
+   route measured slower on every registered shape (§5.1), so `a16_whole_call_job` keeps it on the
+   legacy order. The grouped expert route is unaffected by the gate: `A16Matrix` declares no
+   `kWholeCallJob`, so its `kColTileInner` is bit-for-bit the ungated candidate's.
+9. **No local artifact exercises these kernels end to end.** The Dense8 and Local-NVFP4 artifacts
+   carry `model…experts.*.input_scale` (the A4 activation route) and the W4Dense artifact imports a
+   GGUF expert bank, so no `infernix-serve` run on this host executes `grouped_kernel_a16/a8`. All
+   performance evidence is therefore the op-level bench (§6.1).
+
+## 3. Subsystem breakdown
+
+- `src/ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh` (`M`)
+  - `a16_whole_call_job<Shape>()` (`A`) — a `requires`-based trait: `true` only for a matrix type that
+    declares `kWholeCallJob`, i.e. a pass whose whole matrix is one job. Carries the measured dense
+    numbers so the gate cannot be read as a guess.
+  - `grouped_kernel_a16` (`M`) — `constexpr bool kColTileInner = !a16_whole_call_job<Shape>() &&
+    uint64(kKTiles) * S::kRowGroups * S::kUnitRunBytes >= (1 << 16);`; `tile_end` hoisted out of the
+    `work` expression; the producer (`warp_id == 0`) and consumer work-unit loops replace
+    `tile = tile_begin + w / kRowBlocks, row_block = w % kRowBlocks` with
+    `map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, row_block)`.
+    Nothing else changed: same stages, same bulk-copy addressing, same per-CTA K accumulation order,
+    which is why the output bits are identical (§4).
+- `src/ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh` (`M`) — the same two-loop replacement and
+  the same 64 KiB `kColTileInner`, without the whole-call-job term: `grouped_kernel_a8` has no dense
+  caller, so there is no one-job route to protect.
+- `src/ops/offloaded_sparse_moe/cuda/rg16_linear.cu` (`M`) — `DenseMatrix::kWholeCallJob = true`
+  plus the pointer to the measurement that justifies it. This is the only change to the dense route,
+  and it restores its pre-T5 codegen exactly (§5.1).
+
+## 4. Verification
+
+**Build** (final, one Ninja invocation so the `-rdc` device link runs once, after touching every
+consuming `.cu`):
+
+```text
+find src/ops/offloaded_sparse_moe -name '*.cu' -exec touch {} + && \
+  ninja -C build-native -j 20 infernix-serve infernix_ops_offloaded_moe_test \
+       infernix_ops_projection_test infernix_qwen4_exp_vision_rg16_test \
+       infernix_offloaded_moe_wide_bench                        # exit 0
+```
+
+**Numerical / behavioural suite** — `ctest --test-dir build-native -R
+"offloaded_moe|sparse_moe|rg16|infernix_cuda_stack_check" --output-on-failure`:
+`100% tests passed, 0 tests failed out of 24` on the shipped build (267.00 s), and again on the
+pre-gate candidate (266.95 s / 267.31 s). It covers `infernix_cuda_stack_check`,
+`infernix_offloaded_moe_wide_test`, `infernix_offloaded_moe_a8_wide_test`,
+`infernix_rg16_linear_test`, `infernix_qwen4_exp_vision_rg16_test`,
+`infernix_sparse_moe_wide_test` and the
+`offloaded_moe_{qwen3_5_122b,a4_residual_122b,layer,team,cuda,ggml,ggml_a8,w4a8,fp8}` cases.
+
+**Bit-exactness** — the doc's first acceptance clause, checked directly on the shipped binary against
+the HEAD binary: every `output fnv1a` digest from `infernix_offloaded_moe_wide_bench --repeat 2` is
+identical — 10 comparisons, all matching. Flash-Next `T = 256 / 1024 / 4096`: a16
+`2fe7b6a8604de057 / ea7ed2f0c754b49d / 56919b8a7d2165b0`, a8
+`9fc542e78e609356 / 25551465ee57ca0e / 0ecaa656a1731271`. 122B (the geometry that carries the gains)
+`T = 1024 / 4096`: a16 `9b29f74bc629de1b / f39cdfda4fc22638`, a8 `09743d72ad2116eb /
+d10f3363cffa251d`. Each CTA still reduces the same K-tile sequence in the same order; only which CTA
+owns which unit moved.
+
+**Register / spill resources** (`cuobjdump --dump-resource-usage build-native/apps/infernix-serve`,
+final gated build):
+
+| Kernel family | Instantiations | `REG` | `STACK` | `LOCAL` |
+|---|---|---|---|---|
+| `grouped_kernel_a16<A16Matrix<ExpertGeometry<2560, 640>>, …>>` | 3 | 92 | 0 | 0 |
+| `grouped_kernel_a16<A16Matrix<ExpertGeometry<3072, 1024>>, …>>` | 3 | 92 / 94 | 0 | 0 |
+| `grouped_kernel_a8<A8Matrix<ExpertGeometry<2560, 640>>, …>>` | 3 | 94 / 96 | 0 | 0 |
+| `grouped_kernel_a8<A8Matrix<ExpertGeometry<3072, 1024>>, …>>` | 3 | 94 / 96 | 0 | 0 |
+| `grouped_kernel_a16<rg16_linear's `DenseMatrix`>>` (dense route) | 10 | 92 | 0 | 0 |
+
+All 22 live instantiations are spill-free, and no one of them approaches the 128-register 2-CTA/SM
+ceiling. The A4 route's `grouped_kernel` (not touched here) sits at `REG:128`, unchanged.
+
+**MoE throughput, interleaved A/B** (`ckt ab`, 6 measured rounds + 1 warmup, round-robin, metric
+`moe_experts median … us`; A = the HEAD binary at `c2899906e`, B = this change; negative = faster).
+Three independent runs of the same two binaries: **R1** and **R2** on the ungated candidate, **R3** on
+the shipped gated build. The grouped expert route's codegen is identical in both candidates
+(`A16Matrix` declares no `kWholeCallJob`, §3), so all three measure this change:
+
+| Act | Geometry | T | Placement | Run | A (µs) | B (µs) | Δ | SNR | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| a16 | flash-next | 64 | frames | R2 | 5177.7 | 5230.7 | +1.02 % | 0.61 | within noise |
+| a8 | flash-next | 64 | frames | R2 | 4406.1 | 4401.2 | −0.11 % | 0.18 | within noise |
+| a16 | 122b | 256 | frames | R2 | 17598.3 | 17608.2 | +0.06 % | 0.06 | within noise |
+| a16 | flash-next | 256 | frames | R1 | 10911.2 | 10921.0 | +0.09 % | 0.08 | within noise |
+| a8 | 122b | 256 | frames | R2 | 8180.4 | 8204.0 | +0.29 % | 0.10 | within noise |
+| a8 | flash-next | 256 | frames | R1 | 8189.1 | 8237.5 | +0.59 % | 0.22 | within noise |
+| a16 | 122b | 1024 | frames | R1 | 13220.5 | 12971.1 | −1.89 % | 1.02 | gain (marginal) |
+| a16 | 122b | 1024 | frames | R2 | 13407.0 | 12774.4 | −4.72 % | 3.30 | **meaningful gain** |
+| a16 | 122b | 1024 | frames | R3 | 13482.4 | 13076.1 | −3.01 % | 1.61 | **meaningful gain** |
+| a16 | flash-next | 1024 | frames | R1 | 14331.6 | 14232.6 | −0.69 % | 0.81 | within noise |
+| a16 | flash-next | 1024 | frames | R3 | 14339.8 | 14479.1 | +0.97 % | 0.80 | within noise |
+| a8 | 122b | 1024 | frames | R1 | 9401.2 | 8626.6 | −8.24 % | 2.80 | **meaningful gain** |
+| a8 | 122b | 1024 | frames | R2 | 9172.4 | 8590.2 | −6.35 % | 3.22 | **meaningful gain** |
+| a8 | 122b | 1024 | frames | R3 | 9213.2 | 8736.0 | −5.18 % | 1.92 | **meaningful gain** |
+| a8 | flash-next | 1024 | frames | R1 | 9105.8 | 9036.8 | −0.76 % | 0.27 | within noise |
+| a8 | flash-next | 1024 | frames | R3 | 9180.4 | 9022.2 | −1.72 % | 0.57 | within noise |
+| a16 | 122b | 4096 | frames | R1 | 29628.0 | 27530.8 | −7.08 % | 22.19 | **meaningful gain** |
+| a16 | 122b | 4096 | frames | R2 | 29718.7 | 27524.3 | −7.38 % | 21.53 | **meaningful gain** |
+| a16 | 122b | 4096 | frames | R3 | 29669.9 | 27551.8 | −7.14 % | 4.66 | **meaningful gain** |
+| a16 | flash-next | 4096 | frames | R1 | 20359.5 | 20338.5 | −0.10 % | 0.36 | within noise |
+| a16 | flash-next | 4096 | frames | R3 | 20377.8 | 20389.8 | +0.06 % | 0.24 | within noise |
+| a8 | 122b | 4096 | frames | R1 | 27807.4 | 22797.3 | −18.02 % | 21.12 | **meaningful gain** |
+| a8 | 122b | 4096 | frames | R2 | 28032.5 | 22738.0 | −18.89 % | 14.79 | **meaningful gain** |
+| a8 | 122b | 4096 | frames | R3 | 28018.3 | 22792.0 | −18.65 % | 17.61 | **meaningful gain** |
+| a8 | flash-next | 4096 | frames | R1 | 15815.5 | 15679.6 | −0.86 % | 0.42 | within noise |
+| a8 | flash-next | 4096 | frames | R3 | 15865.5 | 15715.3 | −0.95 % | 0.77 | within noise |
+| a16 | flash-next | 4096 | staged | R2 | 35801.2 | 35572.7 | −0.64 % | 0.67 | within noise |
+| a16 | flash-next | 4096 | staged | R3 | 35849.2 | 35908.0 | +0.16 % | 0.34 | within noise |
+| a8 | flash-next | 4096 | staged | R2 | 31200.6 | 31062.6 | −0.44 % | 1.91 | within noise |
+| a8 | flash-next | 4096 | staged | R3 | 31238.8 | 31122.1 | −0.37 % | 0.51 | within noise |
+
+Every Flash-Next arm — including the `T = 256 / 1024 / 4096` points the task's acceptance command
+actually runs at that bench's default geometry — sits inside noise on every run (largest move
+`+1.02 %`). Every 122B arm at `T ≥ 1024` gains, reproducibly, on all three runs.
+
+**Dense `rg16_linear` route** (`infernix_ops_projection_test --gtest_filter='*rg16*'` under `nsys`,
+per-kernel totals over the run's instances, medians in the same file; base = HEAD build):
+
+| Kernel | base (µs) | ungated T5 | gated T5 (shipped) |
+|---|---|---|---|
+| `grouped_kernel_a16[1152, 4304]` (vision fc2) | 10692.2 | 13010.7 (+21.69 %) | 10692.4 (+0.00 %) |
+| `grouped_kernel_a16[248320, 3072]` (122B head) | 45008.0 | 47918.3 (+6.47 %) | 45011.8 (+0.01 %) |
+| `grouped_kernel_a16[4304, 1152]` (vision fc1) | 8724.8 | 9431.0 (+8.09 %) | 8751.3 (+0.30 %) |
+| `grouped_kernel_a16[2560, 4608]` | 2264.1 | 2270.3 (+0.27 %) | 2267.4 (+0.15 %) |
+| `grouped_kernel_a16[4608, 4608]` | 2774.9 | 2763.2 (−0.42 %) | 2785.7 (+0.39 %) |
+
+The `stream_kernel` mergers of the same test are untouched code; their totals moved −0.8 … +0.2 %
+except one row discussed in §5.4.
+
+## 5. Regressions & adverse results
+
+1. **A real regression was introduced and then fixed: the dense `rg16_linear` route.** The first
+   candidate applied column-tile-inner order to every `grouped_kernel_a16` instantiation, including
+   the dense projections that share the kernel. Against the HEAD build under `nsys` (per-instance
+   pairs, launch order, `n` instances): vision fc2 `[1152, 4304]` total `+21.69 %` (median `−0.22 %`,
+   worst instance `+52.46 %`, n=32), vision fc1 `[4304, 1152]` total `+8.09 %` (median `+4.84 %`,
+   worst `+11.49 %`, n=20), 122B head `[248320, 3072]` total `+6.47 %` (median `+2.05 %`, worst
+   `+31.70 %`, n=9). The two narrow dense shapes were inside noise (`[2560, 4608]` median `−0.25 %`,
+   `[4608, 4608]` median `−0.26 %`), so the loss lands specifically on the wide multi-column-tile
+   dense calls. Cause: that route has one job per pass, so the reordering removes the wave's shared
+   activation slab instead of adding weight-block reuse (§2.8) — the L2 premise does not transfer from
+   a grouped call to a one-job call. Disposition: **fixed** by `a16_whole_call_job` +
+   `DenseMatrix::kWholeCallJob`, which restores the legacy traversal there; the shipped totals are
+   `+0.00 / +0.30 / +0.01 / +0.15 / +0.39 %`, i.e. back inside run-to-run spread.
+2. **The doc's acceptance bar is not met on the bench it names.** The bar is `+10–25 %` at
+   `T = 1024…4096` on `infernix_offloaded_moe_wide_bench --activation a16|a8`. That bench's default
+   geometry is Flash-Next, and every one of its arms is inside noise on every run (`T = 256` reads
+   `+0.09 / +0.59 %`, `T = 1024` `−0.69 / +0.97 %` and `−0.76 / −1.72 %`, `T = 4096` `−0.10 / +0.06 %`
+   and `−0.86 / −0.95 %`; largest single move `+1.02 %`). The gains exist only at `--geometry 122b`,
+   where the three-run spread is: a8 `T = 4096` `−18.02 / −18.89 / −18.65 %` — `+22.0 … +23.3 %`
+   throughput, the only arm inside the doc's band; a16 `T = 4096` `−7.08 / −7.38 / −7.14 %`
+   (`+7.6 … +8.0 %`, below the band); `T = 1024` a16 `−1.89 / −4.72 / −3.01 %` and a8
+   `−8.24 / −6.35 / −5.18 %` (`+2.0 … +9.0 %`, below the band). So the port is a real, reproducible
+   win on the wider-`K` geometry and a no-op on the geometry the acceptance command runs (§2.7).
+3. **The 122B `T = 1024` arms are the least stable measurements here.** `a16 122b T = 1024` read
+   `−1.89 %` (`MARGINAL_OR_NOISY`, SNR 1.02), `−4.72 %` (SNR 3.30) and `−3.01 %` (SNR 1.61) across
+   three runs of the same binaries; `a8 122b T = 1024` read `−8.24 / −6.35 / −5.18 %`. The sign held
+   in all nine of those readings, but the magnitude varies by up to 2.8 points, so the `T = 1024`
+   percentage should be read as roughly `−2 … −8 %`, not as a point estimate. The `T = 4096` arms are
+   stable to within `0.24 … 0.87` points across the same runs. Every reading is tabulated in §4
+   rather than only the favourable one.
+4. **One merger total moved `+12.56 %` in the gated profile** (`stream_kernel<Dense<4608, 4608>, 4,
+   false>`, 3801.3 → 4278.6 µs over 15 instances). That kernel's code is byte-identical between the
+   compared builds; the move is a single 707.7 µs instance against a 164.2 µs median (base median
+   164.5 µs, base max 175.1 µs), so the median is unchanged and the total is outlier-dominated.
+   Disclosed as a measurement artifact, not a regression — but it was not chased further, so it
+   remains an unexplained single instance.
+5. **No end-to-end or in-model arm exists** (§2.9): no delivered artifact on this host binds experts
+   to A16/A8, so `bench/run_kv_matrix_bench.sh` and `infernix-serve` could not confirm or deny an
+   E2E effect in either direction. The claim is op-level only.
+6. **Nothing else moved.** Resources are identical to HEAD (§4 table: no register growth, no spills,
+   no allowlist change), the 24-test suite passes at the same tolerances, all 10 output digests are
+   bit-identical, and the MoE bench's `staged` placement arms moved `−0.64 / +0.16 %` (a16) and
+   `−0.44 / −0.37 %` (a8) across their two runs — within noise. On the shipped gated build the
+   grouped-route gains reproduce (`−3.01 / −5.18 / −7.14 / −18.65 %` at 122B `T = 1024 / 1024 / 4096 /
+   4096`), so the dense gate cost the expert route nothing.
+
+## 6. Accepted gaps / follow-ups
+
+1. **No in-model evidence.** With no artifact that binds A16/A8 experts, the change is qualified only
+   by `infernix_offloaded_moe_wide_bench` and the oracle suites. A 122B-shaped artifact (or a
+   converter route that emits A16 experts for Flash-Next) would be needed for an E2E statement.
+2. **The two passes were never timed separately.** The 122B result includes a reordered Down pass
+   (§2.2); whether Down contributes, is neutral, or is a small loss there is unmeasured, because the
+   bench times `moe_experts` as a whole. Splitting the timer per pass is the cheapest follow-up.
+3. **The Flash-Next fixture cannot show the mechanism.** 16 distinct records repeated over 512
+   experts (§2.7) makes it an unresolved rather than a falsified premise on that geometry; a fixture
+   with per-expert-distinct records (or `--columns-per-expert` uniform blocks) is the discriminating
+   experiment.
+4. **The dense gate is structural, not a per-shape threshold.** `kWholeCallJob` marks a one-job
+   matrix type, so any future dense caller of `grouped_kernel_a16` inherits the legacy order
+   automatically — correct for today's measurement, but it would also inherit it if a future dense
+   route genuinely had multi-tile weight reuse to gain.
+5. **`a16_whole_call_job` is read through a `requires` expression** rather than a field on a shared
+   base, so a typo in a new matrix type's flag name would silently select the grouped order. It is
+   covered by the dense-route measurement above, not by a compile-time check.
+6. **No `ncu` trace of the reordered kernel.** The A/B plus the fixture-size arithmetic in §2.7
+   answered the geometry question (why 122B gains and Flash-Next does not); a counter-level trace
+   would refine the mechanism without changing any shipped decision.

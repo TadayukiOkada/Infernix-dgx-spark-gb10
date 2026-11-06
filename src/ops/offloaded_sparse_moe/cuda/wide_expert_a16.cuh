@@ -98,6 +98,23 @@ __host__ __device__ constexpr bool a16_shared_jobs() {
     }
 }
 
+// True when the kernel's whole matrix is one job (rg16_linear's dense projection, whose tile columns
+// are the call's own columns). A grouped call interleaves several jobs, so a wave's CTAs that share a
+// 128-row weight block are CTAs of the same job's tiles; a one-job pass has no other job, so the same
+// order instead spreads the wave over the call's tiles and gives up the activation slab they shared.
+// Measured on GB10 (2026-11-06, nsys totals against HEAD): it costs the wide multi-column-tile dense
+// shapes time - vision fc2 +21.7 %, vision fc1 +8.1 %, the 122B head +6.5 %, single instances up to
+// +52 % - while the narrow dense shapes stay inside noise, so only the grouped expert route takes the
+// column-tile-inner order.
+template <class Shape>
+__host__ __device__ constexpr bool a16_whole_call_job() {
+    if constexpr (requires { Shape::kWholeCallJob; }) {
+        return Shape::kWholeCallJob;
+    } else {
+        return false;
+    }
+}
+
 __device__ __forceinline__ int a16_tile_row(int warp_n, int r, int tig) {
     return (ScheduleA16::kGroupsPerWarp * warp_n + (r >> 1)) * 16 + 8 * (r & 1) + 2 * tig;
 }
@@ -122,11 +139,19 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
     constexpr int kLastGroups = Shape::kRowGroups - (kRowBlocks - 1) * S::kRowGroups;
     constexpr int kLastUnits  = Shape::kBlocks - (kKTiles - 1) * S::kUnitsPerKTile;
     static_assert(kRowBytes >= kKTiles * S::kStageRowBytes, "the limb rows hold whole stages, zero past K");
+    // The column-tile-inner work mapping where its weight block is big enough to pay for itself
+    // (map_work_unit's comment; the 64 KiB threshold splits Flash-Next's measured gate/up win from
+    // its down loss the same way it does in the A4 route's grouped_kernel), and only for a grouped
+    // call (a16_whole_call_job's comment: the dense rg16 projection measured slower on it).
+    constexpr bool kColTileInner = !a16_whole_call_job<Shape>() &&
+                                   static_cast<std::uint64_t>(kKTiles) * S::kRowGroups * S::kUnitRunBytes >=
+                                       (1ULL << 16);
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<StorageA16*>(shared_bytes);
     const int tile_begin = call.pass_tiles[pass];
-    const int work       = (call.pass_tiles[pass + 1] - tile_begin) * kRowBlocks;
+    const int tile_end   = call.pass_tiles[pass + 1];
+    const int work       = (tile_end - tile_begin) * kRowBlocks;
     if (static_cast<int>(blockIdx.x) >= work) { return; }
 
     if (threadIdx.x == 0) {
@@ -145,7 +170,8 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
         int it = 0;
 #pragma unroll 1
         for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
-            const int tile = tile_begin + w / kRowBlocks, row_block = w % kRowBlocks;
+            int tile = 0, row_block = 0;
+            map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, row_block);
             const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
             const int expert  = call.dispatch.jobs[job];
             const int first   = call.dispatch.offsets[expert] + column;
@@ -219,8 +245,8 @@ __global__ __launch_bounds__(ScheduleA16::kThreads, ScheduleA16::kMinBlocksPerSm
     int it = 0;
 #pragma unroll 1
     for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
-        const int tile = tile_begin + w / kRowBlocks;
-        ctx.row_block  = w % kRowBlocks;
+        int tile = 0;
+        map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, ctx.row_block);
         const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
         ctx.expert      = call.dispatch.jobs[job];
         ctx.first       = call.dispatch.offsets[ctx.expert] + column;

@@ -101,11 +101,17 @@ __global__ __launch_bounds__(ScheduleA8::kThreads, ScheduleA8::kMinBlocksPerSm) 
     constexpr int kRowBlocks = Shape::kRowGroups / S::kRowGroups;
     constexpr int kKTiles    = Shape::kBlocks / S::kUnitsPerKTile;
     namespace a8             = ::infernix::ggml::a8;
+    // The column-tile-inner work mapping where its weight block is big enough to pay for itself
+    // (map_work_unit's comment; the 64 KiB threshold splits Flash-Next's measured gate/up win from
+    // its down loss the same way it does in the A4 route's grouped_kernel).
+    constexpr bool kColTileInner = static_cast<std::uint64_t>(kKTiles) * S::kRowGroups * S::kUnitRunBytes >=
+                                   (1ULL << 16);
 
     extern __shared__ __align__(128) unsigned char a8_shared_bytes[];
     auto& shared = *reinterpret_cast<StorageA8*>(a8_shared_bytes);
     const int tile_begin = call.pass_tiles[pass];
-    const int work       = (call.pass_tiles[pass + 1] - tile_begin) * kRowBlocks;
+    const int tile_end   = call.pass_tiles[pass + 1];
+    const int work       = (tile_end - tile_begin) * kRowBlocks;
     if (static_cast<int>(blockIdx.x) >= work) { return; }
 
     if (threadIdx.x == 0) {
@@ -127,7 +133,8 @@ __global__ __launch_bounds__(ScheduleA8::kThreads, ScheduleA8::kMinBlocksPerSm) 
         int it         = 0;
 #pragma unroll 1
         for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
-            const int tile = tile_begin + w / kRowBlocks, row_block = w % kRowBlocks;
+            int tile = 0, row_block = 0;
+            map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, row_block);
             const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
             const int expert  = call.dispatch.jobs[job];
             const int first   = call.dispatch.offsets[expert] + column;
@@ -194,8 +201,8 @@ __global__ __launch_bounds__(ScheduleA8::kThreads, ScheduleA8::kMinBlocksPerSm) 
     int it = 0;
 #pragma unroll 1
     for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
-        const int tile = tile_begin + w / kRowBlocks;
-        ctx.row_block  = w % kRowBlocks;
+        int tile = 0;
+        map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, ctx.row_block);
         const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
         ctx.expert  = call.dispatch.jobs[job];
         ctx.first   = call.dispatch.offsets[ctx.expert] + column;

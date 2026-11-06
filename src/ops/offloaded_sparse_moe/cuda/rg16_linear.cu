@@ -412,6 +412,9 @@ struct DenseMatrix {
     static constexpr std::size_t kOffset = 0;
     static constexpr int kRowBytes       = D::kRowBytes;
     static constexpr bool kTokenRows     = true;
+    // One job per pass (wide_expert_a16.cuh's a16_whole_call_job): the call's columns are that job's
+    // tile columns, so the grouped expert route's column-tile-inner order is a measured loss here.
+    static constexpr bool kWholeCallJob  = true;
 };
 
 // The canonical output of each tile column into its output column (rows 2i, 2i + 1 in one thread);
