@@ -27,11 +27,13 @@ __global__ __launch_bounds__(Capacity * (16 / kChannelsPerThread), 4)
     if (tid < 4 * Capacity && tid % Capacity < width) {
         const int coefficient = tid / Capacity, position = tid % Capacity,
                   row = coefficient * kGroups + group;
-        float sum     = 0;
-        for (int split = 0; split < splits; ++split)
-            sum += partial[(static_cast<std::int64_t>(split) * tokens + batch * width + position) *
-                               kCoefficientRows +
-                           row];
+        // Scratch rows are [split][coefficient row][token], so adjacent positions read
+        // contiguous floats within one split's row.
+        const float* row_base =
+            partial + static_cast<std::int64_t>(row) * tokens + batch * width + position;
+        const std::int64_t split_stride = static_cast<std::int64_t>(kCoefficientRows) * tokens;
+        float sum                       = 0;
+        for (int split = 0; split < splits; ++split) sum += row_base[split * split_stride];
         projected[coefficient][position] = sum;
     }
     const int position = tid / kGroupThreads, channel = (tid % kGroupThreads) * kChannelsPerThread;

@@ -92,19 +92,31 @@ __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_pre
         if (tile + kStages < tiles_per_split) stage_inputs(stage, kt_begin + tile + kStages);
         cp_commit();
     }
+    // Scratch is [split][coefficient row][token], so each MMA accumulator's adjacent token
+    // columns are adjacent in memory: the four lanes sharing a row store 8 contiguous floats and
+    // even `tokens` (every production width) admits aligned float2 stores.
 #pragma unroll
     for (int m = 0; m < mmas; ++m) {
         const int row = row0 + warp_row * 16 + gid,
                   col = col0 + (warp_col * mmas + m) * 8 + 2 * lid;
-        auto put      = [&](int r, int c, float value) {
-            if (c < tokens)
-                partial[(static_cast<std::int64_t>(split) * tokens + c) * kCoefficientRows<Hidden> + r] =
-                    value;
-        };
-        put(row, col, acc[m][0]);
-        put(row, col + 1, acc[m][1]);
-        put(row + 8, col, acc[m][2]);
-        put(row + 8, col + 1, acc[m][3]);
+        const std::int64_t row_base =
+            (static_cast<std::int64_t>(split) * kCoefficientRows<Hidden> + row) * tokens;
+        const std::int64_t row8_base = row_base + 8 * tokens;
+        if ((tokens & 1) == 0 && col + 1 < tokens) {
+            *reinterpret_cast<float2*>(partial + row_base + col) =
+                make_float2(acc[m][0], acc[m][1]);
+            *reinterpret_cast<float2*>(partial + row8_base + col) =
+                make_float2(acc[m][2], acc[m][3]);
+        } else {
+            if (col < tokens) {
+                partial[row_base + col]     = acc[m][0];
+                partial[row8_base + col]    = acc[m][2];
+            }
+            if (col + 1 < tokens) {
+                partial[row_base + col + 1]  = acc[m][1];
+                partial[row8_base + col + 1] = acc[m][3];
+            }
+        }
     }
 }
 

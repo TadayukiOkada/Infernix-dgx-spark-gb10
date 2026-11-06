@@ -116,3 +116,121 @@ raw-code staging grouping per band, on NVIDIA GB10 (`sm_121a`).
 - `Fused64Mid` is structurally the baseline mainloop; if the LDG pipeline improves (e.g. a
   register-budget change lowers REG below the 2-CTA threshold at 512 threads), retest it as a
   single-LDG band and drop the extra instantiation.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T2: Transpose `dynamic_grouped_conv_prepare` FP32 scratch to `[split][row][token]`
+
+Scope: `bf16_dynamic_grouped_conv_prepare` (DFlash2 drafter RMSNorm→projection→conv-coefficient
+prepare) task T2 from `docs/tasks/20261106-performance-optimization-tasks.md`: transpose the FP32
+split-K partial scratch from `[split][token][coefficient_row]` to
+`[split][coefficient_row][token]` so the MMA epilogue stores are contiguous (float2 across even
+`tokens`) and the split-K reduction reads are contiguous +4 B per lane, on GB10 (`sm_121a`).
+
+## 1. Accounting
+
+- **Base commit (`origin/main`)**: `68c54356fd490ab329bd1475d48957f886bb7dd1`; **previous HEAD**:
+  `1ebbf71a1` (T1).
+- **Files changed**: `src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu` (M),
+  `src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu` (M).
+  `bf16_dynamic_grouped_conv_prepare_plan.cpp` (reviewed, unchanged — capacity formula is
+  layout-invariant and route bands re-validated, §2.5). `cuda-kernel-toolkit/` untouched.
+- **Allowlist delta**: none — both kernels were and remain `STACK:0 LOCAL:0`; no `conv_prepare`
+  entry exists in `tools/cuda_stack/cuda_stack_allowlist.json` and none was added.
+- **Rebuild count**: 2 single-invocation Ninja builds (fresh HEAD baseline binary, candidate),
+  shared device link.
+
+## 2. Task-premise corrections / Architectural rationale ("Why" on GB10 `sm_121a`)
+
+1. **The layout premise held**: the old `put(r, c)` wrote `(split·tokens + c)·kCoefficientRows + r`,
+   so a warp's four lanes sharing accumulator row `r` stored 2,560 B (H=2560) / 5,120 B (H=5120)
+   apart and the reduce's adjacent lanes read the same strides — 1 float per 128 B line. The
+   transpose makes both contiguous; every `(coefficient, position)` still sums the same split values
+   in the same ascending order, so the change is bit-exact by construction.
+2. **The doc's live-evidence symbol is stale**: `partial_kernel<5120, 64, 64, 64, 2, 2>` (`REG:103`)
+   is not instantiated in this tree; live routes are R16/C{8,16,32,48}/S8 (T≤4) and
+   R32/C{32,64}/S4 (T≥5) at `REG:40..58`. Baseline live reduce was `REG:38`, not 32.
+3. **The W14B6 (T=84) "103.8 µs spike" did not reproduce as a spike**: the freshly HEAD-built
+   baseline measured 89.8 µs there, on an already smooth T-curve (T=80: 91.9, T=88: 90.2 medians).
+   The doc's absolute bars came from a different thermal state; all decisions were taken against the
+   freshly built baseline binary in interleaved rounds.
+4. **The improvement is real but smaller than the 15–30 % bar**: the Op is dominated by streaming the
+   13.1 MB BF16 projection weight (~48 µs floor at ~273 GB/s UMA); the scratch is only
+   0.26–2.6 MB, so removing its 32× line amplification moves the total monotonically with T from
+   ≈ −2.7 % (T=13..31) to −13.3 % (T=97..128), mean −7.8 % over T=32..128 (§4).
+5. **Route bands need no retune**: both C32 and C64 R32 bands carry identical split-4 scratch cost,
+   and the candidate T-curve shows no cliff at the 4/5, 12/13, 64/65, 96/97 edges (≤ 1 timer tick).
+   PDL overlap (doc step 3) was already shipped (`pdl::enter_streaming`/`enter` +
+   `pdl::launch_consumer` on both kernels); no additional change.
+
+## 3. Subsystem breakdown
+
+- `bf16_dynamic_grouped_conv_prepare_partial.cu` — `dynamic_grouped_conv_prepare_partial_kernel`
+  epilogue: index `partial` as `(split·kCoefficientRows + r)·tokens + c`; when `tokens` is even and
+  `c + 1 < tokens` (all production widths; `col` provably even → 8 B-aligned) store
+  `make_float2(acc[m][0], acc[m][1])` / `(acc[m][2], acc[m][3])`, else adjacent scalar stores for the
+  odd-token case and the straddling tail column. SASS: 4 × `STG.E.64` in the hot path of
+  `<5120,32,64,4>` (baseline: 8 scalar `STG.E`).
+- `bf16_dynamic_grouped_conv_prepare_reduce.cu` — `dynamic_grouped_conv_prepare_reduce_kernel`
+  phase 1: hoist `row = coefficient·kGroups + group`, read
+  `partial[row·tokens + batch·width + position + split·kCoefficientRows·tokens]` — contiguous +4 B
+  per lane within a `Capacity` group instead of 2.5–5.0 KiB-strided. Sum order unchanged.
+
+## 4. Verification
+
+- **Build**: `find src/ops/dynamic_grouped_conv -name '*.cu' -exec touch {} +` then one
+  `ninja -C build-native -j $(nproc) infernix-serve infernix_ops_recurrent_test
+  infernix_dynamic_grouped_conv_prepare_bench` (the doc's `infernix_ops_conv_state_test` target does
+  not exist; the prepare test builds into `infernix_ops_recurrent_test`).
+- **CTest** (`-R "dynamic_grouped_conv|infernix_cuda_stack_check"`, serial): 3/3 passed —
+  `infernix_cuda_stack_check`, `infernix_dynamic_grouped_conv_prepare_test` (all 120 W×B geometries
+  × H ∈ {5120, 2560, 3072}, incl. odd-token scalar-fallback and CUDA-graph cases),
+  `infernix_linear_dynamic_grouped_conv_add_test`.
+- **Resources** (`cuobjdump --dump-resource-usage`, candidate vs baseline): partial `<5120,32,64,4>`
+  REG 58 vs 56, STACK 0 / LOCAL 0 both; reduce REG 48 vs 38 (+10 from 64-bit row/stride math),
+  STACK 0 / LOCAL 0 both; `__launch_bounds__(…, 4)` still admits 4 CTAs/SM
+  (48·128·4 = 24,576 ≤ 65,536 regs) — occupancy unchanged.
+- **A/B** (`infernix_dynamic_grouped_conv_prepare_bench`, cold-L2 graph medians; 7 baseline ×
+  6 candidate interleaved full sweeps of 120 points, per-point medians of medians):
+
+  | T band | n | mean Δ | worst point |
+  |---|---|---|---|
+  | 2..4 (R16/S8) | 4 | −0.41 % | +0.02 % |
+  | 5..12 (C32) | 19 | −0.96 % | −0.02 % |
+  | 13..31 (C64) | 35 | −2.66 % | +0.11 % |
+  | 32..64 (C64) | 37 | −5.72 % | −2.34 % |
+  | 65..96 (C32) | 18 | −10.00 % | −7.02 % |
+  | 97..128 (C64) | 7 | −13.31 % | −9.07 % |
+  | 32..128 | 62 | **−7.82 %** | −2.34 % (all 62 improved) |
+
+  Key points: W14B6 T=84 89.8 → 78.9 µs (−12.2 %, spike gone — curve monotone-smooth),
+  W16B8 T=128 102.1 → 86.8 µs (−15.0 %), W16B1 T=16 70.7 → 68.4 µs (−3.3 %).
+  Pass-to-pass spread reached 13.7 % (base) / 33.0 % (cand, one small-T point), so single passes are
+  not decision-grade; the medians above are.
+
+## 5. Regressions & adverse results
+
+Compared: all 120 bench points (W∈2..16 × B∈1..8) baseline-vs-candidate on interleaved freshly
+built binaries, plus per-symbol REG/STACK/LOCAL/SMEM, CTest results, and route-band edges.
+
+- **No latency regression at any point.** Largest positive delta +0.11 % (W2B8 T=16, 70.46 → 70.54 µs)
+  and +0.02 % (W2B1 T=2) — both inside the measured pass-to-pass spread and ≈ 0.05–0.1 timer ticks;
+  disposition: noise, accepted.
+- **Reduce kernel REG 38 → 48.** Cause: 64-bit `row_base`/`split_stride` hoisting. STACK/LOCAL stayed
+  0, launch-bounds occupancy unchanged, and no small-T latency cost is measurable (T=2..12 mean
+  −0.96 %). Disposition: accepted tradeoff.
+- **Acceptance bar not met**: the doc's "≥ 15–30 % at T=32..128" is not reached (mean −7.8 %; only
+  T=128 individually approaches −15 %). The premise correction in §2.4 explains the size; the bar is
+  disclosed as unmet rather than re-tuned.
+
+## 6. Accepted gaps / follow-ups
+
+- Bit-exactness is by construction (identical MMA mainloop, identical stored values, identical
+  split-ascending sum order) and the 360-geometry oracle test passes, but the bench does not dump
+  outputs, so no direct old-vs-new binary output-bit diff was run.
+- The E2E drafter routes (DFlash2/MTP decode via `qwen4_exp`/`qwen3_5` `dflash2.cpp`) were not
+  re-benchmarked: outputs are bit-identical by construction and the op-level win is 0.5–2.5 µs per
+  prepare call; E2E effect is expected-positive but unmeasured here.
+- Odd `tokens` (e.g. W3B1) keeps scalar stores and gains nothing measurable (−0.0…0 %); a
+  shuffle-packed float2 path for odd T would trade instructions for sectors at T where the scratch
+  is noise — not worth it at these widths.
