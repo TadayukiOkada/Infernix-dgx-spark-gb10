@@ -597,3 +597,135 @@ baseline is a copy of the HEAD-linked binary):
   route over them (`linear_add --policy a16`) was measured at +0.43% mean.
 - If a future task moves the A16 decode routes off the bandwidth floor, re-measure here first: the
   dedup's headroom is real but small (−1.5% instructions), and it is paid for in `PRMT`.
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-06 — T5 (nvfp4): Coalesced 4-byte scale stores, `__launch_bounds__(256, 2)`, and PDL wiring in the fused RMSNorm NVFP4 quantizer
+
+## 1. Accounting
+
+- Base commit: `7f899d8d5` (HEAD of `dev-rebased-20261028`, clean worktree at start).
+- Files changed (4 files, +50/−18):
+  - `M src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_fused_rmsnorm.cu` — kernel + both launchers
+  - `M src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a4_tma_launch.h` — dependency parameter
+  - `M src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a4_tma.cu` — forward the dependency
+  - `M src/ops/linear/nvfp4/nvfp4_a4_tma.cuh` — dependency parameter + consumer-side wait
+- `tools/cuda_stack/cuda_stack_allowlist.json`: unchanged (zero spills before and after; nothing to
+  ratchet). Rebuilds: 1 full ninja pass (65 edges, one shared device link).
+
+## 2. Task-premise corrections / Architectural rationale
+
+- **Premise 2 ("redundant second global read of `x`") is already false in this codebase.** The task
+  doc describes a group-strided kernel that loads `x_vec4[group * 2]` twice; the shipped
+  `rmsnorm_nvfp4_quantize_kernel` uses pair ownership (`kPairsPerThread = 10` `__nv_bfloat162`
+  `values[]`/`weights[]` registers per thread for the single `Nvfp4N14336K5120` geometry), computes
+  sum-of-squares from those registers, stages the normalized BF16 row in shared, and the quantize
+  pass reads only shared memory. The post-change SASS confirms it: all 20 `LDG.E.CONSTANT`
+  (residual + weight) precede the first `BAR.SYNC` of the block reduction and there is no `LDG`
+  after it (quantize reads `LDS.128` only). Required step 1 was therefore a no-op; no `kIters`
+  cache arrays were added. The doc's `K=2560` case does not exist here — this kernel is fixed to
+  `K = 5120` (`kGroupsPerRow = 320`).
+- **The fused route gate is `T >= 512`, not `T >= 5`.** Eligibility is
+  `nvfp4_attn_input_tma_route(tokens)` (`src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h`),
+  i.e. prefill chunks, not decode/MTP-verify widths.
+- **`store_nvfp4_scale_quad` is not templated on `<Geometry, Layout>` and `pdl::Dependency::None`
+  does not exist.** The shipped helper takes `(scales, offset, scale, tid)`; the enum is
+  `{Serialized, Programmatic}`. Used accordingly: `Serialized` for the quantizer (it reads the
+  residual its producer just wrote), `Programmatic` for the downstream GEMM.
+- Shuffle safety for the quad store: the quantize loop is `for (group = tid; group < 320; group +=
+  256)`, so its second iteration runs only threads 0..63 — whole warps 0 and 1 — and every warp
+  that executes `store_nvfp4_scale_quad`'s `__shfl_sync(FULL_MASK, …, 4)` has all 32 lanes present.
+  Quads cover four consecutive groups of one token, which are one aligned 4-byte word in both
+  tiled layouts (a 16-group scale tile row is 16 bytes).
+- PDL protocol per `core/pdl.cuh`: the quantizer calls `pdl::enter()` (the grid is always ≥ 128
+  CTAs after tile padding, above half of 48 SMs, so it never pre-triggers; dependents launch as its
+  CTAs exit) and the padding early-return happens after the call, keeping the protocol complete.
+  `nvfp4_a4_tma_kernel` gained `pdl::wait_for_dependencies()` after its mbarrier-init preamble —
+  the only producer-dependent reads are the TMA loads below it — and `launch_nvfp4_a4_tma_mma`
+  gained a `pdl::Dependency` parameter defaulting to `Serialized`, so all 17 other call sites
+  (linear, linear_add, linear_swiglu, gdn_input_proj, shapes) keep their exact current launch.
+  Programmatic serialization is applied only under graph capture, as everywhere in this route
+  family; eager launches keep full stream serialization.
+
+## 3. Subsystem breakdown
+
+- `nvfp4_attn_input_fused_rmsnorm.cu`:
+  - `rmsnorm_nvfp4_quantize_kernel`: `__launch_bounds__(kBlock)` → `(kBlock, 2)`; `pdl::enter()` at
+    entry; padding path stores one `uint32_t{0}` per quad from `(thread & 3) == 0` (320 1-byte
+    `STG.E.U8` → 80 4-byte `STG.E` stores per padding token); quantize path replaces the byte
+    `scales[...] = quantized.scale` with `store_nvfp4_scale_quad` (320 1-byte → 80 4-byte stores
+    per token). SASS: `STG.E.U8` 2 → 0, `SHFL` +4 (quad packing), net +32 static instructions.
+  - `launch_quantize`: `<<< >>>` → `pdl::launch_with(pdl::Dependency::Serialized, …)`.
+  - `nvfp4_attn_input_fused_rmsnorm_launch`: passes `pdl::Dependency::Programmatic` to the TMA GEMM.
+- `nvfp4_attn_input_a4_tma_launch.h` / `nvfp4_attn_input_a4_tma.cu`: dependency parameter
+  (default `Serialized` at the header) forwarded to both `Nvfp4A4TmaMmaSchedule` instantiations.
+- `nvfp4_a4_tma.cuh`: `launch_nvfp4_a4_tma_mma(…, Rows = {}, pdl::Dependency = Serialized)`;
+  `kernel<<<>>>` → `pdl::launch_with(dependency, …)`; kernel waits via
+  `pdl::wait_for_dependencies()` between the barrier-init preamble and the TMA producer loop.
+
+## 4. Verification
+
+- Build: `ninja -C build-native -j "$(nproc)" infernix-serve infernix_ops_projection_test
+  infernix_ops_linear_fused_test` after touching all consuming `.cu` under the five touched
+  `nvfp4`/`attn_input_proj` trees (header edits, dead CUDA depfiles). The task doc's
+  `infernix_ops_linear_fused_test` exists but the fused-rmsnorm CTests live in
+  `infernix_ops_projection_test` (FAMILY `projection`); both were built.
+- `ctest -R "infernix_attn_input_proj|infernix_cuda_stack_check"`: 3/3 passed —
+  `infernix_cuda_stack_check` (ratchet gate, zero new spills), `infernix_attn_input_proj_test`,
+  `infernix_attn_input_proj_fused_rmsnorm_test` (byte-exact fused-vs-reference at T = 512, 700,
+  1024, 1500, 2048, 3584, 4096, plus the FP64-oracle A4 criterion and the CUDA-graph-captured
+  T = 1500 byte-exactness that exercises the new Programmatic GEMM launch under capture).
+- Neighbors of the shared TMA kernel: `infernix_gdn_input_proj_test`,
+  `infernix_linear_nvfp4_a16_test`, `infernix_linear_nvfp4_a4_test`,
+  `infernix_linear_add_nvfp4_test`, `infernix_linear_swiglu_nvfp4_test` — 5/5 passed.
+- Resources (`cuobjdump --dump-resource-usage`): both `rmsnorm_nvfp4_quantize_kernel`
+  instantiations `REG:54 STACK:0 SHARED:11300 LOCAL:0`, identical to baseline (the `(256, 2)`
+  clamp is 128 registers, far above 54, so it costs nothing). All 37 `nvfp4_a4_tma_kernel`
+  instantiations: `REG/STACK/SHARED/LOCAL` byte-identical to the baseline binary.
+- SASS (`cuobjdump -sass -fun` on the exact `Tiled256` stored symbol): zero `LDG` after the block
+  reduction's first `BAR.SYNC`; scale stores are 4-byte `STG.E` (padding path `STG.E …, RZ`,
+  quantize path predicated `@!P0 STG.E` from the quad leader); no `STG.E.U8` remains.
+
+## 5. Regressions & adverse results
+
+Fused-route wall time (`INFERNIX_MEASURE_FUSED_STAGE=1`, eager launches, median of 3
+alternating-order rounds of the *test's own* 31-sample medians, baseline binary `/tmp/t5_before_*`
+built from `7f899d8d5`; the `reference_us` column is the *unmodified* rmsnorm+attn route in the
+same process and serves as the drift control):
+
+| T | fused base µs | fused cand µs | Δ fused | control Δ |
+|---|---|---|---|---|
+| 512 | 368.1 | 374.1 | +1.62% | +1.03% |
+| 700 | 531.7 | 535.6 | +0.73% | −0.45% |
+| 1024 | 522.0 | 521.4 | −0.11% | −0.80% |
+| 2048 | 990.4 | 998.5 | +0.82% | +0.61% |
+| 3584 | 1677.2 | 1686.0 | +0.52% | −0.03% |
+| 4096 | 1903.4 | 1906.9 | +0.18% | +0.03% |
+
+- No point regressed beyond the inter-binary drift band (the unchanged control route itself moved
+  ±1% and prior campaigns measured up to ±3.5% between linked binaries); no point improved either.
+  The eager fused stage is GEMM-dominated, the scale stores are 320 B/token of a ~2 MB/token
+  quantizer output, and PDL is inert eagerly — so eager neutrality is the expected result, and
+  that is what was measured. Disposition: accepted; the change's admissible gain is only the
+  captured-graph preamble overlap, which no local harness times (see §6).
+- The small positive fused deltas at T = 700/3584 (+0.73%/+0.52%) sit against control moves of
+  ∓0.45%/−0.03%; they are within the pass-to-pass spread of these wall measurements (round spread
+  ≤ 1.0%) and have no candidate mechanism (register/stack/shared usage identical; the kernel
+  trades 4× fewer scale-store transactions for +32 static instructions and +4 shuffles).
+  Disclosed as unexplained-small, not dismissed by a different criterion than the gains used.
+- No numerical change (byte-exact tests), no new spills, no occupancy/SMEM change, no register or
+  interface change for the 17 unchanged `launch_nvfp4_a4_tma_mma` call sites.
+
+## 6. Accepted gaps / follow-ups
+
+- The PDL enablement's only observable effect is under CUDA graph capture, where the GEMM's
+  preamble can overlap the quantizer's tail; this host has no per-layer capture benchmark for the
+  fused route, so its benefit is **unmeasured** (its correctness is measured: the T = 1500
+  captured byte-exact case). A prefill-graph E2E A/B (`bench/run_kv_matrix_bench.sh` nvfp4 arm)
+  would be the first real number if a future task needs one.
+- The quantizer itself stays `Serialized` behind the residual producer per the spec; if a future
+  prefill pipeline wants it as a consumer too, `launch_with(Programmatic, …)` now needs no code
+  change (the `enter()` protocol is in place).
+- The zero-padding and quantize stores assume the 16-group scale tile keeps quads inside one word
+  (`kNvfp4ScaleTileGroups = 16`, unchanged since the layout's introduction); a layout change would
+  need the same audit the standalone quantizer comment carries.
+- The doc's claimed register-cache win (step 1) was already shipped earlier in this branch; no
+  further register caching was possible or added.

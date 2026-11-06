@@ -27,19 +27,29 @@ static_assert(kPairsPerThread == 10);
 // to the tiled plane the TMA route reads; a token past the real count is a tile's padding and gets
 // zero scales, as the standalone quantizer writes them.
 template <Nvfp4ScaleLayout Layout>
-__launch_bounds__(kBlock) __global__
+__launch_bounds__(kBlock, 2) __global__
     void rmsnorm_nvfp4_quantize_kernel(const __nv_bfloat162* __restrict__ residual,
                                        const __nv_bfloat162* __restrict__ norm_weight,
                                        std::uint8_t* __restrict__ codes,
                                        std::uint8_t* __restrict__ scales, std::int32_t tokens,
                                        float eps, float input_scale_divisor) {
     static_assert(Layout != Nvfp4ScaleLayout::RowMajor);
+    // Consumer protocol: the fused launch keeps this grid behind its residual producer in stream
+    // order, so the wait is satisfied at launch there; the padding early-return below still makes
+    // the protocol complete for every CTA of a programmatic launch.
+    pdl::enter();
     const int token             = static_cast<int>(blockIdx.x);
     const int thread            = static_cast<int>(threadIdx.x);
     constexpr int kGroupsPerRow = Geometry::kGroupsPerRow;
     if (token >= tokens) {
-        for (int group = thread; group < kGroupsPerRow; group += kBlock) {
-            scales[nvfp4_tiled_scale_offset<Geometry, Layout>(token, group)] = 0;
+        // Four consecutive groups of one token occupy one aligned 4-byte word of the tiled plane
+        // (a 16-group tile row is 16 bytes), so the quad's first lane zeroes its word: one fourth
+        // of the padding stores, each 4 bytes.
+        if ((thread & 3) == 0) {
+            for (int group = thread; group < kGroupsPerRow; group += kBlock) {
+                store_vec(scales + nvfp4_tiled_scale_offset<Geometry, Layout>(token, group),
+                          std::uint32_t{0});
+            }
         }
         return;
     }
@@ -85,7 +95,12 @@ __launch_bounds__(kBlock) __global__
         auto* code_destination =
             codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
         store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scales[nvfp4_tiled_scale_offset<Geometry, Layout>(token, group)] = quantized.scale;
+        // Four consecutive lanes hold four consecutive groups of this token, whose scale bytes are
+        // one aligned word of the tiled plane: pack them and store 4 bytes once per quad. Every
+        // warp that enters an iteration has all 32 lanes here (kGroupsPerRow is 320, so the second
+        // iteration runs only threads 0..63, whole warps 0 and 1).
+        store_nvfp4_scale_quad(scales, nvfp4_tiled_scale_offset<Geometry, Layout>(token, group),
+                               quantized.scale, thread);
     }
 }
 
@@ -97,11 +112,15 @@ void launch_quantize(const Tensor& residual, const Tensor& norm_weight, float ep
     if (static_cast<std::size_t>(padded) * Geometry::kGroupsPerRow > workspace.scale_bytes) {
         throw std::logic_error("fused rmsnorm NVFP4 quantize: scale plane is too small");
     }
-    rmsnorm_nvfp4_quantize_kernel<Layout><<<padded, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat162*>(residual.data),
-        static_cast<const __nv_bfloat162*>(norm_weight.data), workspace.codes, workspace.scales,
-        tokens, eps, input_scale_divisor);
-    CUDA_CHECK(cudaGetLastError());
+    // Serialized: the quantizer reads the residual its producer just wrote, so it keeps full
+    // stream ordering; the downstream GEMM is the programmatic dependent of this grid.
+    CUDA_CHECK(pdl::launch_with(pdl::Dependency::Serialized,
+                                {dim3(padded), dim3(kBlock), 0, stream},
+                                rmsnorm_nvfp4_quantize_kernel<Layout>,
+                                static_cast<const __nv_bfloat162*>(residual.data),
+                                static_cast<const __nv_bfloat162*>(norm_weight.data),
+                                workspace.codes, workspace.scales, tokens, eps,
+                                input_scale_divisor));
 }
 
 } // namespace
@@ -137,11 +156,15 @@ void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor& residual, const Tensor&
     launch_nvfp4_attn_input_fused_rmsnorm_quantize(residual, norm_weight, eps,
                                                    weight.input_scale_divisor, scratch, layout,
                                                    stream);
+    // The GEMM reads only this quantizer's planes, so it launches as its programmatic dependent:
+    // captured launches overlap its preamble with the quantizer's tail and wait inside for the
+    // planes; eager launches keep full stream serialization.
     launch_nvfp4_a4_tma_attention(nvfp4_a4_operands(weight, scratch, tokens, layout),
                                   static_cast<__nv_bfloat16*>(q.data),
                                   static_cast<__nv_bfloat16*>(gate.data),
                                   static_cast<__nv_bfloat16*>(k.data),
-                                  static_cast<__nv_bfloat16*>(v.data), stream);
+                                  static_cast<__nv_bfloat16*>(v.data), stream,
+                                  pdl::Dependency::Programmatic);
 }
 
 } // namespace infernix::ops::detail

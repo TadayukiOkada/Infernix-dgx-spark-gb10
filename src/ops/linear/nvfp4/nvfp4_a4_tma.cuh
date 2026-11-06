@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
@@ -274,6 +275,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     }
     __syncthreads();
 
+    // A programmatic launch (a fused quantizer's dependent) overlaps the preamble above with the
+    // producer's tail; the activation planes are only read through the TMA loads below, so every
+    // thread waits here. An ordinary launch passes through.
+    pdl::wait_for_dependencies();
+
     const int kKTiles = K / Schedule::kBlockK;
 
     if (threadIdx.x < Schedule::kProducerThreads) {
@@ -535,7 +541,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilogue,
-                             cudaStream_t stream, Rows = {}) {
+                             cudaStream_t stream, Rows = {},
+                             pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_nvfp4_operands<Schedule>(p);
     static_assert(
         Rows::kContiguous ||
@@ -563,9 +570,9 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
         (void)nvfp4_prepare_shared<bytes, kernel, true>();
         for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
             const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(parameter, p.alpha, p.row_scales, epilogue, output,
-                                                                offset + count, p.rows, p.k, offset);
-            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(pdl::launch_with(
+                dependency, {grid, dim3(Schedule::kThreads), bytes, stream}, kernel, parameter,
+                p.alpha, p.row_scales, epilogue, output, offset + count, p.rows, p.k, offset));
         });
     };
 #ifdef _WIN32

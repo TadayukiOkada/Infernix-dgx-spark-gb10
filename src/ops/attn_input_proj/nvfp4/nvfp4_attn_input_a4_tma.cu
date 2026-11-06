@@ -5,15 +5,15 @@
 namespace infernix::ops::detail {
 void launch_nvfp4_a4_tma_attention(const Nvfp4A4Operands& p, __nv_bfloat16* query,
                                    __nv_bfloat16* gate, __nv_bfloat16* key, __nv_bfloat16* value,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, pdl::Dependency dependency) {
     const Nvfp4AttentionInputOutput output{query, key, gate, value};
     if (p.scale_layout == Nvfp4ScaleLayout::Tiled128)
         launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
             Nvfp4A4TmaMmaSchedule<128, 3, 2, kNvfp4A4TmaWeightCodeL2_128B, 1, 64>, 5120>>(
-            p, output, LinearIdentityEpilogue{}, stream);
+            p, output, LinearIdentityEpilogue{}, stream, {}, dependency);
     else
         launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
             Nvfp4A4TmaMmaSchedule<256, 3, 1, kNvfp4A4TmaWeightCodeL2_128B>, 5120>>(
-            p, output, LinearIdentityEpilogue{}, stream);
+            p, output, LinearIdentityEpilogue{}, stream, {}, dependency);
 }
 } // namespace infernix::ops::detail
