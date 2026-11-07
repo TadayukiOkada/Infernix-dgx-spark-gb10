@@ -43,7 +43,6 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     __syncthreads();
     float total = 0.0F;
     for (int w = 0; w < blockDim.x / 32; ++w) { total += scratch[w]; }
-    __syncthreads();
     return total;
 }
 
