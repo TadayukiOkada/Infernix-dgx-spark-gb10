@@ -2577,7 +2577,11 @@ public:
                                                     : (kMultiRowDrafts > 0.5 ? std::min(kMultiRowNgramMaxDrafts, 32 / batch - 1) : 0))));
                 const auto tail = std::span<const std::int32_t>(lane.history)
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
-                auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
+                std::uint32_t min_match = options_.ngram_min_match;
+                if (min_match == 12) {
+                    min_match = lane.history.size() > 1024 ? 6U : (lane.history.size() <= 512 ? 4U : 5U);
+                }
+                auto match       = lane.proposer->propose(tail, ngram_limit, min_match);
                 const int bucket = ngram_bucket(match.matched);
                 const float copy_width_cost = kNgramWidthCost;
                 if (!match.tokens.empty() && options_.auto_draft_length) {
@@ -5306,11 +5310,14 @@ private:
                 stats.ngram_drafted_tokens += n;
                 stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
                 // The bucket's acceptance per position.
-                if (ngram_bucket_[b] >= 0) {
+                if (ngram_bucket_[b] >= 0 && n > 0) {
                     double& a = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
-                    for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
-                        const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
-                        a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
+                    if (A == 0) {
+                        a = std::max(0.01, (1.0 - 2.0 * kAcceptanceWeight) * a);
+                    } else {
+                        const auto trials       = std::min<std::uint64_t>(A + 1, n);
+                        const double trial_rate = static_cast<double>(A) / static_cast<double>(trials);
+                        a                       = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * trial_rate;
                     }
                 }
             }
@@ -5574,7 +5581,9 @@ private:
         const double cost      = width_cost();
         const double tile_cost = std::min(cost, 0.10);
         for (std::int32_t k = 1; k <= most; ++k) {
-            reach *= lane.mtp_accept[static_cast<std::size_t>(k - 1)];
+            const double p = lane.mtp_accept[static_cast<std::size_t>(k - 1)];
+            if (p < 0.12 && k > 2) { break; }
+            reach *= p;
             tokens += reach;
             const double round_cost = k <= 3 ? tile_cost * k : tile_cost * 3 + cost * (k - 3);
             const double score      = tokens / (1.0 + round_cost);
@@ -5583,7 +5592,11 @@ private:
                 best       = k;
             }
         }
-        if (round % kProbeInterval == 0) { best = std::min(best + 1, most); }
+        if (best == 0 && lane.mtp_accept[0] >= 0.35) { best = 1; }
+        if (round % kProbeInterval == 0 &&
+            (best == 0 || lane.mtp_accept[static_cast<std::size_t>(best - 1)] >= 0.15)) {
+            best = std::min(best + 1, most);
+        }
         return best;
     }
 
@@ -5673,7 +5686,12 @@ private:
                 best       = k;
             }
         }
-        if (round % kProbeInterval == 0) { best = std::min(best + 1, most); }
+        if (best == 0 && (a.mtp_accept[0] + b.mtp_accept[0]) >= 0.70) { best = 1; }
+        if (round % kProbeInterval == 0 &&
+            (best == 0 || (a.mtp_accept[static_cast<std::size_t>(best - 1)] +
+                           b.mtp_accept[static_cast<std::size_t>(best - 1)]) >= 0.30)) {
+            best = std::min(best + 1, most);
+        }
         return best;
     }
 

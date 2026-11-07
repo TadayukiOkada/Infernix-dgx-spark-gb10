@@ -58,6 +58,13 @@ Q8Launch select_q8_n13952_k2560(std::int32_t tokens) {
     return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 
+Q8Launch select_q8_n13952_k2560_fast(std::int32_t tokens) {
+    if (tokens <= 8) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
+    return select_q8_n13952_k2560(tokens);
+}
+
 void q8_qsa_group(const Tensor& x, const Weight& w, const QsaGroupParts& parts, LinearRoutes routes,
                   WorkspaceArena* workspace, cudaStream_t stream) {
     if (has_route(routes, LinearRoutes::F16Accumulate) && q8_f16acc_admits(w.n, w.k, x.ne[1]) &&
