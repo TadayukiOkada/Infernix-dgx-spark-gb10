@@ -66,5 +66,5 @@ bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
 // against 119.1 us), which the gate at 65 leaves to A16 (100.3 us) anyway.
 const Nvfp4LinearShape kNvfp4N12800K2560{
     12800, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4,
-    launch_nvfp4_a4_pair_r64, 65};
+    launch_nvfp4_a4_pair_r64, 33};
 } // namespace infernix::ops::detail

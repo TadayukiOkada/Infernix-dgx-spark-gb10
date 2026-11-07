@@ -43,6 +43,10 @@ fi
 KV_DTYPES="${KV_DTYPES:-$DEFAULT_KV}"
 MODES="${MODES:-$DEFAULT_MODES}"
 MODELS="${MODELS:-$DEFAULT_MODELS}"
+# Repetitions/warmup per run; raise them (e.g. REPS=5) to shrink the run-to-run noise floor
+# when the delta under test is within ~1%. Defaults preserve the fast gate.
+REPS="${REPS:-2}"
+WARMUP="${WARMUP:-1}"
 mkdir -p "$OUT"
 rm -f "$OUT/status.txt"
 
@@ -72,7 +76,7 @@ run() { # run <model-tag> <weights> <ngram> <residency> <kv> <mode>
         --weights "$weights" --ngram-volume "$ngram" --ngram-residency "$residency" \
         --corpus bench/fixtures/bench_corpus.ids \
         -p 8192 -n 512 -pg '8192,512' \
-        -r 2 --warmup 1 --concurrency 1 \
+        -r "$REPS" --warmup "$WARMUP" --concurrency 1 \
         --kv-dtype "$kv" "${spec[@]}" \
         -o json --output-file "$OUT/m_${name}.json" > "$OUT/m_${name}.log" 2>&1
     echo "$name exit=$? $(date +%T)" >> "$OUT/status.txt"

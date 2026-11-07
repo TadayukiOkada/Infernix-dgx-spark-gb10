@@ -130,7 +130,7 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 // and 25..37% faster from T = 65, where it wins outright (T = 65: 111.52us against 148.10, 94.1%
 // against 70.9%; T = 128: 114.11 against 181.86, 99.6% against 62.5%). select_a4 keeps its
 // T <= 64 rungs so a future gate change has its measured per-width argmin recorded.
-bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 65; }
+bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
 } // namespace
 
 // GB10 2026-11-01 (T2): the 64-row pair tile. The 128-row grid is 128 CTAs (2.67 waves of 48);
@@ -140,7 +140,7 @@ bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 65; }
 // gate stays at 65.
 const Nvfp4LinearShape kNvfp4N16384K2560{
     16384, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4,
-    launch_nvfp4_a4_pair_r64, 65};
+    launch_nvfp4_a4_pair_r64, 33};
 
 void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                      cudaStream_t stream, LinearPolicy policy, LinearRoutes routes,
@@ -148,18 +148,30 @@ void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tens
     const LinearBf16SegmentedOutput<10240, 6144> output{
         {static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)}};
     if ((allows_a4_residual(policy) || has_route(routes, LinearRoutes::Nvfp4A4Pair)) &&
-        x.ne[1] >= 65 && workspace != nullptr) {
+        x.ne[1] >= 33 && workspace != nullptr) {
         auto scope = workspace->scope();
         const auto scratch =
             allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k, kNvfp4A4ResidualTerms, true);
         launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled128, stream);
-        using TmaSched = Nvfp4ScheduleInstance<
-            Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B,
-                                  kNvfp4A4ResidualTerms, 128>,
-            Geometry::kInputRows>;
-        launch_nvfp4_a4_tma_mma<TmaSched>(
-            nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128), output,
-            LinearIdentityEpilogue{}, stream);
+        const auto operands =
+            nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled128);
+        if (x.ne[1] <= 128) {
+            using TmaSched64 = Nvfp4ScheduleInstance<
+                Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B,
+                                      kNvfp4A4ResidualTerms, 64>,
+                Geometry::kInputRows>;
+            launch_nvfp4_a4_tma_mma<TmaSched64>(operands, output, LinearIdentityEpilogue{}, stream,
+                                                Nvfp4IdentityRows{},
+                                                pdl::Dependency::Programmatic);
+        } else {
+            using TmaSched128 = Nvfp4ScheduleInstance<
+                Nvfp4A4TmaMmaSchedule<128, 3, 1, kNvfp4A4TmaWeightCodeL2_128B,
+                                      kNvfp4A4ResidualTerms, 128>,
+                Geometry::kInputRows>;
+            launch_nvfp4_a4_tma_mma<TmaSched128>(operands, output, LinearIdentityEpilogue{}, stream,
+                                                 Nvfp4IdentityRows{},
+                                                 pdl::Dependency::Programmatic);
+        }
         return;
     }
     launch_routes(nvfp4_a16_operands(x, weight), output, stream);

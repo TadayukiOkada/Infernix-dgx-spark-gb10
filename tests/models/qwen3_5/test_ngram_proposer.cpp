@@ -80,10 +80,12 @@ int main() {
         std::cout << "round boundary checks=" << boundary_checks << '\n';
 
         NgramProposer special(256, 1024);
-        special.set_boundaries({120});
+        special.set_boundaries({120, 120});
         special.ingest(source);
         require(special.propose(std::span<const int>(source).first(18), 15, 12).tokens.size() == 2,
                 "stop before control token");
+        require(special.propose(std::span<const int>(source).first(22), 15, 4).tokens.empty(),
+                "history tail containing a boundary token must not propose across it");
 
         // Pressure raw and derived sources with both general and patterned token IDs.
         for (const unsigned shift : {0U, 9U}) {

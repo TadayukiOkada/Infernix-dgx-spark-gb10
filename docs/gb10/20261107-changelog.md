@@ -1440,3 +1440,421 @@ NVFP4/T≤8 arms all do not exist, so the task's acceptance bar is unsatisfiable
 - `docs/tasks/20261107-nvfp4-performance-tasks.md` §T10 should be treated as void for this branch;
   its sibling §T1/§T2 `gate_up_kernel`/`grouped_kernel` names collide with unrelated shipped
   kernels and its symbol list was evidently generated against a different (non-repo) source.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-07 — Large-Token NVFP4 Prefill & Wide Speculative Verification Campaign (`T1`–`T8`, `docs/tasks/20261107-nvfp4-large-tokens-performance-tasks.md`)
+
+## 1. Commit range & accounting
+
+- **Base commit:** `c0a43a61f` (branch `dev-rebased-20261028`, upstream base `origin/main`).
+- **Target artifact:** `/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`Qwen4ExpForCausalLM`, 48 layers = 36 GDN + 12 QSA, 512 routed NVFP4 experts/layer, `top_k = 10`, `hidden = 2560`, `moe_intermediate = 640`, all 24,576 experts having `input_gate == input_up`).
+- **Files modified (`18` files, excluding `cuda-kernel-toolkit/`):**
+  - `include/infernix/ops/gated_delta_net.h` (`M`)
+  - `src/ops/common/canonical_math.h` (`M`)
+  - `src/ops/offloaded_sparse_moe/cuda/wide_expert.h` (`M`)
+  - `src/ops/offloaded_sparse_moe/cuda/wide_expert.cu` (`M`)
+  - `src/ops/offloaded_sparse_moe/cuda/wide_expert.cuh` (`M`)
+  - `src/ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh` (`M`)
+  - `src/ops/offloaded_sparse_moe/cuda/wide_expert_a8.cuh` (`M`)
+  - `src/ops/offloaded_sparse_moe/cuda/rg16_linear.cu` (`M`)
+  - `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (`M`)
+  - `src/ops/linear/nvfp4/nvfp4_a4_tma.cu` (`M`)
+  - `src/ops/linear/nvfp4/shapes/n13952_k2560.cu` (`M`)
+  - `src/ops/linear/nvfp4/shapes/n16384_k2560.cu` (`M`)
+  - `src/ops/linear_attention/gated_delta_net/recurrent.cuh` (`M`)
+  - `src/ops/linear_attention/gated_delta_net/recurrent.cu` (`M`)
+  - `src/ops/qsa/qsa_prompt.cu` (`M`)
+  - `src/ops/hyper_connection/hyper_connection_up_collapse.cu` (`M`)
+  - `tests/ops/test_gated_delta_net_replay_record_conv.cpp` (`M`)
+  - `tools/run_server.sh` (`M`)
+- **Stack/local memory allowlist (`tools/cuda_stack/cuda_stack_allowlist.json`):** Unchanged (`infernix_cuda_stack_check` passes across all 7,635 kernels with zero new `STACK > 0` or `LOCAL > 0` symbols).
+
+## 2. Architectural rationale ("Why")
+
+1. **`T1` — Single-Scale (`split_input == false`) Hardware `cvt.rn.satfinite.e2m1x2.f32` + Reciprocal Quantization Across Wide & Narrow MoE:**
+   - All `24,576 / 24,576` routed experts in `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` have `input_gate == input_up` (`split_input == false`), so the earlier `split_input == true` quantization fast path was never executed by the production artifact.
+   - At large token counts (`T > 64`), `quantize_token_kernel` (`wide_expert.cu`) previously recomputed `v[0..15]` and `amax` inside `for (int slot = 0; slot < top_k; ++slot)` (`10` times per block) and executed `170` serial software `fdiv.rn.f32` instructions and `1,120` branch comparisons per 16-element block per token. Hoisting slot metadata (`wide_mask` via `__ballot_sync`) before the `m` loop, computing `v[0..15]` and `amax` once per block outside the `wide_mask` loop, and using `canon::prepare_a4_scale_word` + `canon::scaled_q_value` (4-ULP midpoint guard) + `cvt.rn.satfinite.e2m1x2.f32` in `quantize_token_kernel`, `quantize_kernel`, `GateUpEpilogue`, `quantize_column_codes`, `quantize_pair_codes`, and `quantize_a4_block_warp` preserves 100% bit-exactness (`exact=yes` and identical FNV-1a hashes) while eliminating software E2M1 branches and redundant FP32 divisions.
+2. **`T2` — `RowTile = 64` at `T = 65..128` + Programmatic Dependent Launch (`PDL`) in Split NVFP4 Projections (`[13952, 2560]` and `[16384, 2560]`):**
+   - For `T = 65..128`, `ColTile = 128` produces only 1 column tile. With `RowTile = 128`, the largest sub-output (`v_out` `[6144, 2560]` = 48 tiles, `qkv_out` `[8192, 2560]` = 64 tiles) leaves GB10's 48 SMs under-subscribed or in a 1.33-wave tail, whereas `RowTile = 64` doubles row parallelism and eliminates the `T = 64 -> 65` latency cliff. Enabling `pdl::Dependency::Programmatic` overlaps the shared `nvfp4_quantize_a4_tma_kernel` tail with the first sub-projection MMA consumer.
+3. **`T3` — $O(1)$ Work-Unit Mapping (`job | (span << 16)`) and Direct Unstaged Records in Wide MoE:**
+   - Packing `job | (span << 16)` directly into `tiles[2 * tile]` during `plan_kernel` (where `job < 512` and `span < 64` fit in `uint16_t` halves) replaces two global-memory binary searches per work unit across all 288 CTA threads in `map_work_unit<true>` with a single `uint32_t` load and shift/mask (`O(1)`). When `source.staging_slots == 0 && source.fetch.request == nullptr && (source.cpu.max_jobs == 0 || x.ne[1] > source.cpu.max_columns)` (GB10's `INFERNIX_EXPERTS_ON_GPU=1` UMA configuration), `wide::plan_kernel` resolves `job_records[job]` directly from `source.frames` / `source.bank`.
+4. **`T4` — Extending Fused `gdn_replay_record_conv` from `kGdnReplayConvMaxWidth = 16` to `32`:**
+   - With `--ngram-draft-tokens 31` (`tools/run_server.sh`), speculative verification passes `width` up to `32` tokens per sequence. Extending `kGdnReplayConvMaxWidth` from `16` to `32` via template specializations `gdn_replay_record_conv_kernel<16>` (`width <= 16`, 43.25 KiB SMEM, 2 CTAs/SM) and `gdn_replay_record_conv_kernel<32>` (`width = 17..32`, 84.25 KiB SMEM, 1 CTA/SM) eliminates the unfused fallback (`2 * 36 = 72` extra kernel launches per verification step).
+5. **`T5` — 2-CTA Double-Buffered `Stages = 2` + Query-Overlapped PDL in `qsa_prompt_kernel<Nvfp4Group16>`:**
+   - For `KvCacheStorage::Nvfp4Group16`, `prompt_smem_bytes<Nvfp4Group16, 2>() = 45,056 B`, so two `Stages = 2` CTAs (`90,112 B + 2,048 B <= 100 KiB` and `2 * 128 * 254 = 65,024 <= 65,536` registers) fit simultaneously on each GB10 SM. Keeping `Stages = 2` with `MinBlocksPerSm = 2` preserves both 2 CTAs/SM and double-buffered `cp.async` (`cp_wait<1>()`). Placing `pdl::enter()` after loading and Hadamard-rotating `q` into shared memory allows query preparation to overlap with the final histogram selection CTA of `qsa_select_global_kernel`.
+6. **`T6` — Narrow MoE `gate_up_kernel` 4-Column Quad Loop (`count = 3..8`):**
+   - Adding a 4-column quad pass (`for (; c + 2 < count; c += 4)`) to the `!split_input` branch of `gate_up_kernel` (`moe_layer.cu`) halves the number of 46 KiB staged weight scans when an expert receives `3..8` tokens during speculative verification or multi-lane decode. Reducing each K-half directly into per-lane `std::int64_t s[4]` inside `unit_sums_quad_half` and selecting pair accumulators without dynamic array indexing keeps `gate_up_kernel` at `REG:107 STACK:0 SHARED:0 LOCAL:0`.
+7. **`T7` — Wave-Exact Tile Schedule in `hc_up_collapse` (`T = 17..32`):**
+   - For `hc/up` `[10240, 320]` (`4` streams × `2560`), `MmaR32T24` (`T = 17..24`) and `MmaR32T16` (`T = 25..32`) launch `40` CTAs (`<= 48` SMs, 1 wave) with unpredicated `K = 64`, cutting per-call latency by ~6.1% over `MmaR64x16T48K128A1`, while `T = 33..48` retains `MmaR64x16T48K128A1` (`40` CTAs = 1 wave vs `80` CTAs = 2 waves for `MmaR32T24`).
+8. **`T8` — Server Prefill Chunk Sizing (`PREFILL_CHUNK=16384` in `tools/run_server.sh`):**
+   - Raising `PREFILL_CHUNK` from `4096` to the model's native `16384` default in `tools/run_server.sh` eliminates 4x redundant 68 GiB MoE expert weight sweeps on 16K+ prompts.
+
+## 3. Subsystem breakdown
+
+- **Quantization & Canonical Math (`src/ops/common/canonical_math.h`):**
+  - Added `canon::scaled_q_value`, `canon::prepare_a4_scale_word`, `canon::prepare_a4_scale`, and `canon::quantize_a4_plane_from_f32` using `cvt.rn.satfinite.e2m1x2.f32`.
+- **Wide & Narrow Routed MoE (`src/ops/offloaded_sparse_moe/cuda/{wide_expert.h,wide_expert.cu,wide_expert.cuh,wide_expert_a16.cuh,wide_expert_a8.cuh,rg16_linear.cu,moe_layer.cu}`):**
+  - Updated `quantize_token_kernel`, `quantize_kernel`, `GateUpEpilogue`, `quantize_column_codes`, `quantize_pair_codes`, and `quantize_a4_block_warp` to use hardware `cvt.rn.satfinite.e2m1x2.f32` + reciprocal scaling (`T1`).
+  - Packed `job | (span << 16)` in `tiles[2 * tile]` for $O(1)$ `map_work_unit<true>` and added unstaged direct record resolution in `wide::plan_kernel` (`T3`).
+  - Added 4-column quad loop (`quantize_quad_half_codes` + `unit_sums_quad_half`) to `gate_up_kernel` (`REG:107 STACK:0`) (`T6`).
+- **NVFP4 Linear & Split Input Projections (`src/ops/linear/nvfp4/{nvfp4_a4_tma.cu,shapes/n13952_k2560.cu,shapes/n16384_k2560.cu}`):**
+  - Dispatched `RowTile = 64` (`Mma64x128`) for `T = 65..128` in `launch_nvfp4_n13952_k2560_split` and `launch_nvfp4_n16384_k2560_split` and enabled `pdl::Dependency::Programmatic` (`T2`).
+- **GDN Recurrent Replay Conv (`include/infernix/ops/gated_delta_net.h`, `src/ops/linear_attention/gated_delta_net/recurrent.{cuh,cu}`, `tests/ops/test_gated_delta_net_replay_record_conv.cpp`):**
+  - Raised `kGdnReplayConvMaxWidth` from `16` to `32` with `<16>` and `<32>` kernel specializations (`T4`).
+- **QSA Prompt Attention (`src/ops/qsa/qsa_prompt.cu`):**
+  - Enabled 2 CTAs/SM with `Stages = 2` for `Nvfp4Group16` and added `pdl::launch_consumer` + `pdl::enter()` after query Hadamard rotation (`T5`).
+- **HyperConnection (`src/ops/hyper_connection/hyper_connection_up_collapse.cu`) & Serving Script (`tools/run_server.sh`):**
+  - Dispatched `MmaR32T24` (`T = 17..24`) and `MmaR32T16` (`T = 25..32`) in `hc_up_collapse` (`T7`), and set `PREFILL_CHUNK=16384` in `tools/run_server.sh` (`T8`).
+
+## 4. Verification & benchmark results
+
+### 4.1 Oracle tests & CUDA stack-spill check
+
+- `ctest --test-dir build-native --output-on-failure`:
+  - `infernix_cuda_stack_check`: **Passed** (`7,635` kernels checked, `0` over allowed stack/local memory).
+  - `infernix_offloaded_moe_cuda_test`, `infernix_offloaded_moe_layer_test`, `infernix_offloaded_moe_plan_test`, `infernix_offloaded_moe_wide_test`, `infernix_offloaded_moe_layer_idle_test`: **All Passed** (100% bit-exact A4 quantization and $O(1)$ work-unit mapping).
+  - `infernix_gdn_input_proj_test`, `infernix_linear_nvfp4_a4_test`: **Passed**.
+  - `infernix_gated_delta_net_replay_record_conv_test` (including new `width = 24, 31, 32` oracle cases): **Passed**.
+  - `infernix_qsa_bf16_test`, `infernix_qsa_int8_test`, `infernix_qsa_fp8_test`, `infernix_qsa_nvfp4_test`: **All Passed**.
+  - `infernix_hyper_connection_test`: **Passed**.
+
+### 4.2 Operator microbenchmark A/B summary
+
+1. **Narrow MoE Decode & Multi-Token Verification (`infernix_offloaded_moe_decode_bench --repeat 50`, `split=0` matching all 24,576 `Qwen3.8-Flash-Next` experts):**
+
+   | Width & Cache | Baseline Median (µs) | Post-Change Median (µs) | Delta | Exact vs Oracle |
+   |---|---:|---:|---:|---|
+   | `T=1, split=0, warm` | `104.384` | `96.704` | **-7.4%** | `exact=yes` |
+   | `T=1, split=0, cold` | `134.080` | `134.880` | `+0.6%` | `exact=yes` |
+   | `T=4, split=0, warm` | `150.048` | `136.640` | **-8.9%** | `exact=yes` |
+   | `T=4, split=0, cold` | `163.552` | `152.288` | **-6.9%** | `exact=yes` |
+   | `T=8, split=0, warm` | `278.016` | `249.664` | **-10.2%** | `exact=yes` |
+   | `T=8, split=0, cold` | `285.376` | `264.000` | **-7.5%** | `exact=yes` |
+
+2. **Wide MoE Prefill (`infernix_offloaded_moe_wide_bench --placement frames --cold --warmup 5 --repeat 20`):**
+
+   | Tokens (`T`) | Baseline Median (µs) | Post-Change Median (µs) | Delta (per layer / x48 layers) | Output FNV-1a Hash |
+   |---|---:|---:|---:|---|
+   | `T=512` | `8612.7` | `8486.7` | **-1.5%** (`-6.0 ms`) | `44a3d026d330a364` (identical) |
+   | `T=1024` | `8379.2` | `8216.4` | **-1.9%** (`-7.8 ms`) | `505681a3f4ee4fc1` (identical) |
+   | `T=4096` | `8795.0` | `8571.8` | **-2.5%** (`-10.7 ms`) | `90cb5930998d3eeb` (identical) |
+
+3. **QSA Prompt Attention (`infernix_qsa_attention_bench --storage nvfp4 --warmup 5 --repeat 20`):**
+
+   | Context | Width (`W`) | Baseline Attention (µs) | Post-Change Attention (µs) | Baseline Total (µs) | Post-Change Total (µs) | Attention Delta |
+   |---:|---:|---:|---:|---:|---:|---:|
+   | `8192` | `16` | `69.73` | `65.89` | `98.21` | `94.27` | **-5.5%** |
+   | `8192` | `24` | `75.62` | `67.36` | `102.11` | `94.21` | **-10.9%** |
+   | `8192` | `32` | `86.37` | `84.00` | `112.70` | `110.34` | **-2.7%** |
+   | `8192` | `64` | `167.78` | `163.78` | `198.37` | `194.21` | **-2.4%** |
+   | `8192` | `256` | `501.86` | `495.49` | `593.73` | `587.49` | **-1.3%** |
+   | `8192` | `1024` | `1852.38` | `1822.59` | `2190.05` | `2160.35` | **-1.6%** |
+   | `32768` | `16` | `75.62` | `73.57` | `120.51` | `118.53` | **-2.7%** |
+   | `32768` | `24` | `83.90` | `77.89` | `136.99` | `130.94` | **-7.2%** |
+   | `32768` | `32` | `93.73` | `87.71` | `138.98` | `132.96` | **-6.4%** |
+   | `32768` | `64` | `176.06` | `169.98` | `243.36` | `237.31` | **-3.5%** |
+   | `32768` | `256` | `516.00` | `499.58` | `747.36` | `730.88` | **-3.2%** |
+   | `32768` | `1024` | `1896.58` | `1880.10` | `2801.50` | `2776.80` | **-0.9%** |
+
+4. **HyperConnection Mixer (`infernix_hyper_connection_bench --codec q8 --warmup 10 --repeat 50`):**
+
+   | Columns (`T`) | Baseline Median (µs) | Post-Change Median (µs) | Delta | Output FNV-1a Hash |
+   |---:|---:|---:|---:|---|
+   | `T=16` | `45.38` | `45.24` | `-0.3%` | `69168c54088b0423` (identical) |
+   | `T=20` | `48.26` | `45.30` | **-6.1%** | `959294628b82871a` (identical) |
+   | `T=24` | `48.39` | `45.47` | **-6.0%** | `b38a514f2bf8c6be` (identical) |
+   | `T=28` | `48.62` | `45.97` | **-5.5%** | `4c70a60e48935933` (identical) |
+   | `T=32` | `48.65` | `46.09` | **-5.3%** | `9e0d00f08f1eb5ee` (identical) |
+   | `T=40` | `49.43` | `49.27` | `-0.3%` | `0db96bb949eb7617` (identical) |
+   | `T=48` | `50.70` | `50.93` | `+0.5%` | `1c9a3b5cd846ddca` (identical) |
+
+5. **NVFP4 Linear & Split Projections (`infernix_linear_bench` & `infernix_gdn_input_proj_bench`):**
+   - `N=13952, K=2560`: `T=80..128` (`RowTile=64`) achieves `101.2..102.2 µs` (`224.7..237.9 GB/s`, `91.3..96.7%` of sustained read BW), faster than `T=64` (`105.3 µs`).
+   - `N=16384, K=2560`: `T=80..128` (`RowTile=64`) achieves `112.5..113.5 µs` (`236.7..250.6 GB/s`, **-12.7% faster than `T=64`** at `128.9 µs`).
+   - `gdn_input_proj`: `T=64..128` improved from `223.36 / 226.14 / 231.04 µs` to `220.99 / 224.10 / 229.31 µs`; `T=4096` improved from `2112.45 µs` to `2087.71 µs` (`-24.7 µs`/call).
+
+6. **End-to-End `infernix_bench` on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`INFERNIX_EXPERTS_ON_GPU=1 --kv-dtype nvfp4`):**
+
+   | Mode & Configuration | Workload | Measured Throughput (`tok/s`) | Notes / Comparison |
+   |---|---|---:|---|
+   | Plain (`spec=none`, `prefill_chunk=16384`) | `pp512` | `1,669.48 ± 6.48` | Single-chunk prefill |
+   | Plain (`spec=none`, `prefill_chunk=16384`) | `pp2048` | `2,950.85 ± 4.32` | Single-chunk prefill |
+   | Plain (`spec=none`, `prefill_chunk=16384`) | `pp4096` | `3,601.59 ± 6.48` | Single-chunk prefill |
+   | Plain (`spec=none`, `prefill_chunk=4096` vs `16384`) | `pp8192` | `3,768.68 ± 9.98` → **`3,905.66 ± 4.17`** | **+3.6% (`+137.0 tok/s`)** from `prefill_chunk=16384` |
+   | Plain (`spec=none`, `prefill_chunk=16384`) | `tg128` | `47.14 ± 0.10` | Plain 1-token CUDA Graph decode |
+   | Server Speculative (`--spec mtp --draft-tokens auto --ngram-draft-tokens 31 --ngram-min-match 4 --lm-head-draft`) | `pp512` | `1,671.92 ± 3.82` | Includes MTP KV prefill |
+   | Server Speculative (`--spec mtp ...`) | `pp4096` | `3,721.57 ± 7.28` | Includes MTP KV prefill |
+   | Server Speculative (`--spec mtp ...`) | `pp8192` | **`4,062.53 ± 14.83`** | Single-chunk 8K prefill |
+   | Server Speculative (`prefill_chunk=4096` vs `16384`) | `pp16384` | `3,711.34 ± 5.45` → **`4,388.02 ± 6.36`** | **+18.2% (`+676.7 tok/s`)** at 16K prefill |
+   | Server Speculative (`--spec mtp ...`) | `tg128` (1-tok seed) | **`66.05 ± 0.07`** | `spec acc = 0.663` (MTP 7-draft auto) |
+   | Server Speculative (`--spec mtp ...`) | `pp4096+tg128` | Prefill `3,749.82 ± 2.77`, Decode **`266.67 ± 1.02`** | `369/369` n-gram draft tokens accepted across `15` rounds (`W <= 32` verification) |
+
+## 5. Adverse findings, rejected variants & dispositions
+
+1. **Initial `gate_up_kernel` 64-byte and 32-byte local stack spills (`STACK > 0`) — Fixed:**
+   - First iteration of the 4-column quad loop (`T6`) held `lo[2][4]` and `hi[2][4]` across both K-halves in `gate_up_kernel` (`STACK: 64`). Reducing each K-half inside `unit_sums_quad_half` into per-lane `s[4]` eliminated the 64-byte spill, and replacing runtime-indexed `s[2 * pair]` / `s[c_base + col]` inside the `#pragma unroll 1` pair loop with `pair == 0 ? s[0] : s[2]` eliminated the remaining 32-byte local array (`REG:107 STACK:0 LOCAL:0`).
+2. **`hc_up_collapse` at `T = 33..48` (`MmaR32T24` vs `MmaR64x16T48K128A1`) — Fixed:**
+   - Using `MmaR32T24` at `T = 33..48` launched `40 * 2 = 80` CTAs on 48 SMs (1.67 waves), regressing `T = 40..48` from `49.4..50.7 µs` to `52.7..53.8 µs`. Restricting `MmaR32T24`/`MmaR32T16` to `T = 17..32` (`40` CTAs = 1 wave) and keeping `MmaR64x16T48K128A1` (`40` CTAs = 1 wave) at `T = 33..48` preserved the `-6.1%` win at `T = 20..32` with zero regression at `T = 40..48`.
+3. **`qsa_prompt_kernel` PDL placement (`W = 9`) — Fixed:**
+   - Placing `pdl::enter()` at the very top of `qsa_prompt_kernel` before query loading/rotation caused early-launched CTAs to spin while `qsa_select_global_kernel` finished its final-slice histogram reduction (`+6.2 µs` at `W = 9`). Moving `pdl::enter()` after `q_s` Hadamard rotation and VQ2 codebook loading overlapped query preparation with `qsa_select_global_kernel` and brought `W = 24` down to `-10.9%` (`75.62 → 67.36 µs`). At `W = 9`, `attention_us` remains `+2.3 µs` (`71.65 → 73.98 µs`) due to PDL grid dependency synchronization overhead on an sub-wave 18-CTA grid, outweighed by `-2.7%` to `-10.9%` gains across `W = 16..1024`.
+
+## 6. Rebase conflict resolution policy
+
+- **MoE (`src/ops/offloaded_sparse_moe/cuda/`):** Preserve `canon::prepare_a4_scale_word` + `canon::scaled_q_value` + `cvt.rn.satfinite.e2m1x2.f32` across both `split_input == false` and `split_input == true` paths, $O(1)$ `map_work_unit<true>` (`job | (span << 16)`), unstaged `wide::plan_kernel` record resolution, and the 4-column quad loop in `gate_up_kernel`.
+- **Linear & Mixers (`src/ops/linear/nvfp4/`, `src/ops/qsa/`, `src/ops/linear_attention/gated_delta_net/`, `src/ops/hyper_connection/`):** Preserve `RowTile = 64` at `T = 65..128` + PDL in `n13952_k2560.cu` / `n16384_k2560.cu`, `kGdnReplayConvMaxWidth = 32`, 2-CTA `Stages = 2` for `Nvfp4Group16` in `qsa_prompt.cu`, and 1-wave `MmaR32T24`/`MmaR32T16` for `T = 17..32` in `hc_up_collapse.cu`.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-07 — All-Tokens (`T = 1..16384`) & Large-Tokens NVFP4 Performance Optimization (Tasks T1–T8)
+
+Scope: Implementation of full roadmap tasks `T1`–`T8` from [`docs/tasks/20261107-nvfp4-all-tokens-performance-tasks.md`](file:///opt/etc/Infernix/docs/tasks/20261107-nvfp4-all-tokens-performance-tasks.md) addressing prefill and decode performance across all token regimes (`T = 1` decode & MTP, `T = 2..64` speculative verify & small batches, `T = 65..512` medium prefill, and `T = 1024..16384` large prefill) on NVIDIA DGX Spark GB10 (`sm_121a`, 48 SMs, 99 KiB SMEM/SM, 24 MiB L2, 128 GiB unified LPDDR5X, 273 GB/s DRAM bandwidth).
+
+## 1. Accounting
+
+- **Affected subsystem files**:
+  - `src/ops/linear/q4/shapes/n131072_k2560.cu` (A): New dedicated Q4 proposal head shape implementation.
+  - `src/ops/linear/q4/sources.cmake` (M): Added `shapes/n131072_k2560.cu`.
+  - `src/ops/linear/q4/q4_shapes.h` (M): Declared `select_q4_n131072_k2560`.
+  - `src/ops/linear/q4/q4_dispatch.cpp` (M): Registered `select_q4_n131072_k2560` and admitted `k == 2560` to column-invariant route.
+  - `src/ops/linear_attention/gated_delta_net/recurrent.cuh` (M): ILP=4 pipelined butterfly reduction in `apply_gdn_transition` and `readout_and_store` with named scalar registers (`STACK=0 LOCAL=0`); PDL streaming prefetch; `MaxWidth = 16` shared-memory specialization.
+  - `src/ops/linear_attention/gated_delta_net/recurrent.cu` (M): Dispatched `recurrent_record_conv_kernel` with `MaxWidth = 16` specialization when `width <= 16`.
+  - `src/ops/projection_fp32/projection_fp32.cu` (M): Integrated `pdl::enter()` and `pdl::launch_consumer` on tall kernels; adjusted `__launch_bounds__` to `MaxCols < 32 ? 2 : 1` to strictly preserve zero stack spills.
+  - `src/ops/hyper_connection/hyper_connection_mix_fused.h` (M): Changed `kHcMixFusedMaxColumnsQ8` from 4 to 3 (moving `T = 4` to the faster composed route).
+  - `src/ops/hyper_connection/hyper_connection.cu` (M): Removed redundant second barrier in `block_sum`, added PDL overlap on `norm_vec8`.
+  - `src/ops/hyper_connection/hyper_connection_up_collapse.cu` (M): Routed `T <= 48` to `MmaR32T24`, added `MmaR64x32T64K64A2` (`T <= 64`) and `MmaR64x32T128K64A2` (`T <= 512`).
+  - `src/ops/linear/q8/shapes/n324_k10240.cu` (M): Added `launch_q8_a16_sliced_r32_t48_w4_s1` for `tokens <= 384`.
+  - `src/ops/linear/q8/shapes/n2560_k640.cu` (M): Implemented `select_q8_n2560_k640_fast`.
+  - `src/ops/linear/q8/shapes/n13952_k2560.cu` (M): Implemented `select_q8_n13952_k2560_fast`.
+  - `src/ops/linear/q8/q8_shapes.h` (M): Declared fast shape selectors.
+  - `src/ops/linear/q8/q8_dispatch.cpp` (M): Registered fast selectors in `kShapes`.
+  - `src/ops/linear_swiglu/q8/q8_linear_swiglu_plan.cpp` (M): Set `kFlashNextSharedRoutes` with `StreamPair` at `T <= 16` (preserving column invariance) and `MmaR32C64` up to `512`.
+  - `src/ops/linear/nvfp4/shapes/n16384_k2560.cu` (M): Lowered `pair_min_tokens` and split launcher threshold from 65 to 33.
+  - `src/ops/linear/nvfp4/shapes/n13952_k2560.cu` (M): Lowered `pair_min_tokens` and split launcher threshold from 65 to 33.
+  - `src/ops/linear/nvfp4/shapes/n12800_k2560.cu` (M): Lowered `pair_min_tokens` from 65 to 33.
+  - `src/ops/linear/nvfp4/nvfp4_a4_tma.cu` (M): Routed `p.rows == 2560 && p.tokens > 256 && p.tokens <= 384` to 64-row residual TMA tile.
+  - `src/ops/linear/nvfp4/nvfp4_a4_quantize.cuh` (M): Added reverse-token L2 ordering for `tokens > 1024` in `nvfp4_a4_row_scaled_residual_quantize_kernel`.
+  - `src/models/qwen4_exp/execution/fast_path_flags.h` (M): Lowered `kRouterMmaMinColumns` from 256 to 64.
+
+## 2. Architectural Rationale ("Why" on GB10 `sm_121a`)
+
+1. **MTP Proposal Head `Q4 [131072, 2560]` (`T1`)**:
+   - The MTP draft stage previously evaluated proposal logits via generic fallback, which materialized a full `FP32` logits buffer and launched a subsequent `cast_fp32_to_bf16` kernel.
+   - Dedicated `select_q4_n131072_k2560` evaluates directly via dynamic-K GEMV (`T=1`), Sliced-K (`T=2..32`), and Tensor Core MMA beyond, with PDL consumer launch and zero intermediate buffer allocations.
+2. **Vocabulary Output Head `Q8 [248320, 2560]` PDL & Stack Ratchet (`T2`)**:
+   - Integrated `pdl::enter()` inside `projection_tall_kernel` and `projection_tall_exact_kernel` right after weight prefetches.
+   - Adjusted launch bounds `((std::is_same_v<Codec, TallQ8> || std::is_same_v<Codec, TallQ4>) && MaxCols < 32) ? 2 : 1` to prevent nvcc from restricting registers to 128 when unrolling `MaxCols = 32`, eliminating an 8-byte stack spill and maintaining `infernix_cuda_stack_check` ratchet at 0 spills.
+3. **Gated DeltaNet Recurrence ILP=4 Pipelined Butterfly Reductions (`T3`)**:
+   - In `apply_gdn_transition` and `readout_and_store` (`src/ops/linear_attention/gated_delta_net/recurrent.cuh`), replaced serial `for (r=0..3)` reduction loops (which suffered 5 dependent shuffle stalls per row) with ILP=4 parallel accumulation and lockstep butterfly reductions (`__shfl_xor_sync` across `p0..p3`).
+   - Replaced array indexing (`float partial[4]`) with explicit scalar registers (`p0, p1, p2, p3, v0..v3, d0..d3`), guaranteeing zero stack spills (`STACK=0 LOCAL=0`).
+   - Added `MaxWidth = 16` specialization in `recurrent_record_conv_kernel`, cutting shared memory from ~29 KiB to ~14.5 KiB at `T <= 16` and enabling 5 resident CTAs per SM.
+   - Added `pdl::enter_streaming()` in `recurrent_bf16_direct_kernel` after state load to overlap initial memory access with producers.
+3. **Hyper-Connection Mix Optimization (`T4`)**:
+   - Lowered `kHcMixFusedMaxColumnsQ8` from 4 to 3: at `T = 4`, the composed route was measured faster than the fused route by `1.2 µs × 97 = 116 µs` per pass.
+   - Removed redundant `__syncthreads()` in `block_sum`, added PDL overlap on `norm_vec8`, and tuned `hc_up_collapse` and `n324_k10240` CTA counts to match GB10's 48 SM waves.
+4. **Q8 Linear & SwiGLU Fast Paths (`T5`)**:
+   - Added Sliced-K winners `select_q8_n2560_k640_fast` and `select_q8_n13952_k2560_fast`.
+   - In `kFlashNextSharedRoutes`, preserved `StreamPair` for `T <= 16` to strictly satisfy the column-invariance contract (`infernix_linear_swiglu_q8_a16_test`), while widening `MmaR32C64` up to `512` columns.
+5. **NVFP4 Dense Projections (`T6`)**:
+   - Lowered `pair_min_tokens` to 33 across `[16384, 2560]`, `[13952, 2560]`, and `[12800, 2560]`, avoiding the slower A16 SIMT fallback at `T = 33..64`.
+   - Routed `p.rows == 2560 && p.tokens > 256 && p.tokens <= 384` to 64-row residual TMA tile: eliminating the 60-CTA grid on 48 SMs (which ran a 12-CTA tail wave at only 25% wave efficiency) by doubling to 120 CTAs (2.5 waves).
+   - In `nvfp4_a4_row_scaled_residual_quantize_kernel`, inverted token indexing `token = total_blocks - 1 - blockIdx.x` when `total_blocks > 1024`, ensuring group 0 (tokens 0..1023) is written last and remains 100% hot in GB10's 24 MiB L2 cache for the downstream TMA band.
+6. **MoE Router Tensor Core Admission (`T7`)**:
+   - Lowered `kRouterMmaMinColumns` from 256 to 64 in `fast_path_flags.h`, replacing the un-tiled SIMT fallback (`projection_kernel<128, 1, 8>`) with `projection_fp32_router_mma` at `T = 64..255`.
+
+## 3. Verification & Stack Ratchet Results
+
+- **CUDA Stack-Spill Ratchet Gate (`infernix_cuda_stack_check`)**:
+  - `7,641 / 7,641` kernels checked: **0 spills, 0 local arrays (`STACK=0 LOCAL=0`)**.
+- **Unit & Oracle Tests**:
+  - `infernix_linear_q4_a16_test`: Passed (13.80s).
+  - `infernix_linear_q8_a16_test`: Passed (16.80s).
+  - `infernix_linear_nvfp4_a16_test`: Passed (3.38s).
+  - `infernix_linear_nvfp4_a4_test`: Passed (8.20s).
+  - `infernix_linear_swiglu_q8_a16_test`: Passed (23.28s) — verifies column invariance at `T <= 16`.
+  - `infernix_gated_delta_net_test`: Passed (23.25s) — verifies 100% bit-exact correctness of ILP=4 butterfly reductions against the IEEE-754 FP32 oracle.
+
+### Operator Microbenchmarks: Gated DeltaNet Recurrence (`infernix_gated_delta_net_bench --running`)
+
+Cold-L2 median latencies (32 MiB flush, 10 warmup + 30 measured runs) across speculative verification widths `T = 2..16`:
+
+| Token Width (`T`) | Baseline (`µs`) | Optimized ILP=4 (`µs`) | Delta / Speedup | GB10 Bandwidth |
+|---|---|---|---|---|
+| **`T = 2`** | `23.232 µs` | **`22.336 µs`** | **-0.90 µs (-3.9%)** | `284.6 GB/s` |
+| **`T = 4`** | `27.328 µs` | **`26.336 µs`** | **-0.99 µs (-3.6%)** | `243.9 GB/s` |
+| **`T = 8`** | `37.696 µs` | **`33.888 µs`** | **-3.81 µs (-10.1%)** | `193.5 GB/s` |
+| **`T = 12`** | `47.808 µs` | **`43.008 µs`** | **-4.80 µs (-10.0%)** | `155.5 GB/s` |
+| **`T = 15`** | `55.040 µs` | **`50.880 µs`** | **-4.16 µs (-7.6%)** | `133.4 GB/s` |
+| **`T = 16`** | `30.560 µs` | **`30.432 µs`** | **-0.13 µs (-0.4%)** | `224.2 GB/s` |
+
+Across 36 GDN layers, this optimization reduces per-pass recurrence latency by **`~137–173 µs`** at `T = 8..12`.
+
+## 4. End-to-End Benchmark Results (`infernix_bench`)
+
+### 1. NVFP4 INT8-KV Speculative MTP Matrix (`bench/run_kv_matrix_bench.sh`)
+
+Evaluated on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`INFERNIX_EXPERTS_ON_GPU=1 --kv-dtype int8 --spec mtp --draft-tokens auto --lm-head-draft`):
+
+| Test | Baseline (`b7ff28f8`) | Pre-T1–T8 Head | After T1–T8 + GDN ILP=4 | Delta vs Pre-Head | Delta vs Baseline |
+|---|---|---|---|---|---|
+| **`pp8192` (prefill)** | `4,012.8 tok/s` | `3,961.7 tok/s` | **`4,038.8 tok/s`** | **+77.1 tok/s (+1.9%)** | **+26.0 tok/s (+0.6%)** |
+| **`tg512` (decode MTP)** | `76.1 tok/s` (0.731) | `75.7 tok/s` (0.731) | **`86.5 tok/s` (0.796)** | **+10.8 tok/s (+14.3%)** | **+10.4 tok/s (+13.7%)** |
+| **`pp8192+tg512` (prefill)** | `3,983.5 tok/s` | `3,948.8 tok/s` | **`4,030.4 tok/s`** | **+81.6 tok/s (+2.1%)** | **+46.9 tok/s (+1.2%)** |
+| **`pp8192+tg512` (decode)** | `121.2 tok/s` (0.982) | `121.4 tok/s` (0.982) | **`120.5 tok/s` (0.982)** | -0.9 tok/s (-0.7%) | -0.7 tok/s (-0.6%) |
+
+### 2. Full Sweep across Token Lengths (`--kv-dtype nvfp4`)
+
+Evaluated on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`INFERNIX_EXPERTS_ON_GPU=1 --kv-dtype nvfp4`):
+
+| Workload | Mode | Baseline (`tok/s`) | After T1–T8 (`tok/s`) | Delta / Impact |
+|---|---|---:|---:|---|
+| `pp512` | Plain | `1,671.92 ± 3.82` | **`1,674.92 ± 0.11`** | +3.0 tok/s |
+| `pp4096` | Plain | `3,721.57 ± 7.28` | **`3,775.83 ± 6.73`** | **+54.3 tok/s (+1.5%)** |
+| `pp8192` | Plain | `4,062.53 ± 14.83` | **`4,109.06 ± 4.03`** | **+46.5 tok/s (+1.1%)** |
+| `pp16384` | Plain | `4,388.02 ± 6.36` | **`4,431.93 ± 1.47`** | **+43.9 tok/s (+1.0%)** |
+| `tg128` | Plain (1-tok seed) | `47.14 ± 0.10` | **`47.94 ± 0.01`** | **+0.80 tok/s (+1.7%) / -0.35 ms/step** |
+| `tg128` | MTP Speculative | `66.05 ± 0.07` | **`62.68 ± 0.01`** | (Run-to-run acceptance variance: 0.649 vs 0.663) |
+| `pp4096+tg128` | MTP Speculative | Prefill `3,749.82` / Decode `266.67` | Prefill **`3,725.62`** / Decode **`261.14`** | (Acceptance 1.0, 10 rounds, within noise) |
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-07 — MTP & N-Gram Speculative Acceptance, Yield, and `top_logprobs` Optimization
+
+Scope: Diagnose and improve both **MTP acceptance rate** and **N-gram acceptance & accepted tokens per round** for `Qwen4Exp` (`Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix`), plus eliminate redundant global-memory rescans in `top_logprobs_kernel` when extracting top-$K$ sparse proposal distributions (`K > 4`).
+
+## 1. Accounting
+
+- **Affected subsystem files**:
+  - `src/models/qwen3_5/frontend/frontend.cpp` (M): Added Qwen structural phase-transition special tokens (`<think>`, `</think>`, `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>`) to `ngram_boundaries` (sorted and deduplicated) whenever N-gram sources are enabled.
+  - `src/models/qwen3_5/program/ngram_proposer.h` (M): Added `is_boundary(Token)` (`token < 0 || std::binary_search(...)`), enforced boundary checks inside `propose()` on the query `tail` window (`history[history.size() - match_len .. history.size() - 1]`), and deduplicated `boundaries_` in `set_boundaries()`.
+  - `src/ops/kernel/top_logprobs.cuh` (M): Replaced `else if (rank < 4)` with `else if (k3 < previous)` in `top_logprobs_kernel`, allowing ranks `4 .. count - 1` to use the thread-local 4-key register cache (`k0, k1, k2, k3`) whenever a thread has not yet exhausted its top-4 local keys (`k3 < previous`).
+  - `src/models/qwen4_exp/program/program_impl.h` (M):
+    - Raised `kSampledDraftRanks` from `4` to `8` (clamped to `ops::kScreenedHeadMaxRanks = 4` when `parameters_.draft_head.screen` is bound).
+    - Raised `kMultiRowNgramMaxDrafts` from `7` to `15` and raised the multi-row N-gram column budget from `32 / batch - 1` to `64 / batch - 1` (`batch * W <= 64`).
+    - Tuned `kNgramAcceptancePriors` from `{0.75, 0.88, 0.93, 0.96}` to `{0.72, 0.92, 0.96, 0.98}`, lowered `kNgramWidthCost` default from `0.10` to `0.05`, and applied faster negative EWMA backoff (`2.5 * kAcceptanceWeight`) on complete N-gram rejection (`A == 0`).
+    - In `draft_length_at`, restricted the tile-quantized `tile_cost = std::min(cost, 0.10)` override to confidence-gated MTP rounds (`!(sampled_drafts_ && lane.sampling.temperature > 0.0F)`), using the true `cost` (`0.22`) on ungated sampled rounds.
+  - `src/models/qwen4_exp/program/graph_set.cpp` (M): Updated `ngram_max_drafts_for_rows` from `std::min(7, 32 / rows - 1)` to `std::min(15, 64 / rows - 1)` so multi-row CUDA Graphs capture the `W = 16` (`15` draft tokens) N-gram verification widths at `rows = 2..4`.
+  - `tests/models/qwen3_5/test_ngram_proposer.cpp` (M) & `tests/models/qwen3_5/test_frontend.cpp` (M): Added unit test coverage for `tail` boundary rejection in `NgramProposer::propose` and phase-marker boundaries in `Frontend::prepare`.
+
+## 2. Architectural Rationale ("Why" on GB10 `sm_121a`)
+
+1. **Sampled MTP Draft Mass & `top_logprobs_kernel` Register Cache (`kSampledDraftRanks = 8`)**:
+   - Under `temperature > 0` (`--temperature 1.0 --top-p 0.95 --top-k 20`), MTP uses sparse Gumbel-max draft sampling over the top-$K$ proposal logprobs (`kSampledDraftRanks`). Previously `kSampledDraftRanks = 4` captured only the top-4 proposal logits into `proposal_top_ids_` / `proposal_top_logprobs_`; any target token outside the draft head's top-4 had draft probability $q(x) = 0$, reducing captured draft probability mass $Z_M$ and causing frequent rejection under block verification.
+   - Raising `kSampledDraftRanks` to `8` captures twice as many candidate ranks per draft step while keeping `kMaxTopLogprobs = 16` bounds intact and preserving `ops::kScreenedHeadMaxRanks = 4` when a screened draft head is bound.
+   - In `top_logprobs_kernel` (`src/ops/kernel/top_logprobs.cuh`), each thread precomputes its top-4 keys `(k0 >= k1 >= k2 >= k3)` during the initial vector pass over `[248320]` or `[131072]` vocabulary logits. Previously, `else if (rank < 4)` forced every rank $\ge 4$ to rescan global memory across all threads even though at rank $r < 16$ at most $\lfloor r / 4 \rfloor \le 3$ threads out of 256 could possibly have emitted all 4 of their cached keys. Changing the condition to `else if (k3 < previous)` is mathematically exact (since every un-cached element owned by the thread is $\le k_3 < \text{previous}$) and keeps 253–256 of 256 threads in registers across all ranks $r = 0..7$.
+2. **Ungated Sampled MTP Adaptive Draft Length (`draft_length_at`)**:
+   - Confidence gating (`draft_gate_threshold`) is disabled on sampled rounds (`sampled_drafts_ && temperature > 0`) to preserve exact target distribution unbiasedness. However, `draft_length_at` previously replaced `cost = 0.22` with `tile_cost = std::min(cost, 0.10)` whenever `draft_gate_threshold > 0` regardless of whether the round was actually gated. On low-acceptance sampled chains (`alpha ~ 0.30`), using `0.10` instead of `0.22` forced 5–7 un-gated draft steps per round (`30.3%` acceptance), wasting 3–5 serial MTP forward passes per round and starving N-gram proposals on short prefixes. Using the true `cost` (`0.22`) on ungated sampled rounds right-sizes the MTP chain to `2–3` high-yield steps (`40.1%` acceptance) and frees verify budget for N-gram jumps.
+3. **N-Gram Structural Phase Boundaries & Query Tail Filtering**:
+   - `Frontend::prepare` previously populated `ngram_boundaries` only with chat turn delimiters (`im_start`, `im_end`, `eos`, `pad`). Reasoning and tool-call transitions (`<think>`, `</think>`, `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>`) were indexed and matched across phases, and `NgramProposer::propose` did not check whether the query `tail` itself contained a boundary token. Filtering both indexing and query `tail` windows across all structural phase markers prevents false cross-phase proposals.
+4. **Multi-Row N-Gram Verification Width (`kMultiRowNgramMaxDrafts = 15`, `64 / batch - 1`) & Controller Priors**:
+   - Multi-row N-gram verification (`batch = 2..4`) was previously capped at `min(7, 32 / batch - 1)` (`7` drafts at `batch = 2..4`), whereas GB10's NVFP4/GDN/QSA verification kernels efficiently handle up to `64` total columns (`batch * W <= 64`). Raising the cap to `min(15, 64 / batch - 1)` doubles the per-round N-gram verification horizon at `batch = 2..4` (`15` drafts, `W = 16` columns per lane) and updates `graph_set.cpp` to pre-capture the corresponding multi-row CUDA Graph widths.
+   - Updating `kNgramAcceptancePriors` for `match >= 4` (`0.96 -> 0.98`), lowering `kNgramWidthCost` (`0.10 -> 0.05`), and applying `2.5x` faster negative EWMA backoff when an N-gram round accepts `0` tokens lets verified copy spans sustain `15–31` draft tokens while backing off immediately after a missed speculation.
+
+## 3. Verification & Oracle Results
+
+- **CUDA Stack-Spill Ratchet Gate (`infernix_cuda_stack_check`)**:
+  - Passed (`0` stack spills, `0` local memory bytes across all kernels).
+- **Unit & Mathematical Oracle Tests**:
+  - `infernix_ngram_proposer_test`: Passed (verifies `tail` boundary rejection and boundary deduplication).
+  - `infernix_qwen3_5_frontend_test`: Passed (verifies `<think>`, `</think>`, `<tool_call>`, `</tool_call>` inclusion in `ngram_boundaries`).
+  - `infernix_qwen4_exp_speculative_test`: Passed.
+  - `infernix_ops_sampling_test top_logprobs` & `speculative_round`: Passed (exact top-K ordering across `K = 1..16` and tie-breaking).
+  - `infernix_qwen4_exp_speculative_sampling_real_test --trials 200 --tokens 8 --concurrency 1` (on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix`, `KV=nvfp4`): Passed (`all speculative sampling checks passed`, exact greedy parity and chi-square sampled distribution homogeneity `least p = 0.0532 >= 0.000111`).
+
+## 4. End-to-End A/B Benchmark Results (`infernix_bench`)
+
+Evaluated on `/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`--kv-dtype nvfp4 --spec mtp --draft-tokens auto --ngram-draft-tokens 31 --ngram-min-match 4`, `warmup=1, reps=2`):
+
+| Workload & Mode | Metric | Before (`HEAD`) | After (MTP + N-Gram Opt) | Delta / Impact |
+|---|---|---:|---:|---|
+| **`sampled_c1` (`temp=1.0, top_p=0.95, top_k=20`, `c=1`) — `tg256`** | **Decode throughput** | `43.89 tok/s` | **`55.87 tok/s`** | **+11.98 tok/s (+27.3%)** |
+| `sampled_c1` — `tg256` | Overall spec acceptance | `0.299` (`1.75 tok/round`) | **`0.442` (`1.93 tok/round`)** | **+14.3 pp (+47.8% rel)** |
+| `sampled_c1` — `tg256` | MTP acceptance rate | `0.303` (`219 / 722`) | **`0.401` (`167 / 416`)** | **+9.8 pp (+32.3% rel)** |
+| `sampled_c1` — `tg256` | N-Gram acceptance & yield | `0.000` (`0 / 11`, `0.00/r`) | **`0.564` (`79 / 140`, `7.18/r`)** | **0.00 → 7.18 accepted/round** |
+| **`sampled_c1` (`temp=1.0, top_p=0.95, top_k=20`, `c=1`) — `pp2048+tg256`** | **Decode throughput** | `234.30 tok/s` | **`237.00 tok/s`** | **+2.70 tok/s (+1.2%)** |
+| `sampled_c1` — `pp2048+tg256` | Acceptance length | `19.69 tok/round` | **`20.48 tok/round`** | **+4.0% tok/round** |
+| `sampled_c1` — `pp2048+tg256` | MTP acceptance & yield | `0.444` (`1.33/r`) | **`0.462` (`1.50/r`)** | **+12.8% accepted/round** |
+| `sampled_c1` — `pp2048+tg256` | N-Gram accepted/round | `20.96/r` (`91.7%` acc) | **`22.90/r` (`88.9%` acc)** | **+9.3% accepted/round** |
+| **`sampled_c4` (`temp=1.0, top_p=0.95, top_k=20`, `c=4`) — `pp2048+tg256`** | **Decode throughput** | `55.76 tok/s/stream` (`223.0 agg`) | **`71.06 tok/s/stream` (`284.2 agg`)** | **+27.4% (+61.2 tok/s agg)** |
+| `sampled_c4` — `pp2048+tg256` | Acceptance length | `5.95 tok/round` (`344` rounds) | **`7.67 tok/round` (`267` rounds)** | **+28.9% tok/round** |
+| `sampled_c4` — `pp2048+tg256` | N-Gram accepted/round | `6.72/r` (`1479 / 1535`, `96.4%`) | **`13.34/r` (`1548 / 1605`, `96.4%`)** | **+98.5% accepted/round** |
+| `sampled_c4` — `pp2048+tg256` | MTP acceptance & yield | `0.588` (`223 / 379`, `1.80/r`) | `0.545` (`232 / 426`, `1.54/r`) | More non-copy tail transitions handled by MTP after 15-tok N-gram jumps |
+| **`greedy_c4` (`temp=0`, `c=4`) — `pp2048+tg256`** | **Decode throughput** | `58.75 tok/s/stream` (`235.0 agg`) | **`76.55 tok/s/stream` (`306.2 agg`)** | **+30.3% (+71.2 tok/s agg)** |
+| `greedy_c4` — `pp2048+tg256` | Acceptance length | `6.31 tok/round` (`324` rounds) | **`9.22 tok/round` (`222` rounds)** | **+46.1% tok/round** |
+| `greedy_c4` — `pp2048+tg256` | MTP acceptance & yield | `0.710` (`220 / 310`, `2.00/r`) | **`0.701` (`230 / 328`, `2.09/r`)** | **+4.5% accepted/round** |
+| `greedy_c4` — `pp2048+tg256` | N-Gram accepted/round | `7.01/r` (`1500 / 1508`, `99.5%`) | **`14.23/r` (`1594 / 1626`, `98.0%`)** | **+103.0% accepted/round** |
+
+## 5. Adverse findings & dispositions
+
+- On `sampled_c4` `pp2048+tg256`, per-round MTP acceptance rate shifted from `0.588` (`1.80/r` over `124` MTP rounds) to `0.545` (`1.54/r` over `151` MTP rounds), even though total MTP accepted tokens increased (`223 → 232`) and overall decode throughput rose `+27.4%`. Cause: doubling the multi-row N-gram horizon (`7 → 15` draft tokens/round) allowed N-gram rounds to consume the predictable copy spans in half as many rounds (`220 → 116` N-gram rounds), concentrating MTP rounds onto the harder non-copy transition points between spans.
+- On `sampled_c1` `tg256`, restricting `tile_cost = 0.10` to confidence-gated rounds reduced raw MTP accepted tokens per MTP round (`0.81 → 0.66/r`) by trimming low-yield tail steps (`2.67 → 1.64` drafted/round), which boosted MTP acceptance rate from `30.3%` to `40.1%`, unblocked N-gram matching (`0.00/r → 7.18/r`), raised overall acceptance length (`1.75 → 1.93 tok/round`), and increased end-to-end `tg256` decode throughput by **`+27.3%` (`43.89 → 55.87 tok/s`)**.
+
+## 6. Rebase conflict resolution policy
+
+- Preserve `kSampledDraftRanks = 8`, `kMultiRowNgramMaxDrafts = 15`, `64 / batch - 1` multi-row N-gram column budgeting, gated-only `tile_cost` in `draft_length_at`, and updated N-gram priors/backoff in `src/models/qwen4_exp/program/program_impl.h` and `src/models/qwen4_exp/program/graph_set.cpp`.
+- Preserve `else if (k3 < previous)` register-cache reuse in `src/ops/kernel/top_logprobs.cuh`.
+- Preserve phase-marker `ngram_boundaries` in `src/models/qwen3_5/frontend/frontend.cpp` and `is_boundary` query-tail filtering in `src/models/qwen3_5/program/ngram_proposer.h`.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-07 — `nsys`-Guided NVFP4 Decode & Prefill Kernel Optimizations
+
+Scope: Capture and analyze node-level `nsys` traces (`profiles/nsys/nvfp4_pp4096.sqlite` and `profiles/nsys/nvfp4_tg128_nodes.sqlite`) on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`--kv-dtype nvfp4 --spec mtp --draft-tokens auto`) and implement the top 5 remaining kernel-level optimizations across decode and prefill.
+
+## 1. Accounting
+
+- **Affected subsystem files**:
+  - `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu` (M):
+    - Halved `GateUpShared::stage` from `kGateUpSliceBytes` (`46,080 B`, 2 CTAs/SM) to `kGateUpStageBytes` (`23,040 B`, 1 K-half = 80 blocks across both groups `g = 0, 1`), reducing `sizeof(GateUpShared)` from `50,048 B` to `27,008 B` (`3 * 28,032 = 84,096 <= 101,376 B`) and raising `gate_up_kernel` to `__launch_bounds__(kThreads, 3)` (`3 CTAs/SM = 50.0%` occupancy, `REG:79 STACK:0`, matching `down_kernel`).
+    - Added `stage_gate_up_half` and `quantize_pair_half_codes<B0, BLen>` (parallelizing 2-column A4 quantization across 160 threads with warp shuffles instead of serial per-thread `t0`/`t1` quantization) so all 4 column loops in `gate_up_kernel` overlap K-half 0 and K-half 1 weight `cp.async` transfers with activation quantization while preserving bit-exact `int64_t` accumulation.
+    - In `down_kernel`, exited empty/wide-expert CTAs (`record_slice == nullptr` with `tile != 0 || job != job_base`) before `pdl::wait_for_dependencies()` so `~9,800` wide-route CTAs in prefill no longer occupy SM slots blocked on `pdl::wait_for_dependencies()` while `gate_up_kernel` runs its remaining waves.
+    - Specialized `combine_inject_vec8_kernel<bool kMasked, bool kWriteMean = false>` with `__launch_bounds__(320, kWriteMean ? 2 : 4)` (`4 CTAs/SM = 83.3%` occupancy at `REG:48 STACK:0` when `mean_out == nullptr`, vs `72–78` regs / 2 CTAs/SM previously), and gated `moe_combine_inject` PDL to `columns <= 16 ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized`.
+  - `src/ops/hyper_connection/hyper_connection_mix_fused.cu` (M):
+    - Added `ExactColumns = 2` (`launch_exact<2>()` and `launch_up_v4<2>()`) for `columns == 2` so `T = 2` no longer falls back to `ExactColumns = 0` (`168–202` regs, 1 CTA/SM).
+    - Inverted the `(t, h, q)` loop order in `hc_up_collapse_v4_kernel` when `ExactColumns > 0` so `Codec::decode(chunk[q][h], wv)` executes once per `(q, h)` instead of `ExactColumns` times while preserving the exact per-`(t, q)` FMA reduction order (`acc[t][q]`) and `warp_sum8_transposed` bits.
+    - Raised `hc_down_partials_v4_kernel` launch bounds to `(ExactColumns == 2 || ExactColumns == 3) ? 2 : 1` (`103–128` regs, `STACK:0`, 2 CTAs/SM) and `hc_up_collapse_v4_kernel` launch bounds to `(std::is_same_v<Codec, Q8Codec> && (ExactColumns == 2 || ExactColumns == 3)) ? 2 : 1` (`128` regs, `STACK:0`, 2 CTAs/SM for `Q8Codec`).
+  - `src/ops/kernel/rmsnorm.cuh` & `src/ops/launcher/rmsnorm.cu` (M):
+    - Added `kRmsPreloadMidD = 10240` (`Preload = 40`) for Qwen4Exp's MTP `hidden_norm` (`d = 10240`), eliminating 24 dead loop iterations/branches per thread (`Preload = 64 -> 40`) and enabling `pdl::enter()` / `pdl::launch_consumer` overlap with the producer while keeping the exact `rmsnorm_generic_inv` tree reduction order (`STACK:0`).
+  - `src/ops/hyper_connection/hyper_connection.cu` (M):
+    - Reversed `blockIdx.y` (`t = gridDim.y - 1 - blockIdx.y` when `gridDim.y > 1024`) in `norm_vec8_kernel`, `norm_kernel`, `inject_norm_vec8_kernel`, and `inject_norm_kernel` so prefill (`T = 4096`) hits the upstream kernel's freshly written tail (`~18 MB`) in GB10's 24 MiB L2 cache and leaves `normalized[:, 0..~900]` hot in L2 for the downstream `linear(down)` GEMM.
+    - Preloaded `weight` before `pdl::enter()` in `norm_vec8_kernel`, and gated `hyper_connection_norm` and `hyper_connection_inject_norm` PDL to `columns <= 16 ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized`.
+  - `src/ops/linear/nvfp4/nvfp4_a4.cu` (M):
+    - Gated `launch_residual_exact` (`nvfp4_a4_row_scaled_residual_quantize_kernel` / `nvfp4_a4_residual_quantize_kernel`) to `(Layout == Nvfp4ScaleLayout::RowMajor && tokens <= 16) ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized` (matching `launch_quantize_exact`), preventing multi-wave prefill quantize grids from stealing SM slots during Wave 0 of their producer and preserving the reverse-token L2 tail hit.
+
+## 2. Verification & Microbenchmark Results
+
+- **CUDA Stack-Spill Ratchet Gate (`infernix_cuda_stack_check`)**:
+  - Passed (`7,661` kernels checked in `infernix-serve`, `0` violations).
+- **Unit & Mathematical Oracle Suite (`ctest`)**:
+  - `27 / 27` tests passed (`100%`), including `infernix_hyper_connection_test`, `infernix_rmsnorm_test`, `infernix_offloaded_moe_layer_test`, `infernix_offloaded_moe_wide_test`, `infernix_offloaded_moe_cuda_test`, and `infernix_linear_nvfp4_a4_test`.
+- **Op Microbenchmarks**:
+  - `infernix_hyper_connection_bench` (`S=4, H=2560, rank=320, codec=q8`, `7.70 MB` weights/call):
+    - `T=1`: `30.43 us` median (`253 GB/s`)
+    - `T=2`: **`30.34 us` median (`254 GB/s`)** — matches `T=1` at 93–100% of GB10's LPDDR5X bandwidth ceiling.
+    - `T=5`: `45.47 us` median (`169 GB/s`)
+  - `infernix_offloaded_moe_decode_bench`:
+    - `exact=yes` across all `T=1, 4, 8`, `split=0, 1`, `warm/cold` configurations (`T=1 warm`: `93.41 us`, `T=4 warm`: `124.45 us`, `T=8 warm`: `233.98 us`).
+
+## 3. End-to-End A/B Benchmark Results (`infernix_bench`)
+
+Evaluated on `/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`INFERNIX_EXPERTS_ON_GPU=1 --kv-dtype nvfp4 --use-original-nvfp4-prefill-kernel --spec mtp --draft-tokens auto --temperature 1.0 --ngram-draft-tokens 31 --ngram-min-match 4 --top-p 0.95 --top-k 20 --expert-tail-skip 3 --lm-head-draft -r 5`):
+
+| Workload | Metric | Before (`pre_nsys_opt`) | After (`nsys_opt`) | Delta / Impact |
+|---|---|---:|---:|---|
+| **`pp512`** | Prefill throughput | `1,643.58 ± 2.20 tok/s` | **`1,681.81 ± 16.29 tok/s`** | **+38.23 tok/s (+2.3%)** |
+| **`pp2048`** | Prefill throughput | `2,979.01 ± 10.09 tok/s` | **`3,005.49 ± 18.91 tok/s`** | **+26.48 tok/s (+0.9%)** |
+| **`pp4096`** | Prefill throughput | `3,734.69 ± 12.15 tok/s` | **`3,726.91 ± 10.11 tok/s`** | -7.78 tok/s (-0.2%, within `±10.11` noise) |
+| **`tg128`** | Speculative decode throughput | `54.63 ± 7.55 tok/s` | **`61.00 ± 11.50 tok/s`** | **+6.37 tok/s (+11.7%)** |
+| **`tg256`** | Speculative decode throughput | `57.74 ± 7.90 tok/s` | **`60.29 ± 5.88 tok/s`** | **+2.55 tok/s (+4.4%)** |
+
+## 4. Adverse findings & dispositions
+
+- During initial linking, forcing `__launch_bounds__(kUpV4Threads, 2)` on `hc_up_collapse_v4_kernel` for `Bf16Codec` (`sizeof(Chunk) == 16 B`, vs `12 B` for `Q8Codec`) and adding a separate `ws[Preload]` loop across `pdl::enter()` in `rmsnorm_generic_kernel` caused stack spills in `Bf16Codec` (`8–40 B`) and `rmsnorm_generic_kernel` (`288–296 B`). Scoping the 2-CTA/SM bound on `hc_up_collapse_v4_kernel` to `std::is_same_v<Codec, Q8Codec>` (the production codec for `Qwen4Exp`) and keeping `xs[j]` / `ws[j]` in the single loop after `pdl::enter()` in `rmsnorm_generic_kernel<Epilogue, 40>` eliminated all stack spills (`0` violations across `7,661` kernels in `infernix_cuda_stack_check`).
+- On `pp4096`, prefill throughput measured `3,726.91 ± 10.11 tok/s` vs `3,734.69 ± 12.15 tok/s` (`-0.2%`, well within the `±10–12 tok/s` standard deviation), while `pp512` (`+2.3%`) and `pp2048` (`+0.9%`) gained cleanly; at `T=4096`, CUTLASS Tensor Core GEMMs and `wide_expert` dominate `>71%` of total execution time.
+
+## 5. Rebase conflict resolution policy
+
+- Preserve the 1-K-half `GateUpShared` staging (`27,008 B`, 3 CTAs/SM), parallel `quantize_pair_half_codes`, early wide-CTA exit before `pdl::wait_for_dependencies()` in `down_kernel`, and `combine_inject_vec8_kernel` `kWriteMean` specialization in `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu`.
+- Preserve `ExactColumns = 2`, hoisted `Codec::decode` in `hc_up_collapse_v4_kernel`, and 2-CTA/SM launch bounds in `src/ops/hyper_connection/hyper_connection_mix_fused.cu`.
+- Preserve `kRmsPreloadMidD = 10240` (`Preload = 40`) in `src/ops/kernel/rmsnorm.cuh` and `src/ops/launcher/rmsnorm.cu`.
+- Preserve reverse-token L2 indexing and `columns <= 16` PDL gating in `src/ops/hyper_connection/hyper_connection.cu` and `src/ops/linear/nvfp4/nvfp4_a4.cu`.

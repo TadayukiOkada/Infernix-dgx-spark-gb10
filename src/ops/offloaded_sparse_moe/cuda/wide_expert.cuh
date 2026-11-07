@@ -241,28 +241,19 @@ __device__ __forceinline__ void rg16_fragments(const std::uint8_t* units, int gr
 template <bool ColTileInner>
 __device__ __forceinline__ void map_work_unit(const Call& call, int tile_begin, int tile_end, int w, int kRowBlocks,
                                               int& tile, int& row_block) {
+    (void)tile_end;
     if constexpr (!ColTileInner) {
         tile      = tile_begin + w / kRowBlocks;
         row_block = w % kRowBlocks;
         return;
     }
     const int probe = tile_begin + w / kRowBlocks;
-    const int job   = __ldg(&call.tiles[2 * probe]);
-    int lo = tile_begin, hi = tile_end; // the job's first tile
-    while (lo < hi) {
-        const int mid = (lo + hi) / 2;
-        if (__ldg(&call.tiles[2 * mid]) < job) { lo = mid + 1; } else { hi = mid; }
-    }
-    const int first = lo;
-    lo = first;
-    hi = tile_end; // one past the job's last tile
-    while (lo < hi) {
-        const int mid = (lo + hi) / 2;
-        if (__ldg(&call.tiles[2 * mid]) == job) { lo = mid + 1; } else { hi = mid; }
-    }
-    const int unit = w - (first - tile_begin) * kRowBlocks; // [0, (lo - first) * kRowBlocks)
-    row_block      = unit / (lo - first);
-    tile           = first + unit % (lo - first);
+    const int2 pair = *reinterpret_cast<const int2*>(&call.tiles[2 * probe]);
+    const int span  = pair.x >> 16;
+    const int first = probe - pair.y / kTileColumns;
+    const int unit  = w - (first - tile_begin) * kRowBlocks; // [0, span * kRowBlocks)
+    row_block       = unit / span;
+    tile            = first + unit % span;
 }
 
 template <Matrix M, class Epilogue, class S = Schedule, class G = FlashNextExperts>
@@ -335,7 +326,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
             for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
                 int tile = 0, row_block = 0;
                 map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, row_block);
-                const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+                const int job = call.tiles[2 * tile] & 0xFFFF, column = call.tiles[2 * tile + 1];
                 const int row = call.dispatch.offsets[call.dispatch.jobs[job]] + column;
                 const std::uint8_t* matrix = call.job_records[job] + Shape::kOffset +
                                              static_cast<std::size_t>(row_block) * S::kRowGroups * Shape::kBlocks *
@@ -390,7 +381,7 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void grouped_kerne
     for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
         int tile = 0;
         map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, ctx.row_block);
-        const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+        const int job = call.tiles[2 * tile] & 0xFFFF, column = call.tiles[2 * tile + 1];
         ctx.expert    = call.dispatch.jobs[job];
         const int begin = call.dispatch.offsets[ctx.expert];
         ctx.first       = begin + column;
@@ -550,14 +541,15 @@ struct GateUpEpilogue {
                 const int column    = ctx.col_base + m * 16 + ctx.group + 8 * half;
                 const unsigned mask = __ballot_sync(0xFFFFFFFFU, column < ctx.columns);
                 if (column >= ctx.columns) { continue; }
-                std::uint16_t h[S::kMmaRows];
+                float hf[S::kMmaRows];
                 float amax = 0.0F;
 #pragma unroll
                 for (int r = 0; r < S::kMmaRows; ++r) {
                     const std::uint16_t gate = canon::f32_to_bf16_rn(canon::mul_rn(acc[m][r][2 * half], sc.alpha_gate));
                     const std::uint16_t up = canon::f32_to_bf16_rn(canon::mul_rn(acc[m][r][2 * half + 1], sc.alpha_up));
-                    h[r]           = canon::swiglu_bf16(gate, up);
-                    const float a  = canon::f32_from_bits(canon::f32_bits(canon::bf16_to_f32(h[r])) & 0x7FFFFFFFU);
+                    const float hv = canon::bf16_to_f32(canon::swiglu_bf16(gate, up));
+                    hf[r]          = hv;
+                    const float a  = canon::f32_from_bits(canon::f32_bits(hv) & 0x7FFFFFFFU);
                     amax           = a > amax ? a : amax;
                 }
 #pragma unroll
@@ -565,17 +557,30 @@ struct GateUpEpilogue {
                     const float other = __shfl_xor_sync(mask, amax, offset);
                     amax              = other > amax ? other : amax;
                 }
-                const std::uint8_t scale = canon::a4_scale_word(amax, sc.input_down);
-                unsigned code[S::kMmaRows] = {};
-                if (canon::e4m3_scaled(scale) != 0) {
-                    const float d = canon::mul_rn(canon::e4m3_value(scale), sc.input_down);
-#pragma unroll
-                    for (int r = 0; r < S::kMmaRows; ++r) {
-                        code[r] = canon::e2m1_rn_satfinite(canon::div_rn(canon::bf16_to_f32(h[r]), d));
-                    }
+                std::uint8_t scale = 0U;
+                std::int32_t scale_scaled = 0;
+                float d = 1.0F, inv_d = 0.0F;
+                bool fast_inv = true;
+                canon::prepare_a4_scale_word(amax, sc.input_down, scale, scale_scaled, d, inv_d, fast_inv);
+                unsigned low = 0U, high = 0U;
+                if (scale_scaled != 0) {
+                    const float q0 = canon::scaled_q_value(hf[0], d, inv_d, fast_inv);
+                    const float q1 = canon::scaled_q_value(hf[1], d, inv_d, fast_inv);
+                    const float q2 = canon::scaled_q_value(hf[2], d, inv_d, fast_inv);
+                    const float q3 = canon::scaled_q_value(hf[3], d, inv_d, fast_inv);
+                    unsigned b01, b23;
+                    asm("{\n\t"
+                        ".reg .b8 b0, b1;\n\t"
+                        "cvt.rn.satfinite.e2m1x2.f32 b0, %3, %2;\n\t"
+                        "cvt.rn.satfinite.e2m1x2.f32 b1, %5, %4;\n\t"
+                        "mov.b32 %0, {b0, 0, 0, 0};\n\t"
+                        "mov.b32 %1, {b1, 0, 0, 0};\n\t"
+                        "}"
+                        : "=r"(b01), "=r"(b23)
+                        : "f"(q0), "f"(q1), "f"(q2), "f"(q3));
+                    low  = b01 << (8 * ctx.tig);
+                    high = b23 << (8 * ctx.tig);
                 }
-                unsigned low  = (code[0] | (code[1] << 4)) << (8 * ctx.tig);
-                unsigned high = (code[2] | (code[3] << 4)) << (8 * ctx.tig);
 #pragma unroll
                 for (int offset = 1; offset <= 2; offset <<= 1) {
                     low |= __shfl_xor_sync(mask, low, offset);

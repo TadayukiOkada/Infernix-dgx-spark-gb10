@@ -314,6 +314,83 @@ INFERNIX_CANON_HD std::uint8_t a4_code(float v, std::uint8_t scale_word, float i
     return e2m1_rn_satfinite(div_rn(v, mul_rn(e4m3_value(scale_word), input_scale)));
 }
 
+#if defined(__CUDACC__)
+// Scales one element `vj` by `1 / d`, falling back to exact IEEE-754 division `div_rn(vj, d)`
+// within +-4 ULPs of the seven E2M1 decision midpoints {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0}
+// (all of which have zero in their low 21 mantissa bits), so `cvt.rn.satfinite.e2m1x2.f32`
+// produces the exact same 4-bit E2M1 code as `e2m1_rn_satfinite(div_rn(vj, d))` for every input.
+__device__ __forceinline__ float scaled_q_value(float vj, float d, float inv_d, bool fast_inv) {
+    if (__builtin_expect(fast_inv, 1)) {
+        const float q          = mul_rn(vj, inv_d);
+        const std::uint32_t qa = f32_bits(q) & 0x7FFFFFFFU;
+        if (__builtin_expect(qa >= 0x3E7FFFFCU && qa <= 0x40A00004U && ((qa + 4U) & 0x1FFFF8U) == 0U, 0)) {
+            return div_rn(vj, d);
+        }
+        return q;
+    }
+    return div_rn(vj, d);
+}
+
+__device__ __forceinline__ void prepare_a4_scale_word(float amax, float input_scale, std::uint8_t& scale_word,
+                                                      std::int32_t& scale_scaled, float& d, float& inv_d,
+                                                      bool& fast_inv) {
+    scale_word   = a4_scale_word(amax, input_scale);
+    scale_scaled = e4m3_scaled(scale_word);
+    if (scale_scaled == 0) {
+        d        = 1.0F;
+        inv_d    = 0.0F;
+        fast_inv = true;
+        return;
+    }
+    d                       = mul_rn(e4m3_value(scale_word), input_scale);
+    const std::uint32_t d_u = f32_bits(d) & 0x7FFFFFFFU;
+    fast_inv                = (d_u >= 0x08000000U && d_u < 0x70000000U);
+    inv_d                   = fast_inv ? div_rn(1.0F, d) : 0.0F;
+}
+
+__device__ __forceinline__ void prepare_a4_scale(float amax, float input_scale, std::int32_t& scale_scaled,
+                                                 float& d, float& inv_d, bool& fast_inv) {
+    std::uint8_t scale_word;
+    prepare_a4_scale_word(amax, input_scale, scale_word, scale_scaled, d, inv_d, fast_inv);
+}
+
+// Quantizes a 16-element BF16 block (already unpacked to binary32 `v[16]` with precomputed `amax`)
+// into the wide plane's `(low, high)` code pair (byte j of `low` pairs elements j and 4 + j; byte j
+// of `high` pairs elements 8 + j and 12 + j) and `scale_word`, bit-identical to `quantize_a4_codes`.
+__device__ __forceinline__ void quantize_a4_plane_from_f32(const float (&v)[16], float amax, float input_scale,
+                                                           unsigned& low, unsigned& high,
+                                                           std::uint8_t& scale_word) {
+    std::int32_t scale_scaled;
+    float d, inv_d;
+    bool fast_inv;
+    prepare_a4_scale_word(amax, input_scale, scale_word, scale_scaled, d, inv_d, fast_inv);
+    if (scale_scaled == 0) {
+        low  = 0U;
+        high = 0U;
+        return;
+    }
+    float q[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) { q[j] = scaled_q_value(v[j], d, inv_d, fast_inv); }
+    asm("{\n\t"
+        ".reg .b8 b0, b1, b2, b3, b4, b5, b6, b7;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %6, %2;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %7, %3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %8, %4;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %9, %5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b4, %14, %10;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b5, %15, %11;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b6, %16, %12;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b7, %17, %13;\n\t"
+        "mov.b32 %0, {b0, b1, b2, b3};\n\t"
+        "mov.b32 %1, {b4, b5, b6, b7};\n\t"
+        "}"
+        : "=r"(low), "=r"(high)
+        : "f"(q[0]), "f"(q[1]), "f"(q[2]), "f"(q[3]), "f"(q[4]), "f"(q[5]), "f"(q[6]), "f"(q[7]),
+          "f"(q[8]), "f"(q[9]), "f"(q[10]), "f"(q[11]), "f"(q[12]), "f"(q[13]), "f"(q[14]), "f"(q[15]));
+}
+#endif
+
 struct A4Codes {
     std::uint8_t code[16]; // E2M1 code words, sign in bit 3
     std::uint8_t scale_word;

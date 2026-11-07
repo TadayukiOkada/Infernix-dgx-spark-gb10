@@ -15,11 +15,13 @@ void launch(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream
         launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
             Nvfp4A4TmaMmaSchedule<128, Tiled128Stages, (Tiled128Rows == 64 ? 2 : 1), Promotions, 1,
                                   Tiled128Rows>,
-            K>>(p, y, LinearIdentityEpilogue{}, stream);
+            K>>(p, y, LinearIdentityEpilogue{}, stream, Nvfp4IdentityRows{},
+                pdl::Dependency::Programmatic);
     else
         launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
-            Nvfp4A4TmaMmaSchedule<256, 3, 1, Promotions>, K>>(p, y, LinearIdentityEpilogue{},
-                                                              stream);
+            Nvfp4A4TmaMmaSchedule<256, 3, 1, Promotions>, K>>(
+            p, y, LinearIdentityEpilogue{}, stream, Nvfp4IdentityRows{},
+            pdl::Dependency::Programmatic);
 }
 } // namespace
 
@@ -74,22 +76,27 @@ void launch_residual(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream
     if (p.scale_layout == Nvfp4ScaleLayout::Tiled256) {
         launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
             Nvfp4A4TmaMmaSchedule<256, 2, 1, Promotions, kNvfp4A4ResidualTerms, 64>, K>>(
-            p, y, LinearIdentityEpilogue{}, stream);
+            p, y, LinearIdentityEpilogue{}, stream, Nvfp4IdentityRows{},
+            pdl::Dependency::Programmatic);
         return;
     }
     // When 128-row tiles launch at most 24 CTAs (half of GB10's 48 SMs), 64-row tiles double
     // the CTA count while staying within a single 48-SM wave; when ctas_128 is 32..47, keeping
     // 128-row tiles finishes in 1 wave instead of spilling 64..94 CTAs into a 2nd wave.
+    // For N = 2560 at T = 257..384, ctas_128 = 60 leaves a 25% tail wave; 64-row tiles double the
+    // grid to 120 CTAs (2.5 waves of 48) eliminating the wave-tail efficiency cliff.
     const int ctas_128 = (p.rows / 128) * ((p.tokens + 127) / 128);
-    if (ctas_128 <= 24) {
+    if (ctas_128 <= 24 || (p.rows == 2560 && p.tokens > 256 && p.tokens <= 384)) {
         launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
             Nvfp4A4TmaMmaSchedule<128, 3, 1, Promotions, kNvfp4A4ResidualTerms, 64>, K>>(
-            p, y, LinearIdentityEpilogue{}, stream);
+            p, y, LinearIdentityEpilogue{}, stream, Nvfp4IdentityRows{},
+            pdl::Dependency::Programmatic);
         return;
     }
     launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
         Nvfp4A4TmaMmaSchedule<128, 3, 1, Promotions, kNvfp4A4ResidualTerms, 128>, K>>(
-        p, y, LinearIdentityEpilogue{}, stream);
+        p, y, LinearIdentityEpilogue{}, stream, Nvfp4IdentityRows{},
+        pdl::Dependency::Programmatic);
 }
 
 // The shape table's 64-row pair panel, over the same K set the public pair route serves. The
@@ -100,7 +107,8 @@ void launch_residual_r64(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaSt
     const LinearBf16Output y{output, p.rows};
     launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
         Nvfp4A4TmaMmaSchedule<128, 3, 1, Promotions, kNvfp4A4ResidualTerms, 64>, K>>(
-        p, y, LinearIdentityEpilogue{}, stream);
+        p, y, LinearIdentityEpilogue{}, stream, Nvfp4IdentityRows{},
+        pdl::Dependency::Programmatic);
 }
 } // namespace
 

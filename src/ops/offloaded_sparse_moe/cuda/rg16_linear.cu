@@ -476,7 +476,7 @@ __global__ void plan_kernel(WidePlan plan, const std::uint8_t* matrix, int colum
          i += static_cast<int>(gridDim.x * blockDim.x)) {
         plan.entries[i] = i;
         if (i < tiles) {
-            plan.tiles[2 * i]     = 0;
+            plan.tiles[2 * i]     = tiles << 16;
             plan.tiles[2 * i + 1] = i * wide::kTileColumns;
         }
     }

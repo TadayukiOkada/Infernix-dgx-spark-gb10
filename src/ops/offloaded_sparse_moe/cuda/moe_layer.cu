@@ -98,11 +98,11 @@ __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_
 
 __device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
 
-// The pitch of frames, staging slots and landings (MoeExpertSource::frame_stride; prefetch slots
-// take prefetch_stride when it is set).
-__host__ __device__ __forceinline__ std::uint64_t frame_pitch(const MoeExpertSource& source) {
-    return source.frame_stride != 0 ? source.frame_stride : source.record_stride;
-}
+using moe::frame_pitch;
+using moe::host_record;
+using moe::report_error;
+using moe::resident_record;
+using moe::resolve_unstaged_record;
 
 // Bytes a stage copies: a ggml bank's record, else the NVFP4 record of the bank's geometry.
 __device__ __forceinline__ int record_copy_bytes(const MoeExpertSource& source) {
@@ -162,12 +162,6 @@ std::optional<DownBytes> record_down_bytes(const MoeExpertSource& source) {
 // matrix or the down matrix. A Down launch is an ordinary launch: an event wait precedes it.
 enum class PassPart : int { Both = 0, GateUp = 1, Down = 2 };
 
-// A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
-__device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
-    return source.host_table != nullptr ? source.host_table[expert]
-                                        : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
-}
-
 // A call takes the fork route when it has a fork stream, fits one staging pass and is narrow (no
 // expert can have more than eight columns); moe_experts and moe_experts_cpu_wait decide it
 // identically.
@@ -179,39 +173,6 @@ bool forked(const MoeExpertSource& source, std::int32_t max_jobs, std::int32_t c
 // Which jobs a pass launch computes: all of them, only those resident in frames (their record is
 // resolved directly, so they need not wait for the stage kernel), or only the others.
 enum class PassPhase : int { All = 0, Resident = 1, Staged = 2 };
-
-// A job's record when no copy serves it: the layer's shared expert (MoeExpertSource::shared_record) or
-// a frame-resident expert; null otherwise.
-__device__ __forceinline__ const std::uint8_t* resident_record(const MoeExpertSource& source, int expert) {
-    if (expert == source.shared_expert) { return source.shared_record; }
-    if (source.frame_base == nullptr) { return nullptr; }
-    const int frame = source.frames[expert];
-    return frame >= 0 ? source.frame_base + static_cast<std::uint64_t>(frame) * frame_pitch(source) : nullptr;
-}
-
-// The call's error word: layer << 16 | code (MoeExpertSource::error).
-__device__ __forceinline__ void report_error(const MoeExpertSource& source, std::uint32_t code) {
-    if (source.error == nullptr) { return; }
-    const int layer = source.fetch.request != nullptr ? source.fetch.layer : source.cpu.layer;
-    *reinterpret_cast<volatile std::uint32_t*>(source.error) = (static_cast<std::uint32_t>(layer) << 16U) | (code & 0xFFFFU);
-}
-
-__device__ __forceinline__ const std::uint8_t* resolve_unstaged_record(const MoeExpertSource& source, int expert) {
-    const std::uint8_t* record = resident_record(source, expert);
-    if (record == nullptr && source.prefetched != nullptr) {
-        const int slot = source.prefetched[expert];
-        if (slot >= 0) {
-            record = source.prefetch_base +
-                     static_cast<std::uint64_t>(slot) *
-                         (source.prefetch_stride != 0 ? source.prefetch_stride : frame_pitch(source));
-        }
-    }
-    if (record == nullptr) {
-        record = host_record(source, expert);
-        if (record == nullptr) { report_error(source, offloaded_moe::kErrorUnservedRecord); }
-    }
-    return record;
-}
 
 __device__ __forceinline__ const std::uint8_t* pass_record(PassPhase phase, const MoeExpertSource& source,
                                                            int expert, const std::uint8_t* const* job_records,
@@ -1005,7 +966,7 @@ __device__ __forceinline__ void reduce_row_sums(std::int64_t (&lo)[Groups][Colum
 // share the parity of i = lane & 7 and the shuffles by 8 and 16 preserve it, so even lanes only
 // ever sum gate (even) rows and odd lanes only ever sum up (odd) rows: each lane reads the nibble
 // pair and the scale of its rows' parity and one pass over the matrix computes all 16 rows.
-template <int Groups, bool SplitInput = false>
+template <int Groups, bool SplitInput = false, bool Accumulate = false>
 __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes* acts, std::int64_t (&s)[Groups]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int q = lane >> 3, i = lane & 7;
@@ -1046,11 +1007,16 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
             lo[g] += __shfl_xor_sync(0xFFFFFFFFU, lo[g], offset);
             hi[g] += __shfl_xor_sync(0xFFFFFFFFU, hi[g], offset);
         }
-        s[g] = (lane & 8) != 0 ? hi[g] : lo[g];
+        const std::int64_t v = (lane & 8) != 0 ? hi[g] : lo[g];
+        if constexpr (Accumulate) {
+            s[g] += v;
+        } else {
+            s[g] = v;
+        }
     }
 }
 
-template <int Groups>
+template <int Groups, bool Accumulate = false>
 __device__ void unit_sums_pair(const std::uint8_t* matrix, int blocks, const ActCodes* acts, std::int64_t (&s0)[Groups],
                                std::int64_t (&s1)[Groups]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -1092,8 +1058,15 @@ __device__ void unit_sums_pair(const std::uint8_t* matrix, int blocks, const Act
             lo1[g] += __shfl_xor_sync(0xFFFFFFFFU, lo1[g], offset);
             hi1[g] += __shfl_xor_sync(0xFFFFFFFFU, hi1[g], offset);
         }
-        s0[g] = (lane & 8) != 0 ? hi0[g] : lo0[g];
-        s1[g] = (lane & 8) != 0 ? hi1[g] : lo1[g];
+        const std::int64_t v0 = (lane & 8) != 0 ? hi0[g] : lo0[g];
+        const std::int64_t v1 = (lane & 8) != 0 ? hi1[g] : lo1[g];
+        if constexpr (Accumulate) {
+            s0[g] += v0;
+            s1[g] += v1;
+        } else {
+            s0[g] = v0;
+            s1[g] = v1;
+        }
     }
 }
 
@@ -1148,109 +1121,103 @@ __device__ __forceinline__ void unit_sums_split_pair_half(const std::uint8_t* ma
     }
 }
 
+using canon::prepare_a4_scale;
+using canon::scaled_q_value;
+
+__device__ __forceinline__ void quantize_a4_words_from_bf16(const uint4* src, float scale,
+                                                            std::uint32_t (&w)[4], std::uint8_t& scale_word,
+                                                            std::int32_t& scale_scaled) {
+    const uint4 lo               = src[0], hi = src[1];
+    const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    float amax                   = 0.0F;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float a0 = canon::f32_from_bits((words[i] & 0x7FFFU) << 16);
+        const float a1 = canon::f32_from_bits((words[i] >> 16) << 16 & 0x7FFFFFFFU);
+        amax           = a0 > amax ? a0 : amax;
+        amax           = a1 > amax ? a1 : amax;
+    }
+    float d, inv_d;
+    bool fast_inv;
+    canon::prepare_a4_scale_word(amax, scale, scale_word, scale_scaled, d, inv_d, fast_inv);
+    const float z = 0.0F;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const float v0 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q] & 0xFFFFU));
+        const float v1 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q] >> 16));
+        const float v2 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q + 1] & 0xFFFFU));
+        const float v3 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q + 1] >> 16));
+        const float q0 = scale_scaled != 0 ? scaled_q_value(v0, d, inv_d, fast_inv) : 0.0F;
+        const float q1 = scale_scaled != 0 ? scaled_q_value(v1, d, inv_d, fast_inv) : 0.0F;
+        const float q2 = scale_scaled != 0 ? scaled_q_value(v2, d, inv_d, fast_inv) : 0.0F;
+        const float q3 = scale_scaled != 0 ? scaled_q_value(v3, d, inv_d, fast_inv) : 0.0F;
+        std::uint32_t wq;
+        asm("{\n\t"
+            ".reg .b8 b0, b1, b2, b3;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b0, %5, %1;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b1, %5, %2;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b2, %5, %3;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b3, %5, %4;\n\t"
+            "mov.b32 %0, {b0, b1, b2, b3};\n\t"
+            "}"
+            : "=r"(wq)
+            : "f"(q0), "f"(q1), "f"(q2), "f"(q3), "f"(z));
+        w[q] = wq;
+    }
+}
+
 // Quantizes column x[:, t] of entry `first` to A4 codes of blocks [0, blocks) with `scale` into smem.
 // Each block's sixteen BF16 values are contiguous, so they arrive as two 16-byte vector loads:
 // reading them as sixteen 2-byte loads cost one 32-byte sector each (ncu: 59% of this kernel's
 // global sectors were excessive), which is what exposed the fabric latency on `stall_long_sb`.
 // The unpacked values are identical, so every quantized block keeps its bits.
 __device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
-                                      int top_k, float scale, ActCodes* acts, int blocks) {
+                                      int top_k, float scale, ActCodes* acts, int blocks, int b0 = 0) {
     const int t = entries[first] / top_k;
     for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
-        const uint4 lo = source[0], hi = source[1];
-        const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-        std::uint16_t v[16];
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
-            v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
-        }
-        const canon::A4Codes c = canon::quantize_a4_codes(v, scale);
+        const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (b0 + b));
+        std::uint32_t w[4];
+        std::uint8_t s_word;
+        std::int32_t s_scaled;
+        quantize_a4_words_from_bf16(source, scale, w, s_word, s_scaled);
         ActCodes out;
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const std::uint32_t w = static_cast<std::uint32_t>(c.code[4 * q]) |
-                                    (static_cast<std::uint32_t>(c.code[4 * q + 1]) << 8) |
-                                    (static_cast<std::uint32_t>(c.code[4 * q + 2]) << 16) |
-                                    (static_cast<std::uint32_t>(c.code[4 * q + 3]) << 24);
-            out.dup[q] = dup_nibbles(w);
-        }
-        out.scale  = canon::e4m3_scaled(c.scale_word);
+        for (int q = 0; q < 4; ++q) { out.dup[q] = dup_nibbles(w[q]); }
+        out.scale  = s_scaled;
         out.scale1 = 0;
         acts[b]    = out;
     }
 }
 
-__device__ void quantize_pair_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
-                                    int top_k, float scale, ActCodes* acts, int blocks) {
-    const int t0 = entries[first] / top_k;
-    const int t1 = entries[first + 1] / top_k;
-    for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const auto* src0 = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t0) * hidden + 16 * b);
-        const auto* src1 = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t1) * hidden + 16 * b);
-        const uint4 lo0 = src0[0], hi0 = src0[1];
-        const uint4 lo1 = src1[0], hi1 = src1[1];
-        const std::uint32_t words0[8] = {lo0.x, lo0.y, lo0.z, lo0.w, hi0.x, hi0.y, hi0.z, hi0.w};
-        const std::uint32_t words1[8] = {lo1.x, lo1.y, lo1.z, lo1.w, hi1.x, hi1.y, hi1.z, hi1.w};
-        std::uint16_t v0[16], v1[16];
+template <int B0, int BLen>
+__device__ __forceinline__ void quantize_pair_half_codes(const bf16* __restrict__ x, int hidden, int t0, int t1,
+                                                         float scale, ActCodes* __restrict__ acts) {
+    static_assert(2 * BLen <= kThreads && (2 * BLen) % 32 == 0);
+    const int idx = static_cast<int>(threadIdx.x);
+    if (idx >= 2 * BLen) { return; }
+    const int db    = idx >> 1;
+    const int col   = idx & 1;
+    const int t     = col != 0 ? t1 : t0;
+    const auto* src = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (B0 + db));
+    std::uint32_t w[4];
+    std::uint8_t s_word;
+    std::int32_t s_scaled;
+    quantize_a4_words_from_bf16(src, scale, w, s_word, s_scaled);
+    std::uint32_t dup[4];
 #pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            v0[2 * w]     = static_cast<std::uint16_t>(words0[w] & 0xFFFFU);
-            v0[2 * w + 1] = static_cast<std::uint16_t>(words0[w] >> 16);
-            v1[2 * w]     = static_cast<std::uint16_t>(words1[w] & 0xFFFFU);
-            v1[2 * w + 1] = static_cast<std::uint16_t>(words1[w] >> 16);
-        }
-        const canon::A4Codes c0 = canon::quantize_a4_codes(v0, scale);
-        const canon::A4Codes c1 = canon::quantize_a4_codes(v1, scale);
+    for (int q = 0; q < 4; ++q) {
+        const std::uint32_t w_partner = __shfl_xor_sync(0xFFFFFFFFU, w[q], 1);
+        dup[q]                        = w[q] | (w_partner << 4);
+    }
+    const std::int32_t s_partner = __shfl_xor_sync(0xFFFFFFFFU, s_scaled, 1);
+    if (col == 0) {
         ActCodes out;
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const std::uint32_t w0 = static_cast<std::uint32_t>(c0.code[4 * q]) |
-                                     (static_cast<std::uint32_t>(c0.code[4 * q + 1]) << 8) |
-                                     (static_cast<std::uint32_t>(c0.code[4 * q + 2]) << 16) |
-                                     (static_cast<std::uint32_t>(c0.code[4 * q + 3]) << 24);
-            const std::uint32_t w1 = static_cast<std::uint32_t>(c1.code[4 * q]) |
-                                     (static_cast<std::uint32_t>(c1.code[4 * q + 1]) << 8) |
-                                     (static_cast<std::uint32_t>(c1.code[4 * q + 2]) << 16) |
-                                     (static_cast<std::uint32_t>(c1.code[4 * q + 3]) << 24);
-            out.dup[q] = w0 | (w1 << 4);
-        }
-        out.scale  = canon::e4m3_scaled(c0.scale_word);
-        out.scale1 = canon::e4m3_scaled(c1.scale_word);
-        acts[b]    = out;
+        for (int q = 0; q < 4; ++q) { out.dup[q] = dup[q]; }
+        out.scale  = s_scaled;
+        out.scale1 = s_partner;
+        acts[db]   = out;
     }
-}
-
-// Scales one element `vj` by `1 / d` (with exact IEEE-754 division fallback within +-4 ULPs of
-// the seven E2M1 decision boundaries {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0}, all of which have
-// zero in their low 21 mantissa bits).
-__device__ __forceinline__ float scaled_q_value(float vj, float d, float inv_d, bool fast_inv) {
-    if (__builtin_expect(fast_inv, 1)) {
-        const float q          = canon::mul_rn(vj, inv_d);
-        const std::uint32_t qa = canon::f32_bits(q) & 0x7FFFFFFFU;
-        if (__builtin_expect(qa >= 0x3E7FFFFCU && qa <= 0x40A00004U && ((qa + 4U) & 0x1FFFF8U) == 0U, 0)) {
-            return canon::div_rn(vj, d);
-        }
-        return q;
-    }
-    return canon::div_rn(vj, d);
-}
-
-__device__ __forceinline__ void prepare_a4_scale(float amax, float input_scale, std::int32_t& scale_scaled,
-                                                 float& d, float& inv_d, bool& fast_inv) {
-    const std::uint8_t s = canon::a4_scale_word(amax, input_scale);
-    scale_scaled         = canon::e4m3_scaled(s);
-    if (scale_scaled == 0) {
-        d        = 1.0F;
-        inv_d    = 0.0F;
-        fast_inv = true;
-        return;
-    }
-    d                       = canon::mul_rn(canon::e4m3_value(s), input_scale);
-    const std::uint32_t d_u = canon::f32_bits(d) & 0x7FFFFFFFU;
-    fast_inv                = (d_u >= 0x08000000U && d_u < 0x70000000U);
-    inv_d                   = fast_inv ? canon::div_rn(1.0F, d) : 0.0F;
 }
 
 // Quantizes a 16-element BF16 block (already unpacked to binary32 with precomputed `amax`) under
@@ -1292,10 +1259,11 @@ __device__ __forceinline__ void quantize_split_block_from_f32(const float (&v)[1
 // and `up_scale` (high nibbles) into `acts`. Each thread `b < blocks` loads its 16 BF16 elements once
 // and encodes both scales together via `quantize_split_block_from_f32`.
 __device__ void quantize_split_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
-                                     int top_k, float gate_scale, float up_scale, ActCodes* acts, int blocks) {
+                                     int top_k, float gate_scale, float up_scale, ActCodes* acts, int blocks,
+                                     int b0 = 0) {
     const int t = entries[first] / top_k;
     for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const auto* source           = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
+        const auto* source           = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (b0 + b));
         const uint4 lo               = source[0], hi = source[1];
         const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
         float v[16];
@@ -1377,12 +1345,22 @@ __device__ __forceinline__ void quantize_a4_block_warp(std::uint16_t h_bf16, flo
         const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
         amax              = other > amax ? other : amax;
     }
-    const std::uint8_t s            = canon::e4m3_rn_satfinite(canon::div_rn(amax, canon::mul_rn(6.0F, input_scale)));
-    const std::int32_t scale_scaled = canon::e4m3_scaled(s);
+    std::uint8_t s;
+    std::int32_t scale_scaled;
+    float d, inv_d;
+    bool fast_inv;
+    canon::prepare_a4_scale_word(amax, input_scale, s, scale_scaled, d, inv_d, fast_inv);
     std::uint32_t code              = 0U;
     if (lane < 16 && scale_scaled != 0) {
-        const float d = canon::mul_rn(canon::e4m3_value(s), input_scale);
-        code          = canon::e2m1_rn_satfinite(canon::div_rn(v, d));
+        const float q = scaled_q_value(v, d, inv_d, fast_inv);
+        asm("{\n\t"
+            ".reg .b8 b;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b, %1, %1;\n\t"
+            "cvt.u32.u8 %0, b;\n\t"
+            "}"
+            : "=r"(code)
+            : "f"(q));
+        code &= 0xFU;
         if ((code & 7U) == 0U) { code = 0U; }
     }
     std::uint32_t packed = code << (8 * (lane & 3));
@@ -1412,26 +1390,141 @@ bool narrow_pairs() {
     return enabled;
 }
 
-constexpr int kGateUpGroupBytes = moe::kGateUpBlocks * static_cast<int>(moe::kUnitBytes);                 // 23,040
-constexpr int kGateUpSliceBytes = kGateUpGroups * kGateUpGroupBytes;                                      // 46,080
-constexpr int kDownSliceBytes   = kDownGroups * moe::kDownBlocks * static_cast<int>(moe::kUnitBytes);     // 23,040
-static_assert(kGateUpSliceBytes % 16 == 0 && kDownSliceBytes % 16 == 0);
+constexpr int kGateUpHalfBlocks     = moe::kGateUpBlocks / 2;                                            // 80
+constexpr int kGateUpHalfGroupBytes = kGateUpHalfBlocks * static_cast<int>(moe::kUnitBytes);             // 11,520
+constexpr int kGateUpGroupBytes     = moe::kGateUpBlocks * static_cast<int>(moe::kUnitBytes);            // 23,040
+constexpr int kGateUpStageBytes     = kGateUpGroups * kGateUpHalfGroupBytes;                             // 23,040
+constexpr int kGateUpSliceBytes     = kGateUpGroups * kGateUpGroupBytes;                                 // 46,080
+constexpr int kDownSliceBytes       = kDownGroups * moe::kDownBlocks * static_cast<int>(moe::kUnitBytes); // 23,040
+static_assert(kGateUpStageBytes % 16 == 0 && kGateUpSliceBytes % 16 == 0 && kDownSliceBytes % 16 == 0);
+
+__device__ __forceinline__ void stage_gate_up_half(const std::uint8_t* record_slice, std::uint8_t* dst, int half) {
+    const std::uint8_t* const src0 = record_slice + half * kGateUpHalfGroupBytes;
+    for (int i = static_cast<int>(threadIdx.x) * 16; i < kGateUpStageBytes; i += static_cast<int>(blockDim.x) * 16) {
+        const std::uint8_t* const src = i < kGateUpHalfGroupBytes
+                                            ? (src0 + i)
+                                            : (src0 + kGateUpGroupBytes + (i - kGateUpHalfGroupBytes));
+        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src) : "memory");
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+struct DownActCodes {
+    std::uint32_t dup01[4];
+    std::uint32_t dup23[4];
+    std::uint8_t scale_word[4];
+};
+
+template <int B0, int BLen>
+__device__ __forceinline__ void quantize_quad_half_codes(const bf16* __restrict__ x, int hidden, int t0, int t1, int t2,
+                                                         int t3, float scale, DownActCodes* __restrict__ acts) {
+    static_assert(4 * BLen % 32 == 0);
+    for (int idx = static_cast<int>(threadIdx.x); idx < 4 * BLen; idx += kThreads) {
+        const int db      = idx >> 2;
+        const int col     = idx & 3;
+        const int t       = col == 0 ? t0 : col == 1 ? t1 : col == 2 ? t2 : t3;
+        const auto* src   = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (B0 + db));
+        std::uint32_t w[4];
+        std::uint8_t s_word;
+        std::int32_t s_scaled;
+        quantize_a4_words_from_bf16(src, scale, w, s_word, s_scaled);
+        std::uint32_t dup[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const std::uint32_t w_partner = __shfl_xor_sync(0xFFFFFFFFU, w[q], 1);
+            dup[q]                        = w[q] | (w_partner << 4);
+        }
+        const std::uint32_t s_partner = __shfl_xor_sync(0xFFFFFFFFU, static_cast<std::uint32_t>(s_word), 1);
+        if ((col & 1) == 0) {
+            std::uint32_t* dst = col == 0 ? acts[db].dup01 : acts[db].dup23;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) { dst[q] = dup[q]; }
+            reinterpret_cast<std::uint16_t*>(acts[db].scale_word)[col >> 1] =
+                static_cast<std::uint16_t>(static_cast<std::uint32_t>(s_word) | (s_partner << 8));
+        }
+    }
+}
+
+template <int Groups, int B0, int BLen>
+__device__ __forceinline__ void unit_sums_quad_half(const std::uint8_t* matrix, int blocks,
+                                                    const DownActCodes* __restrict__ acts,
+                                                    std::int64_t (&s)[4]) {
+    static_assert(Groups == 2);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int q = lane >> 3, i = lane & 7;
+    std::int64_t lo[2][4] = {}, hi[2][4] = {};
+#pragma unroll 1
+    for (int m = 0; m < BLen / kWarps; ++m) {
+        const int db                = warp + kWarps * m;
+        const int b                 = B0 + db;
+        const DownActCodes& a       = acts[db];
+        const std::uint32_t packed0 = a.dup01[q];
+        const std::uint32_t packed1 = a.dup23[q];
+        const std::int32_t sa0      = canon::e4m3_scaled(a.scale_word[0]);
+        const std::int32_t sa1      = canon::e4m3_scaled(a.scale_word[1]);
+        const std::int32_t sa2      = canon::e4m3_scaled(a.scale_word[2]);
+        const std::int32_t sa3      = canon::e4m3_scaled(a.scale_word[3]);
+        std::uint32_t ah0[4], ah1[4], ah2[4], ah3[4];
+        e2m1x2_word_to_half2(dup_nibbles(packed0 & 0x0F0F0F0FU), ah0);
+        e2m1x2_word_to_half2(dup_nibbles((packed0 >> 4) & 0x0F0F0F0FU), ah1);
+        e2m1x2_word_to_half2(dup_nibbles(packed1 & 0x0F0F0F0FU), ah2);
+        e2m1x2_word_to_half2(dup_nibbles((packed1 >> 4) & 0x0F0F0F0FU), ah3);
+#pragma unroll
+        for (int g = 0; g < Groups; ++g) {
+            const std::uint8_t* unit      = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
+            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
+            std::uint32_t wh[4];
+            e2m1x2_word_to_half2(code_word, wh);
+            const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]);
+            const std::int32_t sw_hi = canon::e4m3_scaled(unit[136 + i]);
+            int p0_lo, p0_hi, p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
+            unit_shares_half2(wh, ah0, p0_lo, p0_hi);
+            unit_shares_half2(wh, ah1, p1_lo, p1_hi);
+            unit_shares_half2(wh, ah2, p2_lo, p2_hi);
+            unit_shares_half2(wh, ah3, p3_lo, p3_hi);
+            lo[g][0] += static_cast<std::int64_t>(p0_lo * sw_lo) * sa0;
+            hi[g][0] += static_cast<std::int64_t>(p0_hi * sw_hi) * sa0;
+            lo[g][1] += static_cast<std::int64_t>(p1_lo * sw_lo) * sa1;
+            hi[g][1] += static_cast<std::int64_t>(p1_hi * sw_hi) * sa1;
+            lo[g][2] += static_cast<std::int64_t>(p2_lo * sw_lo) * sa2;
+            hi[g][2] += static_cast<std::int64_t>(p2_hi * sw_hi) * sa2;
+            lo[g][3] += static_cast<std::int64_t>(p3_lo * sw_lo) * sa3;
+            hi[g][3] += static_cast<std::int64_t>(p3_hi * sw_hi) * sa3;
+        }
+    }
+#pragma unroll
+    for (int col = 0; col < 4; ++col) {
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+#pragma unroll
+            for (int offset = 8; offset <= 16; offset <<= 1) {
+                lo[g][col] += __shfl_xor_sync(0xFFFFFFFFU, lo[g][col], offset);
+                hi[g][col] += __shfl_xor_sync(0xFFFFFFFFU, hi[g][col], offset);
+            }
+        }
+        const std::int64_t v = (lane & 16) != 0 ? ((lane & 8) != 0 ? hi[1][col] : lo[1][col])
+                                                : ((lane & 8) != 0 ? hi[0][col] : lo[0][col]);
+        s[col] += v;
+    }
+}
 
 struct GateUpShared {
-    alignas(16) std::uint8_t stage[kGateUpSliceBytes];
+    alignas(16) std::uint8_t stage[kGateUpStageBytes];
     // The activations are read only by unit_sums and the partial sums are written only after the
     // barrier that follows it, so they share storage. Warp 0 holds its own partial sums in
     // registers, so only warps 1..kWarps-1 write to partial.
     union {
         ActCodes acts[moe::kGateUpBlocks];
+        DownActCodes acts_quad[moe::kGateUpBlocks / 2];
         std::int64_t partial[kWarps - 1][2][16 * kGateUpGroups];
     };
     std::uint16_t y[2][16 * kGateUpGroups];
 };
 
-static_assert(sizeof(GateUpShared) + 1024 <= 102400 / 2, "two gate/up CTAs must fit an SM");
+static_assert(3 * (sizeof(GateUpShared) + 1024) <= 101376, "three gate/up CTAs must fit an SM");
 
-__global__ void __launch_bounds__(kThreads, 2)
+__global__ void __launch_bounds__(kThreads, 3)
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
                    MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
                    const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks,
@@ -1452,22 +1545,77 @@ __global__ void __launch_bounds__(kThreads, 2)
     if (moe::wide_route(count, scales)) { return; }
     const std::uint8_t* const record_slice =
         record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes;
-    stage_async(record_slice, sm.stage, kGateUpSliceBytes);
+    stage_gate_up_half(record_slice, sm.stage, 0);
     const int lane         = threadIdx.x % 32, warp = threadIdx.x / 32;
     const bool split_input = scales.input_up != scales.input_gate;
-    int c                  = 0;
+    constexpr int kHalf    = moe::kGateUpBlocks / 2;
+    static_assert(2 * kHalf == moe::kGateUpBlocks && kHalf % kWarps == 0,
+                  "two K-halves must partition the gate/up blocks across warps");
+    int c = 0;
     if (!split_input) {
+        for (; c + 2 < count; c += 4) {
+            const int cols = min(4, count - c);
+            __syncthreads();
+            if (c > 0) { stage_gate_up_half(record_slice, sm.stage, 0); }
+            const int t0 = dispatch.entries[first + c] / top_k;
+            const int t1 = dispatch.entries[first + c + 1] / top_k;
+            const int t2 = dispatch.entries[first + c + 2] / top_k;
+            const int t3 = cols == 4 ? dispatch.entries[first + c + 3] / top_k : t2;
+            std::int64_t s[4] = {};
+            quantize_quad_half_codes<0, kHalf>(x, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
+            stage_wait();
+            __syncthreads();
+            unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s);
+            __syncthreads();
+            stage_gate_up_half(record_slice, sm.stage, 1);
+            quantize_quad_half_codes<kHalf, kHalf>(x, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
+            stage_wait();
+            if (c == 0) { pdl::trigger_dependents(); }
+            __syncthreads();
+            unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s);
+#pragma unroll 1
+            for (int pair = 0; pair < 2; ++pair) {
+                const int c_base           = 2 * pair;
+                const std::int64_t s0_pair = pair == 0 ? s[0] : s[2];
+                const std::int64_t s1_pair = pair == 0 ? s[1] : s[3];
+                __syncthreads(); // every warp has read sm.acts_quad/partial before writing sm.partial
+                if (warp > 0) { sm.partial[warp - 1][0][lane] = s0_pair; }
+                if (warp != 1) { sm.partial[warp == 0 ? 0 : warp - 1][1][lane] = s1_pair; }
+                __syncthreads();
+                if (warp < 2 && c_base + warp < cols) {
+                    const int col      = warp;
+                    const int row      = lane;
+                    const bool gate    = (row & 1) == 0;
+                    std::int64_t total = col == 0 ? s0_pair : s1_pair;
+#pragma unroll
+                    for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][col][row]; }
+                    sm.y[col][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+                    __syncwarp();
+                    const std::uint16_t h_val =
+                        lane < 16 ? canon::swiglu_bf16(sm.y[col][2 * lane], sm.y[col][2 * lane + 1]) : 0;
+                    quantize_a4_block_warp(
+                        h_val, scales.input_down,
+                        &h_blocks[static_cast<std::size_t>(first + c + c_base + col) * kHBlocks + slice]);
+                }
+            }
+        }
         for (; c + 1 < count; c += 2) {
             __syncthreads();
+            if (c > 0) { stage_gate_up_half(record_slice, sm.stage, 0); }
+            const int t0 = dispatch.entries[first + c] / top_k;
+            const int t1 = dispatch.entries[first + c + 1] / top_k;
             std::int64_t s0[kGateUpGroups], s1[kGateUpGroups];
-            quantize_pair_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts,
-                                moe::kGateUpBlocks);
-            if (c == 0) {
-                stage_wait();
-                pdl::trigger_dependents();
-            }
+            quantize_pair_half_codes<0, kHalf>(x, hidden, t0, t1, scales.input_gate, sm.acts);
+            stage_wait();
             __syncthreads();
-            unit_sums_pair<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s0, s1);
+            unit_sums_pair<kGateUpGroups, false>(sm.stage, kHalf, sm.acts, s0, s1);
+            __syncthreads();
+            stage_gate_up_half(record_slice, sm.stage, 1);
+            quantize_pair_half_codes<kHalf, kHalf>(x, hidden, t0, t1, scales.input_gate, sm.acts);
+            stage_wait();
+            if (c == 0) { pdl::trigger_dependents(); }
+            __syncthreads();
+            unit_sums_pair<kGateUpGroups, true>(sm.stage, kHalf, sm.acts, s0, s1);
             __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
             if (lane < 16) {
 #pragma unroll
@@ -1493,25 +1641,23 @@ __global__ void __launch_bounds__(kThreads, 2)
             }
         }
     } else { // split input scales: pairs share one weight scan over two K-halves
-        constexpr int kHalf = moe::kGateUpBlocks / 2;
-        static_assert(2 * kHalf == moe::kGateUpBlocks && kHalf % kWarps == 0,
-                      "two K-halves must partition the gate/up blocks across warps");
         for (; c + 1 < count; c += 2) {
             __syncthreads();
+            if (c > 0) { stage_gate_up_half(record_slice, sm.stage, 0); }
             const int t0 = dispatch.entries[first + c] / top_k;
             const int t1 = dispatch.entries[first + c + 1] / top_k;
             std::int64_t lo[kGateUpGroups][2] = {}, hi[kGateUpGroups][2] = {};
             quantize_split_pair_half<0, kHalf>(x, hidden, t0, t1, scales.input_gate, scales.input_up, sm.acts);
-            if (c == 0) {
-                stage_wait();
-                pdl::trigger_dependents();
-            }
+            stage_wait();
             __syncthreads();
-            unit_sums_split_pair_half<kGateUpGroups, 0, kHalf>(sm.stage, moe::kGateUpBlocks, sm.acts, lo, hi);
+            unit_sums_split_pair_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts, lo, hi);
             __syncthreads();
+            stage_gate_up_half(record_slice, sm.stage, 1);
             quantize_split_pair_half<kHalf, kHalf>(x, hidden, t0, t1, scales.input_gate, scales.input_up, sm.acts);
+            stage_wait();
+            if (c == 0) { pdl::trigger_dependents(); }
             __syncthreads();
-            unit_sums_split_pair_half<kGateUpGroups, kHalf, kHalf>(sm.stage, moe::kGateUpBlocks, sm.acts, lo, hi);
+            unit_sums_split_pair_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts, lo, hi);
             std::int64_t s[kGateUpGroups][2];
             reduce_row_sums<kGateUpGroups, 2>(lo, hi, s);
             __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
@@ -1543,23 +1689,37 @@ __global__ void __launch_bounds__(kThreads, 2)
         // Gate rows are even, up rows odd; with distinct input scales one scan computes both, each
         // lane reading the nibble pair and scale of its rows' parity (unit_sums SplitInput).
         __syncthreads();
+        if (c > 0) { stage_gate_up_half(record_slice, sm.stage, 0); }
         if (split_input) {
             quantize_split_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, scales.input_up,
-                                 sm.acts, moe::kGateUpBlocks);
+                                 sm.acts, kHalf, 0);
         } else {
-            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts,
-                                  moe::kGateUpBlocks);
+            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts, kHalf, 0);
         }
-        if (c == 0) {
-            stage_wait();
-            pdl::trigger_dependents();
-        }
+        stage_wait();
         __syncthreads();
         std::int64_t s[kGateUpGroups];
         if (split_input) {
-            unit_sums<kGateUpGroups, true>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
+            unit_sums<kGateUpGroups, true, false>(sm.stage, kHalf, sm.acts, s);
         } else {
-            unit_sums<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
+            unit_sums<kGateUpGroups, false, false>(sm.stage, kHalf, sm.acts, s);
+        }
+        __syncthreads();
+        stage_gate_up_half(record_slice, sm.stage, 1);
+        if (split_input) {
+            quantize_split_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, scales.input_up,
+                                 sm.acts, kHalf, kHalf);
+        } else {
+            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts, kHalf,
+                                  kHalf);
+        }
+        stage_wait();
+        if (c == 0) { pdl::trigger_dependents(); }
+        __syncthreads();
+        if (split_input) {
+            unit_sums<kGateUpGroups, true, true>(sm.stage, kHalf, sm.acts, s);
+        } else {
+            unit_sums<kGateUpGroups, false, true>(sm.stage, kHalf, sm.acts, s);
         }
         __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
         if (warp > 0 && lane < 16) {
@@ -1582,12 +1742,6 @@ __global__ void __launch_bounds__(kThreads, 2)
         }
     }
 }
-
-struct DownActCodes {
-    std::uint32_t dup01[4];
-    std::uint32_t dup23[4];
-    std::uint8_t scale_word[4];
-};
 
 __device__ __forceinline__ void act_codes_quad_word_into(const canon::A4Block& a0, const canon::A4Block& a1,
                                                          const canon::A4Block& a2, const canon::A4Block& a3, int q,
@@ -1711,9 +1865,12 @@ __global__ void __launch_bounds__(kThreads, 3)
         record != nullptr ? (record + moe::kGateUpBytes +
                              static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes)
                           : nullptr;
-    if (record_slice != nullptr) { stage_async(record_slice, sm.stage, kDownSliceBytes); }
+    if (record_slice == nullptr) {
+        if (tile == 0 && job == job_base) { pdl::wait_for_dependencies(); }
+        return;
+    }
+    stage_async(record_slice, sm.stage, kDownSliceBytes);
     pdl::wait_for_dependencies();
-    if (record_slice == nullptr) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int c = 0;
     for (; c + 2 < count; c += 4) {
@@ -3634,8 +3791,8 @@ __launch_bounds__(320) __global__ void combine_vec8_kernel(const bf16* __restric
     *reinterpret_cast<uint4*>(y + static_cast<std::size_t>(t) * hidden + d) = out_packed;
 }
 
-template <bool kMasked>
-__launch_bounds__(320) __global__ void combine_inject_vec8_kernel(
+template <bool kMasked, bool kWriteMean = false>
+__launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_kernel(
     const bf16* __restrict__ outputs, const float* __restrict__ weights, const float* __restrict__ shared_gate,
     const bf16* __restrict__ shared, const float* __restrict__ inject, int hidden, int top_k, int streams,
     int columns, bf16* __restrict__ residual, MoeColumnMask mask, bf16* __restrict__ mean_out,
@@ -3645,26 +3802,26 @@ __launch_bounds__(320) __global__ void combine_inject_vec8_kernel(
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
-    const bool    write_mean = mean_out != nullptr && t >= mean_first;
     if constexpr (kMasked) {
         if (!column_live(mask, t)) {
-            // The inject skips the column; its mean is the untouched residual's, as stream_mean's.
-            if (write_mean) {
-                float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-                for (int s = 0; s < streams; ++s) {
-                    const uint4 r_packed = *reinterpret_cast<const uint4*>(
-                        residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
-                    const bf16* r_vals = reinterpret_cast<const bf16*>(&r_packed);
+            if constexpr (kWriteMean) {
+                if (t >= mean_first) {
+                    float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+                    for (int s = 0; s < streams; ++s) {
+                        const uint4 r_packed = *reinterpret_cast<const uint4*>(
+                            residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
+                        const bf16* r_vals = reinterpret_cast<const bf16*>(&r_packed);
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) { mean[j] += __bfloat162float(r_vals[j]); }
+                        for (int j = 0; j < 8; ++j) { mean[j] += __bfloat162float(r_vals[j]); }
+                    }
+                    const float inv_s = 1.0F / static_cast<float>(streams);
+                    uint4       mean_packed;
+                    bf16*       mean_bf16 = reinterpret_cast<bf16*>(&mean_packed);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
+                    *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) =
+                        mean_packed;
                 }
-                const float inv_s = 1.0F / static_cast<float>(streams);
-                uint4       mean_packed;
-                bf16*       mean_bf16 = reinterpret_cast<bf16*>(&mean_packed);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
-                *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) =
-                    mean_packed;
             }
             return;
         }
@@ -3688,29 +3845,43 @@ __launch_bounds__(320) __global__ void combine_inject_vec8_kernel(
     float v[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) { v[j] = __bfloat162float(__float2bfloat16_rn(sum[j])); }
-    float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-    for (int s = 0; s < streams; ++s) {
-        const float inj = inject[static_cast<std::size_t>(t) * streams + s];
-        uint4* r_ptr    = reinterpret_cast<uint4*>(
-            residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
-        uint4 r_packed = *r_ptr;
-        bf16* r        = reinterpret_cast<bf16*>(&r_packed);
+    if constexpr (kWriteMean) {
+        const bool write_mean = t >= mean_first;
+        float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+        for (int s = 0; s < streams; ++s) {
+            const float inj = inject[static_cast<std::size_t>(t) * streams + s];
+            uint4* r_ptr    = reinterpret_cast<uint4*>(
+                residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
+            uint4 r_packed = *r_ptr;
+            bf16* r        = reinterpret_cast<bf16*>(&r_packed);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
-        *r_ptr = r_packed;
-        if (write_mean) {
+            for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
+            *r_ptr = r_packed;
+            if (write_mean) {
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { mean[j] += __bfloat162float(r[j]); }
+                for (int j = 0; j < 8; ++j) { mean[j] += __bfloat162float(r[j]); }
+            }
         }
-    }
-    if (write_mean) {
-        // stream_mean_vec8_kernel's bits: the stream-order sum scaled by 1/streams.
-        const float inv_s = 1.0F / static_cast<float>(streams);
-        uint4       mean_packed;
-        bf16*       mean_bf16 = reinterpret_cast<bf16*>(&mean_packed);
+        if (write_mean) {
+            const float inv_s = 1.0F / static_cast<float>(streams);
+            uint4       mean_packed;
+            bf16*       mean_bf16 = reinterpret_cast<bf16*>(&mean_packed);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
-        *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) = mean_packed;
+            for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
+            *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) =
+                mean_packed;
+        }
+    } else {
+        for (int s = 0; s < streams; ++s) {
+            const float inj = inject[static_cast<std::size_t>(t) * streams + s];
+            uint4* r_ptr    = reinterpret_cast<uint4*>(
+                residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
+            uint4 r_packed = *r_ptr;
+            bf16* r        = reinterpret_cast<bf16*>(&r_packed);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
+            *r_ptr = r_packed;
+        }
     }
 }
 
@@ -4246,7 +4417,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const bool unstaged_direct =
         source.staging_slots == 0 && source.fetch.request == nullptr &&
         source.activation == moe::ExpertActivation::kA4 && !ggml &&
-        source.ggml.gate_up_format != QType::FP8_E4M3FN_B128 && !use_wide;
+        source.ggml.gate_up_format != QType::FP8_E4M3FN_B128;
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         if (!unstaged_direct) {
@@ -4346,31 +4517,44 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
     const auto* shared_out = static_cast<const bf16*>(shared.data);
     const auto* inject_in  = static_cast<const float*>(inject.data);
     auto* residual_io      = static_cast<bf16*>(residual.data);
+    const pdl::Dependency dep = columns <= 16 ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
     if (hidden % 8 == 0 && aligned_16(routed_out) && aligned_16(shared_out) && aligned_16(residual_io) &&
         (mean_out == nullptr || (mean_pitch % 8 == 0 && aligned_16(mean_out)))) {
         const int vec_elems = hidden / 8;
         const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
         const pdl::LaunchConfig cfg{dim3((vec_elems + threads - 1) / threads, columns), dim3(threads), 0, stream};
-        if (masked) {
-            CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_vec8_kernel<true>, routed_out, weights, gate,
+        if (mean_out != nullptr) {
+            if (masked) {
+                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<true, true>, routed_out, weights, gate,
                                             shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
                                             routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+            } else {
+                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<false, true>, routed_out, weights,
+                                            gate, shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
+                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+            }
         } else {
-            CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_vec8_kernel<false>, routed_out, weights, gate,
-                                            shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
+            if (masked) {
+                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<true, false>, routed_out, weights,
+                                            gate, shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
                                             routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+            } else {
+                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<false, false>, routed_out, weights,
+                                            gate, shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
+                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+            }
         }
         return;
     }
     const pdl::LaunchConfig cfg{dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream};
     if (masked) {
-        CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<true>, routed_out, weights, gate, shared_out,
-                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask,
-                                        mean_out, mean_pitch, stream_mean_first_column));
+        CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_kernel<true>, routed_out, weights, gate, shared_out,
+                                    inject_in, hidden, top_k, streams, columns, residual_io, routing.mask,
+                                    mean_out, mean_pitch, stream_mean_first_column));
     } else {
-        CUDA_CHECK(pdl::launch_consumer(cfg, combine_inject_kernel<false>, routed_out, weights, gate, shared_out,
-                                        inject_in, hidden, top_k, streams, columns, residual_io, routing.mask,
-                                        mean_out, mean_pitch, stream_mean_first_column));
+        CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_kernel<false>, routed_out, weights, gate, shared_out,
+                                    inject_in, hidden, top_k, streams, columns, residual_io, routing.mask,
+                                    mean_out, mean_pitch, stream_mean_first_column));
     }
 }
 

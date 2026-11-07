@@ -43,10 +43,10 @@ constexpr std::array<RouteSpec, 7> kDFlash2Routes{{
 // route while the weights dominate, the sliced-K paired-row MMA ladder for small multi-row T, then
 // the paired-row MMA tiles.
 constexpr std::array<RouteSpec, 4> kFlashNextSharedRoutes{{
-    {1, 8, Q8LinearSwiGluScheduleId::StreamPair},
-    {9, 40, Q8LinearSwiGluScheduleId::DFlash2SmallT},
-    {41, 256, Q8LinearSwiGluScheduleId::MmaR32C64},
-    {257, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
+    {1, 16, Q8LinearSwiGluScheduleId::StreamPair},
+    {17, 40, Q8LinearSwiGluScheduleId::DFlash2SmallT},
+    {41, 512, Q8LinearSwiGluScheduleId::MmaR32C64},
+    {513, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
 }};
 
 template <std::size_t N>

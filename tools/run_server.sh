@@ -170,9 +170,9 @@ export INFERNIX_EXPERTS_ON_GPU=1
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
-    --ngram-cache-mib 512 \
-    --prefill-chunk 8192 \
+    --ngram-cache-mib 2048 \
     --kv-dtype "${KV_DTYPE}" \
+    --use-original-nvfp4-prefill-kernel \
     --spec mtp \
     --draft-tokens auto \
     --temperature 1.0 \

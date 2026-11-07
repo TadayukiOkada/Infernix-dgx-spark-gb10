@@ -135,7 +135,7 @@ __global__ __launch_bounds__(ScheduleA8::kThreads, ScheduleA8::kMinBlocksPerSm) 
         for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
             int tile = 0, row_block = 0;
             map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, row_block);
-            const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+            const int job = call.tiles[2 * tile] & 0xFFFF, column = call.tiles[2 * tile + 1];
             const int expert  = call.dispatch.jobs[job];
             const int first   = call.dispatch.offsets[expert] + column;
             const int columns = min(S::kBlockTokens, call.dispatch.offsets[expert + 1] - first);
@@ -203,7 +203,7 @@ __global__ __launch_bounds__(ScheduleA8::kThreads, ScheduleA8::kMinBlocksPerSm) 
     for (int w = static_cast<int>(blockIdx.x); w < work; w += static_cast<int>(gridDim.x)) {
         int tile = 0;
         map_work_unit<kColTileInner>(call, tile_begin, tile_end, w, kRowBlocks, tile, ctx.row_block);
-        const int job = call.tiles[2 * tile], column = call.tiles[2 * tile + 1];
+        const int job = call.tiles[2 * tile] & 0xFFFF, column = call.tiles[2 * tile + 1];
         ctx.expert  = call.dispatch.jobs[job];
         ctx.first   = call.dispatch.offsets[ctx.expert] + column;
         ctx.columns = min(S::kBlockTokens, call.dispatch.offsets[ctx.expert + 1] - ctx.first);

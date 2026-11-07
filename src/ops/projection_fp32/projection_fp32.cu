@@ -622,6 +622,7 @@ __global__ void __launch_bounds__(
             if (chunk < chunks) { w[r][i] = codec.load(row, chunk); }
         }
     }
+    pdl::enter();
     for (int i = static_cast<int>(threadIdx.x); i < MaxCols * chunks; i += kTallThreads) {
         const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(reinterpret_cast<const uint4*>(x) + i)
@@ -664,7 +665,7 @@ __global__ void __launch_bounds__(
 
 template <class Codec, int MaxCols = kTallMaxColumns, bool SingleStage = false>
 __global__ void __launch_bounds__(
-    kTallThreads, (std::is_same_v<Codec, TallQ8> || std::is_same_v<Codec, TallQ4>) ? 2 : 1)
+    kTallThreads, ((std::is_same_v<Codec, TallQ8> || std::is_same_v<Codec, TallQ4>) && MaxCols < 32) ? 2 : 1)
     projection_tall_kernel(const bf16* __restrict__ x, int k, int columns, int rows, Codec codec,
                            float* __restrict__ out) {
     extern __shared__ uint4 staged[]; // [columns][SingleStage ? chunks : kTallPassChunks]
@@ -672,6 +673,7 @@ __global__ void __launch_bounds__(
     const int lane      = static_cast<int>(threadIdx.x) % 32;
     const int first_row = (static_cast<int>(blockIdx.x) * kTallWarps + static_cast<int>(threadIdx.x) / 32) *
                           kTallRowsPerWarp;
+    pdl::enter();
     if constexpr (SingleStage) {
         for (int i = static_cast<int>(threadIdx.x); i < columns * chunks; i += kTallThreads) {
             const auto dst  = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
@@ -755,8 +757,9 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
     const std::size_t staged_exact = static_cast<std::size_t>(columns) * k * sizeof(bf16);
     const std::size_t staged_pass  = static_cast<std::size_t>(columns) * kTallPassChunks * sizeof(uint4);
     const auto launch_exact = [&]<int MaxCols>() {
-        projection_tall_exact_kernel<Codec, MaxCols><<<blocks, kTallThreads, staged_exact, stream>>>(
-            static_cast<const bf16*>(x.data), k, rows, codec, static_cast<float*>(out.data));
+        CUDA_CHECK(pdl::launch_consumer({dim3(blocks), dim3(kTallThreads), staged_exact, stream},
+            projection_tall_exact_kernel<Codec, MaxCols>,
+            static_cast<const bf16*>(x.data), k, rows, codec, static_cast<float*>(out.data)));
     };
     const auto launch_pass = [&]<int MaxCols>() {
         if (staged_exact <= 49152U) {
@@ -765,8 +768,9 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 49152) == cudaSuccess;
             }();
             require(configured_single, "the single-stage tall kernel's shared memory could not be configured");
-            projection_tall_kernel<Codec, MaxCols, true><<<blocks, kTallThreads, staged_exact, stream>>>(
-                static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
+            CUDA_CHECK(pdl::launch_consumer({dim3(blocks), dim3(kTallThreads), staged_exact, stream},
+                projection_tall_kernel<Codec, MaxCols, true>,
+                static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data)));
             return;
         }
         static const bool configured = [] {
@@ -775,8 +779,9 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
                                         static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
         }();
         require(configured, "the tall kernel's shared memory could not be configured");
-        projection_tall_kernel<Codec, MaxCols, false><<<blocks, kTallThreads, staged_pass, stream>>>(
-            static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
+        CUDA_CHECK(pdl::launch_consumer({dim3(blocks), dim3(kTallThreads), staged_pass, stream},
+            projection_tall_kernel<Codec, MaxCols, false>,
+            static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data)));
     };
     switch (columns) {
     case 1:

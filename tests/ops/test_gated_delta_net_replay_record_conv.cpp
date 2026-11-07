@@ -213,7 +213,8 @@ INFERNIX_OP_TEST(gated_delta_net_replay_record_conv) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    int failures = expect_rejected(48, 17) + expect_rejected(48, 1) + expect_rejected(32, 8);
+    int failures = expect_rejected(48, ops::kGdnReplayConvMaxWidth + 1) + expect_rejected(48, 1) +
+                   expect_rejected(32, 8);
     std::uint32_t seed = 4100U;
     for (std::int32_t width = 2; width <= ops::kGdnReplayConvMaxWidth; ++width) {
         failures += run_case({width, 1, false, false}, seed += 16);

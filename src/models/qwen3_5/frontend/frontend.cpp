@@ -680,6 +680,18 @@ public:
             for (int id = 0; id < static_cast<int>(tokenizer->vocab_size()); ++id) {
                 if (tokenizer->is_special_token(id)) { ngram_boundaries.push_back(id); }
             }
+            for (const std::string_view marker :
+                 {std::string_view("<think>"), fi::kReasoningCloseMarker, fi::kToolCallOpen,
+                  std::string_view("</tool_call>"), std::string_view("<tool_response>"),
+                  std::string_view("</tool_response>")}) {
+                if (const fi::AddedToken* token = tokenizer->find_added_token(marker)) {
+                    ngram_boundaries.push_back(static_cast<TokenId>(token->id));
+                }
+            }
+            std::sort(ngram_boundaries.begin(), ngram_boundaries.end());
+            ngram_boundaries.erase(
+                std::unique(ngram_boundaries.begin(), ngram_boundaries.end()),
+                ngram_boundaries.end());
         }
         // The checkpoint's recommended presets when the artifact carries them (sampling.json).
         sampling = resources.sampling_json.empty() ? default_sampling(options.architecture)

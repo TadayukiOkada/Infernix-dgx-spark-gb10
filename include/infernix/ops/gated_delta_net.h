@@ -133,7 +133,7 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    cudaStream_t stream);
 
 // The widest call gated_delta_net_replay_record_conv takes.
-inline constexpr std::int32_t kGdnReplayConvMaxWidth = 16;
+inline constexpr std::int32_t kGdnReplayConvMaxWidth = 32;
 
 /**
  * gated_delta_net_replay_record with its inputs' causal convolution and gates evaluated inside the same kernel:

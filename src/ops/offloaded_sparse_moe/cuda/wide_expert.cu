@@ -29,15 +29,19 @@ void check_launch(const char* what) {
     }
 }
 
-// One CTA: the call's wide work tiles, (job, first column) for each 64-column slice of every wide
-// job in job order, and for each pass of pass_jobs jobs the index of its first tile.
+// One CTA: the call's wide work tiles, (job | (span << 16), first column) for each 64-column slice
+// of every wide job in job order, and for each pass of pass_jobs jobs the index of its first tile.
+// When staging is disabled (staging_slots == 0 && fetch.request == nullptr), also resolves
+// job_records[job] directly so unstaged calls can omit the redundant stage_kernel launch.
 __global__ void __launch_bounds__(kPlanThreads)
-    plan_kernel(MoeDispatch dispatch, const ExpertScales* __restrict__ scales, int max_jobs, int pass_jobs, int passes,
+    plan_kernel(MoeDispatch dispatch, MoeExpertSource source, int max_jobs, int pass_jobs, int passes,
+                const std::int32_t* __restrict__ cpu_flags, const std::uint8_t** __restrict__ job_records,
                 std::int32_t* __restrict__ tiles, std::int32_t* __restrict__ pass_tiles) {
     __shared__ int scan[kPlanThreads];
     __shared__ int base;
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int jobs = min(*dispatch.job_count, max_jobs);
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int jobs         = min(*dispatch.job_count, max_jobs);
+    const bool resolve_rec = source.staging_slots == 0 && source.fetch.request == nullptr && job_records != nullptr;
     if (tid == 0) { base = 0; }
     __syncthreads();
     for (int chunk = 0; chunk < passes * pass_jobs; chunk += kPlanThreads) {
@@ -46,7 +50,10 @@ __global__ void __launch_bounds__(kPlanThreads)
         if (job < jobs) {
             const int expert  = dispatch.jobs[job];
             const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            if (wide_route(columns, scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
+            if (wide_route(columns, source.scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
+            if (resolve_rec && (cpu_flags == nullptr || cpu_flags[job] == 0)) {
+                job_records[job] = resolve_unstaged_record(source, expert);
+            }
         }
         scan[tid] = n;
         __syncthreads();
@@ -58,7 +65,7 @@ __global__ void __launch_bounds__(kPlanThreads)
         }
         const int first = base + scan[tid] - n;
         for (int i = 0; i < n; ++i) {
-            tiles[2 * (first + i)]     = job;
+            tiles[2 * (first + i)]     = job | (n << 16);
             tiles[2 * (first + i) + 1] = i * kTileColumns;
         }
         if (job % pass_jobs == 0 && job / pass_jobs < passes) { pass_tiles[job / pass_jobs] = first; }
@@ -81,7 +88,7 @@ __global__ void __launch_bounds__(kQuantizeThreads)
     const int warp       = static_cast<int>(threadIdx.x) >> 5;
     const int total      = pass_tiles[passes];
     for (int tile = static_cast<int>(blockIdx.x); tile < total; tile += static_cast<int>(gridDim.x)) {
-        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int job = tiles[2 * tile] & 0xFFFF, column = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
         const int first  = dispatch.offsets[expert] + column;
         const int count  = min(kTileColumns, dispatch.offsets[expert + 1] - first);
@@ -96,23 +103,26 @@ __global__ void __launch_bounds__(kQuantizeThreads)
                 const int b        = m * 32 + lane;
                 const auto* source = reinterpret_cast<const uint4*>(token_x + 16 * b);
                 const uint4 v0 = source[0], v1 = source[1];
-                std::uint16_t v[16];
                 const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+                float v[16];
+                float amax = 0.0F;
 #pragma unroll
                 for (int w = 0; w < 8; ++w) {
-                    v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
-                    v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
+                    const float f0 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] & 0xFFFFU));
+                    const float f1 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] >> 16));
+                    v[2 * w]       = f0;
+                    v[2 * w + 1]   = f1;
+                    const float a0 = canon::f32_from_bits(canon::f32_bits(f0) & 0x7FFFFFFFU);
+                    const float a1 = canon::f32_from_bits(canon::f32_bits(f1) & 0x7FFFFFFFU);
+                    amax           = a0 > amax ? a0 : amax;
+                    amax           = a1 > amax ? a1 : amax;
                 }
-                const canon::A4Codes q = canon::quantize_a4_codes(v, scale);
-                unsigned low = 0, high = 0;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    low |= (static_cast<unsigned>(q.code[j]) | (static_cast<unsigned>(q.code[4 + j]) << 4)) << (8 * j);
-                    high |= (static_cast<unsigned>(q.code[8 + j]) | (static_cast<unsigned>(q.code[12 + j]) << 4)) << (8 * j);
-                }
+                unsigned low = 0U, high = 0U;
+                std::uint8_t scale_word = 0U;
+                canon::quantize_a4_plane_from_f32(v, amax, scale, low, high, scale_word);
                 const int position = plane_block(b);
                 *reinterpret_cast<uint2*>(row + 8 * position) = make_uint2(low, high);
-                row[kXCodeBytes + position]                   = q.scale_word;
+                row[kXCodeBytes + position]                   = scale_word;
             }
         }
     }
@@ -151,54 +161,51 @@ __global__ void __launch_bounds__(kQuantizeThreads, 3)
     const int lane           = static_cast<int>(threadIdx.x) & 31;
     const int warp           = static_cast<int>(threadIdx.x) >> 5;
     for (int t = static_cast<int>(blockIdx.x) * kWarps + warp; t < tokens; t += static_cast<int>(gridDim.x) * kWarps) {
+        int slot_p         = 0;
+        float slot_scale   = 0.0F;
+        bool slot_is_wide  = false;
+        if (lane < top_k) {
+            const int entry           = t * top_k + lane;
+            slot_p                    = map[2 * entry];
+            const int expert          = map[2 * entry + 1];
+            const ExpertScales sc     = scales[expert];
+            slot_scale                = sc.input_gate;
+            slot_is_wide              = wide_route(dispatch.offsets[expert + 1] - dispatch.offsets[expert], sc);
+        }
+        const unsigned wide_mask = __ballot_sync(0xFFFFFFFFU, slot_is_wide);
+        if (wide_mask == 0U) { continue; }
         const auto* token_x = x + static_cast<std::size_t>(t) * kHidden;
-        // One 16-element block per lane at a time keeps the registers low enough for three CTAs per SM
-        // (the row is read once from memory; its repeats for the other slots hit the L1).
+        // One 16-element block per lane at a time keeps the registers low enough for three CTAs per SM.
 #pragma unroll 1
         for (int m = 0; m < kPerLane; ++m) {
             const int b        = m * 32 + lane;
             const auto* source = reinterpret_cast<const uint4*>(token_x + 16 * b);
             const uint4 v0 = source[0], v1 = source[1];
             const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            float v[16];
+            float amax = 0.0F;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const float f0 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] & 0xFFFFU));
+                const float f1 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] >> 16));
+                v[2 * w]       = f0;
+                v[2 * w + 1]   = f1;
+                const float a0 = canon::f32_from_bits(canon::f32_bits(f0) & 0x7FFFFFFFU);
+                const float a1 = canon::f32_from_bits(canon::f32_bits(f1) & 0x7FFFFFFFU);
+                amax           = a0 > amax ? a0 : amax;
+                amax           = a1 > amax ? a1 : amax;
+            }
             const int position = plane_block(b);
+            unsigned rem       = wide_mask;
 #pragma unroll 1
-            for (int slot = 0; slot < top_k; ++slot) {
-                const int entry  = t * top_k + slot;
-                const int p      = map[2 * entry];
-                const int expert = map[2 * entry + 1];
-                if (!wide_route(dispatch.offsets[expert + 1] - dispatch.offsets[expert], scales[expert])) { continue; }
-                // Rebuilt from the registers per slot so every index of v is static (no local memory).
-                std::uint16_t v[16];
-#pragma unroll
-                for (int w = 0; w < 8; ++w) {
-                    v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
-                    v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
-                }
-                // canon::quantize_a4_codes with its loops unrolled explicitly (the same operations in the same
-                // order), so the sixteen codes stay in registers inside this non-unrolled loop.
-                const float input_scale = scales[expert].input_gate;
-                float amax              = 0.0F;
-#pragma unroll
-                for (int j = 0; j < 16; ++j) {
-                    const float a = canon::f32_from_bits(canon::f32_bits(canon::bf16_to_f32(v[j])) & 0x7FFFFFFFU);
-                    amax          = a > amax ? a : amax;
-                }
-                const std::uint8_t scale_word = canon::a4_scale_word(amax, input_scale);
-                unsigned code[16];
-#pragma unroll
-                for (int j = 0; j < 16; ++j) { code[j] = 0; }
-                if (canon::e4m3_scaled(scale_word) != 0) {
-#pragma unroll
-                    for (int j = 0; j < 16; ++j) {
-                        code[j] = canon::a4_code(canon::bf16_to_f32(v[j]), scale_word, input_scale);
-                    }
-                }
-                unsigned low = 0, high = 0;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    low |= (code[j] | (code[4 + j] << 4)) << (8 * j);
-                    high |= (code[8 + j] | (code[12 + j] << 4)) << (8 * j);
-                }
+            while (rem != 0U) {
+                const int slot          = __ffs(rem) - 1;
+                rem &= rem - 1U;
+                const int p             = __shfl_sync(0xFFFFFFFFU, slot_p, slot);
+                const float input_scale = __shfl_sync(0xFFFFFFFFU, slot_scale, slot);
+                unsigned low = 0U, high = 0U;
+                std::uint8_t scale_word = 0U;
+                canon::quantize_a4_plane_from_f32(v, amax, input_scale, low, high, scale_word);
                 std::uint8_t* const row = plane + static_cast<std::size_t>(p) * kXRowBytes;
                 *reinterpret_cast<uint2*>(row + 8 * position) = make_uint2(low, high);
                 row[kXCodeBytes + position]                   = scale_word;
@@ -414,7 +421,7 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
     const int first_tile = pass_tiles[pass], tile_count = pass_tiles[pass + 1] - first_tile;
     for (int task = warp; task < tile_count * kTileColumns; task += warps) {
         const int tile = first_tile + task / kTileColumns, c = task % kTileColumns;
-        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int job = tiles[2 * tile] & 0xFFFF, column = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
         const int entry  = dispatch.offsets[expert] + column + c;
         if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
@@ -449,7 +456,7 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
     const bool mine = lane < kSlices;
     for (int task = warp; task < tile_count * kTileColumns; task += warps) {
         const int tile = first_tile + task / kTileColumns, c = task % kTileColumns;
-        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int job = tiles[2 * tile] & 0xFFFF, column = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
         const int entry  = dispatch.offsets[expert] + column + c;
         if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
@@ -604,7 +611,7 @@ __global__ void __launch_bounds__(kQuantizeThreads)
     const int warp       = static_cast<int>(threadIdx.x) >> 5;
     const int total      = pass_tiles[passes];
     for (int tile = static_cast<int>(blockIdx.x); tile < total; tile += static_cast<int>(gridDim.x)) {
-        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int job = tiles[2 * tile] & 0xFFFF, column = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
         const int first  = dispatch.offsets[expert] + column;
         const int count  = min(kTileColumns, dispatch.offsets[expert + 1] - first);
@@ -636,7 +643,7 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
     const int first_tile = pass_tiles[pass], tile_count = pass_tiles[pass + 1] - first_tile;
     for (int task = warp; task < tile_count * kTileColumns; task += warps) {
         const int tile = first_tile + task / kTileColumns, c = task % kTileColumns;
-        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int job = tiles[2 * tile] & 0xFFFF, column = tiles[2 * tile + 1];
         const int expert = dispatch.jobs[job];
         const int entry  = dispatch.offsets[expert] + column + c;
         if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
@@ -792,7 +799,9 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.outputs     = static_cast<std::uint16_t*>(outputs.data);
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
     call.mean_job_columns = entries / max_jobs;
-    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
+    const bool cpu        = source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
+    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, max_jobs, pass_jobs, call.passes,
+                                                cpu ? workspace.cpu_flags : nullptr, workspace.job_records,
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
     if (source.activation == ExpertActivation::kA16 && source.wide_a16 == WideA16::kA8) {

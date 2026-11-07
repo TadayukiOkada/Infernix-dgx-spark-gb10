@@ -716,7 +716,7 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
 // column, GB10 candidate 2026-10-30) measured 3..8 % slower at the widths this branch now serves
 // (T = 2..3) and neutral at 4..8, so the pass loop stays.
 template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
-__global__ __launch_bounds__(kDownThreads, ExactColumns == 3 ? 2 : 1) void hc_down_partials_v4_kernel(
+__global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns == 3) ? 2 : 1) void hc_down_partials_v4_kernel(
     const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
     const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
@@ -912,7 +912,9 @@ constexpr int kUpV4MaxSmem = static_cast<int>(
     sizeof(float));
 
 template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
-__global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
+__global__ __launch_bounds__(
+    kUpV4Threads,
+    (std::is_same_v<Codec, Q8Codec> && (ExactColumns == 2 || ExactColumns == 3)) ? 2 : 1) void hc_up_collapse_v4_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
     float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
@@ -1001,36 +1003,81 @@ __global__ __launch_bounds__(kUpV4Threads, 1) void hc_up_collapse_v4_kernel(
 
     // 3. Per token, the warp's 8 rows in the lane-chunk order, one transposed butterfly, and lane
     // 4q stores row q's sum.
+    if constexpr (ExactColumns > 0) {
+        float acc[ExactColumns][kUpV4Rows];
 #pragma unroll
-    for (int t = 0; t < n_cols; ++t) {
-        const float4* mt = reinterpret_cast<const float4*>(m + t * rank);
-        float acc[kUpV4Rows];
+        for (int t = 0; t < ExactColumns; ++t) {
 #pragma unroll
-        for (int q = 0; q < kUpV4Rows; ++q) { acc[q] = 0.0F; }
+            for (int q = 0; q < kUpV4Rows; ++q) { acc[t][q] = 0.0F; }
+        }
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int c = lane + 32 * h;
             if (c < chunks) {
-                const float4 a = mt[c], b = mt[chunks + c];
+                float4 a[ExactColumns], b[ExactColumns];
+#pragma unroll
+                for (int t = 0; t < ExactColumns; ++t) {
+                    const float4* mt = reinterpret_cast<const float4*>(m + t * rank);
+                    a[t]             = mt[c];
+                    b[t]             = mt[chunks + c];
+                }
 #pragma unroll
                 for (int q = 0; q < kUpV4Rows; ++q) {
                     float wv[8];
                     Codec::decode(chunk[q][h], wv);
-                    acc[q] = fmaf(wv[0], a.x, acc[q]);
-                    acc[q] = fmaf(wv[1], a.y, acc[q]);
-                    acc[q] = fmaf(wv[2], a.z, acc[q]);
-                    acc[q] = fmaf(wv[3], a.w, acc[q]);
-                    acc[q] = fmaf(wv[4], b.x, acc[q]);
-                    acc[q] = fmaf(wv[5], b.y, acc[q]);
-                    acc[q] = fmaf(wv[6], b.z, acc[q]);
-                    acc[q] = fmaf(wv[7], b.w, acc[q]);
+#pragma unroll
+                    for (int t = 0; t < ExactColumns; ++t) {
+                        acc[t][q] = fmaf(wv[0], a[t].x, acc[t][q]);
+                        acc[t][q] = fmaf(wv[1], a[t].y, acc[t][q]);
+                        acc[t][q] = fmaf(wv[2], a[t].z, acc[t][q]);
+                        acc[t][q] = fmaf(wv[3], a[t].w, acc[t][q]);
+                        acc[t][q] = fmaf(wv[4], b[t].x, acc[t][q]);
+                        acc[t][q] = fmaf(wv[5], b[t].y, acc[t][q]);
+                        acc[t][q] = fmaf(wv[6], b[t].z, acc[t][q]);
+                        acc[t][q] = fmaf(wv[7], b[t].w, acc[t][q]);
+                    }
                 }
             }
         }
-        const float total = warp_sum8_transposed(acc, lane);
-        if ((lane & 3) == 0) {
-            const int q = lane >> 2;
-            u[(t * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+#pragma unroll
+        for (int t = 0; t < ExactColumns; ++t) {
+            const float total = warp_sum8_transposed(acc[t], lane);
+            if ((lane & 3) == 0) {
+                const int q = lane >> 2;
+                u[(t * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+            }
+        }
+    } else {
+        for (int t = 0; t < n_cols; ++t) {
+            const float4* mt = reinterpret_cast<const float4*>(m + t * rank);
+            float acc[kUpV4Rows];
+#pragma unroll
+            for (int q = 0; q < kUpV4Rows; ++q) { acc[q] = 0.0F; }
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int c = lane + 32 * h;
+                if (c < chunks) {
+                    const float4 a = mt[c], b = mt[chunks + c];
+#pragma unroll
+                    for (int q = 0; q < kUpV4Rows; ++q) {
+                        float wv[8];
+                        Codec::decode(chunk[q][h], wv);
+                        acc[q] = fmaf(wv[0], a.x, acc[q]);
+                        acc[q] = fmaf(wv[1], a.y, acc[q]);
+                        acc[q] = fmaf(wv[2], a.z, acc[q]);
+                        acc[q] = fmaf(wv[3], a.w, acc[q]);
+                        acc[q] = fmaf(wv[4], b.x, acc[q]);
+                        acc[q] = fmaf(wv[5], b.y, acc[q]);
+                        acc[q] = fmaf(wv[6], b.z, acc[q]);
+                        acc[q] = fmaf(wv[7], b.w, acc[q]);
+                    }
+                }
+            }
+            const float total = warp_sum8_transposed(acc, lane);
+            if ((lane & 3) == 0) {
+                const int q = lane >> 2;
+                u[(t * kStreams + (q >> 1)) * kUpFeatures + warp + kUpV4Warps * (q & 1)] = total;
+            }
         }
     }
     __syncthreads();
@@ -1080,13 +1127,16 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
         const cudaError_t e0 = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec, Norm, Fold, 0>,
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                     static_cast<int>(kDownSharedBytes));
+        const cudaError_t e2 = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec, Norm, Fold, 2>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    static_cast<int>(2 * kHidden * sizeof(float)));
         const cudaError_t e3 = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec, Norm, Fold, 3>,
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                     static_cast<int>(3 * kHidden * sizeof(float)));
         const cudaError_t e4 = cudaFuncSetAttribute(hc_down_partials_v4_kernel<Codec, Norm, Fold, 4>,
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                     static_cast<int>(kDownSharedBytes));
-        const cudaError_t error = e0 != cudaSuccess ? e0 : (e3 != cudaSuccess ? e3 : e4);
+        const cudaError_t error = e0 != cudaSuccess ? e0 : (e2 != cudaSuccess ? e2 : (e3 != cudaSuccess ? e3 : e4));
         if (error != cudaSuccess) {
             throw std::runtime_error(std::string("hyper_connection_mix: shared memory: ") + cudaGetErrorString(error));
         }
@@ -1102,7 +1152,9 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
                                           down, down_rows, columns, eps, partial, inv, pending.y, pending.inject),
                      "down partials v4");
     };
-    if (columns == 3) {
+    if (columns == 2) {
+        launch_exact.template operator()<2>();
+    } else if (columns == 3) {
         launch_exact.template operator()<3>();
     } else if (columns == 4) {
         launch_exact.template operator()<4>();
@@ -1135,11 +1187,14 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, kUpMaxSmem);
         const cudaError_t e3_0 = cudaFuncSetAttribute(hc_up_collapse_v4_kernel<Codec, Norm, Fold, 0>,
                                                       cudaFuncAttributeMaxDynamicSharedMemorySize, kUpV4MaxSmem);
+        const cudaError_t e3_2 = cudaFuncSetAttribute(hc_up_collapse_v4_kernel<Codec, Norm, Fold, 2>,
+                                                      cudaFuncAttributeMaxDynamicSharedMemorySize, kUpV4MaxSmem);
         const cudaError_t e3_3 = cudaFuncSetAttribute(hc_up_collapse_v4_kernel<Codec, Norm, Fold, 3>,
                                                       cudaFuncAttributeMaxDynamicSharedMemorySize, kUpV4MaxSmem);
         const cudaError_t e3_4 = cudaFuncSetAttribute(hc_up_collapse_v4_kernel<Codec, Norm, Fold, 4>,
                                                       cudaFuncAttributeMaxDynamicSharedMemorySize, kUpV4MaxSmem);
-        const cudaError_t e3 = e3_0 != cudaSuccess ? e3_0 : (e3_3 != cudaSuccess ? e3_3 : e3_4);
+        const cudaError_t e3 =
+            e3_0 != cudaSuccess ? e3_0 : (e3_2 != cudaSuccess ? e3_2 : (e3_3 != cudaSuccess ? e3_3 : e3_4));
         if (e1 != cudaSuccess || e1_wide != cudaSuccess || e2_1 != cudaSuccess || e2 != cudaSuccess ||
             e3 != cudaSuccess) {
             throw std::runtime_error(
@@ -1208,7 +1263,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                          "up collapse v4");
         };
         if (columns == 2) {
-            launch_up_v4.template operator()<0>();
+            launch_up_v4.template operator()<2>();
         } else if (columns == 3) {
             launch_up_v4.template operator()<3>();
         } else if (columns == 4) {

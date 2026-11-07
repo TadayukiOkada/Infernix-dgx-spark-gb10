@@ -168,7 +168,9 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
     __shared__ float warp_maxima[kWarps];
 
     pdl::enter();
-    const int token = static_cast<int>(blockIdx.x);
+    const int total_blocks = static_cast<int>(gridDim.x);
+    const int token = total_blocks > 1024 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
+                                          : static_cast<int>(blockIdx.x);
     const int tid   = static_cast<int>(threadIdx.x);
     if (token >= tokens) {
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {

@@ -52,6 +52,53 @@ INFERNIX_WIDE_HD bool wide_route(int columns, const ExpertScales& scales) {
     return columns > kMaxColumns && scales.input_gate == scales.input_up;
 }
 
+// The pitch of frames, staging slots and landings (MoeExpertSource::frame_stride; prefetch slots
+// take prefetch_stride when it is set).
+INFERNIX_WIDE_HD std::uint64_t frame_pitch(const MoeExpertSource& source) {
+    return source.frame_stride != 0 ? source.frame_stride : source.record_stride;
+}
+
+#if defined(__CUDACC__)
+// A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
+__device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
+    return source.host_table != nullptr ? source.host_table[expert]
+                                        : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+}
+
+// A job's record when no copy serves it: the layer's shared expert (MoeExpertSource::shared_record) or
+// a frame-resident expert; null otherwise.
+__device__ __forceinline__ const std::uint8_t* resident_record(const MoeExpertSource& source, int expert) {
+    if (expert == source.shared_expert) { return source.shared_record; }
+    if (source.frame_base == nullptr) { return nullptr; }
+    const int frame = source.frames[expert];
+    return frame >= 0 ? source.frame_base + static_cast<std::uint64_t>(frame) * frame_pitch(source) : nullptr;
+}
+
+// The call's error word: layer << 16 | code (MoeExpertSource::error).
+__device__ __forceinline__ void report_error(const MoeExpertSource& source, std::uint32_t code) {
+    if (source.error == nullptr) { return; }
+    const int layer = source.fetch.request != nullptr ? source.fetch.layer : source.cpu.layer;
+    *reinterpret_cast<volatile std::uint32_t*>(source.error) = (static_cast<std::uint32_t>(layer) << 16U) | (code & 0xFFFFU);
+}
+
+__device__ __forceinline__ const std::uint8_t* resolve_unstaged_record(const MoeExpertSource& source, int expert) {
+    const std::uint8_t* record = resident_record(source, expert);
+    if (record == nullptr && source.prefetched != nullptr) {
+        const int slot = source.prefetched[expert];
+        if (slot >= 0) {
+            record = source.prefetch_base +
+                     static_cast<std::uint64_t>(slot) *
+                         (source.prefetch_stride != 0 ? source.prefetch_stride : frame_pitch(source));
+        }
+    }
+    if (record == nullptr) {
+        record = host_record(source, expert);
+        if (record == nullptr) { report_error(source, kErrorUnservedRecord); }
+    }
+    return record;
+}
+#endif
+
 namespace wide {
 
 inline constexpr int kTileColumns = 64; // columns (routed entries of one expert) per work tile

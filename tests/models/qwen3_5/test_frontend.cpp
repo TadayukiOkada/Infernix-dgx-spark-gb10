@@ -3751,6 +3751,13 @@ int test_ngram_proposal_only_sources() {
                               content_tokens("def f():\n    x = 1\n    return x\n"),
                       "ngram tool sources lost provenance/indentation");
     failures += check(!after.ngram_boundaries.empty(), "ngram special-token boundaries absent");
+    for (const std::string_view marker : {"<think>", "</think>", "<tool_call>", "</tool_call>"}) {
+        const auto encoded = fixture_tokenizer().encode(marker);
+        failures += check(encoded.size() == 1 &&
+                              std::binary_search(after.ngram_boundaries.begin(),
+                                                 after.ngram_boundaries.end(), encoded[0]),
+                          "ngram boundaries must include structural phase markers");
+    }
     infernix::PromptInput quoted_input              = input;
     quoted_input.messages.back().parts.front().text =
         "7: <|im_start|>user\n8: <think>plan</think>\n9: <|im_end|><|image_pad|>\n";

@@ -280,12 +280,21 @@ void launch_recurrent_record_conv(const RecordConvInputs& inputs, std::int32_t q
             static_cast<const float*>(inputs.dt_bias.data),
             inputs.qkv.ne[0],
         };
-        if (inputs.a_direct) {
-            CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_conv_kernel<true, State>,
-                                            access));
+        const auto dispatch = [&]<int MaxWidth>() {
+            if (inputs.a_direct) {
+                CUDA_CHECK(pdl::launch_consumer(
+                    {grid, block, 0, stream},
+                    recurrent_record_conv_kernel<true, State, MaxWidth>, access));
+            } else {
+                CUDA_CHECK(pdl::launch_consumer(
+                    {grid, block, 0, stream},
+                    recurrent_record_conv_kernel<false, State, MaxWidth>, access));
+            }
+        };
+        if (width <= 16) {
+            dispatch.template operator()<16>();
         } else {
-            CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_conv_kernel<false, State>,
-                                            access));
+            dispatch.template operator()<32>();
         }
     });
     CUDA_CHECK(cudaGetLastError());

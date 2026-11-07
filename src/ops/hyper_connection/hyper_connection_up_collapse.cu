@@ -142,12 +142,26 @@ void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized,
     // The 64-row K128 tile of the 17..48 band runs ~180 GB/s here and loses even to the composed
     // pair it replaces (infernix_hyper_connection_bench, GB10, 2026-11-05).
     if (T <= 16) return launch<q8_instances::MmaR32T16>(m, up, normalized, x, stream);
-    if (T <= 48) return launch<q8_instances::MmaR64x16T48K128A1>(m, up, normalized, x, stream);
+    if (T <= 24) return launch<q8_instances::MmaR32T24>(m, up, normalized, x, stream);
+    if (T <= 32) return launch<q8_instances::MmaR32T16>(m, up, normalized, x, stream);
+    if (T <= 48) return launch<q8_instances::MmaR32T24>(m, up, normalized, x, stream);
+    if (T <= 64) {
+        if (hidden % 32 == 0) {
+            return launch<q8_instances::MmaR64x32T64K64A2>(m, up, normalized, x, stream);
+        }
+        return launch<q8_instances::MmaR32T64>(m, up, normalized, x, stream);
+    }
     if (T <= 128) {
         if (hidden % 32 == 0) {
             return launch<q8_instances::MmaR128x32T64K64A2>(m, up, normalized, x, stream);
         }
         return launch<q8_instances::MmaR32T64>(m, up, normalized, x, stream);
+    }
+    if (T <= 512) {
+        if (hidden % 32 == 0) {
+            return launch<q8_instances::MmaR64x32T128K64A2>(m, up, normalized, x, stream);
+        }
+        return launch<q8_instances::MmaR64T128>(m, up, normalized, x, stream);
     }
     if (hidden % 32 == 0) {
         return launch<q8_instances::MmaR128x64T128K64A1>(m, up, normalized, x, stream);

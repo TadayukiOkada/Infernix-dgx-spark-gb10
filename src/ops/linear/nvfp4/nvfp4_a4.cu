@@ -71,13 +71,16 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
     constexpr int kThreads    = 256;
     const std::int32_t written_tokens =
         Layout != Nvfp4ScaleLayout::RowMajor ? nvfp4_a4_padded_tokens(tokens, Layout) : tokens;
+    const pdl::Dependency dep =
+        (Layout == Nvfp4ScaleLayout::RowMajor && tokens <= 16) ? pdl::Dependency::Programmatic
+                                                               : pdl::Dependency::Serialized;
     if (workspace.row_scales != nullptr) {
         constexpr int kRowScaleThreads =
             ActivationGeometry::kGroupsPerRow <= 160
                 ? 160
                 : (ActivationGeometry::kGroupsPerRow == 384 ? 192 : 256);
-        CUDA_CHECK(pdl::launch_consumer(
-            {dim3(written_tokens), dim3(kRowScaleThreads), 0, stream},
+        CUDA_CHECK(pdl::launch_with(
+            dep, {dim3(written_tokens), dim3(kRowScaleThreads), 0, stream},
             nvfp4_a4_row_scaled_residual_quantize_kernel<ActivationGeometry, kRowScaleThreads, Terms,
                                                          Layout>,
             static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales,
@@ -87,8 +90,8 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
     }
     const int blocks =
         (written_tokens * ActivationGeometry::kGroupsPerRow + kThreads - 1) / kThreads;
-    CUDA_CHECK(pdl::launch_consumer(
-        {dim3(blocks), dim3(kThreads), 0, stream},
+    CUDA_CHECK(pdl::launch_with(
+        dep, {dim3(blocks), dim3(kThreads), 0, stream},
         nvfp4_a4_residual_quantize_kernel<ActivationGeometry, kThreads, Terms, Layout>,
         static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
         written_tokens, weight.input_scale_divisor,
