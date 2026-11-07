@@ -53,7 +53,7 @@ __device__ int draw_rank(float edge, float temperature, unsigned long long seed,
         return selected;
     }
     const float weight      = lane < kCandidates ? __expf((edge - maximum) / temperature) : 0.0F;
-    const float probability = weight / warp_sum(weight);
+    const float probability = weight * (1.0F / warp_sum(weight));
     if (lane < kCandidates) q[lane] = probability;
     float uniform =
         lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDFlash2Proposal, static_cast<unsigned>(step))
@@ -202,7 +202,7 @@ __device__ __forceinline__ float child_law(float edge, float temperature) {
     const float scale       = temperature > 0.0F ? temperature : 1.0F;
     const float maximum     = warp_max(edge);
     const float weight      = lane < kCandidates ? __expf((edge - maximum) / scale) : 0.0F;
-    const float probability = weight / warp_sum(weight);
+    const float probability = weight * (1.0F / warp_sum(weight));
     return lane < kCandidates ? probability : 0.0F;
 }
 
@@ -219,7 +219,7 @@ __device__ __forceinline__ float next_child_expectation(float law, unsigned take
     }
     const float mass = warp_sum(available ? law : 0.0F);
     if (!(mass > 0.0F)) return -CUDART_INF_F;
-    return warp_sum(available ? law * law : 0.0F) / mass;
+    return warp_sum(available ? law * law : 0.0F) * (1.0F / mass);
 }
 
 // Without-replacement draw of a node's next child from its law restricted to the untaken ranks.

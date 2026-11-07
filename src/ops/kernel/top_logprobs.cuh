@@ -121,6 +121,10 @@ __launch_bounds__(BlockSize) __global__
     unsigned long long k1        = 0;
     unsigned long long k2        = 0;
     unsigned long long k3        = 0;
+    unsigned long long k4        = 0;
+    unsigned long long k5        = 0;
+    unsigned long long k6        = 0;
+    unsigned long long k7        = 0;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
         const float value   = logprob_logit(values[row]);
@@ -131,21 +135,23 @@ __launch_bounds__(BlockSize) __global__
         local_max = new_max;
         local_sum += expf(value - local_max);
         const unsigned long long key = top_logprobs_key(value, row);
-        if (key > k3) {
+        if (key > k7) {
             if (key > k0) {
-                k3 = k2;
-                k2 = k1;
-                k1 = k0;
-                k0 = key;
+                k7 = k6; k6 = k5; k5 = k4; k4 = k3; k3 = k2; k2 = k1; k1 = k0; k0 = key;
             } else if (key > k1) {
-                k3 = k2;
-                k2 = k1;
-                k1 = key;
+                k7 = k6; k6 = k5; k5 = k4; k4 = k3; k3 = k2; k2 = k1; k1 = key;
             } else if (key > k2) {
-                k3 = k2;
-                k2 = key;
+                k7 = k6; k6 = k5; k5 = k4; k4 = k3; k3 = k2; k2 = key;
+            } else if (key > k3) {
+                k7 = k6; k6 = k5; k5 = k4; k4 = k3; k3 = key;
+            } else if (key > k4) {
+                k7 = k6; k6 = k5; k5 = k4; k4 = key;
+            } else if (key > k5) {
+                k7 = k6; k6 = k5; k5 = key;
+            } else if (key > k6) {
+                k7 = k6; k6 = key;
             } else {
-                k3 = key;
+                k7 = key;
             }
         }
     }
@@ -161,8 +167,8 @@ __launch_bounds__(BlockSize) __global__
         unsigned long long best = 0;
         if (rank == 0) {
             best = k0;
-        } else if (rank < 4) {
-            best = k0 < previous ? k0 : (k1 < previous ? k1 : (k2 < previous ? k2 : (k3 < previous ? k3 : 0ULL)));
+        } else if (rank < 8) {
+            best = k0 < previous ? k0 : (k1 < previous ? k1 : (k2 < previous ? k2 : (k3 < previous ? k3 : (k4 < previous ? k4 : (k5 < previous ? k5 : (k6 < previous ? k6 : (k7 < previous ? k7 : 0ULL)))))));
         } else {
             for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
                  row += BlockSize) {

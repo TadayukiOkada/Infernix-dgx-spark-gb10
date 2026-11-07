@@ -222,7 +222,9 @@ __global__ __launch_bounds__(kDownThreads, MinBlocks) void hc_down_partials_kern
             }
         }
         if constexpr (Pending) {
-            const float inject = pending_inject[s];
+            float inject = 0.0f;
+            if (lane == 0) { inject = pending_inject[s]; }
+            inject = __shfl_sync(0xFFFFFFFFU, inject, 0);
 #pragma unroll
             for (int h = 0; h < kSlices; ++h) {
                 const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
@@ -311,7 +313,11 @@ __global__ __launch_bounds__(kDownThreads, MinBlocks) void hc_down_partials_kern
 #pragma unroll
                 for (int c = 0; c < PassColumns; ++c) {
                     if (c < pass) {
-                        const float inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+                        float inject = 0.0f;
+                        if (lane == 0) {
+                            inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+                        }
+                        inject = __shfl_sync(0xFFFFFFFFU, inject, 0);
 #pragma unroll
                         for (int h = 0; h < kSlices; ++h) {
                             const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
@@ -778,7 +784,11 @@ __global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns ==
 #pragma unroll
             for (int c = 0; c < kColumns; ++c) {
                 if (ExactColumns > 0 || c < pass) {
-                    const float inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+                    float inject = 0.0f;
+                    if (lane == 0) {
+                        inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+                    }
+                    inject = __shfl_sync(0xFFFFFFFFU, inject, 0);
 #pragma unroll
                     for (int h = 0; h < kSlices; ++h) {
                         const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;

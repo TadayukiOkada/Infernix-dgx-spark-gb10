@@ -891,7 +891,7 @@ __device__ __forceinline__ void e2m1x2_word_to_half2(std::uint32_t word, std::ui
 }
 
 // Lane l = 8q + i's integer shares (P_q of rows i and i + 8) of one unit against one activation word.
-__device__ __forceinline__ void unit_shares_half2(const std::uint32_t (&w)[4], const std::uint32_t (&a)[4], int& lo,
+[[maybe_unused]] __device__ __forceinline__ void unit_shares_half2(const std::uint32_t (&w)[4], const std::uint32_t (&a)[4], int& lo,
                                                   int& hi) {
     __half2 acc = __hmul2(*reinterpret_cast<const __half2*>(&w[0]), *reinterpret_cast<const __half2*>(&a[0]));
 #pragma unroll
@@ -901,6 +901,26 @@ __device__ __forceinline__ void unit_shares_half2(const std::uint32_t (&w)[4], c
     const __half2 four = __hmul2(acc, __float2half2_rn(4.0F));
     lo = __half2int_rn(__low2half(four));
     hi = __half2int_rn(__high2half(four));
+}
+
+__device__ __forceinline__ void e2m1x2_word_to_half2_x4(std::uint32_t word, std::uint32_t (&h)[4]) {
+    e2m1x2_word_to_half2(word, h);
+    const __half2 four = __float2half2_rn(4.0F);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        *reinterpret_cast<__half2*>(&h[j]) = __hmul2(*reinterpret_cast<const __half2*>(&h[j]), four);
+    }
+}
+
+__device__ __forceinline__ void unit_shares_half2_pre4(const std::uint32_t (&w)[4], const std::uint32_t (&a_x4)[4],
+                                                       int& lo, int& hi) {
+    __half2 acc = __hmul2(*reinterpret_cast<const __half2*>(&w[0]), *reinterpret_cast<const __half2*>(&a_x4[0]));
+#pragma unroll
+    for (int j = 1; j < 4; ++j) {
+        acc = __hfma2(*reinterpret_cast<const __half2*>(&w[j]), *reinterpret_cast<const __half2*>(&a_x4[j]), acc);
+    }
+    lo = __half2int_rn(__low2half(acc));
+    hi = __half2int_rn(__high2half(acc));
 }
 
 // Compact activations (for the two-term kernels): a 16-element block's E2M1
@@ -986,7 +1006,7 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
             sa       = a.scale;
         }
         std::uint32_t ah[4];
-        e2m1x2_word_to_half2(act_word, ah);
+        e2m1x2_word_to_half2_x4(act_word, ah);
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
@@ -994,7 +1014,7 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
             std::uint32_t wh[4];
             e2m1x2_word_to_half2(code_word, wh);
             int p_lo, p_hi;
-            unit_shares_half2(wh, ah, p_lo, p_hi);
+            unit_shares_half2_pre4(wh, ah, p_lo, p_hi);
             // |P_q| <= 576 and Sw < 2^18: P_q * Sw fits int32.
             lo[g] += static_cast<std::int64_t>(p_lo * canon::e4m3_scaled(unit[128 + i])) * sa;
             hi[g] += static_cast<std::int64_t>(p_hi * canon::e4m3_scaled(unit[136 + i])) * sa;
@@ -1030,8 +1050,8 @@ __device__ void unit_sums_pair(const std::uint8_t* matrix, int blocks, const Act
         const std::int32_t sa0       = a.scale;
         const std::int32_t sa1       = a.scale1;
         std::uint32_t ah0[4], ah1[4];
-        e2m1x2_word_to_half2(dup_nibbles(packed & 0x0F0F0F0FU), ah0);
-        e2m1x2_word_to_half2(dup_nibbles((packed >> 4) & 0x0F0F0F0FU), ah1);
+        e2m1x2_word_to_half2_x4(dup_nibbles(packed & 0x0F0F0F0FU), ah0);
+        e2m1x2_word_to_half2_x4(dup_nibbles((packed >> 4) & 0x0F0F0F0FU), ah1);
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             const std::uint8_t* unit      = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
@@ -1041,8 +1061,8 @@ __device__ void unit_sums_pair(const std::uint8_t* matrix, int blocks, const Act
             const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]);
             const std::int32_t sw_hi = canon::e4m3_scaled(unit[136 + i]);
             int p0_lo, p0_hi, p1_lo, p1_hi;
-            unit_shares_half2(wh, ah0, p0_lo, p0_hi);
-            unit_shares_half2(wh, ah1, p1_lo, p1_hi);
+            unit_shares_half2_pre4(wh, ah0, p0_lo, p0_hi);
+            unit_shares_half2_pre4(wh, ah1, p1_lo, p1_hi);
             lo0[g] += static_cast<std::int64_t>(p0_lo * sw_lo) * sa0;
             hi0[g] += static_cast<std::int64_t>(p0_hi * sw_hi) * sa0;
             lo1[g] += static_cast<std::int64_t>(p1_lo * sw_lo) * sa1;
@@ -1099,8 +1119,8 @@ __device__ __forceinline__ void unit_sums_split_pair_half(const std::uint8_t* ma
         const std::int32_t sa0     = a.scale;
         const std::int32_t sa1     = a.scale1;
         std::uint32_t ah0[4], ah1[4];
-        e2m1x2_word_to_half2(dup_nibbles(packed & 0x0F0F0F0FU), ah0);
-        e2m1x2_word_to_half2(dup_nibbles((packed >> 4) & 0x0F0F0F0FU), ah1);
+        e2m1x2_word_to_half2_x4(dup_nibbles(packed & 0x0F0F0F0FU), ah0);
+        e2m1x2_word_to_half2_x4(dup_nibbles((packed >> 4) & 0x0F0F0F0FU), ah1);
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             const std::uint8_t* unit      = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
@@ -1110,8 +1130,8 @@ __device__ __forceinline__ void unit_sums_split_pair_half(const std::uint8_t* ma
             const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]);
             const std::int32_t sw_hi = canon::e4m3_scaled(unit[136 + i]);
             int p0_lo, p0_hi, p1_lo, p1_hi;
-            unit_shares_half2(wh, ah0, p0_lo, p0_hi);
-            unit_shares_half2(wh, ah1, p1_lo, p1_hi);
+            unit_shares_half2_pre4(wh, ah0, p0_lo, p0_hi);
+            unit_shares_half2_pre4(wh, ah1, p1_lo, p1_hi);
             // |P_q| <= 576 and Sw < 2^18: P_q * Sw fits int32.
             lo[g][0] += static_cast<std::int64_t>(p0_lo * sw_lo) * sa0;
             hi[g][0] += static_cast<std::int64_t>(p0_hi * sw_hi) * sa0;
@@ -1466,10 +1486,10 @@ __device__ __forceinline__ void unit_sums_quad_half(const std::uint8_t* matrix, 
         const std::int32_t sa2      = canon::e4m3_scaled(a.scale_word[2]);
         const std::int32_t sa3      = canon::e4m3_scaled(a.scale_word[3]);
         std::uint32_t ah0[4], ah1[4], ah2[4], ah3[4];
-        e2m1x2_word_to_half2(dup_nibbles(packed0 & 0x0F0F0F0FU), ah0);
-        e2m1x2_word_to_half2(dup_nibbles((packed0 >> 4) & 0x0F0F0F0FU), ah1);
-        e2m1x2_word_to_half2(dup_nibbles(packed1 & 0x0F0F0F0FU), ah2);
-        e2m1x2_word_to_half2(dup_nibbles((packed1 >> 4) & 0x0F0F0F0FU), ah3);
+        e2m1x2_word_to_half2_x4(dup_nibbles(packed0 & 0x0F0F0F0FU), ah0);
+        e2m1x2_word_to_half2_x4(dup_nibbles((packed0 >> 4) & 0x0F0F0F0FU), ah1);
+        e2m1x2_word_to_half2_x4(dup_nibbles(packed1 & 0x0F0F0F0FU), ah2);
+        e2m1x2_word_to_half2_x4(dup_nibbles((packed1 >> 4) & 0x0F0F0F0FU), ah3);
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             const std::uint8_t* unit      = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
@@ -1479,10 +1499,10 @@ __device__ __forceinline__ void unit_sums_quad_half(const std::uint8_t* matrix, 
             const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]);
             const std::int32_t sw_hi = canon::e4m3_scaled(unit[136 + i]);
             int p0_lo, p0_hi, p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
-            unit_shares_half2(wh, ah0, p0_lo, p0_hi);
-            unit_shares_half2(wh, ah1, p1_lo, p1_hi);
-            unit_shares_half2(wh, ah2, p2_lo, p2_hi);
-            unit_shares_half2(wh, ah3, p3_lo, p3_hi);
+            unit_shares_half2_pre4(wh, ah0, p0_lo, p0_hi);
+            unit_shares_half2_pre4(wh, ah1, p1_lo, p1_hi);
+            unit_shares_half2_pre4(wh, ah2, p2_lo, p2_hi);
+            unit_shares_half2_pre4(wh, ah3, p3_lo, p3_hi);
             lo[g][0] += static_cast<std::int64_t>(p0_lo * sw_lo) * sa0;
             hi[g][0] += static_cast<std::int64_t>(p0_hi * sw_hi) * sa0;
             lo[g][1] += static_cast<std::int64_t>(p1_lo * sw_lo) * sa1;
@@ -1771,10 +1791,10 @@ __device__ void unit_sums_down_quad_pair_groups(const std::uint8_t* matrix, int 
         const std::int32_t sa2      = canon::e4m3_scaled(a.scale_word[2]);
         const std::int32_t sa3      = canon::e4m3_scaled(a.scale_word[3]);
         std::uint32_t ah0[4], ah1[4], ah2[4], ah3[4];
-        e2m1x2_word_to_half2(dup_nibbles(packed0 & 0x0F0F0F0FU), ah0);
-        e2m1x2_word_to_half2(dup_nibbles((packed0 >> 4) & 0x0F0F0F0FU), ah1);
-        e2m1x2_word_to_half2(dup_nibbles(packed1 & 0x0F0F0F0FU), ah2);
-        e2m1x2_word_to_half2(dup_nibbles((packed1 >> 4) & 0x0F0F0F0FU), ah3);
+        e2m1x2_word_to_half2_x4(dup_nibbles(packed0 & 0x0F0F0F0FU), ah0);
+        e2m1x2_word_to_half2_x4(dup_nibbles((packed0 >> 4) & 0x0F0F0F0FU), ah1);
+        e2m1x2_word_to_half2_x4(dup_nibbles(packed1 & 0x0F0F0F0FU), ah2);
+        e2m1x2_word_to_half2_x4(dup_nibbles((packed1 >> 4) & 0x0F0F0F0FU), ah3);
 #pragma unroll
         for (int g = 0; g < 2; ++g) {
             const std::uint8_t* unit =
@@ -1785,10 +1805,10 @@ __device__ void unit_sums_down_quad_pair_groups(const std::uint8_t* matrix, int 
             const std::int32_t sw_lo = canon::e4m3_scaled(unit[128 + i]);
             const std::int32_t sw_hi = canon::e4m3_scaled(unit[136 + i]);
             int p0_lo, p0_hi, p1_lo, p1_hi, p2_lo, p2_hi, p3_lo, p3_hi;
-            unit_shares_half2(wh, ah0, p0_lo, p0_hi);
-            unit_shares_half2(wh, ah1, p1_lo, p1_hi);
-            unit_shares_half2(wh, ah2, p2_lo, p2_hi);
-            unit_shares_half2(wh, ah3, p3_lo, p3_hi);
+            unit_shares_half2_pre4(wh, ah0, p0_lo, p0_hi);
+            unit_shares_half2_pre4(wh, ah1, p1_lo, p1_hi);
+            unit_shares_half2_pre4(wh, ah2, p2_lo, p2_hi);
+            unit_shares_half2_pre4(wh, ah3, p3_lo, p3_hi);
             lo0[g] += static_cast<std::int64_t>(p0_lo * sw_lo) * sa0;
             hi0[g] += static_cast<std::int64_t>(p0_hi * sw_hi) * sa0;
             lo1[g] += static_cast<std::int64_t>(p1_lo * sw_lo) * sa1;
@@ -3683,22 +3703,32 @@ template <bool kMasked>
 __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
                                const float* __restrict__ shared_gate, const bf16* __restrict__ shared,
                                int hidden, int top_k, int columns, bf16* __restrict__ y, MoeColumnMask mask) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
-    if (d >= hidden || t >= columns) { return; }
+    if (t >= columns) { return; }
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if constexpr (kMasked) {
         // A masked column has no outputs (no dispatch entry): its y is 0.
         if (!column_live(mask, t)) {
-            y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(0.0F);
+            if (d < hidden) { y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(0.0F); }
             return;
         }
     }
+    __shared__ float s_weights[32];
+    __shared__ float s_gate;
+    if (threadIdx.x < static_cast<unsigned>(top_k) && threadIdx.x < 32U) {
+        s_weights[threadIdx.x] = weights[static_cast<std::size_t>(t) * top_k + threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        s_gate = shared_gate[t];
+    }
+    __syncthreads();
+    if (d >= hidden) { return; }
     float sum = 0.0F;
     for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
-        sum += weights[static_cast<std::size_t>(t) * top_k + k] *
-               __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+        const float w = (k < 32) ? s_weights[k] : weights[static_cast<std::size_t>(t) * top_k + k];
+        sum += w * __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
     }
-    sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
+    sum += s_gate * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
     y[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum);
 }
 
@@ -3714,15 +3744,15 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
                                       bf16* __restrict__ mean_out, std::int64_t mean_pitch, int mean_first) {
     // A programmatic dependent; its small grid lets the next mixer launch and fetch its weights at once.
     pdl::enter();
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
-    if (d >= hidden || t >= columns) { return; }
+    if (t >= columns) { return; }
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
     const bool    write_mean = mean_out != nullptr && t >= mean_first;
     if constexpr (kMasked) {
         if (!column_live(mask, t)) {
             // The inject skips the column; its mean is the untouched residual's, as stream_mean's.
-            if (write_mean) {
+            if (write_mean && d < hidden) {
                 float mean = 0.0F;
                 for (int s = 0; s < streams; ++s) {
                     mean += __bfloat162float(
@@ -3734,17 +3764,32 @@ __global__ void combine_inject_kernel(const bf16* __restrict__ outputs, const fl
             return;
         }
     }
+    __shared__ float s_weights[32];
+    __shared__ float s_inject[16];
+    __shared__ float s_gate;
+    if (threadIdx.x < static_cast<unsigned>(top_k) && threadIdx.x < 32U) {
+        s_weights[threadIdx.x] = weights[static_cast<std::size_t>(t) * top_k + threadIdx.x];
+    }
+    if (threadIdx.x < static_cast<unsigned>(streams) && threadIdx.x < 16U) {
+        s_inject[threadIdx.x] = inject[static_cast<std::size_t>(t) * streams + threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        s_gate = shared_gate[t];
+    }
+    __syncthreads();
+    if (d >= hidden) { return; }
     float sum = 0.0F;
     for (int k = 0; k < top_k; ++k) { // fixed rank order: placement-invariant
-        sum += weights[static_cast<std::size_t>(t) * top_k + k] *
-               __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
+        const float w = (k < 32) ? s_weights[k] : weights[static_cast<std::size_t>(t) * top_k + k];
+        sum += w * __bfloat162float(outputs[(static_cast<std::size_t>(t) * top_k + k) * hidden + d]);
     }
-    sum += shared_gate[t] * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
+    sum += s_gate * __bfloat162float(shared[static_cast<std::size_t>(t) * hidden + d]);
     const float v           = __bfloat162float(__float2bfloat16_rn(sum));
     float mean              = 0.0F;
     for (int s = 0; s < streams; ++s) {
+        const float inj = (s < 16) ? s_inject[s] : inject[static_cast<std::size_t>(t) * streams + s];
         bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
-        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
+        r       = __float2bfloat16_rn(__bfloat162float(r) + inj * v);
         mean += __bfloat162float(r);
     }
     if (write_mean) {
@@ -3759,18 +3804,31 @@ __launch_bounds__(320) __global__ void combine_vec8_kernel(const bf16* __restric
                                                            const float* __restrict__ shared_gate,
                                                            const bf16* __restrict__ shared, int hidden, int top_k,
                                                            int columns, bf16* __restrict__ y, MoeColumnMask mask) {
-    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int t = blockIdx.y;
-    if (d >= hidden || t >= columns) { return; }
+    if (t >= columns) { return; }
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if constexpr (kMasked) {
         if (!column_live(mask, t)) {
-            *reinterpret_cast<uint4*>(y + static_cast<std::size_t>(t) * hidden + d) = make_uint4(0U, 0U, 0U, 0U);
+            if (d < hidden) {
+                *reinterpret_cast<uint4*>(y + static_cast<std::size_t>(t) * hidden + d) = make_uint4(0U, 0U, 0U, 0U);
+            }
             return;
         }
     }
+    __shared__ float s_weights[32];
+    __shared__ float s_gate;
+    if (threadIdx.x < static_cast<unsigned>(top_k) && threadIdx.x < 32U) {
+        s_weights[threadIdx.x] = weights[static_cast<std::size_t>(t) * top_k + threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        s_gate = shared_gate[t];
+    }
+    __syncthreads();
+
+    if (d >= hidden) { return; }
     float sum[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (int k = 0; k < top_k; ++k) {
-        const float w      = weights[static_cast<std::size_t>(t) * top_k + k];
+        const float w      = (k < 32) ? s_weights[k] : weights[static_cast<std::size_t>(t) * top_k + k];
         const uint4 packed = *reinterpret_cast<const uint4*>(
             outputs + (static_cast<std::size_t>(t) * top_k + k) * hidden + d);
         const bf16* o = reinterpret_cast<const bf16*>(&packed);
@@ -3778,7 +3836,7 @@ __launch_bounds__(320) __global__ void combine_vec8_kernel(const bf16* __restric
         for (int j = 0; j < 8; ++j) { sum[j] += w * __bfloat162float(o[j]); }
     }
     {
-        const float wg     = shared_gate[t];
+        const float wg     = s_gate;
         const uint4 packed = *reinterpret_cast<const uint4*>(shared + static_cast<std::size_t>(t) * hidden + d);
         const bf16* sh     = reinterpret_cast<const bf16*>(&packed);
 #pragma unroll
@@ -3798,14 +3856,14 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
     int columns, bf16* __restrict__ residual, MoeColumnMask mask, bf16* __restrict__ mean_out,
     std::int64_t mean_pitch, int mean_first) {
     pdl::enter();
-    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int t = blockIdx.y;
-    if (d >= hidden || t >= columns) { return; }
+    if (t >= columns) { return; }
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     if constexpr (kMasked) {
         if (!column_live(mask, t)) {
             if constexpr (kWriteMean) {
-                if (t >= mean_first) {
+                if (d < hidden && t >= mean_first) {
                     float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
                     for (int s = 0; s < streams; ++s) {
                         const uint4 r_packed = *reinterpret_cast<const uint4*>(
@@ -3826,9 +3884,24 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
             return;
         }
     }
+    __shared__ float s_weights[32];
+    __shared__ float s_inject[16];
+    __shared__ float s_gate;
+    if (threadIdx.x < static_cast<unsigned>(top_k) && threadIdx.x < 32U) {
+        s_weights[threadIdx.x] = weights[static_cast<std::size_t>(t) * top_k + threadIdx.x];
+    }
+    if (threadIdx.x < static_cast<unsigned>(streams) && threadIdx.x < 16U) {
+        s_inject[threadIdx.x] = inject[static_cast<std::size_t>(t) * streams + threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        s_gate = shared_gate[t];
+    }
+    __syncthreads();
+
+    if (d >= hidden) { return; }
     float sum[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (int k = 0; k < top_k; ++k) {
-        const float w      = weights[static_cast<std::size_t>(t) * top_k + k];
+        const float w      = (k < 32) ? s_weights[k] : weights[static_cast<std::size_t>(t) * top_k + k];
         const uint4 packed = *reinterpret_cast<const uint4*>(
             outputs + (static_cast<std::size_t>(t) * top_k + k) * hidden + d);
         const bf16* o = reinterpret_cast<const bf16*>(&packed);
@@ -3836,7 +3909,7 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
         for (int j = 0; j < 8; ++j) { sum[j] += w * __bfloat162float(o[j]); }
     }
     {
-        const float wg     = shared_gate[t];
+        const float wg     = s_gate;
         const uint4 packed = *reinterpret_cast<const uint4*>(shared + static_cast<std::size_t>(t) * hidden + d);
         const bf16* sh     = reinterpret_cast<const bf16*>(&packed);
 #pragma unroll
@@ -3849,7 +3922,7 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
         const bool write_mean = t >= mean_first;
         float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
         for (int s = 0; s < streams; ++s) {
-            const float inj = inject[static_cast<std::size_t>(t) * streams + s];
+            const float inj = (s < 16) ? s_inject[s] : inject[static_cast<std::size_t>(t) * streams + s];
             uint4* r_ptr    = reinterpret_cast<uint4*>(
                 residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
             uint4 r_packed = *r_ptr;
@@ -3873,7 +3946,7 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
         }
     } else {
         for (int s = 0; s < streams; ++s) {
-            const float inj = inject[static_cast<std::size_t>(t) * streams + s];
+            const float inj = (s < 16) ? s_inject[s] : inject[static_cast<std::size_t>(t) * streams + s];
             uint4* r_ptr    = reinterpret_cast<uint4*>(
                 residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
             uint4 r_packed = *r_ptr;

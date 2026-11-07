@@ -510,7 +510,13 @@ __device__ __forceinline__ float q4_row(const std::uint8_t* codes, const __half*
     for (int i = 0; i < kHidden / 8 / 32; ++i) {
         const int chunk            = lane + 32 * i;
         const std::uint32_t packed = __ldg(w + chunk);
-        const float scale          = __half2float(srow[chunk / 8]);
+        const int src_lane         = lane & ~7;
+        __half scale_h             = __ushort_as_half(0);
+        if (lane == src_lane) {
+            scale_h = srow[(src_lane + 32 * i) / 8];
+        }
+        scale_h                    = __shfl_sync(0xFFFFFFFFU, scale_h, src_lane);
+        const float scale          = __half2float(scale_h);
         const uint4 xp             = *reinterpret_cast<const uint4*>(x + chunk * 8);
         const bf16* xv             = reinterpret_cast<const bf16*>(&xp);
         float wf[8];
@@ -535,7 +541,13 @@ __device__ __forceinline__ float q8_row(const std::int8_t* codes, const __half* 
     for (int i = 0; i < kHidden / 8 / 32; ++i) {
         const int chunk    = lane + 32 * i;
         const uint2 packed = __ldg(w + chunk);
-        const float scale  = __half2float(srow[chunk / 4]);
+        const int src_lane = lane & ~3;
+        __half scale_h     = __ushort_as_half(0);
+        if (lane == src_lane) {
+            scale_h = srow[(src_lane + 32 * i) / 4];
+        }
+        scale_h            = __shfl_sync(0xFFFFFFFFU, scale_h, src_lane);
+        const float scale  = __half2float(scale_h);
         const uint4 xp     = __ldcg(reinterpret_cast<const uint4*>(x + chunk * 8));
         const bf16* xv     = reinterpret_cast<const bf16*>(&xp);
         const auto* wv     = reinterpret_cast<const std::int8_t*>(&packed);

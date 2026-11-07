@@ -121,13 +121,24 @@ __device__ __forceinline__ RawValueLane load_value_lane(const __nv_bfloat16* bas
 
 __device__ __forceinline__ RawGatePair load_source_gate(const float* g, const float* beta,
                                                         std::int64_t offset) {
-    const float g_value    = g[offset];
-    const float beta_value = beta[offset];
+    float g_value    = 0.0f;
+    float beta_value = 0.0f;
+    if ((static_cast<int>(threadIdx.x) & (kWarpSize - 1)) == 0) {
+        g_value    = g[offset];
+        beta_value = beta[offset];
+    }
+    g_value    = __shfl_sync(kFullWarpMask, g_value, 0);
+    beta_value = __shfl_sync(kFullWarpMask, beta_value, 0);
     return {make_uint2(__float_as_uint(g_value), __float_as_uint(beta_value)), g_value, beta_value};
 }
 
 __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::int64_t offset) {
-    const uint2 bits = load_vec<uint2>(gate + offset);
+    uint2 bits = make_uint2(0U, 0U);
+    if ((static_cast<int>(threadIdx.x) & (kWarpSize - 1)) == 0) {
+        bits = load_vec<uint2>(gate + offset);
+    }
+    bits.x = __shfl_sync(kFullWarpMask, bits.x, 0);
+    bits.y = __shfl_sync(kFullWarpMask, bits.y, 0);
     return {bits, __uint_as_float(bits.x), __uint_as_float(bits.y)};
 }
 
