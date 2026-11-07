@@ -1858,3 +1858,60 @@ Evaluated on `/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Fl
 - Preserve `ExactColumns = 2`, hoisted `Codec::decode` in `hc_up_collapse_v4_kernel`, and 2-CTA/SM launch bounds in `src/ops/hyper_connection/hyper_connection_mix_fused.cu`.
 - Preserve `kRmsPreloadMidD = 10240` (`Preload = 40`) in `src/ops/kernel/rmsnorm.cuh` and `src/ops/launcher/rmsnorm.cu`.
 - Preserve reverse-token L2 indexing and `columns <= 16` PDL gating in `src/ops/hyper_connection/hyper_connection.cu` and `src/ops/linear/nvfp4/nvfp4_a4.cu`.
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-07 — `c591b202` vs `7734da89` Milestone Split & MTP Acceptance Recovery
+
+Scope: Root-cause and resolve the `-12.5%` to `-37.9%` MTP decode throughput and acceptance regressions observed in `7734da89b` vs `c591b202c` on the 3-model `int8 × mtp` milestone benchmark (`./bench/run_kv_matrix_bench.sh`, `-r 5 --warmup 2`), while retaining the `+1.85%` prefill and kernel occupancy gains.
+
+## 1. Root-Cause Diagnosis
+
+Inspection of the per-repetition trajectories in `dist/kv_matrix_head_pair/c591b202/` vs `dist/kv_matrix_head_pair/7734da89/` revealed two distinct root causes inside `7734da89b`:
+
+1. **Non-deterministic MTP draft corruptions across repetitions (`pp8192+tg512` `-36.3%` to `-37.9%` across `iq3s` and `nvfp4`)**:
+   - In `c591b202c`, greedy (`temperature = 0`) MTP decoding produced identical `(rounds, drafted_tokens, accepted_tokens)` across all 5 repetitions (`iq3s pp8192+tg512`: `[(73, 451, 438), (74, 460, 438) × 4]`, `acc = 0.9559`; `nvfp4 pp8192+tg512`: `[(74, 446, 438) × 5]`, `acc = 0.9821`).
+   - In `7734da89b`, every repetition diverged (`iq3s pp8192+tg512`: `acc = 0.7486`; `nvfp4 pp8192+tg512`: `acc = 0.7455`).
+   - **Cause A (PDL + CUDA Graph fork/workspace hazards)**: Converting `projection_fp32` (`launch_tall`), `rmsnorm_generic_kernel<Epilogue, 40>` (`d = 10240`), `hyper_connection_norm`, and `qsa_prompt_kernel` to `pdl::launch_consumer` introduced programmatic stream edges across `Forward::moe` / `Forward::mtp_block` event forks (`experts_.shared_events`) and across `Forward::mtp_block`'s recycled split-K workspace (`project(e, p.embedding_projection, ...)` -> `hn`), where `split_k_reduce_bf16_kernel` (a non-PDL kernel) overlapped with `rmsnorm_generic_kernel` writing `hn` at the freed split-K partial address.
+   - **Cause B (`Q4 [131072, 2560]` draft-head route flip)**: Registering `src/ops/linear/q4/shapes/n131072_k2560.cu` flipped `linear_projects_head_rows(*head.rows)` in `Forward::mtp_block` (`forward.cpp:127`) from `false` (`ops::projection_fp32` FP32 accumulation) to `true` (`GemvR4W1` `Fp16Mantissa`).
+2. **Deterministic greedy trajectory shifts on `tg512` (`dense8 tg512` `-26.9%`, `iq3s tg512` `-12.5%`)**:
+   - Adding `select_q8_n13952_k2560_fast` and `select_q8_n2560_k640_fast` (`if (tokens <= 8) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;`) overrode `T = 1` GEMV with 2-launch 8-warp sliced-K and changed `T = 2..8` from 4-warp (`w4`) to 8-warp (`w8`) reduction order on `dense8` and `iq3s`.
+   - Rewriting the 4-element dot product in `apply_gdn_transition` and `readout_and_store` (`recurrent.cuh`) without the `0.0f` accumulator seed altered FMA contraction across all 36 GDN layers.
+
+## 2. Changes Applied (Split of `7734da89b`)
+
+- **Reverted to `c591b202c`**:
+  - Speculative-acceptance / n-gram / router-mma tuning: `src/models/qwen3_5/frontend/frontend.cpp`, `src/models/qwen3_5/program/ngram_proposer.h`, `src/models/qwen4_exp/execution/fast_path_flags.h`, `src/models/qwen4_exp/program/graph_set.cpp`, `src/models/qwen4_exp/program/program_impl.h`, `src/ops/kernel/top_logprobs.cuh`, `tests/models/qwen3_5/test_frontend.cpp`, `tests/models/qwen3_5/test_ngram_proposer.cpp`, `src/ops/hyper_connection/hyper_connection_mix_fused.h`, `tools/run_server.sh`.
+  - `Q4 [131072, 2560]` shape registration: removed `src/ops/linear/q4/shapes/n131072_k2560.cu` and restored `src/ops/linear/q4/{q4_dispatch.cpp,q4_shapes.h,sources.cmake}` so `Forward::mtp_block` keeps `ops::projection_fp32` for the `2560`-wide proposal head.
+  - `Q8` `_fast` overrides and `GDN` inner FMA contraction: restored `src/ops/linear/q8/{q8_dispatch.cpp,q8_shapes.h,shapes/n13952_k2560.cu,shapes/n2560_k640.cu}` and the exact `0.0f`-seeded loop in `apply_gdn_transition` / `readout_and_store` (`src/ops/linear_attention/gated_delta_net/recurrent.cuh`, keeping the `MaxWidth <= 16 ? 5 : 4` occupancy specialization of `recurrent_record_conv_kernel`).
+  - Unsafe PDL consumer conversions: restored serialized stream launches in `src/ops/projection_fp32/projection_fp32.cu`, `src/ops/kernel/rmsnorm.cuh` + `src/ops/launcher/rmsnorm.cu` (retaining `kRmsPreloadMidD = 10240`, `Preload = 40`), `src/ops/hyper_connection/hyper_connection.cu` (`norm_kernel` / `norm_vec8_kernel` and `block_sum` barrier, retaining `columns <= 16` PDL gating on `inject_norm` and reverse-token prefill indexing), and `src/ops/qsa/qsa_prompt.cu` (retaining `two_ctas_2` 2-CTA `Stages = 2` occupancy for `Nvfp4Group16`).
+- **Retained from `7734da89b` (verified bit-exact and prefill-positive)**:
+  - `src/ops/common/canonical_math.h` and `src/ops/offloaded_sparse_moe/cuda/{moe_layer.cu,wide_expert.cu,wide_expert.cuh,wide_expert.h,wide_expert_a16.cuh,wide_expert_a8.cuh,rg16_linear.cu}`: 3-CTA/SM 1-K-half `GateUpShared` staging (`27,008 B`), 4-column quad loop (`gate_up_kernel`), parallel `quantize_pair_half_codes`, hardware `cvt.rn.satfinite.e2m1x2.f32` A4 quantization, $O(1)$ `map_work_unit<true>`, early wide-CTA exit in `down_kernel`, and 4-CTA/SM `combine_inject_vec8_kernel` specialization.
+  - `src/ops/hyper_connection/hyper_connection_mix_fused.cu` and `hyper_connection_up_collapse.cu`: `ExactColumns = 2`, hoisted `Codec::decode`, 2-CTA/SM launch bounds, and wave-exact `hc_up_collapse` tiles.
+  - `src/ops/linear/nvfp4/{nvfp4_a4.cu,nvfp4_a4_quantize.cuh,nvfp4_a4_tma.cu,shapes/n12800_k2560.cu,shapes/n13952_k2560.cu,shapes/n16384_k2560.cu}` and `src/ops/linear/q8/shapes/n324_k10240.cu` + `src/ops/linear_swiglu/q8/q8_linear_swiglu_plan.cpp`.
+
+## 3. Three-Way Milestone A/B Verification (`c591b202` vs `7734da89` vs `fixed_head2`, `-r 5 --warmup 2`)
+
+Measured with `BENCH_BIN=./build-native/bench/infernix_bench REPS=5 WARMUP=2 ./bench/run_kv_matrix_bench.sh dist/kv_matrix_head_pair/fixed_head2` against the existing `dist/kv_matrix_head_pair/c591b202/` and `dist/kv_matrix_head_pair/7734da89/` reports:
+
+### Prefill (`tok/s` median)
+
+| Run / Test | `c591b202` | `7734da89` (broken) | `fixed_head2` (split) | $\Delta$ (`fixed_head2` vs `c591b202`) |
+|---|---:|---:|---:|---:|
+| **`nvfp4 pp8192`** | `4007.2` | `4077.2` | **`4081.3`** | **`+1.85%` (`+74.1 tok/s`)** |
+| **`nvfp4 pp8192+tg512`** | `3978.6` | `4040.8` | **`4052.0`** | **`+1.84%` (`+73.4 tok/s`)** |
+| **`dense8 pp8192`** | `3409.4` | `3408.3` | **`3430.6`** | **`+0.62%` (`+21.2 tok/s`)** |
+| **`dense8 pp8192+tg512`** | `3405.2` | `3408.0` | **`3414.1`** | **`+0.26%` (`+8.9 tok/s`)** |
+| **`iq3s pp8192`** | `1619.5` | `1614.2` | **`1619.1`** | `-0.02%` (mean `1620.8 -> 1620.3`) |
+| **`iq3s pp8192+tg512`** | `1614.4` | `1599.4` | **`1611.9`** | `-0.15%` |
+
+### Decode (`tok/s` median) & MTP Acceptance Rate
+
+| Run / Test | `c591b202` (`tok/s` / `acc`) | `7734da89` (`tok/s` / `acc`) | `fixed_head2` (`tok/s` / `acc`) | $\Delta$ (`fixed_head2` vs `c591b202`) | Per-Repetition `(rounds, drafted, accepted)` (`fixed_head2`) |
+|---|---:|---:|---:|---:|---|
+| **`dense8 tg512`** | `83.9` / `0.861` | `61.3` / `0.713` | **`83.5` / `0.859`** | `-0.5%` / `-0.1pp` (**recovered `+22.2 tok/s`**) | `[(113,459,392), (107,455,395), ...]` |
+| **`dense8 pp8192+tg512`** | `108.2` / `0.980` | `107.6` / `0.974` | **`108.9` / `0.980`** | **`+0.6%` / `0.0pp`** | `[(72, 449, 440) × 5]` (bit-exact to `c591b202`) |
+| **`iq3s tg512`** | `74.4` / `0.782` | `65.1` / `0.688` | **`74.1` / `0.782`** | `-0.4%` / `0.0pp` (**recovered `+9.0 tok/s`**) | `[(158, 436, 341) × 5]` (bit-exact to `c591b202`) |
+| **`iq3s pp8192+tg512`** | `113.2` / `0.956` | `70.3` / `0.749` | **`112.4` / `0.957`** | `-0.7%` / `+0.1pp` (**recovered `+42.1 tok/s`**) | `[(72,449,439), (74,460,438) × 4]` |
+| **`nvfp4 tg512`** | `76.8` / `0.731` | `95.5` / `0.832` | **`76.9` / `0.731`** | **`+0.1%` / `0.0pp`** | `[(168, 431, 315) × 5]` (bit-exact to `c591b202`) |
+| **`nvfp4 pp8192+tg512`** | `122.8` / `0.982` | `78.3` / `0.745` | **`123.2` / `0.984`** | **`+0.3%` / `+0.2pp`** (**recovered `+44.9 tok/s`**) | `[(74,446,438) × 3, (72,444,440), (74,446,438)]` |

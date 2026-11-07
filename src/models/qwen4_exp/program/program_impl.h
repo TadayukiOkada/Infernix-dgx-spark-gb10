@@ -315,9 +315,9 @@ struct DFlash2Io {
                 words = 0;
 };
 
-// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's eight most probable tokens
-// (or four when screened_head_top is bound), backed by the register-cached top_logprobs_kernel.
-inline constexpr std::int32_t kSampledDraftRanks = 8;
+// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's four most probable tokens:
+// measured against 8 and 16 at T 1.0 / top-p 0.95 / top-k 20 (design §19.3.24).
+inline constexpr std::int32_t kSampledDraftRanks = 4;
 
 // Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
 // (ProgramImpl::plan_device) computes it from the options and the configuration alone: before the
@@ -2574,7 +2574,7 @@ public:
                                      static_cast<std::uint32_t>(std::max<std::int32_t>(
                                          pair_k,
                                          batch == 2 ? kPairNgramMaxDrafts
-                                                    : (kMultiRowDrafts > 0.5 ? std::min(kMultiRowNgramMaxDrafts, 64 / batch - 1) : 0))));
+                                                    : (kMultiRowDrafts > 0.5 ? std::min(kMultiRowNgramMaxDrafts, 32 / batch - 1) : 0))));
                 const auto tail = std::span<const std::int32_t>(lane.history)
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
                 auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
@@ -5308,13 +5308,9 @@ private:
                 // The bucket's acceptance per position.
                 if (ngram_bucket_[b] >= 0) {
                     double& a = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
-                    if (A == 0) {
-                        a = (1.0 - 2.5 * kAcceptanceWeight) * a;
-                    } else {
-                        for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
-                            const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
-                            a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
-                        }
+                    for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
+                        const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
+                        a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
                     }
                 }
             }
@@ -5576,8 +5572,7 @@ private:
         double best_score = 1.0;
         double reach = 1.0, tokens = 1.0;
         const double cost      = width_cost();
-        const bool ungated_sampled = sampled_drafts_ && lane.sampling.temperature > 0.0F;
-        const double tile_cost = ungated_sampled ? cost : std::min(cost, 0.10);
+        const double tile_cost = std::min(cost, 0.10);
         for (std::int32_t k = 1; k <= most; ++k) {
             reach *= lane.mtp_accept[static_cast<std::size_t>(k - 1)];
             tokens += reach;
@@ -5892,9 +5887,6 @@ private:
                            : Tensor{};
             };
             constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
-            const std::int32_t sampled_ranks =
-                parameters_.draft_head.rows && parameters_.draft_head.screen ? ops::kScreenedHeadMaxRanks
-                                                                             : kSampledDraftRanks;
             forward_->run_mtp({.residuals    = chain,
                                .ids          = j == 0 ? anchors
                                                       : Tensor(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j - 1) * batch),
@@ -5917,8 +5909,8 @@ private:
                                        : Tensor{},
                                .sample_configs   = sampled ? samplers : nullptr,
                                .draft_step       = static_cast<std::uint32_t>(j),
-                               .sample_rows      = plane(mtp_io_.sample_rows, sampled_ranks, DType::I32),
-                               .sample_logprobs  = plane(mtp_io_.sample_logprobs, sampled_ranks, DType::FP32),
+                               .sample_rows      = plane(mtp_io_.sample_rows, kSampledDraftRanks, DType::I32),
+                               .sample_logprobs  = plane(mtp_io_.sample_logprobs, kSampledDraftRanks, DType::FP32),
                                .draft_candidates = plane(mtp_io_.draft_candidates, C, DType::I32),
                                .draft_q          = plane(mtp_io_.draft_q, C, DType::FP32)});
         };
@@ -6819,7 +6811,7 @@ private:
     // acceptance learned per match-length bucket (4-7, 8-11, 12-15, 16+ tokens; Strata's priors).
     // IQ3_S import, 4K + 512 tokens, MTP 4 and 7 n-gram drafts: 190.2 -> 194.2 tok/s (2026-10-15).
     static int ngram_bucket(std::uint32_t matched) { return matched < 8 ? 0 : matched < 12 ? 1 : matched < 16 ? 2 : 3; }
-    static constexpr std::array<double, 4> kNgramAcceptancePriors{0.72, 0.92, 0.96, 0.98};
+    static constexpr std::array<double, 4> kNgramAcceptancePriors{0.75, 0.88, 0.93, 0.96};
     std::array<int, kMaximumConcurrency> ngram_bucket_{};
     // A copy proposal the neural chain won before the round was drafted, kept for the round's cut: when
     // the cut leaves the row fewer drafts than this copy, the round verifies the copy instead of
@@ -6846,7 +6838,7 @@ private:
     // ~40 tok/s (optimum), <=0.20 overshoots (positions 4+ accept ~0). Default lowered to 0.25;
     // INFERNIX_WIDTH_COST still overrides for per-workload tuning.
     static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.18);
-    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.05);
+    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.10);
     static constexpr std::uint64_t kProbeInterval = 8;
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
     // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV
@@ -6883,7 +6875,7 @@ private:
     static inline const std::int32_t kMultiRowMaxDrafts =
         static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 3.0));
     static constexpr std::int32_t kPairNgramMaxDrafts     = 15;
-    static constexpr std::int32_t kMultiRowNgramMaxDrafts = 15;
+    static constexpr std::int32_t kMultiRowNgramMaxDrafts = 7;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
     // same bits whatever the call boundaries (request invariance's resume grid).
     static constexpr std::uint32_t kResumeGrid = 16;

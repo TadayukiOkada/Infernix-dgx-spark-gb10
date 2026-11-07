@@ -43,7 +43,6 @@ public:
     void set_boundaries(std::vector<Token> tokens) {
         boundaries_ = std::move(tokens);
         std::sort(boundaries_.begin(), boundaries_.end());
-        boundaries_.erase(std::unique(boundaries_.begin(), boundaries_.end()), boundaries_.end());
     }
 
     void append(Token token) {
@@ -118,8 +117,8 @@ public:
         for (const auto n : widths_) {
             if (history.size() < n) { continue; }
             const auto tail = history.last(n);
-            if (std::find_if(tail.begin(), tail.end(),
-                             [this](Token t) { return is_boundary(t); }) != tail.end()) {
+            if (std::find_if(tail.begin(), tail.end(), [](Token t) { return t < 0; }) !=
+                tail.end()) {
                 continue;
             }
             const auto& bucket = buckets_[hash(tail, n) & (buckets_.size() - 1)];
@@ -197,13 +196,9 @@ private:
 #endif
     }
 
-    [[nodiscard]] bool is_boundary(Token token) const noexcept {
-        return token < 0 || std::binary_search(boundaries_.begin(), boundaries_.end(), token);
-    }
-
     // Writes the next ring token; false when it is a boundary, which starts a new segment.
     bool store(Token token) {
-        if (is_boundary(token)) { token = -1; }
+        if (std::binary_search(boundaries_.begin(), boundaries_.end(), token)) { token = -1; }
         tokens_[end_ & token_mask_] = token;
         ++end_;
         if (token < 0) {

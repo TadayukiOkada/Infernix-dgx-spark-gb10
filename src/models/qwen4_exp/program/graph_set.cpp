@@ -95,7 +95,7 @@ void ProgramImpl::capture_graph_set() {
                     options_.ngram_draft_tokens > 0
                         ? std::min<std::int32_t>(static_cast<std::int32_t>(options_.ngram_draft_tokens),
                                                  rows == 2 ? kPairNgramMaxDrafts
-                                                           : std::min(kMultiRowNgramMaxDrafts, 64 / rows - 1))
+                                                           : std::min(kMultiRowNgramMaxDrafts, 32 / rows - 1))
                         : 0;
                 if (rows == 2 ? (mtp_ || dflash2_) : (dflash2_ && rows <= dflash2_rows_)) {
                     const std::int32_t neural_width =

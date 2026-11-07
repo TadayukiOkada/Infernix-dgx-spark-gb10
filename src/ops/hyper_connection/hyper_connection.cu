@@ -43,6 +43,7 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     __syncthreads();
     float total = 0.0F;
     for (int w = 0; w < blockDim.x / 32; ++w) { total += scratch[w]; }
+    __syncthreads();
     return total;
 }
 
@@ -59,7 +60,6 @@ template <class Norm = bf16, int PerThread = kNormPerThread, bool Full = false>
 __global__ void __launch_bounds__(kThreads) norm_kernel(const bf16* __restrict__ residual,
                                                         const Norm* __restrict__ weight, int hidden,
                                                         int width, float eps, bf16* __restrict__ out) {
-    pdl::enter();
     __shared__ float scratch[kThreads / 32];
     const int s = blockIdx.x;
     const int t = gridDim.y > 1024 ? (static_cast<int>(gridDim.y) - 1 - static_cast<int>(blockIdx.y))
@@ -157,6 +157,8 @@ __global__ void __launch_bounds__(kVec8Threads) norm_vec8_kernel(const bf16* __r
     bf16* y       = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
     const Norm* w = weight + static_cast<std::size_t>(s) * hidden + d;
 
+    const uint4 x_packed = *reinterpret_cast<const uint4*>(x);
+    const bf16* xs       = reinterpret_cast<const bf16*>(&x_packed);
     float wf[8];
     if constexpr (sizeof(Norm) == 4) {
         const float4 w0 = *reinterpret_cast<const float4*>(w);
@@ -169,9 +171,6 @@ __global__ void __launch_bounds__(kVec8Threads) norm_vec8_kernel(const bf16* __r
 #pragma unroll
         for (int j = 0; j < 8; ++j) { wf[j] = __bfloat162float(ws[j]); }
     }
-    pdl::enter();
-    const uint4 x_packed = *reinterpret_cast<const uint4*>(x);
-    const bf16* xs       = reinterpret_cast<const bf16*>(&x_packed);
 
     float sum = 0.0F;
 #pragma unroll
@@ -480,39 +479,36 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::in
     const int hidden = width / streams;
     const bool vec8  = hidden == kVec8Threads * 8 && aligned_16(residual.data) && aligned_16(weight.data) &&
                       aligned_16(out.data);
-    const pdl::Dependency dep = columns <= 16 ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
-    const pdl::LaunchConfig cfg{dim3(streams, columns), dim3(vec8 ? kVec8Threads : kThreads), 0, stream};
-    cudaError_t status = cudaSuccess;
     if (weight.dtype == DType::FP32) {
         if (vec8) {
-            status = pdl::launch_with(dep, cfg, norm_vec8_kernel<float>,
+            norm_vec8_kernel<float><<<dim3(streams, columns), kVec8Threads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
         } else if (hidden == kThreads * 10) {
-            status = pdl::launch_with(dep, cfg, norm_kernel<float, 10, true>,
+            norm_kernel<float, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
         } else {
-            status = pdl::launch_with(dep, cfg, norm_kernel<float>,
+            norm_kernel<float><<<dim3(streams, columns), kThreads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
         }
     } else {
         if (vec8) {
-            status = pdl::launch_with(dep, cfg, norm_vec8_kernel<bf16>,
+            norm_vec8_kernel<bf16><<<dim3(streams, columns), kVec8Threads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
         } else if (hidden == kThreads * 10) {
-            status = pdl::launch_with(dep, cfg, norm_kernel<bf16, 10, true>,
+            norm_kernel<bf16, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
         } else {
-            status = pdl::launch_with(dep, cfg, norm_kernel<bf16>,
+            norm_kernel<bf16><<<dim3(streams, columns), kThreads, 0, stream>>>(
                 static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
                 hidden, width, eps, static_cast<bf16*>(out.data));
         }
     }
-    if (status != cudaSuccess) { check_launch("norm"); }
+    check_launch("norm");
 }
 
 void hyper_connection_inject_norm(const Tensor& y, const Tensor& inject, Tensor& residual,

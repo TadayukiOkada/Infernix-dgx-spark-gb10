@@ -136,35 +136,18 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
                                                      float g, float beta) {
     const float alpha = expf(g);
 
-    float p0 = state[0][0] * key[0] + state[0][1] * key[1] + state[0][2] * key[2] + state[0][3] * key[3];
-    float p1 = state[1][0] * key[0] + state[1][1] * key[1] + state[1][2] * key[2] + state[1][3] * key[3];
-    float p2 = state[2][0] * key[0] + state[2][1] * key[1] + state[2][2] * key[2] + state[2][3] * key[3];
-    float p3 = state[3][0] * key[0] + state[3][1] * key[1] + state[3][2] * key[2] + state[3][3] * key[3];
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * key[c]; }
+        partial = warp_sum<kWarpSize>(partial);
+
+        const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
+        const float delta = beta * (v_r - alpha * partial);
 
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        p0 += __shfl_xor_sync(0xFFFFFFFFU, p0, offset);
-        p1 += __shfl_xor_sync(0xFFFFFFFFU, p1, offset);
-        p2 += __shfl_xor_sync(0xFFFFFFFFU, p2, offset);
-        p3 += __shfl_xor_sync(0xFFFFFFFFU, p3, offset);
-    }
-
-    const float v0 = __shfl_sync(0xffffffff, v_local, 0, kWarpSize);
-    const float v1 = __shfl_sync(0xffffffff, v_local, 1, kWarpSize);
-    const float v2 = __shfl_sync(0xffffffff, v_local, 2, kWarpSize);
-    const float v3 = __shfl_sync(0xffffffff, v_local, 3, kWarpSize);
-
-    const float d0 = beta * (v0 - alpha * p0);
-    const float d1 = beta * (v1 - alpha * p1);
-    const float d2 = beta * (v2 - alpha * p2);
-    const float d3 = beta * (v3 - alpha * p3);
-
-#pragma unroll
-    for (int c = 0; c < kQkPerLane; ++c) {
-        state[0][c] = alpha * state[0][c] + d0 * key[c];
-        state[1][c] = alpha * state[1][c] + d1 * key[c];
-        state[2][c] = alpha * state[2][c] + d2 * key[c];
-        state[3][c] = alpha * state[3][c] + d3 * key[c];
+        for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = alpha * state[r][c] + delta * key[c]; }
     }
 }
 
@@ -176,23 +159,16 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
     RawQkLane q = load_raw_qk_lane(query, dqk_base);
     normalize_qk_lane<Normalize>(q.value, lane);
 
-    float p0 = state[0][0] * q.value[0] + state[0][1] * q.value[1] + state[0][2] * q.value[2] + state[0][3] * q.value[3];
-    float p1 = state[1][0] * q.value[0] + state[1][1] * q.value[1] + state[1][2] * q.value[2] + state[1][3] * q.value[3];
-    float p2 = state[2][0] * q.value[0] + state[2][1] * q.value[1] + state[2][2] * q.value[2] + state[2][3] * q.value[3];
-    float p3 = state[3][0] * q.value[0] + state[3][1] * q.value[1] + state[3][2] * q.value[2] + state[3][3] * q.value[3];
-
+    float attn_val = 0.0f;
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        p0 += __shfl_xor_sync(0xFFFFFFFFU, p0, offset);
-        p1 += __shfl_xor_sync(0xFFFFFFFFU, p1, offset);
-        p2 += __shfl_xor_sync(0xFFFFFFFFU, p2, offset);
-        p3 += __shfl_xor_sync(0xFFFFFFFFU, p3, offset);
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q.value[c]; }
+        partial = warp_sum<kWarpSize>(partial);
+        if (lane == r) { attn_val = partial; }
     }
-
-    if (lane == 0) { output[dv_base + 0] = __float2bfloat16(p0 * scale); }
-    if (lane == 1) { output[dv_base + 1] = __float2bfloat16(p1 * scale); }
-    if (lane == 2) { output[dv_base + 2] = __float2bfloat16(p2 * scale); }
-    if (lane == 3) { output[dv_base + 3] = __float2bfloat16(p3 * scale); }
+    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
 struct RecurrentCoordinates {
@@ -867,7 +843,6 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
-    pdl::enter_streaming();
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, width);
     store_state_tile(state, access.state_write_base(coord), coord);
 }

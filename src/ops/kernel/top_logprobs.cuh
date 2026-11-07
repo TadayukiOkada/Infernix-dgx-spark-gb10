@@ -161,8 +161,8 @@ __launch_bounds__(BlockSize) __global__
         unsigned long long best = 0;
         if (rank == 0) {
             best = k0;
-        } else if (k3 < previous) {
-            best = k0 < previous ? k0 : (k1 < previous ? k1 : (k2 < previous ? k2 : k3));
+        } else if (rank < 4) {
+            best = k0 < previous ? k0 : (k1 < previous ? k1 : (k2 < previous ? k2 : (k3 < previous ? k3 : 0ULL)));
         } else {
             for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
                  row += BlockSize) {

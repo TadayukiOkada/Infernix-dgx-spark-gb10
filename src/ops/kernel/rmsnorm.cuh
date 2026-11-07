@@ -291,7 +291,6 @@ __launch_bounds__(256) __global__
                                 std::int64_t rows, float eps) {
     static_assert(Preload >= 0 && (Preload == 0 || !rms_gated(Epilogue)),
                   "the preloading instance serves the ungated epilogues");
-    if constexpr (Preload == kRmsPreloadMidD / 256) { pdl::enter(); }
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 

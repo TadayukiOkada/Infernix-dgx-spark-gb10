@@ -314,6 +314,11 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
     const int gid = lane >> 2, lid = lane & 3;
     const int group = heads / kv_heads;
+    const int p     = positions[t];
+    const int count = counts[t];
+    const int total = count < 0 ? p + 1 : count * ratio + (p + 1) % ratio;
+    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t / width]) * table_stride;
+    const std::int32_t* list  = selected + static_cast<std::size_t>(t) * top_blocks;
 
     // Query rows (rotated into the keys' Hadamard domain where keys are rotated, then FP16 in the
     // key code's k-step order; BF16 keys: the stored values). Rows past the group are zero.
@@ -352,12 +357,6 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
         }
         __syncthreads();
     }
-    pdl::enter();
-    const int p     = positions[t];
-    const int count = counts[t];
-    const int total = count < 0 ? p + 1 : count * ratio + (p + 1) % ratio;
-    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t / width]) * table_stride;
-    const std::int32_t* list  = selected + static_cast<std::size_t>(t) * top_blocks;
     const int call_first = positions[(t / width) * width];
     const int window_row = vq.slots != nullptr ? vq.slots[t / width] : 0;
     unsigned char* stages = smem + kQRow * kRows + warp * (Stages * S::Bytes + S::Scratch);
@@ -1008,15 +1007,13 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
         require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
         const int columns = q.ne[2];
         const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
-        const cudaError_t launch_err = pdl::launch_consumer(
-            {grid, dim3(PromptShape<Storage>::Warps * 32), static_cast<std::size_t>(bytes), stream},
-            qsa_prompt_kernel<Storage, Stages>, static_cast<const bf16*>(q.data), g.heads, g.kv_heads,
-            layer.kv.k_pages.data, layer.kv.v_pages.data, layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
-            static_cast<const std::int32_t*>(batch.block_tables.data), static_cast<int>(batch.block_tables.ne[0]),
+        qsa_prompt_kernel<Storage, Stages><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(
+            static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
+            layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
+            static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
             static_cast<const std::int32_t*>(batch.table_rows.data),
             static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
             g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
-        require(launch_err == cudaSuccess, "qsa prompt pdl launch failed");
     };
     // One stage where two CTAs fit an SM only at Stages = 1 and the call fills a wave: the second CTA's
     // warps hide each tile's gather better than a second stage does (26-41 % faster at 86-512 columns,

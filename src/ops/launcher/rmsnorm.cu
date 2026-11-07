@@ -133,10 +133,9 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         // kernel would also take d = 10240 but sums in another order, so it would change the bits.
         if constexpr (!rms_gated(Epilogue)) {
             if (d <= kRmsPreloadMidD) {
-                CUDA_CHECK(pdl::launch_consumer(
-                    {dim3(static_cast<unsigned int>(rows)), dim3(256), 0, stream},
-                    rmsnorm_generic_kernel<Epilogue, kRmsPreloadMidD / 256>, x_bf16, w_bf16, z_bf16,
-                    out_bf16, d, rows, eps));
+                rmsnorm_generic_kernel<Epilogue, kRmsPreloadMidD / 256>
+                    <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(x_bf16, w_bf16, z_bf16, out_bf16, d,
+                                                                          rows, eps);
             } else {
                 rmsnorm_generic_kernel<Epilogue, kRmsPreloadMaxD / 256>
                     <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(x_bf16, w_bf16, z_bf16, out_bf16, d,
