@@ -252,3 +252,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 39. **Commit `fb64385be` (`perf(serve): right-size default concurrency and clamp http server thread pool for Grace CPU`):**
     - Set default `max_concurrency = 4` in `src/serve/serve_options.h:61` and clamped `worker_count` to `std::min<std::size_t>(std::thread::hardware_concurrency(), 24)` in `src/serve/http_server.cpp:218-223`, preventing connection queueing from over-subscribing Grace 20-core threads.
     - Validation: `infernix_serve_options_test` passed; `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).
+
+40. **Commit `a32a05ba6` (`perf(serve): rate-limit console stats redraws and bypass redundant NVML queries during idle`):**
+    - Added rate-limiting to `ConsoleStatsPanel` with a background flusher thread capped at 10 Hz (100 ms) and immediate return if `!panel_->enabled()`, eliminating terminal I/O latency on request completion. In `HttpServer::run_stats_reporter`, skipped NVML queries during idle intervals (`!report_has_activity(report)`) and marked baseline `valid = false` across idle gaps to eliminate redundant driver crossings and energy spikes.
+    - Validation: `infernix_console_stats_test` passed; `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,197 ms).

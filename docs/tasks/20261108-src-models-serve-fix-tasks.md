@@ -158,9 +158,10 @@
 - **Verification**: `infernix_serve_options_test` passed; `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).
 
 #### Task 3.4: Rate-Limit Console Stats Panel and Redundant Telemetry Queries in [`src/serve/console_stats.cpp`](file:///opt/etc/Infernix/src/serve/console_stats.cpp) & [`http_server.cpp`](file:///opt/etc/Infernix/src/serve/http_server.cpp)
-- **Problem**: `ConsoleStatsPanel::request_done` executes synchronous ANSI terminal redraws on every completed request. `run_stats_reporter` executes double NVML sweeps every 5 seconds.
-- **Action**: Rate-limit console stats redraws to a maximum 10 Hz timer, and skip redundant NVML telemetry sweeps when no engine activity occurred.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Problem**: `ConsoleStatsPanel::request_done` executes synchronous ANSI terminal redraws on every completed request. `run_stats_reporter` executes double NVML sweeps every 5 seconds even when the engine is completely idle.
+- **Action**: Added rate-limiting to `ConsoleStatsPanel` with a background flusher thread capped at 10 Hz (100 ms) and immediate return if `!panel_->enabled()`, eliminating terminal I/O latency on request completion. In `HttpServer::run_stats_reporter`, skipped NVML queries during idle intervals (`!report_has_activity(report)`) and marked baseline `valid = false` across idle gaps to eliminate redundant driver crossings and energy spikes.
+- **Commit**: `a32a05ba6` (`perf(serve): rate-limit console stats redraws and bypass redundant NVML queries during idle`)
+- **Verification**: `infernix_console_stats_test` passed; `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,197 ms).
 
 #### Task 3.5: Pointer Ping-Pong for MTP Proposal Hidden States in [`src/models/qwen3_5/program/speculative/mtp.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/speculative/mtp.cpp)
 - **Problem**: `MtpRound::propose` executes `cudaMemcpyAsync(ar_hidden_.data, next_hidden_.data, ..., cudaMemcpyDeviceToDevice)` on every draft step.
