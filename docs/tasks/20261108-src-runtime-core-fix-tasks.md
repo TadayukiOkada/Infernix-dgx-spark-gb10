@@ -149,10 +149,11 @@
 - **Commit**: `a206e1bad` (`perf(core): bypass PCIe link warmup spin and stream contention on integrated UMA`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,173 ms).
 
-#### Task 3.4: Right-Size Block Copy Slice Count for 48 SMs in [`src/core/block_copy.cu`](file:///opt/etc/Infernix/src/core/block_copy.cu)
-- **Problem**: `kSlices = 16` leaves 32 of 48 SMs idle when copying a single block.
-- **Action**: Size `kSlices` dynamically based on `device_sms` or set `kSlices = 24` or `48` to saturate all 48 SMs on GB10.
-- **Verification**: Run `ctest -R infernix_block_copy_test`; verify copy throughput.
+#### Task 3.4: Right-Size Block Copy Slice Count for 48 SMs in [`src/core/block_copy.cu`](file:///opt/etc/Infernix/src/core/block_copy.cu) [COMPLETED]
+- **Problem**: `kSlices = 16` left 32 of 48 SMs idle when copying a single block during page compaction or defragmentation.
+- **Action**: Updated `kSlices` to `48` to match the 48 SM architecture on GB10, and dynamically clamped `slices = std::max(1, std::min<int>(kSlices, (vectors + kThreads - 1) / kThreads))` so that small sub-192 KiB blocks do not launch idle trailing CTAs.
+- **Commit**: `56908c418` (`perf(core): right-size block copy slice count to 48 SMs for GB10`)
+- **Verification**: `infernix_block_copy_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,195 ms).
 
 #### Task 3.5: Eliminate Synchronous Device Waits in `arena.cu` in [`src/core/arena.cu`](file:///opt/etc/Infernix/src/core/arena.cu)
 - **Problem**: `DeviceBuffer::fill` and `copy_from_host` call `cudaStreamSynchronize(nullptr)` to settle the legacy default stream, blocking all streams on the GPU.
