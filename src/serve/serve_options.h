@@ -58,7 +58,7 @@ struct ServeOptions {
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     bool a8_activations            = false; // EngineOptions::a8_activations
     bool embedding_host            = false; // EngineOptions::embedding_host
-    std::uint32_t max_concurrency      = 1;
+    std::uint32_t max_concurrency      = 4;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 0; // 0: the model's default (EngineOptions)

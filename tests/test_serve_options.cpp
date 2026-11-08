@@ -1213,7 +1213,7 @@ int main() {
                               !from_file.preserve_thinking.has_value() &&
                               from_file.claude_code_prompt == ClaudeCodePrompt::Local,
                           "--config values did not reach serving options");
-        failures += check(from_file.host == "127.0.0.1" && from_file.max_concurrency == 1 &&
+        failures += check(from_file.host == "127.0.0.1" && from_file.max_concurrency == 4 &&
                               from_file.prefill_chunk == 0,
                           "options absent from --config lost their defaults");
         for (const std::vector<std::string>& command : std::vector<std::vector<std::string>>{

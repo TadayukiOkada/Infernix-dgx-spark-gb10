@@ -217,7 +217,10 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     }
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
+    const std::size_t hw_threads = std::thread::hardware_concurrency();
+    const std::size_t max_workers =
+        std::max<std::size_t>(4, std::min<std::size_t>(hw_threads > 0 ? hw_threads : 20, 24));
+    const std::size_t worker_count = std::min<std::size_t>(queued_requests + 1, max_workers);
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
     };
