@@ -117,10 +117,11 @@
 - **Commit**: `186246401` (`perf(runtime): eliminate duplicate publish_runtime_stats call in run_decode_batch`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.45s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
 
-#### Task 2.3: Eliminate Per-Iteration Heap Vector Allocations in `hold_queued_sources()` in [`src/runtime/engine/engine_core.h`](file:///opt/etc/Infernix/src/runtime/engine/engine_core.h)
-- **Problem**: `hold_queued_sources()` allocates 3 `std::vector`s on every worker iteration even when the queue is idle or unchanged.
-- **Action**: Keep reusable scratch vectors in `EngineCore` member state and `.clear()` them between iterations.
-- **Verification**: Verify zero regression on generation tests and benchmarks.
+#### Task 2.3: Eliminate Per-Iteration Heap Vector Allocations in `hold_queued_sources()` in [`src/runtime/engine/engine_core.h`](file:///opt/etc/Infernix/src/runtime/engine/engine_core.h) [COMPLETED]
+- **Problem**: `hold_queued_sources()` allocated 3 `std::vector`s on every worker iteration when queue holds were active, including copying `std::shared_ptr<Request>` into a temporary heap vector which caused atomic refcount churn and dynamic allocations.
+- **Action**: Added `scratch_hold_ids_` and `scratch_hold_bases_` member vectors to `EngineCore`, pre-reserved to `max_outstanding_`, and iterated `paused_` and `pending_` directly without copying shared pointers or allocating vectors.
+- **Commit**: `40e293a7f` (`perf(runtime): eliminate vector heap allocations in hold_queued_sources`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.48s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,159 ms).
 
 #### Task 2.4: Optimize `PrefixCacheIndex::stats()` in [`src/runtime/prefix_cache/prefix_index.cpp`](file:///opt/etc/Infernix/src/runtime/prefix_cache/prefix_index.cpp)
 - **Problem**: `PrefixCacheIndex::stats()` performs full linear scans over `holds_` and slabs (up to 4,096 entries) on every stats publication.

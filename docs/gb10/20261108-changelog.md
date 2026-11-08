@@ -168,3 +168,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 18. **Commit `186246401` (`perf(runtime): eliminate duplicate publish_runtime_stats call in run_decode_batch`):**
     - Removed redundant intermediate `publish_runtime_stats();` call inside `run_decode_batch()` in `src/runtime/engine/engine_core.h`, eliminating duplicate `queue_mutex_` acquisition, prefix index table scans, and 1.5 KiB struct copies per decode round. Unified publication remains at worker loop boundary.
     - Validation: `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
+
+19. **Commit `40e293a7f` (`perf(runtime): eliminate vector heap allocations in hold_queued_sources`):**
+    - Added `scratch_hold_ids_` and `scratch_hold_bases_` member vectors pre-reserved in `EngineCore` and replaced temporary `std::vector<std::shared_ptr<Request>>` heap vector with direct iteration over `paused_` and `pending_` in `src/runtime/engine/engine_core.h`, removing dynamic allocations and shared_ptr atomic refcount churn from `hold_queued_sources()`.
+    - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,159 ms).
