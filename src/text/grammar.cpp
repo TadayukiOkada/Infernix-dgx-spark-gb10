@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
+#include <thread>
 
 namespace infernix::text {
 namespace {
@@ -173,6 +175,18 @@ std::shared_ptr<const std::vector<std::int32_t>> tokens_containing(const std::ve
     }
     return ids;
 }
+
+int resolve_compiler_threads() noexcept {
+    if (const char* env = std::getenv("INFERNIX_GRAMMAR_THREADS")) {
+        char* end = nullptr;
+        const long val = std::strtol(env, &end, 10);
+        if (end != env && val > 0 && val <= 64) {
+            return static_cast<int>(val);
+        }
+    }
+    const unsigned int hw = std::thread::hardware_concurrency();
+    return hw == 0 ? 8 : std::clamp(static_cast<int>(hw), 1, 8);
+}
 } // namespace
 
 class GrammarCompiler::Impl {
@@ -181,7 +195,7 @@ public:
         : vocab(std::make_shared<const std::vector<std::string>>(std::move(vocab_))),
           eos(std::move(eos_)), tag_ends(tokens_containing(*vocab, '>')),
           tokenizer(*vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab->size()), eos),
-          compiler(tokenizer, 1, true, static_cast<std::int64_t>(bytes)) {}
+          compiler(tokenizer, resolve_compiler_threads(), true, static_cast<std::int64_t>(bytes)) {}
 
     std::shared_ptr<const std::vector<std::string>> vocab;
     std::vector<std::int32_t> eos;

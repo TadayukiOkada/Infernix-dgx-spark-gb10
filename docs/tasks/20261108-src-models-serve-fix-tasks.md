@@ -175,6 +175,12 @@
 - **Commit**: `b6b9483d1` (`perf(models): retain device-resident overlay embeddings on integrated UMA`)
 - **Verification**: `infernix_qwen3_5_vision_workspace_test` passed (code 77 skip on absent weights); `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).
 
+#### Task 3.7: Multi-Threaded Grammar Compilation for Constrained Tool Decoding in [`src/text/grammar.cpp`](file:///opt/etc/Infernix/src/text/grammar.cpp)
+- **Problem**: `xgrammar::GrammarCompiler` was instantiated with hardcoded `max_threads = 1`, causing the 152k-token vocabulary adaptive token mask compilation to run sequentially on a single CPU core. On Turn 1 of TC-14 (12 universal tools), grammar compilation took 458 ms, driving Turn 1 preparation latency to 467 ms (total turn 1.775s) and capping Responsiveness at 68/100.
+- **Action**: Added `resolve_compiler_threads()` in `src/text/grammar.cpp` to resolve hardware concurrency clamped to `[1, 8]` (or configured via `INFERNIX_GRAMMAR_THREADS`), enabling xgrammar's internal multi-threaded `ThreadPool` and sharded `RuleLevelCache` (16 shards) across CPU cores.
+- **Commit**: `e1fdfa93c` (`perf(text): multi-thread xgrammar compiler token mask generation`)
+- **Verification**: `infernix_grammar_test` and `infernix_qwen3_5_tool_constraints_test` passed in 0.15s; `infernix_cuda_stack_check` passed (1.50s, 0 stack spills); Turn 1 constraint preparation dropped from 458 ms to 83 ms (5.5x faster); `tool-eval-bench run --scenarios TC-14` achieved **Responsiveness 72–73 / 100** (median turn 1.6s vs target > 69) and **Quality 100 / 100** (2/2 points, 0 partial, 0 failed).
+
 ---
 
 ## 3. Execution Priority & Acceptance Criteria
