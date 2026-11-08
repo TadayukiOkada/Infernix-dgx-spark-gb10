@@ -779,19 +779,15 @@ void validate_screen(const Weight& screen) {
 // where it measured faster (2026-10-29, GB10); every other device keeps the deep-ring CTA it was
 // tuned with. Fixed per device, so a column's lists do not depend on the call.
 bool narrow_ring_device() {
-    static std::array<std::atomic<int>, 64> choices{};
+    thread_local int cached = -1;
+    if (cached != -1) return cached == 1;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
-    const int slot = device >= 0 && device < 64 ? device : 0;
-    int choice     = choices[slot].load(std::memory_order_acquire);
-    if (choice == 0) {
-        int major = 0, minor = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
-        CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
-        choice = (major == 12 && minor == 1) ? 2 : 1;
-        choices[slot].store(choice, std::memory_order_release);
-    }
-    return choice == 2;
+    int major = 0, minor = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+    cached = (major == 12 && minor == 1) ? 1 : 0;
+    return cached == 1;
 }
 
 // The screen grid for one (Tiles, NarrowRing) shape: the co-resident CTAs per SM the occupancy
@@ -800,20 +796,17 @@ bool narrow_ring_device() {
 // the launch grid the round-robin candidate lists depend on is form-independent.
 template <int Tiles, bool NarrowRing>
 int screen_grid(int items) {
-    static std::array<std::atomic<int>, 64> grids{};
-    int device = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    const int slot = device >= 0 && device < 64 ? device : 0;
-    int grid       = grids[slot].load(std::memory_order_acquire);
-    if (grid == 0) {
+    thread_local int cached_grid = 0;
+    if (cached_grid == 0) {
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
         int sms = 0, per_sm = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, screen_kernel<Tiles, NarrowRing, false, true>,
                                                                 kScreenThreads, screen_shared_bytes<Tiles, NarrowRing>()));
-        grid = std::clamp(sms * std::max(per_sm, 1), 1, kMaxGrid);
-        grids[slot].store(grid, std::memory_order_release);
+        cached_grid = std::clamp(sms * std::max(per_sm, 1), 1, kMaxGrid);
     }
-    return std::min(grid, items);
+    return std::min(cached_grid, items);
 }
 
 template <int Tiles, bool NarrowRing, bool Logits, bool Softmax>

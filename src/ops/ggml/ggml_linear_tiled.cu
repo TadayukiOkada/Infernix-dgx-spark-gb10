@@ -149,15 +149,13 @@ struct TiledDevice {
 };
 
 TiledDevice tiled_device() {
-    thread_local int device = -1;
-    thread_local TiledDevice d;
-    int current = 0;
-    CUDA_CHECK(cudaGetDevice(&current));
-    if (current != device) {
+    thread_local TiledDevice d{0, 0, 0};
+    if (d.sms == 0) {
+        int current = 0;
+        CUDA_CHECK(cudaGetDevice(&current));
         CUDA_CHECK(cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, current));
         CUDA_CHECK(cudaDeviceGetAttribute(&d.limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, current));
         CUDA_CHECK(cudaDeviceGetAttribute(&d.l2, cudaDevAttrL2CacheSize, current));
-        device = current;
     }
     return d;
 }

@@ -450,14 +450,12 @@ struct Device {
 };
 
 inline Device device() {
-    thread_local int current_device = -1;
-    thread_local Device d;
-    int current = 0;
-    CUDA_CHECK(cudaGetDevice(&current));
-    if (current != current_device) {
+    thread_local Device d{0, 0};
+    if (d.sms == 0) {
+        int current = 0;
+        CUDA_CHECK(cudaGetDevice(&current));
         CUDA_CHECK(cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, current));
         CUDA_CHECK(cudaDeviceGetAttribute(&d.limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, current));
-        current_device = current;
     }
     return d;
 }

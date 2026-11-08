@@ -505,15 +505,13 @@ void sliced_k_allow_shared() {
     CUDA_CHECK(attribute);
 }
 
-// The device's SMs (cached per thread and device).
+// The device's SMs (cached per thread).
 inline int sliced_k_multiprocessors() {
-    thread_local int device = -1;
-    thread_local int sms    = 0;
-    int current             = 0;
-    CUDA_CHECK(cudaGetDevice(&current));
-    if (current != device) {
+    thread_local int sms = 0;
+    if (sms == 0) {
+        int current = 0;
+        CUDA_CHECK(cudaGetDevice(&current));
         CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, current));
-        device = current;
     }
     return sms;
 }
