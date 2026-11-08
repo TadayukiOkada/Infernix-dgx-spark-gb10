@@ -244,3 +244,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 37. **Commit `870bef2c7` (`perf(models): preallocate n-gram proposal buffers in ProgramImpl`):**
     - Preallocated persistent `std::array<NgramProposer::Match, kMaximumConcurrency> ngram_matches_` in `src/models/qwen3_5/program/program_impl.h:948` and returned `std::span<const NgramProposer::Match>` from `propose_ngram` in `src/models/qwen3_5/program/decode.cpp:470-488`, eliminating per-round dynamic vector allocations during speculative decode.
     - Validation: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,159 ms).
+
+38. **Commit `aa37a36b8` (`perf(models): eliminate per-round vector heap allocation in MtpDraftPolicy::step`):**
+    - In `src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp:146-155`, replaced per-round heap allocation of `std::vector<std::uint32_t> candidates` with stack-allocated `std::array<std::uint32_t, kMtpPolicyMaximumDrafts>` and `std::span<const std::uint32_t>`, eliminating vector allocation in the hot inner MTP drafting loop.
+    - Validation: `infernix_qwen3_5_mtp_draft_policy_test` passed; `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,194 ms).

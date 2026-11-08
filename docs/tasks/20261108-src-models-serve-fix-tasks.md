@@ -145,10 +145,11 @@
 - **Commit**: `870bef2c7` (`perf(models): preallocate n-gram proposal buffers in ProgramImpl`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,159 ms).
 
-#### Task 3.2: Eliminate Per-Round Heap Allocation in `MtpDraftPolicy::lengths` in [`src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp)
+#### Task 3.2: Eliminate Per-Round Heap Allocation in `MtpDraftPolicy::lengths` in [`src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp) [COMPLETED]
 - **Problem**: `MtpDraftPolicy::lengths()` allocates and returns a `std::vector<std::uint32_t>` on every speculative round.
-- **Action**: Replace dynamic vector allocation with a fixed `std::array<std::uint32_t, 16>` or inline span.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: In `MtpDraftPolicy::step()`, replaced per-round heap allocation of `std::vector<std::uint32_t>` with stack-allocated `std::array<std::uint32_t, kMtpPolicyMaximumDrafts>` and `std::span<const std::uint32_t>`, completely eliminating vector construction in the MTP draft candidate selection path.
+- **Commit**: `aa37a36b8` (`perf(models): eliminate per-round vector heap allocation in MtpDraftPolicy::step`)
+- **Verification**: `infernix_qwen3_5_mtp_draft_policy_test` passed; `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,194 ms).
 
 #### Task 3.3: Right-Size Default Concurrency & Clamp HTTP Thread Pool for Grace 20-Core in [`src/serve/serve_options.h`](file:///opt/etc/Infernix/src/serve/serve_options.h) & [`http_server.cpp`](file:///opt/etc/Infernix/src/serve/http_server.cpp)
 - **Problem**: `max_concurrency = 1` defaults to single-lane execution on a 128 GiB unified device capable of 4–8 concurrent lanes. Meanwhile, `worker_count = queued_requests + 1` scales HTTP worker threads 1:1 with queue depth, spawning hundreds of threads that thrash Grace 20-core CPU.
