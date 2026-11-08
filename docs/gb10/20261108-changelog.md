@@ -260,3 +260,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 41. **Commit `f76a75e39` (`perf(models): ping-pong hidden buffers in MTP decode proposal to eliminate D2D memcpy`):**
     - Ping-ponged buffer views between `ar_hidden_` and `next_hidden_` across draft steps based on step parity (`ping_pong = (step % 2U == 0U)`), completely eliminating D2D memory copy kernel launches across all draft steps in both eager and CUDA graph modes.
     - Validation: `infernix_cuda_stack_check` passed (1.44s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,183 ms).
+
+42. **Commit `b6b9483d1` (`perf(models): retain device-resident overlay embeddings on integrated UMA`):**
+    - Retained patch embeddings directly in device memory using `std::unique_ptr<DeviceBuffer>` on integrated UMA (`device.props.integrated != 0`), bypassed the blocking `cudaStreamSynchronize` stall in `encode_items_overlay`, and switched `read_chunk` to fast stream-ordered device-to-device transfers.
+    - Validation: `infernix_qwen3_5_vision_workspace_test` passed (code 77 skip on absent weights); `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).

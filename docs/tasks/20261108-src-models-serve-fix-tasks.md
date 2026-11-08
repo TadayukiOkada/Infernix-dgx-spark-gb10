@@ -171,8 +171,9 @@
 
 #### Task 3.6: Retain Device-Resident Overlay Embeddings on Unified UMA in [`src/models/qwen3_5/execution/vision_overlay.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/execution/vision_overlay.cpp)
 - **Problem**: `encode_overlay` copies patch embeddings to host pinned memory with `cudaMemcpyDeviceToHost` and stalls on `cudaStreamSynchronize`, only for `read_chunk` to copy them back to device during prefill.
-- **Action**: On integrated UMA, retain patch embeddings in device memory and bypass the D2H/H2D copy ping-pong.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Retained patch embeddings directly in device memory using `std::unique_ptr<DeviceBuffer>` on integrated UMA (`device.props.integrated != 0`), bypassed the blocking `cudaStreamSynchronize` stall in `encode_items_overlay`, and switched `read_chunk` to fast stream-ordered device-to-device transfers.
+- **Commit**: `b6b9483d1` (`perf(models): retain device-resident overlay embeddings on integrated UMA`)
+- **Verification**: `infernix_qwen3_5_vision_workspace_test` passed (code 77 skip on absent weights); `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).
 
 ---
 
