@@ -155,10 +155,11 @@
 - **Commit**: `56908c418` (`perf(core): right-size block copy slice count to 48 SMs for GB10`)
 - **Verification**: `infernix_block_copy_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,195 ms).
 
-#### Task 3.5: Eliminate Synchronous Device Waits in `arena.cu` in [`src/core/arena.cu`](file:///opt/etc/Infernix/src/core/arena.cu)
-- **Problem**: `DeviceBuffer::fill` and `copy_from_host` call `cudaStreamSynchronize(nullptr)` to settle the legacy default stream, blocking all streams on the GPU.
-- **Action**: Use explicit caller stream or replace with stream-ordered asynchronous memset/memcpy.
-- **Verification**: Verify all arena unit tests pass.
+#### Task 3.5: Eliminate Synchronous Device Waits in `arena.cu` in [`src/core/arena.cu`](file:///opt/etc/Infernix/src/core/arena.cu) [COMPLETED]
+- **Problem**: `DeviceBuffer::fill` and `copy_from_host` called `cudaStreamSynchronize(nullptr)` unconditionally to settle the default stream, causing synchronous CPU stalls and blocking all GPU streams.
+- **Action**: Added `cudaStream_t stream = nullptr` parameter to `DeviceBuffer::{fill, copy_from_host, copy_to_host}`. When a stream is provided, operations execute asynchronously via `cudaMemsetAsync` / `cudaMemcpyAsync` in stream order without host stalling. Synchronous fallback is preserved when `stream == nullptr`. Added stream tests in `tests/test_arena.cpp`.
+- **Commit**: `8a390e9cc` (`perf(core): support stream-ordered asynchronous execution in DeviceBuffer`)
+- **Verification**: `infernix_arena_test` passed; `infernix_cuda_stack_check` passed (1.50s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
 
 #### Task 3.6: Reduce 8-Second Settled CPU Rate Measurement Delay in [`src/runtime/expert_offload/expert_offload.cpp`](file:///opt/etc/Infernix/src/runtime/expert_offload/expert_offload.cpp)
 - **Problem**: `measure_cpu_rate_settled()` runs a 4s–8s sleep loop with 150 background copies.

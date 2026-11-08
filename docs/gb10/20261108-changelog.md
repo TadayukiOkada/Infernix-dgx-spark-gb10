@@ -184,3 +184,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 22. **Commit `56908c418` (`perf(core): right-size block copy slice count to 48 SMs for GB10`):**
     - Increased `kSlices` from `16` to `48` in `src/core/block_copy.cu` to fully saturate GB10's 48 SMs during single-block moves, and dynamically clamped `slices` to the vector extent to avoid empty thread blocks on smaller blocks.
     - Validation: `infernix_block_copy_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,195 ms).
+
+23. **Commit `8a390e9cc` (`perf(core): support stream-ordered asynchronous execution in DeviceBuffer`):**
+    - Added stream-ordered asynchronous execution (`cudaMemsetAsync`, `cudaMemcpyAsync`) via optional `cudaStream_t stream = nullptr` in `src/core/arena.cu` and `arena.h`, eliminating CPU blocking synchronization when callers operate on dedicated non-blocking CUDA streams.
+    - Validation: `infernix_arena_test` passed; `infernix_cuda_stack_check` passed (1.50s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
