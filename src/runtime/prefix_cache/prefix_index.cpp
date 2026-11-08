@@ -280,6 +280,7 @@ void PrefixCacheIndex::set_queue_holds(std::span<const SnapshotRef> holds) {
         holds_.push_back(ref.index);
         refresh_tail(ref.index);
     }
+    held_snapshots_ = static_cast<std::uint32_t>(holds_.size());
     refresh_holds();
 }
 
@@ -1380,6 +1381,7 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
         // Every unheld victim was gone: the queued request resumes from an earlier source.
         holds_[snapshot.hold] = kNoId;
         snapshot.hold         = kNoHold;
+        --held_snapshots_;
         ++counters_.held_snapshot_losses;
     }
     backend_->release_snapshot(ref_of_snapshot(index));
@@ -1789,8 +1791,7 @@ PrefixIndexStats PrefixCacheIndex::stats() const noexcept {
     stats.device_evictable_blocks = device_evictable_blocks();
     stats.device_resident_blocks  = device_resident_;
     stats.free_device_slots       = free_slots_;
-    stats.held_snapshots          = static_cast<std::uint32_t>(
-        std::count_if(holds_.begin(), holds_.end(), [](std::uint32_t held) { return held != kNoId; }));
+    stats.held_snapshots          = held_snapshots_;
     return stats;
 }
 
@@ -1941,6 +1942,11 @@ void PrefixCacheIndex::check_invariants() const {
         if (nodes_[i].occupied && nodes_[i].hold != holds[i]) {
             invariant("node hold is inconsistent");
         }
+    }
+    if (static_cast<std::uint32_t>(
+            std::count_if(holds_.begin(), holds_.end(), [](std::uint32_t held) { return held != kNoId; })) !=
+        held_snapshots_) {
+        invariant("held snapshot count mismatch");
     }
 }
 

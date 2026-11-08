@@ -608,6 +608,7 @@ private:
 
     std::uint32_t node_count_      = 0;
     std::uint32_t snapshot_count_  = 0;
+    std::uint32_t held_snapshots_  = 0;
     std::uint32_t device_resident_ = 0;
     std::uint32_t free_slots_      = 0;
     std::uint64_t tick_            = 0;
