@@ -2237,7 +2237,6 @@ private:
         const std::uint64_t round_ns = elapsed_ns(started, Clock::now());
         cumulative_stats_.execution.decode.add(round_ns);
         cumulative_stats_.execution.decode_by_batch[membership.size - 1].add(round_ns);
-        publish_runtime_stats();
     }
 
     void run_control_batch(const ControlMembership& membership) {
