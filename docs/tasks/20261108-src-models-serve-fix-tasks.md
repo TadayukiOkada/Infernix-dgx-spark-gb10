@@ -165,8 +165,9 @@
 
 #### Task 3.5: Pointer Ping-Pong for MTP Proposal Hidden States in [`src/models/qwen3_5/program/speculative/mtp.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/speculative/mtp.cpp)
 - **Problem**: `MtpRound::propose` executes `cudaMemcpyAsync(ar_hidden_.data, next_hidden_.data, ..., cudaMemcpyDeviceToDevice)` on every draft step.
-- **Action**: Swap buffer pointers between `ar_hidden_` and `next_hidden_` instead of issuing a D2D copy kernel across draft steps.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Ping-ponged buffer views between `ar_hidden_` and `next_hidden_` across draft steps based on step parity (`ping_pong = (step % 2U == 0U)`), completely eliminating D2D memory copy kernel launches across all draft steps in both eager and CUDA graph modes.
+- **Commit**: `f76a75e39` (`perf(models): ping-pong hidden buffers in MTP decode proposal to eliminate D2D memcpy`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.44s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,183 ms).
 
 #### Task 3.6: Retain Device-Resident Overlay Embeddings on Unified UMA in [`src/models/qwen3_5/execution/vision_overlay.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/execution/vision_overlay.cpp)
 - **Problem**: `encode_overlay` copies patch embeddings to host pinned memory with `cudaMemcpyDeviceToHost` and stalls on `cudaStreamSynchronize`, only for `read_chunk` to copy them back to device during prefill.

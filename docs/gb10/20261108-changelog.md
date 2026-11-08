@@ -256,3 +256,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 40. **Commit `a32a05ba6` (`perf(serve): rate-limit console stats redraws and bypass redundant NVML queries during idle`):**
     - Added rate-limiting to `ConsoleStatsPanel` with a background flusher thread capped at 10 Hz (100 ms) and immediate return if `!panel_->enabled()`, eliminating terminal I/O latency on request completion. In `HttpServer::run_stats_reporter`, skipped NVML queries during idle intervals (`!report_has_activity(report)`) and marked baseline `valid = false` across idle gaps to eliminate redundant driver crossings and energy spikes.
     - Validation: `infernix_console_stats_test` passed; `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,197 ms).
+
+41. **Commit `f76a75e39` (`perf(models): ping-pong hidden buffers in MTP decode proposal to eliminate D2D memcpy`):**
+    - Ping-ponged buffer views between `ar_hidden_` and `next_hidden_` across draft steps based on step parity (`ping_pong = (step % 2U == 0U)`), completely eliminating D2D memory copy kernel launches across all draft steps in both eager and CUDA graph modes.
+    - Validation: `infernix_cuda_stack_check` passed (1.44s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,183 ms).
