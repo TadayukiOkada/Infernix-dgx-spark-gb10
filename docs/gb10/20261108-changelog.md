@@ -156,3 +156,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 15. **Commit `0279d6dbf` (`fix(core): skip efficiency cores instead of aborting in ARM hybrid cpu fallback`):**
     - In `src/core/cpu_topology.cpp`, replaced premature `return {};` on `!arm_performance_part(midr)` with `continue;`, enabling the fallback path to collect all 10 Grace Cortex-X925 cores instead of aborting when evaluating Cortex-A725 efficiency cores.
     - Validation: `infernix_cpu_topology_test` passed (`hybrid=yes, big cpus: 5 6 7 8 9 15 16 17 18 19`); `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).
+
+16. **Commit `d545cafca` (`fix(core): add NVML device handle by index fallback for integrated SoC telemetry and vram budget`):**
+    - Added `nvmlDeviceGetHandleByIndex_v2` / `nvmlDeviceGetHandleByIndex` dynamic resolution and fallback in `src/core/gpu_telemetry.cpp` and `src/core/vram_budget.cpp` when `by_pci` fails on integrated SoCs like GB10, restoring live clock, temperature, and power telemetry.
+    - Validation: Live telemetry verified in server logs (`gpu 2548/0 MHz 54 W 50 C`); `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).

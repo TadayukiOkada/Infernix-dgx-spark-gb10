@@ -92,10 +92,11 @@
 - **Commit**: `0279d6dbf` (`fix(core): skip efficiency cores instead of aborting in ARM hybrid cpu fallback`)
 - **Verification**: `infernix_cpu_topology_test` passed (reported `hybrid=yes, big cpus: 5 6 7 8 9 15 16 17 18 19`); `infernix_cuda_stack_check` passed (1.45s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).
 
-#### Task 1.3: Add NVML Handle Fallback for Integrated SoC in [`src/core/gpu_telemetry.cpp`](file:///opt/etc/Infernix/src/core/gpu_telemetry.cpp) & [`src/core/vram_budget.cpp`](file:///opt/etc/Infernix/src/core/vram_budget.cpp)
+#### Task 1.3: Add NVML Handle Fallback for Integrated SoC in [`src/core/gpu_telemetry.cpp`](file:///opt/etc/Infernix/src/core/gpu_telemetry.cpp) & [`src/core/vram_budget.cpp`](file:///opt/etc/Infernix/src/core/vram_budget.cpp) [COMPLETED]
 - **Problem**: Calling `nvmlDeviceGetHandleByPciBusId_v2` with formatted PCIe bus string fails on integrated GB10 SoC. This sets `device_ = nullptr` and causes telemetry to report all zeros or invalid data.
-- **Action**: In `gpu_telemetry.cpp` and `vram_budget.cpp`, if `by_pci(bus, &device)` fails or returns nonzero, fall back to `nvmlDeviceGetHandleByIndex_v2(cuda_device, &device)`.
-- **Verification**: Start server and query `/metrics` or inspect startup logs to confirm live GPU clocks, temperatures, and power usage are correctly reported.
+- **Action**: In `gpu_telemetry.cpp` and `vram_budget.cpp`, added fallback to `nvmlDeviceGetHandleByIndex_v2` (and legacy `nvmlDeviceGetHandleByIndex`) whenever PCIe bus ID handle acquisition fails or returns null.
+- **Commit**: `d545cafca` (`fix(core): add NVML device handle by index fallback for integrated SoC telemetry and vram budget`)
+- **Verification**: Server correctly reports live GPU telemetry (`gpu 2548/0 MHz 54 W 50 C`); `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).
 
 #### Task 1.4: Implement ARM `yield` in Spin Loop in [`src/runtime/expert_offload/host_expert_tier.cpp`](file:///opt/etc/Infernix/src/runtime/expert_offload/host_expert_tier.cpp)
 - **Problem**: `relax()` on non-x86 is currently an empty inline function. In busy-spin loops waiting for worker completions, this burns pipeline execution resources on Grace ARMv9.2 cores.
