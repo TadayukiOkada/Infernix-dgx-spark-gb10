@@ -56,12 +56,12 @@ void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q
 // activation-scale plane that route reads. The quantizer that feeds the TMA route must write the
 // same layout, so both entries derive it here.
 [[nodiscard]] inline constexpr bool nvfp4_attn_input_tma_route(std::int32_t tokens) {
-    return tokens >= 512;
+    return tokens >= 129;
 }
 
 [[nodiscard]] inline constexpr Nvfp4ScaleLayout nvfp4_attn_input_scale_layout(std::int32_t tokens) {
     return !nvfp4_attn_input_tma_route(tokens) ? Nvfp4ScaleLayout::RowMajor
-           : tokens < 1024                     ? Nvfp4ScaleLayout::Tiled128
+           : tokens <= 384                     ? Nvfp4ScaleLayout::Tiled128
                                                : Nvfp4ScaleLayout::Tiled256;
 }
 

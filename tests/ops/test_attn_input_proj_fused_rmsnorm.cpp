@@ -236,17 +236,17 @@ INFERNIX_OP_TEST(attn_input_proj_fused_rmsnorm) {
         if (ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(weight, ops::LinearPolicy::A16Only,
                                                               1024) ||
             ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(weight, ops::LinearPolicy::AllowA4,
-                                                              511) ||
+                                                              128) ||
             !ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(weight, ops::LinearPolicy::AllowA4,
-                                                               512)) {
+                                                               129)) {
             std::cerr << "fused route eligibility mismatch\n";
             return 1;
         }
         int failures       = 0;
         const bool measure = std::getenv("INFERNIX_MEASURE_FUSED_STAGE") != nullptr;
-        // 512 and 700 read the 128-token scale tiles (700 a ragged last tile); from 1024 the tiles
-        // are 256 tokens. 3584 is the production prefill chunk under the fast prefill kernel.
-        for (const int tokens : {512, 700, 1024, 1500, 2048, 3584, 4096}) {
+        // 129..384 read 128-token scale tiles under Tma128; from 385 (tested at 512, 700, 1024, ...)
+        // the tiles are 256 tokens under Tma256. 3584 is the production prefill chunk.
+        for (const int tokens : {129, 256, 384, 512, 700, 1024, 1500, 2048, 3584, 4096}) {
             failures += run_case(weight, parent.host, tokens, measure);
         }
         return failures == 0 ? 0 : 1;
