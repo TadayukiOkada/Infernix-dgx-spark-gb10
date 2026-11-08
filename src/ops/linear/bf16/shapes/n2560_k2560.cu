@@ -33,7 +33,7 @@ Bf16Launch select_bf16_n2560_k2560(std::int32_t tokens) {
     if (tokens <= 96) return launch_bf16_mma<Bf16A16MmaR32T32K128S3>; // mma_r32t32k128s3 (1.19x faster at T=32..48)
     if (tokens <= 128) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 64, 128, 32, 32, 2>>;
     if (tokens <= 512) return launch_bf16_tma_mma<S7>;
-    if (tokens <= 2048) return launch_bf16_tma_mma<S8>;
-    return launch_bf16_tma_mma<S9>;
+    if (tokens <= 1024) return launch_bf16_tma_mma<S8>;
+    return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1, Bf16MmaRaster::Grouped, 8>>;
 }
 } // namespace infernix::ops::detail

@@ -604,15 +604,18 @@ def run_production_audit(
                         "--repeat", str(repeat),
                         "--csv-out", csv_path,
                     ]
+                    if os.path.exists(csv_path):
+                        os.remove(csv_path)
                     r = subprocess.run(cmd, capture_output=True, text=True)
-                    if r.returncode != 0:
+                    if r.returncode != 0 or not os.path.exists(csv_path):
                         break
-                    rows = list(csv.DictReader(open(csv_path)))
+                    with open(csv_path, "r") as f:
+                        rows = list(csv.DictReader(f))
                     if rows:
                         vals[t] = (
-                            float(rows[0]["effective_gbs"]),
-                            float(rows[0]["useful_tflops"]),
-                            float(rows[0]["median_us"]),
+                            float(rows[-1]["effective_gbs"]),
+                            float(rows[-1]["useful_tflops"]),
+                            float(rows[-1]["median_us"]),
                         )
                 if len(vals) != len(tokens):
                     continue
@@ -626,12 +629,25 @@ def run_production_audit(
 
                 reasons: List[str] = []
                 w_mib = weight_bytes_for_shape(qt, n, k) / (1024.0 * 1024.0)
-                if pol != "a4" and w_mib >= 4.0 and g1 > 0 and (g1 - min(g2, g5, g8)) / g1 > 0.15:
-                    reasons.append(f"T=1->2..8 drop ({g1:.0f}->{min(g2,g5,g8):.0f} GB/s)")
+                min_decode_gbs = min(g2, g5, g8)
+                if pol != "a4" and w_mib >= 4.0 and g1 > 0 and (g1 - min_decode_gbs) / g1 > 0.25 and min_decode_gbs < 145.0:
+                    reasons.append(f"T=1->2..8 drop ({g1:.0f}->{min_decode_gbs:.0f} GB/s)")
                 if tf512 > 0 and tf4096 < tf512 * 0.88:
                     reasons.append(f"L2 thrash T=512->4096 ({tf512:.1f}->{tf4096:.1f} TF)")
                 qt_key = "nvfp4_a4" if (qt == "nvfp4" and pol == "a4") else qt
-                target_tf = GB10_HEALTHY_TFLOPS.get(qt_key, 45.0)
+                # Physical roofline ceiling at T=4096 accounting for mixed DRAM read/write bandwidth
+                t4k = 4096
+                w_bytes = weight_bytes_for_shape(qt, n, k)
+                x_bytes = k * t4k * (0.5 if pol == "a4" else 2.0)
+                y_bytes = n * t4k * 2.0
+                tot_bytes = w_bytes + x_bytes + y_bytes
+                intensity = (2.0 * n * k * t4k) / tot_bytes
+                read_frac = (w_bytes + x_bytes) / tot_bytes
+                write_frac = y_bytes / tot_bytes
+                effective_bw = 1.0 / (read_frac / GB10_SUSTAINED_READ_GBPS + write_frac / 150.0)
+                pipe_eff = 0.90 if k > 1152 else 0.80
+                roofline_tf = (effective_bw * intensity) / 1000.0
+                target_tf = min(GB10_HEALTHY_TFLOPS.get(qt_key, 45.0), roofline_tf * pipe_eff)
                 if n >= 1024 and tf4096 > 0 and tf4096 < target_tf:
                     reasons.append(f"Low T=4096 ({tf4096:.1f} < {target_tf:.0f} TF)")
 
@@ -675,7 +691,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations per point")
     parser.add_argument("--repeat", type=int, default=6, help="Measured cold-L2 iterations per point")
     parser.add_argument("--flush-mib", type=int, default=32, help="L2 flush size in MiB (32 MiB = 1.33x GB10 L2)")
-    parser.add_argument("--hysteresis-pct", type=float, default=1.5, help="Minimum % win to switch routes")
+    parser.add_argument("--hysteresis-pct", type=float, default=1.5, help="Minimum %% win to switch routes")
     parser.add_argument("--emit-cpp", action="store_true", help="Emit C++ candidate schedule lines in analytical mode")
     parser.add_argument("--auto-explore", action="store_true", help="Automatically run --mode explore on flagged audit shapes")
     args = parser.parse_args()

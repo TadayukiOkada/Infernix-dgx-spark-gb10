@@ -43,10 +43,8 @@ Bf16Launch ninfer_route(std::int32_t tokens) {
 // fastest measured route per interval (bench/ops/bf16_flash_next_sweep.cu, GB10 sm_121a,
 // warmup 8 / repeat 40, 2 % tolerance, seams at the last measured T).
 Bf16Launch select_bf16_n324_k10240(std::int32_t tokens) {
-    // NInfer's T = 1 route accumulates a column like its T = 8 route (checked bit for bit): 6.75 us vs 7.26.
-    if (tokens == 1) return ninfer_route(1);
-    if (tokens <= 4) return launch_bf16_simt<Simt<2>>;
-    if (tokens <= 8) return launch_bf16_simt<Simt<4>>;
+    if (tokens <= 1) return ninfer_route(1);
+    if (tokens <= 8) return launch_bf16_sliced_k_mma<S2>;
     if (tokens <= 64) return ninfer_route(tokens); // 9..64 ninfer fastest on GB10
     if (tokens <= 128) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 32, 32, 16, 3>>; // tail_r64t32s3 (1.10-1.52x at 96..128)
     if (tokens <= 384) return ninfer_route(tokens); // 192..384 ninfer fastest on GB10

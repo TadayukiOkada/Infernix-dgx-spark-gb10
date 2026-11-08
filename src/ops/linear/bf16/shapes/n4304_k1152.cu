@@ -9,6 +9,9 @@ Bf16Launch select_bf16_n4304_k1152(std::int32_t tokens) {
     if (tokens <= 8) return select_bf16_general_launch(tokens);
     if (tokens <= 128)
         return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaTailMmaSchedule<64, 32, 32, 16, 3>, 1152>>; // tail_r64t32s3
-    return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>, 1152>>; // tail_r64t64s3 (1.08x faster at T=256)
+    if (tokens <= 512)
+        return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>, 1152>>; // tail_r64t64s3 (1.08x faster at T=256)
+    return launch_bf16_tma_mma<
+        Bf16ScheduleInstance<Bf16A16TmaTailMmaSchedule<128, 128, 64, 32, 3, 1, Bf16MmaRaster::RowFast>, 1152>>;
 }
 } // namespace infernix::ops::detail
