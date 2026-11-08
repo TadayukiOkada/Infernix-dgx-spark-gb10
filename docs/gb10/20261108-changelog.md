@@ -120,3 +120,31 @@ Every atomic change below was individually compiled, verified with the `infernix
 6. **Commit `1b3d74a3a` (`perf(ops): cache uncached cudaGetDevice and driver queries on hot launch paths`):**
    - Cached `cudaGetDevice` and device attribute queries behind thread-local checks in `sliced_k_pipelined.cuh` (`sliced_k_multiprocessors`), `ggml_linear_a8.cuh` (`device`), `ggml_linear_tiled.cu` (`tiled_device`), and `screened_head.cu` (`narrow_ring_device`, `screen_grid`).
    - Validation: `infernix_cuda_stack_check` passed (1.51s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~86–124ms, median turn 2.0s).
+
+7. **Commit `fe249f25f` (`perf(ops): align fp8 attn input n17408_k3072 tile bands to GB10 wave boundaries`):**
+   - Retuned tile band schedules in `fp8_attn_input_n17408_k3072.cu` to match 48-SM GB10 wave boundaries (`T <= 32`, `33..64`, `65..96`, `97..192`).
+   - Validation: `infernix_cuda_stack_check` passed (1.49s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~83–119ms, median turn 1.8s).
+
+8. **Commit `8f3a8f39f` (`feat(ops): add K=5120 support in launch_nvfp4_a4_tma_linear_narrow`):**
+   - Added `K == 5120` template instantiation for narrow TMA GEMM in `nvfp4_a4_tma.cu`, completing coverage for Qwen 14B shapes.
+   - Validation: `infernix_cuda_stack_check` passed (1.52s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~83–120ms, median turn 1.8s).
+
+9. **Commit `2b78f1b8c` (`perf(ops): align n12800_k2560 A4 gate threshold to 65 for GB10`):**
+   - Aligned `uses_a4` and `kNvfp4N12800K2560` `pair_min_tokens` threshold from `33` to `65` in `n12800_k2560.cu`, matching the measured GB10 A16 crossover.
+   - Validation: `infernix_cuda_stack_check` passed (1.55s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~83–123ms, median turn 1.8s).
+
+10. **Commit `02d00638e` (`perf(ops): cache device prefetch limit query in sparse moe decode planning`):**
+    - Cached `device_prefetch_limit()` in `sparse_moe_decode_plan.cpp` and `sparse_moe_small_t_plan.cpp` to eliminate `cudaGetDevice` runtime queries on every decode planning step.
+    - Validation: `infernix_cuda_stack_check` passed (1.46s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~82–122ms, median turn 1.8s).
+
+11. **Commit `f6e2f526f` (`perf(ops): eliminate heap allocations in sparse moe address validation`):**
+    - Replaced `std::vector<AddressRange>` and `std::string` in `src/ops/wrapper/sparse_moe.cpp` with a stack-allocated fixed-capacity `AddressRangeList` and `const char*` literals, removing all heap allocations from `sparse_moe()` validation.
+    - Validation: `infernix_cuda_stack_check` passed (1.49s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~81–121ms, median turn 1.8s).
+
+12. **Commit `cfcc3decb` (`perf(ops): eliminate heap allocation in gated delta net replay record validation`):**
+    - Replaced `std::vector<MemoryRange>` in `src/ops/linear_attention/gated_delta_net/replay.cpp` with stack-allocated `std::array<MemoryRange, 12>` and `std::span`, eliminating heap allocations on the replay validation path.
+    - Validation: `infernix_cuda_stack_check` passed (1.53s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~81–122ms, median turn 1.8s).
+
+13. **Commit `0037b6ad4` (`perf(ops): align full-vocabulary argmax block schedule to 256 for GB10`):**
+    - Checked `kFullPhysicalRows` and `kFullValidRows` before `t_count <= kSmallAggregateColumns` in `src/ops/launcher/argmax.cu`, launching 61 CTAs (1.27 waves on 48 SMs) instead of 31 CTAs (leaving 17 SMs idle) for full vocabulary reductions at `T = 1..8`.
+    - Validation: `infernix_cuda_stack_check` passed (1.46s); `infernix_argmax_test` passed (3.54s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~81–121ms, median turn 2.0s).
