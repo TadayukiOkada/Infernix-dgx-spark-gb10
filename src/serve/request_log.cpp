@@ -1018,7 +1018,8 @@ void JsonlRequestLog::write_request_scheduling(
     const infernix::GenerationSchedulingObservation& observation) {
     if (!enabled()) { return; }
     append(format_request_scheduling_json(server_instance_id_, unix_time_ms(), request_id,
-                                          http_request_id, observation));
+                                          http_request_id, observation),
+           /*flush=*/false);
 }
 
 void JsonlRequestLog::write_request_rejected(const RequestRejectionLogContext& context) {
@@ -1043,14 +1044,16 @@ void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
     append(format_throughput_json(server_instance_id_, unix_time_ms(), report));
 }
 
-void JsonlRequestLog::append(std::string record) {
+void JsonlRequestLog::append(std::string record, bool flush) {
     bool report_failure = false;
     std::string rotation_warning;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (failed_) { return; }
         output_ << record << '\n';
-        output_.flush();
+        if (flush) {
+            output_.flush();
+        }
         if (!output_) {
             failed_        = true;
             report_failure = true;

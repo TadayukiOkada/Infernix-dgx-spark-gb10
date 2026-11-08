@@ -101,7 +101,7 @@ public:
     void write_throughput(const ThroughputReport& report);
 
 private:
-    void append(std::string record);
+    void append(std::string record, bool flush = true);
     // Caller holds mutex_. Returns a warning to log after the lock is released, or empty.
     [[nodiscard]] std::string rotate_locked();
     [[nodiscard]] std::string rotated_path(std::uint32_t index) const;
