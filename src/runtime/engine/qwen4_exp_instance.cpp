@@ -428,7 +428,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         const bool experts_kept = demand.expert_cap ? trial.expert_ram >= without.expert_ram
                                                     : trial.placement == expert_offload::ExpertPlacement::Full;
         const std::uint64_t tier_floor =
-            prefix_auto ? (integrated ? kDefaultHybridHostCacheBytes : kMinAutoHostContextBytes) : 0;
+            prefix_auto ? ((integrated && !device_experts) ? kDefaultHybridHostCacheBytes : kMinAutoHostContextBytes) : 0;
         if (options.ngram_residency == NgramResidency::Ram ||
             (experts_kept && !trial.cap_too_large && ledger_left_bytes(trial) >= tier_floor)) {
             demand       = with_table;
