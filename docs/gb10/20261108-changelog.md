@@ -236,3 +236,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 35. **Commit `44eeef6af` (`perf(models): eliminate synchronous global cudaMemcpy in constraint draw collection`):**
     - Converted synchronous `cudaMemcpy(..., cudaMemcpyDeviceToHost)` calls to stream-ordered `cudaMemcpyAsync(..., stream)` followed by `cudaStreamSynchronize(stream)` across `src/models/qwen3_5/program/constraint.cpp:121-133` and `src/models/qwen4_exp/program/constraint.cpp:163-172`, eliminating whole-device driver synchronization stalls.
     - Validation: `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,195 ms).
+
+36. **Commit `fb6ac48ca` (`perf(serve): cache pre-rendered tool schemas on ToolDefinition`):**
+    - Added `mutable std::string cached_rendered_json;` to `ToolDefinition` in `src/serve/request.h:102` and cached rendered tool definitions in `render_tool_definition()` in `src/serve/translate.cpp:92-105`, eliminating repeated JSON schema re-parsing across multi-turn sessions.
+    - Validation: `infernix_openai_schema_test` passed; `infernix_anthropic_schema_test` passed; `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,184 ms).

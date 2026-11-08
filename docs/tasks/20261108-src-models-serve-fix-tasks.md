@@ -129,10 +129,11 @@
 - **Commit**: `44eeef6af` (`perf(models): eliminate synchronous global cudaMemcpy in constraint draw collection`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,195 ms).
 
-#### Task 2.5: Cache Pre-Rendered Tool Schemas in [`src/serve/translate.cpp`](file:///opt/etc/Infernix/src/serve/translate.cpp)
+#### Task 2.5: Cache Pre-Rendered Tool Schemas in [`src/serve/translate.cpp`](file:///opt/etc/Infernix/src/serve/translate.cpp) [COMPLETED]
 - **Problem**: Multi-turn tool calling calls `render_tool_definition(tool)` on every turn, repeatedly parsing and serializing the exact same JSON schema strings.
-- **Action**: Cache the rendered tool definition JSON string directly on `ToolDefinition` or pass through already-valid JSON schemas without re-parsing.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Added `mutable std::string cached_rendered_json;` to `ToolDefinition` in `src/serve/request.h` and cached rendered tool definitions in `render_tool_definition()`, eliminating repeated JSON schema deserialization and serialization across conversational turns.
+- **Commit**: `fb6ac48ca` (`perf(serve): cache pre-rendered tool schemas on ToolDefinition`)
+- **Verification**: `infernix_openai_schema_test` passed; `infernix_anthropic_schema_test` passed; `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,184 ms).
 
 ---
 
