@@ -6853,7 +6853,7 @@ private:
     // ~40 tok/s (optimum), <=0.20 overshoots (positions 4+ accept ~0). Default lowered to 0.25;
     // INFERNIX_WIDTH_COST still overrides for per-workload tuning.
     static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.18);
-    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.025);
+    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.08);
     static constexpr std::uint64_t kProbeInterval = 8;
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
     // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV

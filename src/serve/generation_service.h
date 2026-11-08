@@ -81,6 +81,7 @@ struct StreamSink {
     std::function<void(const std::string& delta_text)> on_reasoning;
     // A constrained call's next step (infernix::ToolCallDelta), after the content before it.
     std::function<void(const infernix::ToolCallDelta& delta)> on_tool_call;
+    std::function<void()> on_flush;
     std::function<bool()> is_cancelled;
 };
 

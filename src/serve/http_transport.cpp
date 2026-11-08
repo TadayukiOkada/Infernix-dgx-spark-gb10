@@ -160,11 +160,31 @@ SseTransport::SseTransport(httplib::DataSink& sink, std::atomic<bool>& cancelled
     if (heartbeat_interval_ <= Clock::duration::zero()) {
         throw std::invalid_argument("SSE heartbeat interval must be positive");
     }
+    buffer_.reserve(8192);
 }
 
 bool SseTransport::mark_cancelled() noexcept {
     cancelled_.store(true, std::memory_order_release);
     return true;
+}
+
+void SseTransport::write_buffered(std::string_view item) {
+    buffer_.append(item);
+    if (buffer_.size() >= 4096) {
+        flush();
+    }
+}
+
+void SseTransport::write_buffered(const std::vector<std::string>& items) {
+    for (const auto& item : items) {
+        write_buffered(item);
+    }
+}
+
+void SseTransport::flush(Clock::time_point now) {
+    if (buffer_.empty()) { return; }
+    write(buffer_, now);
+    buffer_.clear();
 }
 
 void SseTransport::write(std::string_view item, Clock::time_point now) {
@@ -176,10 +196,22 @@ void SseTransport::write(std::string_view item, Clock::time_point now) {
 }
 
 void SseTransport::write(const std::vector<std::string>& items, Clock::time_point now) {
-    for (const std::string& item : items) { write(item, now); }
+    flush(now);
+    if (items.empty()) { return; }
+    if (items.size() == 1) {
+        write(items[0], now);
+        return;
+    }
+    std::string combined;
+    std::size_t total = 0;
+    for (const auto& item : items) { total += item.size(); }
+    combined.reserve(total);
+    for (const auto& item : items) { combined.append(item); }
+    write(combined, now);
 }
 
 bool SseTransport::poll(Clock::time_point now) {
+    flush(now);
     if (cancelled_.load(std::memory_order_acquire)) { return true; }
     if (sink_.is_writable && !sink_.is_writable()) { return mark_cancelled(); }
     if (now - last_write_ < heartbeat_interval_) { return false; }

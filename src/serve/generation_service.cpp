@@ -321,6 +321,12 @@ public:
         });
     }
 
+    void flush() override {
+        deliver([&] {
+            if (sink_->on_flush) { sink_->on_flush(); }
+        });
+    }
+
     [[nodiscard]] bool disconnected() const noexcept { return disconnected_; }
 
 private:

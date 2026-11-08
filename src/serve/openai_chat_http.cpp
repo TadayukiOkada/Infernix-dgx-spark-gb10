@@ -217,14 +217,17 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                             encoder->note_timing(timing);
                         };
                     }
+                    output.on_flush = [&] {
+                        transport.flush();
+                    };
                     output.on_content = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->content_delta(text); });
+                        render_and_write(transport, [&] { return encoder->content_delta(text); }, true);
                     };
                     output.on_reasoning = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
+                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); }, true);
                     };
                     output.on_tool_call = [&](const infernix::ToolCallDelta& delta) {
-                        render_and_write(transport, [&] { return encoder->tool_call_delta(delta); });
+                        render_and_write(transport, [&] { return encoder->tool_call_delta(delta); }, true);
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
 
@@ -254,9 +257,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return send_error(error);
                 }
 
-                lifecycle->done(outcome);
                 if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
                     stream->cancelled.load(std::memory_order_acquire)) {
+                    lifecycle->done(outcome);
                     lifecycle->response_failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;
@@ -264,12 +267,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);
-                    remember_reasoning(outcome, encoder->tool_call_ids());
                     if (auto comment = ngram_generation_comment(outcome.ngram_archive);
                         !comment.empty()) {
                         terminal.insert(terminal.begin(), std::move(comment));
                     }
                 } catch (const std::exception& exception) {
+                    lifecycle->done(outcome);
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));
                     ApiError error;
@@ -281,8 +284,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 try {
                     transport.write(terminal);
                     sink.done();
+                    remember_reasoning(outcome, encoder->tool_call_ids());
+                    lifecycle->done(outcome);
                     return true;
                 } catch (const ClientDisconnected&) {
+                    remember_reasoning(outcome, encoder->tool_call_ids());
+                    lifecycle->done(outcome);
                     lifecycle->response_failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
                     return false;

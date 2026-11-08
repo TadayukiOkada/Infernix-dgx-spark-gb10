@@ -159,6 +159,34 @@ inline bool is_simple_json_string(std::string_view s) noexcept {
     return true;
 }
 
+inline void append_escaped_json_string(std::string& out, std::string_view s) {
+    if (is_simple_json_string(s)) {
+        out.append(s);
+        return;
+    }
+    for (const char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        switch (c) {
+        case '"':  out.append("\\\""); break;
+        case '\\': out.append("\\\\"); break;
+        case '\b': out.append("\\b"); break;
+        case '\f': out.append("\\f"); break;
+        case '\n': out.append("\\n"); break;
+        case '\r': out.append("\\r"); break;
+        case '\t': out.append("\\t"); break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out.append(buf);
+            } else {
+                out.push_back(ch);
+            }
+            break;
+        }
+    }
+}
+
 } // namespace
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model) {
@@ -214,6 +242,28 @@ OpenAIChatStream::OpenAIChatStream(OpenAIChatResponseIdentity identity, bool inc
         if (pos != std::string::npos) {
             content_prefix_ = template_chunk.substr(0, pos + 10);
             content_suffix_ = template_chunk.substr(pos + 12);
+        }
+
+        const std::string reasoning_template =
+            chunk(identity_, Json{{"reasoning", ""}, {"reasoning_content", ""}}, nullptr, include_usage_);
+        constexpr std::string_view kReasoningAnchor = "\"reasoning\":\"\"";
+        constexpr std::string_view kReasoningContentAnchor = "\"reasoning_content\":\"\"";
+        const auto rpos1 = reasoning_template.find(kReasoningAnchor);
+        const auto rpos2 = reasoning_template.find(kReasoningContentAnchor);
+        if (rpos1 != std::string::npos && rpos2 != std::string::npos && rpos1 < rpos2) {
+            reasoning_prefix_ = reasoning_template.substr(0, rpos1 + 12);
+            reasoning_mid_    = reasoning_template.substr(rpos1 + 14, (rpos2 + 20) - (rpos1 + 14));
+            reasoning_suffix_ = reasoning_template.substr(rpos2 + 22);
+        }
+
+        const std::string tool_template =
+            chunk(identity_, Json{{"tool_calls", Json::array({Json{{"index", 0}, {"function", Json{{"arguments", ""}}}}})}},
+                  nullptr, include_usage_);
+        constexpr std::string_view kArgAnchor = "\"arguments\":\"\"";
+        const auto tpos = tool_template.find(kArgAnchor);
+        if (tpos != std::string::npos) {
+            tool_args_prefix_ = tool_template.substr(0, tpos + 12);
+            tool_args_suffix_ = tool_template.substr(tpos + 14);
         }
     }
 }
@@ -295,6 +345,21 @@ std::string OpenAIChatStream::reasoning_delta(const std::string& text) {
         throw std::logic_error("invalid OpenAI Chat reasoning delta state");
     }
     reasoning_ += text;
+    if (!timings_per_token_ && !reasoning_prefix_.empty()) {
+        std::string result;
+        result.reserve(reasoning_prefix_.size() + 4 + text.size() * 4 + reasoning_mid_.size() +
+                       reasoning_suffix_.size());
+        result.append(reasoning_prefix_);
+        result.push_back('"');
+        append_escaped_json_string(result, text);
+        result.push_back('"');
+        result.append(reasoning_mid_);
+        result.push_back('"');
+        append_escaped_json_string(result, text);
+        result.push_back('"');
+        result.append(reasoning_suffix_);
+        return result;
+    }
     return chunk(identity_, Json{{"reasoning_content", text}, {"reasoning", text}}, nullptr, include_usage_,
                  live_timings_json());
 }
@@ -307,20 +372,12 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     content_ += text;
     if (!timings_per_token_ && !content_prefix_.empty()) {
         std::string result;
-        if (is_simple_json_string(text)) {
-            result.reserve(content_prefix_.size() + text.size() + 2 + content_suffix_.size());
-            result.append(content_prefix_);
-            result.push_back('"');
-            result.append(text);
-            result.push_back('"');
-            result.append(content_suffix_);
-        } else {
-            const std::string quoted = Json(text).dump();
-            result.reserve(content_prefix_.size() + quoted.size() + content_suffix_.size());
-            result.append(content_prefix_);
-            result.append(quoted);
-            result.append(content_suffix_);
-        }
+        result.reserve(content_prefix_.size() + 2 + text.size() * 2 + content_suffix_.size());
+        result.append(content_prefix_);
+        result.push_back('"');
+        append_escaped_json_string(result, text);
+        result.push_back('"');
+        result.append(content_suffix_);
         return result;
     }
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
@@ -343,6 +400,16 @@ std::string OpenAIChatStream::tool_call_delta(const infernix::ToolCallDelta& del
     }
     calls_.back().arguments += delta.arguments;
     calls_.back().complete = delta.complete;
+    if (!opens && delta.index == 0 && !timings_per_token_ && !tool_args_prefix_.empty()) {
+        std::string result;
+        result.reserve(tool_args_prefix_.size() + 2 + delta.arguments.size() * 2 + tool_args_suffix_.size());
+        result.append(tool_args_prefix_);
+        result.push_back('"');
+        append_escaped_json_string(result, delta.arguments);
+        result.push_back('"');
+        result.append(tool_args_suffix_);
+        return result;
+    }
     return chunk(identity_, Json{{"tool_calls", Json::array({std::move(call)})}}, nullptr,
                  include_usage_, live_timings_json());
 }

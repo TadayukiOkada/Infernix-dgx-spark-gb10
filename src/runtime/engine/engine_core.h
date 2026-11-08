@@ -667,6 +667,11 @@ private:
                     } catch (...) { fail_consumer(); }
                 }
             }
+            if (caller_error == nullptr && sink != nullptr && !events.empty()) {
+                try {
+                    sink->flush();
+                } catch (...) { fail_consumer(); }
+            }
 
             if (caller_error == nullptr) {
                 try {
@@ -1147,6 +1152,39 @@ private:
         return cancelled;
     }
 
+    void settle_terminal_slot(std::uint32_t lane, FinishReason reason) {
+        const auto request = slots_[lane];
+        if (request == nullptr) { return; }
+        if (!request->is_model_finished() || !request->sequence || !request->lane ||
+            request->lane->value != lane) {
+            throw std::logic_error("terminal-pending request has invalid ownership");
+        }
+        auto finished = instance_.program->finish(*request->sequence);
+        if (finished.status != ConsumeStatus::Consumed) {
+            throw std::logic_error("terminal native sequence could not finish");
+        }
+        request->generation_timings = finished.timings;
+        request->speculative_stats  = std::move(finished.speculative);
+        request->constrained_draws  = std::move(finished.constrained_draws);
+        if constexpr (requires { finished.expert_cache; }) { request->expert_cache = finished.expert_cache; }
+        if constexpr (requires { finished.cache_created_prompt_tokens; }) {
+            request->cache_created_prompt_tokens = finished.cache_created_prompt_tokens;
+        }
+        request->terminal_reason.reset();
+        if (request->background && reason != FinishReason::Cancelled) {
+            ++next_turn_counters_.completed;
+        }
+        // A reply that hands the client a tool call is followed by the conversation's next
+        // turn once the tool has run: what that turn resumes from is held meanwhile.
+        if (tool_call_hold_.count() > 0 && reason != FinishReason::Cancelled &&
+            !request->background && request->output.has_tool_calls()) {
+            // Applied by the next admission pass's queue holds.
+            resources_.hold_continuation(*instance_.program, Clock::now() + tool_call_hold_);
+        }
+        complete_success(request, reason);
+        remove_completed_slot(lane);
+    }
+
     bool settle_terminal_requests(HostPhaseMeasurement& boundary) {
         if (instance_.program->has_context_transaction()) { return false; }
 
@@ -1165,37 +1203,9 @@ private:
 
             const std::uint32_t lane = *selected;
             const auto request       = slots_[lane];
-            if (!request->is_model_finished() || !request->sequence || !request->lane ||
-                request->lane->value != lane) {
-                throw std::logic_error("terminal-pending request has invalid ownership");
-            }
             const FinishReason reason = *request->terminal_reason;
-            auto finished             = instance_.program->finish(*request->sequence);
-            if (finished.status != ConsumeStatus::Consumed) {
-                throw std::logic_error("terminal native sequence could not finish");
-            }
-            request->generation_timings = finished.timings;
-            request->speculative_stats  = std::move(finished.speculative);
-            request->constrained_draws  = std::move(finished.constrained_draws);
-            if constexpr (requires { finished.expert_cache; }) { request->expert_cache = finished.expert_cache; }
-            if constexpr (requires { finished.cache_created_prompt_tokens; }) {
-                request->cache_created_prompt_tokens = finished.cache_created_prompt_tokens;
-            }
-            request->terminal_reason.reset();
-            if (request->background && reason != FinishReason::Cancelled) {
-                ++next_turn_counters_.completed;
-            }
-            // A reply that hands the client a tool call is followed by the conversation's next
-            // turn once the tool has run: what that turn resumes from is held meanwhile.
-            if (tool_call_hold_.count() > 0 && reason != FinishReason::Cancelled &&
-                !request->background && request->output.has_tool_calls()) {
-                // Applied by the next admission pass's queue holds.
-                resources_.hold_continuation(*instance_.program, Clock::now() + tool_call_hold_);
-            }
-
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            complete_success(request, reason);
-            remove_completed_slot(lane);
+            settle_terminal_slot(lane, reason);
             boundary = begin_host_phase();
             changed  = true;
         }
@@ -1537,6 +1547,15 @@ private:
         for (std::size_t index = 0; index < terminal_count; ++index) {
             complete_success(terminal_requests[index], terminal_reasons[index]);
             remove_completed_slot(terminal_lanes[index]);
+        }
+        for (std::size_t row = 0; row < row_count; ++row) {
+            const std::uint32_t lane = lane_indices[row];
+            const auto& request      = slots_[lane];
+            if (decisions[row].terminal && !cancelled[row] && request && request->is_model_finished() &&
+                request->terminal_reason && !instance_.program->has_context_transaction()) {
+                const FinishReason reason = *request->terminal_reason;
+                settle_terminal_slot(lane, reason);
+            }
         }
     }
 

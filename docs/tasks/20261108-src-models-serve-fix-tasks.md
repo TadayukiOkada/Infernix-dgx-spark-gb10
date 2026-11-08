@@ -181,6 +181,23 @@
 - **Commit**: `e1fdfa93c` (`perf(text): multi-thread xgrammar compiler token mask generation`)
 - **Verification**: `infernix_grammar_test` and `infernix_qwen3_5_tool_constraints_test` passed in 0.15s; `infernix_cuda_stack_check` passed (1.50s, 0 stack spills); Turn 1 constraint preparation dropped from 458 ms to 83 ms (5.5x faster); `tool-eval-bench run --scenarios TC-14` achieved **Responsiveness 72–73 / 100** (median turn 1.6s vs target > 69) and **Quality 100 / 100** (2/2 points, 0 partial, 0 failed).
 
+#### Task 3.8: Right-Size N-Gram Width Cost on GB10 and Zero-Allocation Streaming SSE Transport in [`src/models/qwen4_exp/program/program_impl.h`](file:///opt/etc/Infernix/src/models/qwen4_exp/program/program_impl.h) & [`src/serve/`](file:///opt/etc/Infernix/src/serve/) [COMPLETED]
+- **Problem**: Nsight Systems (`nsys`) profiling with node-level CUDA graph tracing (`--cuda-graph-trace=node`) on Turn 2 of TC-14 revealed that `gate_up_kernel` (560.7 ms) and `down_kernel` (248.1 ms) dominated GPU execution (808.8 ms MoE total). In particular, `kNgramWidthCost` defaulted to `0.025` (an RTX 5090 constant), which severely underestimated the cost of wide verification on GB10's 48 SMs. For a 25-token copy, the policy assumed only a 1.625x round cost, but top-8 routing fanned out across 220 distinct experts in Round 33 (422,400 thread blocks across 48 layers), inflating MoE execution from 8.8 ms to 60.3 ms (91.4 ms round time) for zero accepted tokens. Additionally, streaming SSE chunk delivery suffered from per-chunk string copies, missing immediate flush signaling, and synchronous EOF socket turnaround.
+- **Action**:
+  1. Updated `kNgramWidthCost` default from `0.025` to `0.08` in `src/models/qwen4_exp/program/program_impl.h` (and exported `INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.08}"` in `tools/run_server.sh`) to penalize low-probability long n-gram tail drafts and prevent pathological 220-expert fan-out on GB10's 48 SMs.
+  2. Implemented `write_buffered(std::string_view)` and zero-reallocation `flush()` in `SseTransport` (`src/serve/http_transport.h` and `src/serve/http_transport.cpp`).
+  3. Added `flush()` to `OutputSink` (`include/infernix/types.h`) and wired it through `ServiceOutputSink` (`src/serve/generation_service.h` / `src/serve/generation_service.cpp`) and `EngineCore` (`src/runtime/engine/engine_core.h`).
+  4. Instant terminal slot settlement in `commit_pending()` in `src/runtime/engine/engine_core.h`, notifying `wait_for_request` immediately upon row finish without an extra scheduler cycle latency.
+  5. Implemented zero-allocation `append_escaped_json_string()` for `reasoning_delta` and `tool_call_delta` in `src/serve/openai_chat_response.cpp`, completely eliminating dynamic JSON AST allocations during streaming token delivery.
+- **Verification**:
+  - `infernix_cuda_stack_check` PASSED (0 stack spills, 1.49s).
+  - `infernix_openai_schema_test` PASSED.
+  - `tool-eval-bench run --scenarios TC-14`:
+    - **Quality**: **100 / 100** (2/2 points, 0 partial, 0 failed).
+    - **Responsiveness**: **74 / 100** (median turn: **1.5s**, achieving `> 73` and `< 1.6s`).
+    - **Deployability**: **92 / 100** (α=0.7).
+    - Total execution time dropped from 5.3s to 4.0s (Turn 2 total latency dropped from 1,563 ms to 1,475 ms).
+
 ---
 
 ## 3. Execution Priority & Acceptance Criteria

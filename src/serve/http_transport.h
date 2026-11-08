@@ -51,6 +51,9 @@ public:
 
     void write(std::string_view item, Clock::time_point now = Clock::now());
     void write(const std::vector<std::string>& items, Clock::time_point now = Clock::now());
+    void write_buffered(std::string_view item);
+    void write_buffered(const std::vector<std::string>& items);
+    void flush(Clock::time_point now = Clock::now());
 
     // Called by the Engine wait loop. Besides observing an already-closed socket, a quiet stream
     // periodically writes an SSE comment so TCP_USER_TIMEOUT has traffic with which to detect an
@@ -64,13 +67,18 @@ private:
     std::atomic<bool>& cancelled_;
     Clock::duration heartbeat_interval_;
     Clock::time_point last_write_;
+    std::string buffer_;
 };
 
 template <class Render>
-void render_and_write(SseTransport& transport, Render&& render) {
+void render_and_write(SseTransport& transport, Render&& render, bool buffered = false) {
     try {
         auto payload = std::forward<Render>(render)();
-        transport.write(payload);
+        if (buffered) {
+            transport.write_buffered(payload);
+        } else {
+            transport.write(payload);
+        }
     } catch (const ClientDisconnected&) { throw; } catch (const ResponseRenderFailure&) {
         throw;
     } catch (const std::exception& exception) { throw ResponseRenderFailure(exception.what()); }

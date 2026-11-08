@@ -165,12 +165,13 @@ echo "==========================================================================
 echo
 
 export INFERNIX_EXPERTS_ON_GPU=1
+export INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.08}"
     #--draft-model "$DRAFT_PATH" \
     #--draft-tokens auto \
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
-    --ngram-cache-mib 512 \
+    --ngram-cache-mib 4096 \
     --prefill-chunk 8192 \
     --kv-dtype "${KV_DTYPE}" \
     --spec mtp \
@@ -181,9 +182,9 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --top-p 0.95 \
     --top-k 20 \
     --lm-head-draft \
+    --restore-tool-reasoning \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --host "${HOST}" \
     --port "${PORT}" \
-    --model-id "${MODEL_ID}" \
-    --request-log-jsonl /tmp/serve_requests.jsonl
+    --model-id "${MODEL_ID}"

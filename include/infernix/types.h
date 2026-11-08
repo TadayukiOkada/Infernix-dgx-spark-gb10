@@ -1559,6 +1559,7 @@ public:
     virtual void publish(OutputDelta delta)                 = 0;
     // Published after the content that precedes the call, in generation order.
     virtual void tool_call(ToolCallDelta delta)             = 0;
+    virtual void flush() {}
 };
 
 enum class OutputConsumerMode : std::uint8_t {
