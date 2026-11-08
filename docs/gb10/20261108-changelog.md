@@ -188,3 +188,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 23. **Commit `8a390e9cc` (`perf(core): support stream-ordered asynchronous execution in DeviceBuffer`):**
     - Added stream-ordered asynchronous execution (`cudaMemsetAsync`, `cudaMemcpyAsync`) via optional `cudaStream_t stream = nullptr` in `src/core/arena.cu` and `arena.h`, eliminating CPU blocking synchronization when callers operate on dedicated non-blocking CUDA streams.
     - Validation: `infernix_arena_test` passed; `infernix_cuda_stack_check` passed (1.50s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
+
+24. **Commit `2136a6252` (`perf(runtime): right-size settled CPU rate measurement duration on integrated UMA`):**
+    - Checked `vram_->query().integrated` in `src/runtime/expert_offload/expert_offload.cpp` during `measure_cpu_rate_settled()`, reducing settle sleep delay to 200 ms and maximum readings to 2 on integrated UMA (GB10), saving up to 7.8s of idle sleep.
+    - Validation: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,171 ms).

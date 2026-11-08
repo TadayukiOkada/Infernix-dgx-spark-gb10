@@ -161,10 +161,11 @@
 - **Commit**: `8a390e9cc` (`perf(core): support stream-ordered asynchronous execution in DeviceBuffer`)
 - **Verification**: `infernix_arena_test` passed; `infernix_cuda_stack_check` passed (1.50s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
 
-#### Task 3.6: Reduce 8-Second Settled CPU Rate Measurement Delay in [`src/runtime/expert_offload/expert_offload.cpp`](file:///opt/etc/Infernix/src/runtime/expert_offload/expert_offload.cpp)
-- **Problem**: `measure_cpu_rate_settled()` runs a 4s–8s sleep loop with 150 background copies.
-- **Action**: Reduce repetition count and sampling interval when UMA is detected.
-- **Verification**: Measure startup latency improvement.
+#### Task 3.6: Reduce 8-Second Settled CPU Rate Measurement Delay in [`src/runtime/expert_offload/expert_offload.cpp`](file:///opt/etc/Infernix/src/runtime/expert_offload/expert_offload.cpp) [COMPLETED]
+- **Problem**: `measure_cpu_rate_settled()` ran a 4s–8s sleep loop (`kRateSettle = 4s`, up to 3 readings) waiting for memory settling after loading, adding up to 8s of delay to CPU offload setup.
+- **Action**: Queried `vram_->query().integrated`. When running on integrated UMA (GB10), scaled `settle_time` to 200 ms and capped max readings at 2, avoiding up to 7.8s of idle sleeping on platforms with no discrete PCIe topology.
+- **Commit**: `2136a6252` (`perf(runtime): right-size settled CPU rate measurement duration on integrated UMA`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,171 ms).
 
 #### Task 3.7: Optimize `CopyBatch::add()` Overlap Checking in [`src/core/copy_batch.cpp`](file:///opt/etc/Infernix/src/core/copy_batch.cpp)
 - **Problem**: `ranges_` is a `std::map` performing dynamic tree allocations per add.
