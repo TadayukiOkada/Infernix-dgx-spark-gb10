@@ -30,10 +30,11 @@ double measure_h2d_bytes_per_second(const void* source, void* destination, std::
     if (source == nullptr || destination == nullptr || bytes == 0 || repetitions <= 0) {
         throw std::invalid_argument("link probe needs a source, a destination, bytes and repetitions");
     }
-    int device = 0, sms = 0, clock_khz = 0;
+    int device = 0, sms = 0, clock_khz = 0, integrated = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device));
     // Cycles of `ms` milliseconds at the device's highest clock (a lower clock only spins longer).
     const auto cycles = [&](float ms) { return static_cast<long long>(static_cast<double>(clock_khz) * ms); };
     cudaStream_t stream = nullptr, busy = nullptr;
@@ -50,25 +51,33 @@ double measure_h2d_bytes_per_second(const void* source, void* destination, std::
     };
     try {
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaStreamCreateWithFlags(&busy, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
-        CUDA_CHECK(cudaEventCreateWithFlags(&warm, cudaEventDisableTiming));
-        CUDA_CHECK(cudaMalloc(&done, sizeof(unsigned)));
-        CUDA_CHECK(cudaMemsetAsync(done, 0, sizeof(unsigned), busy));
-        // Warm-up: the SMs busy for kWarmMilliseconds, which brings the GPU (and its link) out of its
-        // idle state, while the link copies; then the timed copies run with the SMs still busy, under
-        // one spin the copy stream stops once they are done (bounded at 2 s).
-        spin_kernel<<<sms, 32, 0, busy>>>(cycles(kWarmMilliseconds), nullptr);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaEventRecord(warm, busy));
-        spin_kernel<<<sms, 32, 0, busy>>>(cycles(2000.0F), done);
-        CUDA_CHECK(cudaGetLastError());
-        do {
+        if (integrated != 0) {
+            // On integrated SoC (GB10 UMA), there is no PCIe link power state or transition to
+            // warm up. Running 200 ms of spin kernels wastes startup time and contends for SoC
+            // crossbar bandwidth. Run one untimed warm-up copy to prime the stream and page tables.
             CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-        } while (cudaEventQuery(warm) == cudaErrorNotReady);
-        CUDA_CHECK(cudaEventSynchronize(warm));
+        } else {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&busy, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&warm, cudaEventDisableTiming));
+            CUDA_CHECK(cudaMalloc(&done, sizeof(unsigned)));
+            CUDA_CHECK(cudaMemsetAsync(done, 0, sizeof(unsigned), busy));
+            // Warm-up: the SMs busy for kWarmMilliseconds, which brings the GPU (and its link) out of its
+            // idle state, while the link copies; then the timed copies run with the SMs still busy, under
+            // one spin the copy stream stops once they are done (bounded at 2 s).
+            spin_kernel<<<sms, 32, 0, busy>>>(cycles(kWarmMilliseconds), nullptr);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaEventRecord(warm, busy));
+            spin_kernel<<<sms, 32, 0, busy>>>(cycles(2000.0F), done);
+            CUDA_CHECK(cudaGetLastError());
+            do {
+                CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            } while (cudaEventQuery(warm) == cudaErrorNotReady);
+            CUDA_CHECK(cudaEventSynchronize(warm));
+        }
         for (int r = 0; r < repetitions; ++r) {
             CUDA_CHECK(cudaEventRecord(start, stream));
             CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream));
@@ -78,10 +87,12 @@ double measure_h2d_bytes_per_second(const void* source, void* destination, std::
             CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
             if (ms > 0.0F) { best = std::max(best, static_cast<double>(bytes) / (static_cast<double>(ms) * 1e-3)); }
         }
-        const unsigned one = 1U;
-        CUDA_CHECK(cudaMemcpyAsync(done, &one, sizeof(one), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaStreamSynchronize(busy));
+        if (integrated == 0) {
+            const unsigned one = 1U;
+            CUDA_CHECK(cudaMemcpyAsync(done, &one, sizeof(one), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaStreamSynchronize(busy));
+        }
     } catch (...) {
         release();
         throw;
