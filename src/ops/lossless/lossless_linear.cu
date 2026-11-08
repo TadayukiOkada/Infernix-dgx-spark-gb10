@@ -155,8 +155,21 @@ std::size_t lossless_linear_workspace_bytes(const Weight& weight, std::int32_t r
 
 std::size_t lossless_linear_shared_workspace_bytes(std::span<const LosslessProjection> projections, std::int32_t columns) {
     require(!projections.empty() && columns > 0, "at least one projection over positive columns");
-    std::vector<Projection> ps;
     const std::int32_t k = projections[0].weight->k;
+    if (projections.size() <= 8) {
+        std::array<Projection, 8> stack_ps;
+        for (std::size_t i = 0; i < projections.size(); ++i) {
+            const LosslessProjection& p = projections[i];
+            require(p.weight != nullptr && p.weight->k == k && k > 0 && k % kBlockK == 0 && p.rows > 0,
+                    "the projections share K, a positive multiple of 64");
+            Call c{};
+            c.rows = p.rows;
+            stack_ps[i] = Projection{c, route_of(*p.weight)};
+        }
+        return projections_bytes(k, std::span<const Projection>(stack_ps.data(), projections.size()), columns);
+    }
+    std::vector<Projection> ps;
+    ps.reserve(projections.size());
     for (const LosslessProjection& p : projections) {
         require(p.weight != nullptr && p.weight->k == k && k > 0 && k % kBlockK == 0 && p.rows > 0,
                 "the projections share K, a positive multiple of 64");
@@ -170,6 +183,18 @@ std::size_t lossless_linear_shared_workspace_bytes(std::span<const LosslessProje
 void lossless_linear_shared(const Tensor& x, std::span<const LosslessProjection> projections, WorkspaceArena& workspace,
                             cudaStream_t stream, const LosslessActivationScale& scale) {
     require(!projections.empty(), "at least one projection");
+    if (projections.size() <= 8) {
+        std::array<Projection, 8> stack_ps;
+        for (std::size_t i = 0; i < projections.size(); ++i) {
+            const LosslessProjection& p = projections[i];
+            require(p.weight != nullptr && p.out != nullptr, "each projection names its weight and output");
+            Route route = Route::None;
+            const Call c = projection_call(x, *p.weight, p.row_begin, p.rows, *p.out, p.out_row, scale, route);
+            stack_ps[i] = Projection{c, route};
+        }
+        run(std::span<Projection>(stack_ps.data(), projections.size()), workspace, stream);
+        return;
+    }
     std::vector<Projection> ps;
     ps.reserve(projections.size());
     for (const LosslessProjection& p : projections) {
