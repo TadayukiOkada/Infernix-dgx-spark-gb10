@@ -143,7 +143,15 @@ std::uint32_t MtpDraftPolicy::step(MtpDraftMemory& memory,
         memory.probe_rounds -= 1;
         return memory.probe_length;
     }
-    const std::vector<std::uint32_t> candidates = lengths(static_cast<std::uint32_t>(rows.size()));
+    std::array<std::uint32_t, kMtpPolicyMaximumDrafts> candidates_buf{};
+    std::size_t candidate_count = 0;
+    const std::uint32_t b_size  = static_cast<std::uint32_t>(rows.size());
+    for (std::uint32_t k = 1; k <= ceiling_; ++k) {
+        if (serves(k, b_size)) {
+            candidates_buf[candidate_count++] = k;
+        }
+    }
+    const std::span<const std::uint32_t> candidates(candidates_buf.data(), candidate_count);
     // The current length stands unless a challenger beats it by the margin; the first choice has
     // no incumbent. Ties keep the shorter length.
     const bool incumbent =
