@@ -220,3 +220,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 31. **Commit `b9e6cde5a` (`perf(models): right-size L2 weight warming for smaller L2 caches in qwen3_5 offloaded MoE`):**
     - Dynamically queried device L2 cache bytes via `cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)` in `src/models/qwen3_5/execution/offloaded_moe.cpp:78-135` and right-sized `chain_warm = std::min(kRefChainWarm, l2_bytes * 5 / 12)` (~10 MiB on GB10 vs 40 MiB on RTX 5090) and `input_warm = std::min(kRefInputWarm, l2_bytes / 6)` (~4 MiB on GB10 vs 16 MiB on RTX 5090), avoiding evicting active KV and activation cache lines on GB10's 24 MiB L2 cache.
     - Validation: `infernix_qwen3_5_runtime_mechanisms_test` passed; `infernix_cuda_stack_check` passed (1.53s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,180 ms).
+
+32. **Commit `990c26a36` (`perf(engine): convert engine status checks to wait-free atomics`):**
+    - Converted `stopping_`, `failed_`, and `execution_failed_` in `EngineCore` to `std::atomic<bool>` in `src/runtime/engine/engine_core.h:438-447, 2972-2975`, allowing `is_available()` and `has_failed()` to perform wait-free acquire loads without holding `queue_mutex_`, eliminating lock contention from health probes and engine watch threads.
+    - Validation: `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,199 ms).

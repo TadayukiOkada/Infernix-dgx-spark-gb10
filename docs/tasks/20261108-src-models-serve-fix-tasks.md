@@ -105,10 +105,11 @@
 
 ### Work Package 2: Tier 2 - Wait-Free Engine Synchronization & Serving Hot-Path Optimization (P1)
 
-#### Task 2.1: Convert Engine Status Checks to Wait-Free Atomics in [`src/runtime/engine/engine_core.h`](file:///opt/etc/Infernix/src/runtime/engine/engine_core.h)
+#### Task 2.1: Convert Engine Status Checks to Wait-Free Atomics in [`src/runtime/engine/engine_core.h`](file:///opt/etc/Infernix/src/runtime/engine/engine_core.h) [COMPLETED]
 - **Problem**: `has_failed()` and `is_available()` acquire `std::lock_guard lock(queue_mutex_)`. The background `run_engine_watch()` thread queries `has_failed()` every 250 ms, and `/health` or `/metrics` HTTP requests query `is_available()`, causing lock contention on the Engine worker thread's queue mutex.
-- **Action**: Make `execution_failed_`, `stopping_`, and `failed_` in `EngineCore` `std::atomic<bool>` and read them with `std::memory_order_acquire` without acquiring `queue_mutex_`.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Converted `stopping_`, `failed_`, and `execution_failed_` in `EngineCore` to `std::atomic<bool>` and read them via `load(std::memory_order_acquire)` in `is_available()` and `has_failed()` without locking `queue_mutex_`, eliminating lock contention between external health/watch threads and the batch scheduling worker loop.
+- **Commit**: `990c26a36` (`perf(engine): convert engine status checks to wait-free atomics`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,199 ms).
 
 #### Task 2.2: Convert `RequestCapacity` to Wait-Free Atomic Counter in [`src/serve/generation_service.cpp`](file:///opt/etc/Infernix/src/serve/generation_service.cpp)
 - **Problem**: `RequestCapacity` uses `std::mutex mutex` to guard `active` count during both request admission (`acquire_lifetime`) and destruction (`~RequestLifetime()`), serializing connection handoffs across all 20 Grace cores.
