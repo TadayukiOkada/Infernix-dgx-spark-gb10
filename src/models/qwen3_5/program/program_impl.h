@@ -816,7 +816,7 @@ public:
     // split (adaptive-dflash width) families or the others.
     [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
                                                        std::uint32_t drafts = 0, bool split = false);
-    [[nodiscard]] std::vector<NgramProposer::Match>
+    [[nodiscard]] std::span<const NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
                   std::span<const runtime::RoundBudget> budgets);
     // A row's copy proposal; a copy replaces the neural proposal only when it offers more than
@@ -946,5 +946,7 @@ public:
     // publication): what it superseded is the lineage's resume point again, unless the lane has
     // published a deeper snapshot since.
     void hybrid_undo_supersession(HybridLaneState& lane, const HybridSupersession& superseded);
+
+    std::array<NgramProposer::Match, kMaximumConcurrency> ngram_matches_{};
 };
 } // namespace infernix::models::qwen3_5::detail

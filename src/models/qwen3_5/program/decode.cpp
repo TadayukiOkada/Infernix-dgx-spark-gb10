@@ -467,11 +467,19 @@ void ProgramImpl::end_offloaded_round(std::span<const std::uint32_t> lanes, std:
                        std::span<const std::uint8_t>(live.data(), lanes.size() * width), parameters.model.info().name);
 }
 
-std::vector<NgramProposer::Match>
+std::span<const NgramProposer::Match>
 ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
                            std::span<const runtime::RoundBudget> budgets) {
-    std::vector<NgramProposer::Match> matches(lanes.size());
-    if (ngram_draft_window == 0) { return matches; }
+    if (ngram_draft_window == 0) {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            ngram_matches_[row].tokens.clear();
+            ngram_matches_[row].matched = 0;
+            ngram_matches_[row].source = 0;
+            ngram_matches_[row].offset = 0;
+            ngram_matches_[row].archived = false;
+        }
+        return std::span<const NgramProposer::Match>(ngram_matches_.data(), lanes.size());
+    }
     if (budgets.size() != lanes.size()) {
         throw std::invalid_argument("ngram budget count does not match lane count");
     }
@@ -481,9 +489,9 @@ ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
         if (lanes[row] >= max_concurrency) {
             throw std::invalid_argument("ngram lane is out of range");
         }
-        matches[row] = propose_ngram_one(lanes[row], budgets[row], neural_drafts, window);
+        ngram_matches_[row] = propose_ngram_one(lanes[row], budgets[row], neural_drafts, window);
     }
-    return matches;
+    return std::span<const NgramProposer::Match>(ngram_matches_.data(), lanes.size());
 }
 
 std::uint32_t ProgramImpl::ngram_copy_floor(std::uint32_t batch_rows) const noexcept {
