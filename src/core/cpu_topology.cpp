@@ -236,9 +236,11 @@ std::vector<int> performance_cpus() {
         for (const int cpu : cpus) {
             long long midr = 0;
             if (!read_sysfs_long("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/regs/identification/midr_el1",
-                                 midr) ||
-                !arm_performance_part(midr)) {
+                                 midr)) {
                 return {};
+            }
+            if (!arm_performance_part(midr)) {
+                continue;
             }
             big.push_back(cpu);
         }
