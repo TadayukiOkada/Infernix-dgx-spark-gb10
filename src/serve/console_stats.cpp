@@ -247,6 +247,36 @@ ConsoleStatsPanel::ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> pan
     : panel_(std::move(panel)) {
     state_.recent_window = kRecentRequests;
     state_.ngram_enabled = ngram_enabled;
+    flusher_             = std::thread([this] { run_flusher(); });
+}
+
+ConsoleStatsPanel::~ConsoleStatsPanel() {
+    {
+        std::lock_guard lock(mutex_);
+        stopping_ = true;
+    }
+    cv_.notify_all();
+    if (flusher_.joinable()) { flusher_.join(); }
+}
+
+void ConsoleStatsPanel::run_flusher() {
+    constexpr auto kMinInterval = std::chrono::milliseconds(100); // 10 Hz
+    std::unique_lock lock(mutex_);
+    while (!stopping_) {
+        if (dirty_) {
+            const auto now     = std::chrono::steady_clock::now();
+            const auto elapsed = now - last_render_;
+            if (elapsed >= kMinInterval) {
+                publish_locked(/*force=*/true);
+            } else {
+                const auto wait_time = kMinInterval - elapsed;
+                cv_.wait_for(lock, wait_time, [this] { return stopping_.load() || !dirty_; });
+                continue;
+            }
+        }
+        cv_.wait(lock, [this] { return stopping_.load() || dirty_; });
+    }
+    if (dirty_) { publish_locked(/*force=*/true); }
 }
 
 void ConsoleStatsPanel::request_done(const GenerationOutcome& outcome) {
@@ -261,7 +291,7 @@ void ConsoleStatsPanel::request_done(const GenerationOutcome& outcome) {
     if (recent_.size() > kRecentRequests) { recent_.pop_front(); }
     state_.recent = {};
     for (const ConsoleRequestSample& entry : recent_) { state_.recent.add(entry); }
-    publish_locked();
+    publish_locked(/*force=*/false);
 }
 
 void ConsoleStatsPanel::request_failure(const RequestFailure& failure) {
@@ -271,7 +301,7 @@ void ConsoleStatsPanel::request_failure(const RequestFailure& failure) {
     } else {
         ++state_.failed;
     }
-    publish_locked();
+    publish_locked(/*force=*/false);
 }
 
 void ConsoleStatsPanel::request_rejected(const RequestFailure& failure) {
@@ -281,22 +311,23 @@ void ConsoleStatsPanel::request_rejected(const RequestFailure& failure) {
     } else {
         ++state_.rejected;
     }
-    publish_locked();
+    publish_locked(/*force=*/false);
 }
 
 void ConsoleStatsPanel::runtime(const infernix::RuntimeStats& current) {
     std::lock_guard lock(mutex_);
     if (state_.running == current.running_requests && state_.waiting == current.waiting_requests) {
+        if (dirty_) { publish_locked(/*force=*/false); }
         return;
     }
     state_.running = current.running_requests;
     state_.waiting = current.waiting_requests;
-    publish_locked();
+    publish_locked(/*force=*/false);
 }
 
 void ConsoleStatsPanel::show() {
     std::lock_guard lock(mutex_);
-    publish_locked();
+    publish_locked(/*force=*/true);
 }
 
 ConsoleStatsSnapshot ConsoleStatsPanel::snapshot() const {
@@ -304,8 +335,23 @@ ConsoleStatsSnapshot ConsoleStatsPanel::snapshot() const {
     return state_;
 }
 
-void ConsoleStatsPanel::publish_locked() {
-    // Publishing under the statistics lock keeps concurrent updates from drawing out of order.
+void ConsoleStatsPanel::publish_locked(bool force) {
+    // Avoid formatting strings and querying terminal if panel is disabled.
+    if (!panel_->enabled()) {
+        dirty_ = false;
+        return;
+    }
+    if (!force) {
+        constexpr auto kMinInterval = std::chrono::milliseconds(100); // 10 Hz
+        const auto now              = std::chrono::steady_clock::now();
+        if ((now - last_render_) < kMinInterval) {
+            dirty_ = true;
+            cv_.notify_one();
+            return;
+        }
+    }
+    dirty_       = false;
+    last_render_ = std::chrono::steady_clock::now();
     panel_->update(render_console_stats_panel(state_));
 }
 

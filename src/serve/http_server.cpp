@@ -353,10 +353,11 @@ void HttpServer::run_stats_reporter() {
     // sample is invalid without it).
     const infernix::GpuTelemetry telemetry(options_.device);
     infernix::GpuTelemetrySample gpu_previous = telemetry.sample();
-    infernix::RuntimeStats previous   = service_->runtime_stats();
-    Clock::time_point previous_time = Clock::now();
-    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
-    Clock::time_point next_deadline = previous_time + interval;
+    bool gpu_idle                            = false;
+    infernix::RuntimeStats previous          = service_->runtime_stats();
+    Clock::time_point previous_time          = Clock::now();
+    const auto interval                      = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    Clock::time_point next_deadline          = previous_time + interval;
     // An exception leaving this thread would terminate the server: a failed report is noted on
     // stderr (once; the log writers may be what failed) and the next interval reports again.
     bool failure_noted       = false;
@@ -380,12 +381,24 @@ void HttpServer::run_stats_reporter() {
             const Clock::time_point now        = Clock::now();
             ThroughputReport report            = make_throughput_report(
                 previous, current, std::chrono::duration<double>(now - previous_time).count());
-            report.gpu_previous = gpu_previous;
-            report.gpu_current  = telemetry.sample();
-            gpu_previous        = report.gpu_current;
+            const bool active = report_has_activity(report);
+            if (active) {
+                if (gpu_idle) {
+                    report.gpu_current        = telemetry.sample();
+                    gpu_previous              = report.gpu_current;
+                    report.gpu_previous.valid = false;
+                    gpu_idle                  = false;
+                } else {
+                    report.gpu_previous = gpu_previous;
+                    report.gpu_current  = telemetry.sample();
+                    gpu_previous        = report.gpu_current;
+                }
+                record_throughput(report);
+            } else {
+                gpu_idle = true;
+            }
             previous      = current;
             previous_time = now;
-            if (report_has_activity(report)) { record_throughput(report); }
             if (console_stats_) { console_stats_->runtime(current); }
         } catch (const std::exception& error) {
             note_failure(error.what());
@@ -402,8 +415,13 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         ThroughputReport tail              = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
-        tail.gpu_previous = gpu_previous;
-        tail.gpu_current  = telemetry.sample();
+        if (gpu_idle) {
+            tail.gpu_current        = telemetry.sample();
+            tail.gpu_previous.valid = false;
+        } else {
+            tail.gpu_previous = gpu_previous;
+            tail.gpu_current  = telemetry.sample();
+        }
         // The exact partial interval remains useful to measurement consumers. Pretty throughput is
         // a fixed-cadence operational record and deliberately has no irregular shutdown tail.
         tail.final_interval = true;

@@ -6,6 +6,9 @@
 
 #include "serve/request_events.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -13,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace infernix::product {
@@ -85,6 +89,7 @@ public:
     static constexpr std::size_t kRecentRequests = 10;
 
     ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> panel, bool ngram_enabled);
+    ~ConsoleStatsPanel();
 
     void request_done(const GenerationOutcome& outcome);
     void request_failure(const RequestFailure& failure);
@@ -95,12 +100,18 @@ public:
     [[nodiscard]] ConsoleStatsSnapshot snapshot() const;
 
 private:
-    void publish_locked();
+    void publish_locked(bool force = false);
+    void run_flusher();
 
     std::shared_ptr<product::TerminalPanel> panel_;
     mutable std::mutex mutex_;
     ConsoleStatsSnapshot state_;
     std::deque<ConsoleRequestSample> recent_;
+    std::chrono::steady_clock::time_point last_render_{};
+    bool dirty_ = false;
+    std::atomic<bool> stopping_{false};
+    std::condition_variable cv_;
+    std::thread flusher_;
 };
 
 } // namespace infernix::serve
