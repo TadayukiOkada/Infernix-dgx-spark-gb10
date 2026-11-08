@@ -79,6 +79,8 @@ private:
     };
 
     OpenAIChatResponseIdentity identity_;
+    std::string content_prefix_;
+    std::string content_suffix_;
     std::string reasoning_;
     std::string content_;
     std::vector<StreamedCall> calls_;

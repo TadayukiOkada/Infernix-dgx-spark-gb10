@@ -152,6 +152,13 @@ void require_prefix(std::string_view complete, std::string_view streamed, const 
     }
 }
 
+inline bool is_simple_json_string(std::string_view s) noexcept {
+    for (const unsigned char c : s) {
+        if (c == '"' || c == '\\' || c < 0x20) { return false; }
+    }
+    return true;
+}
+
 } // namespace
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model) {
@@ -198,7 +205,18 @@ OpenAIChatStream::OpenAIChatStream(OpenAIChatResponseIdentity identity, bool inc
                                    bool usage_chunk_choice)
     : identity_(std::move(identity)), include_usage_(include_usage),
       timings_per_token_(timings_per_token), return_progress_(return_progress),
-      usage_chunk_choice_(usage_chunk_choice) {}
+      usage_chunk_choice_(usage_chunk_choice) {
+    if (!timings_per_token_) {
+        const std::string template_chunk =
+            chunk(identity_, Json{{"content", ""}}, nullptr, include_usage_);
+        constexpr std::string_view kAnchor = "\"content\":\"\"";
+        const auto pos = template_chunk.find(kAnchor);
+        if (pos != std::string::npos) {
+            content_prefix_ = template_chunk.substr(0, pos + 10);
+            content_suffix_ = template_chunk.substr(pos + 12);
+        }
+    }
+}
 
 std::string OpenAIChatStream::start() {
     if (started_ || finished_) { throw std::logic_error("OpenAI Chat stream already started"); }
@@ -287,6 +305,24 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     }
     content_started_ = true;
     content_ += text;
+    if (!timings_per_token_ && !content_prefix_.empty()) {
+        std::string result;
+        if (is_simple_json_string(text)) {
+            result.reserve(content_prefix_.size() + text.size() + 2 + content_suffix_.size());
+            result.append(content_prefix_);
+            result.push_back('"');
+            result.append(text);
+            result.push_back('"');
+            result.append(content_suffix_);
+        } else {
+            const std::string quoted = Json(text).dump();
+            result.reserve(content_prefix_.size() + quoted.size() + content_suffix_.size());
+            result.append(content_prefix_);
+            result.append(quoted);
+            result.append(content_suffix_);
+        }
+        return result;
+    }
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
 
