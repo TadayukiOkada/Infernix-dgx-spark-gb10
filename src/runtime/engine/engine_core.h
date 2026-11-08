@@ -113,6 +113,8 @@ public:
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         paused_.reserve(max_outstanding_);
+        scratch_hold_ids_.reserve(max_outstanding_);
+        scratch_hold_bases_.reserve(max_outstanding_);
         if (options.speculative.ngram_archive_bytes != 0) {
             ngram_archive_ = std::make_unique<NgramArchive>(typename NgramArchive::Limits{
                 .session_bytes = options.speculative.ngram_session_bytes,
@@ -1845,21 +1847,26 @@ private:
     void hold_queued_sources() {
         // Tool-call holds share the queue holds' ranks, after every queued request.
         if (!queue_holds_ && tool_call_hold_.count() == 0) { return; }
-        std::vector<std::shared_ptr<Request>> queue(paused_.begin(), paused_.end());
-        {
-            std::lock_guard lock(queue_mutex_);
-            queue.insert(queue.end(), pending_.begin(), pending_.end());
-        }
-        std::vector<std::uint64_t> ids;
-        std::vector<const typename ModelContract::RequestBasePlan*> bases;
-        for (const auto& request : queue) {
+        scratch_hold_ids_.clear();
+        scratch_hold_bases_.clear();
+        for (const auto& request : paused_) {
             if (!request->base_plan || request->cancelled.load(std::memory_order_acquire)) {
                 continue;
             }
-            ids.push_back(request->id);
-            bases.push_back(&*request->base_plan);
+            scratch_hold_ids_.push_back(request->id);
+            scratch_hold_bases_.push_back(&*request->base_plan);
         }
-        resources_.hold_queue(*instance_.program, ids, bases);
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (const auto& request : pending_) {
+                if (!request->base_plan || request->cancelled.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                scratch_hold_ids_.push_back(request->id);
+                scratch_hold_bases_.push_back(&*request->base_plan);
+            }
+        }
+        resources_.hold_queue(*instance_.program, scratch_hold_ids_, scratch_hold_bases_);
     }
 
     // Fails a waiting (fresh or paused) request that admission can never serve, alone: as a worker
@@ -2950,6 +2957,8 @@ private:
     std::uint64_t admission_generation_ = 1;
     std::shared_ptr<Request> context_owner_;
     std::vector<std::shared_ptr<Request>> paused_;
+    std::vector<std::uint64_t> scratch_hold_ids_;
+    std::vector<const typename ModelContract::RequestBasePlan*> scratch_hold_bases_;
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
     std::array<std::uint32_t, kMaximumConcurrency> deferred_first_tokens_{};
