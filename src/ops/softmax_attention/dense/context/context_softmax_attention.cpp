@@ -108,6 +108,9 @@ std::size_t context_softmax_attention_workspace_capacity_bytes(
     }
     const auto endpoint_capacity = [&](std::int32_t tokens) {
         const auto plan = detail::context_attention_resolve_plan(tokens, envelope);
+        if (plan.route == detail::ContextAttentionRoute::Direct) {
+            return std::size_t{0};
+        }
         WorkspaceLayoutBuilder layout;
         (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
         return layout.peak_bytes(1);
@@ -168,7 +171,10 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
 
     auto scope               = workspace.scope();
     const auto plan          = detail::context_attention_resolve_plan(tokens, envelope);
-    PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
+    PartialWorkspace partial{};
+    if (plan.route == detail::ContextAttentionRoute::SplitKv) {
+        partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
+    }
     detail::context_attention_launch(q, query_k, query_v, context_lengths, valid_columns,
                                      table_rows, scale, context, plan, partial.acc, partial.m,
                                      partial.l, out, stream);

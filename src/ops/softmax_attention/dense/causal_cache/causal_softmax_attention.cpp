@@ -277,12 +277,15 @@ struct StagedColumns {
 
 template <class Allocator>
 StagedColumns stage_columns(Allocator& allocator, AttentionHeadGeometry geometry,
-                            std::int32_t width, std::int32_t batch, bool masked) {
+                            std::int32_t width, std::int32_t batch, bool masked,
+                            bool stage_kv = true) {
     const std::int32_t rows = width * batch;
     StagedColumns out;
     out.q         = allocator.alloc(DType::BF16, {kHeadDim, geometry.query_heads, 1, rows});
-    out.k         = allocator.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, 1, rows});
-    out.v         = allocator.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, 1, rows});
+    if (stage_kv) {
+        out.k     = allocator.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, 1, rows});
+        out.v     = allocator.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, 1, rows});
+    }
     out.out       = allocator.alloc(DType::BF16, {kHeadDim, geometry.query_heads, 1, rows});
     out.positions = allocator.alloc(DType::I32, {1, rows});
     if (masked) { out.valid = allocator.alloc(DType::I32, {batch, width}); }
@@ -421,7 +424,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     CausalAttentionExecutionEnvelope column = envelope;
     column.column_invariant                 = false;
     WorkspaceLayoutBuilder layout;
-    (void)stage_columns(layout, geometry, max_width, batch_size, true);
+    const bool stage_kv = !verify_rows_attention(cache_storage);
+    (void)stage_columns(layout, geometry, max_width, batch_size, true, stage_kv);
     std::size_t one = routes(1, 1, column);
     if (verify_rows_attention(cache_storage)) {
         // The rows variant: the round's table rows beside the widest rows call's partials.
@@ -484,7 +488,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         // place, and the outputs return in one scatter.
         auto scope            = workspace.scope();
         const bool masked     = valid_columns.data != nullptr;
-        StagedColumns staged  = stage_columns(workspace, geometry, width, batch, masked);
+        const bool stage_kv   = !verify_rows_attention(cache.storage);
+        StagedColumns staged  = stage_columns(workspace, geometry, width, batch, masked, stage_kv);
         cudaStream_t stream   = execution.stream;
         const std::size_t qb  = static_cast<std::size_t>(kHeadDim) * geometry.query_heads * 2;
         const std::size_t kb  = static_cast<std::size_t>(kHeadDim) * kv_heads * 2;
