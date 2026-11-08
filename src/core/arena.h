@@ -3,6 +3,8 @@
 #include "core/dtype.h"
 #include "core/tensor.h"
 
+#include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -27,11 +29,11 @@ public:
     DeviceBuffer(DeviceBuffer&& other) noexcept;
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
 
-    // Both complete on the device before returning. Callers must first order any prior device
-    // accesses to the destination range.
-    void fill(int byte_value = 0);
-    void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0);
-    void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const;
+    // Fills or copies device bytes. When stream is non-null, operations are stream-ordered and asynchronous.
+    // When stream is null, operations are synchronized before returning.
+    void fill(int byte_value = 0, cudaStream_t stream = nullptr);
+    void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0, cudaStream_t stream = nullptr);
+    void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0, cudaStream_t stream = nullptr) const;
 
     // Raw access is intentional: Tensor and Weight are non-owning views.
     void* p           = nullptr;

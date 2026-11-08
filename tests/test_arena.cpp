@@ -84,6 +84,24 @@ int main() {
         ++failures;
         std::cerr << "device buffer round trip changed payload\n";
     }
+
+    cudaStream_t test_stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&test_stream, cudaStreamNonBlocking));
+    buffer.fill(0x5a, test_stream);
+    CUDA_CHECK(cudaStreamSynchronize(test_stream));
+    buffer.copy_to_host(host_destination.data(), host_destination.size());
+    if (host_destination != std::array<std::uint8_t, 8>{0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a}) {
+        ++failures;
+        std::cerr << "device buffer fill on stream failed\n";
+    }
+    buffer.copy_from_host(host_source.data(), host_source.size(), 0, test_stream);
+    buffer.copy_to_host(host_destination.data(), host_destination.size(), 0, test_stream);
+    CUDA_CHECK(cudaStreamSynchronize(test_stream));
+    if (host_destination != host_source) {
+        ++failures;
+        std::cerr << "device buffer async copy round trip on stream failed\n";
+    }
+    CUDA_CHECK(cudaStreamDestroy(test_stream));
     failures += expect_throws<std::out_of_range>(
         [&] { buffer.copy_from_host(host_source.data(), 2, buffer.bytes - 1); },
         "device buffer upload range");

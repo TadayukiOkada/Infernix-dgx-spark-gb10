@@ -87,8 +87,15 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     return *this;
 }
 
-void DeviceBuffer::fill(int byte_value) {
+void DeviceBuffer::fill(int byte_value, cudaStream_t stream) {
     if (bytes == 0) { return; }
+    if (stream != nullptr) {
+        const cudaError_t err = cudaMemsetAsync(p, byte_value, bytes, stream);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cuda_error_message("cudaMemsetAsync failed", err));
+        }
+        return;
+    }
     const cudaError_t err = cudaMemset(p, byte_value, bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
@@ -101,10 +108,18 @@ void DeviceBuffer::fill(int byte_value) {
     }
 }
 
-void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
+void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset,
+                                  cudaStream_t stream) {
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
-    void* destination     = static_cast<std::uint8_t*>(p) + byte_offset;
+    void* destination = static_cast<std::uint8_t*>(p) + byte_offset;
+    if (stream != nullptr) {
+        const cudaError_t err = cudaMemcpyAsync(destination, source, count, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cuda_error_message("cudaMemcpyAsync host-to-device failed", err));
+        }
+        return;
+    }
     const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
@@ -119,10 +134,17 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
 }
 
 void DeviceBuffer::copy_to_host(void* destination, std::size_t count,
-                                std::size_t byte_offset) const {
+                                std::size_t byte_offset, cudaStream_t stream) const {
     require_range(byte_offset, count, "device-to-host copy");
     if (count == 0) { return; }
-    const void* source    = static_cast<const std::uint8_t*>(p) + byte_offset;
+    const void* source = static_cast<const std::uint8_t*>(p) + byte_offset;
+    if (stream != nullptr) {
+        const cudaError_t err = cudaMemcpyAsync(destination, source, count, cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cuda_error_message("cudaMemcpyAsync device-to-host failed", err));
+        }
+        return;
+    }
     const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy device-to-host failed", err));
