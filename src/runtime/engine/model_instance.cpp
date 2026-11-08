@@ -707,7 +707,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             .prefill_signature = signature},
         options.context_cost.preset_path);
     const std::size_t default_headroom =
-        device.props.integrated != 0 ? 0ULL : kDefaultKvCapacityHeadroomBytes;
+        device.props.integrated != 0 ? (512ULL * 1024ULL * 1024ULL) : kDefaultKvCapacityHeadroomBytes;
     const std::size_t base_headroom = options.vram_headroom_bytes.value_or(default_headroom);
     std::size_t retry_headroom      = 0;
     // Offloaded experts take the VRAM the Program leaves (their frames are sized after its fixed
