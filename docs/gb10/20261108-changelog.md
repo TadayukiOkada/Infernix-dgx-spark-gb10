@@ -216,3 +216,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 30. **Commit `1a624698e` (`perf(serve): decouple synchronous flush from per-request scheduling records in request log`):**
     - Added `bool flush = true` parameter to `JsonlRequestLog::append()` and passed `/*flush=*/false` for `write_request_scheduling()` in `src/serve/request_log.h` and `src/serve/request_log.cpp`, preventing the primary Engine worker thread from synchronously blocking on disk I/O inside its admission/scheduling loop.
     - Validation: `infernix_request_log_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,206 ms).
+
+31. **Commit `b9e6cde5a` (`perf(models): right-size L2 weight warming for smaller L2 caches in qwen3_5 offloaded MoE`):**
+    - Dynamically queried device L2 cache bytes via `cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)` in `src/models/qwen3_5/execution/offloaded_moe.cpp:78-135` and right-sized `chain_warm = std::min(kRefChainWarm, l2_bytes * 5 / 12)` (~10 MiB on GB10 vs 40 MiB on RTX 5090) and `input_warm = std::min(kRefInputWarm, l2_bytes / 6)` (~4 MiB on GB10 vs 16 MiB on RTX 5090), avoiding evicting active KV and activation cache lines on GB10's 24 MiB L2 cache.
+    - Validation: `infernix_qwen3_5_runtime_mechanisms_test` passed; `infernix_cuda_stack_check` passed (1.53s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,180 ms).

@@ -95,10 +95,11 @@
 - **Commit**: `1a624698e` (`perf(serve): decouple synchronous flush from per-request scheduling records in request log`)
 - **Verification**: `infernix_request_log_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,206 ms).
 
-#### Task 1.4: Right-Size L2 Weight Warming for 24 MiB L2 in [`src/models/qwen3_5/execution/offloaded_moe.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/execution/offloaded_moe.cpp)
+#### Task 1.4: Right-Size L2 Weight Warming for 24 MiB L2 in [`src/models/qwen3_5/execution/offloaded_moe.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/execution/offloaded_moe.cpp) [COMPLETED]
 - **Problem**: `warm_next` hardcodes `kChainWarm = std::size_t{40} << 20` (40 MiB). On DGX Spark GB10 (`24 MiB` L2 cache), warming 40 MiB of weight data completely flushes the entire L2 cache, destroying active KV cache and activation cache lines.
-- **Action**: Clamp `kChainWarm` based on actual device L2 cache bytes (e.g. `std::min<std::size_t>(device.l2_cache_bytes() * 5 / 12, 8ULL << 20)` = ~8–10 MiB on GB10), matching the dynamic calculation already used in `qwen4_exp/execution/forward.cpp`.
-- **Verification**: `infernix_qwen3_5_runtime_mechanisms_test` passes; `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Dynamically queried device L2 cache bytes via `cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)` and right-sized `chain_warm = std::min(kRefChainWarm, l2_bytes * 5 / 12)` (~10 MiB on GB10 vs 40 MiB on RTX 5090) and `input_warm = std::min(kRefInputWarm, l2_bytes / 6)` (~4 MiB on GB10 vs 16 MiB on RTX 5090), preserving active KV cache and activation cache lines in L2.
+- **Commit**: `b9e6cde5a` (`perf(models): right-size L2 weight warming for smaller L2 caches in qwen3_5 offloaded MoE`)
+- **Verification**: `infernix_qwen3_5_runtime_mechanisms_test` passed; `infernix_cuda_stack_check` passed (1.53s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,180 ms).
 
 ---
 
