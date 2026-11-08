@@ -123,10 +123,11 @@
 - **Commit**: `c86527e7c` (`perf(serve): pre-format static SSE envelope and avoid dynamic JSON AST allocation for content deltas`)
 - **Verification**: `infernix_openai_schema_test` passed; `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).
 
-#### Task 2.4: Eliminate Synchronous `cudaMemcpy(DeviceToHost)` in [`src/models/*/program/constraint.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/constraint.cpp)
+#### Task 2.4: Eliminate Synchronous `cudaMemcpy(DeviceToHost)` in [`src/models/*/program/constraint.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/constraint.cpp) [COMPLETED]
 - **Problem**: `read_constraint_draws` executes synchronous `cudaMemcpy(..., cudaMemcpyDeviceToHost)`, blocking the CPU thread on every token when constrained grammar/regex decoding is enabled.
-- **Action**: Use asynchronous copies into pinned memory (`cudaMemcpyAsync`) with stream event tracking or zero-copy host-mapped memory.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Converted synchronous `cudaMemcpy(..., cudaMemcpyDeviceToHost)` calls to stream-ordered `cudaMemcpyAsync(..., stream)` followed by `cudaStreamSynchronize(stream)` across both `qwen3_5/program/constraint.cpp` and `qwen4_exp/program/constraint.cpp`, preventing whole-device driver syncs that stall concurrent streams and background worker threads.
+- **Commit**: `44eeef6af` (`perf(models): eliminate synchronous global cudaMemcpy in constraint draw collection`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,195 ms).
 
 #### Task 2.5: Cache Pre-Rendered Tool Schemas in [`src/serve/translate.cpp`](file:///opt/etc/Infernix/src/serve/translate.cpp)
 - **Problem**: Multi-turn tool calling calls `render_tool_definition(tool)` on every turn, repeatedly parsing and serializing the exact same JSON schema strings.

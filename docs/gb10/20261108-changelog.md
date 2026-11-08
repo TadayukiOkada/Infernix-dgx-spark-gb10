@@ -232,3 +232,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 34. **Commit `c86527e7c` (`perf(serve): pre-format static SSE envelope and avoid dynamic JSON AST allocation for content deltas`):**
     - Pre-formatted static SSE envelope prefix and suffix in `OpenAIChatStream` constructor in `src/serve/openai_chat_response.cpp:203-215` and implemented direct string reservation and quotation for simple tokens in `content_delta`, eliminating 8,000–12,000 dynamic heap allocations/sec across concurrent streams.
     - Validation: `infernix_openai_schema_test` passed; `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).
+
+35. **Commit `44eeef6af` (`perf(models): eliminate synchronous global cudaMemcpy in constraint draw collection`):**
+    - Converted synchronous `cudaMemcpy(..., cudaMemcpyDeviceToHost)` calls to stream-ordered `cudaMemcpyAsync(..., stream)` followed by `cudaStreamSynchronize(stream)` across `src/models/qwen3_5/program/constraint.cpp:121-133` and `src/models/qwen4_exp/program/constraint.cpp:163-172`, eliminating whole-device driver synchronization stalls.
+    - Validation: `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,195 ms).
