@@ -1003,6 +1003,7 @@ public:
         // Every fixed allocation below is checked against the plan and against device free memory
         // (an allocation the driver placed in system memory fails startup, design §19.3.7).
         vram_ = open_vram_budget_source(device_.device);
+        link_bytes_per_second_ = reference_link_bytes_per_second();
         SpillGuard guard(*vram_);
         guard.begin();
         std::uint64_t allocated = 0;
@@ -3152,7 +3153,7 @@ private:
     // on a faster link, whose rounds leave it more idle, so it promotes proportionally more often
     // (x8 4, x16 2; the x16 value is derived, not measured).
     std::uint64_t promotion_interval() const noexcept {
-        const double scaled = static_cast<double>(kDecodePromotionInterval) * kReferenceLinkBytesPerSecond / link_bytes_per_second_;
+        const double scaled = static_cast<double>(kDecodePromotionInterval) * reference_link_bytes_per_second() / link_bytes_per_second_;
         return static_cast<std::uint64_t>(std::clamp(std::lround(scaled), 1L, 8L));
     }
     std::uint64_t budget_tokens_ = 0;
@@ -6171,6 +6172,13 @@ private:
     // ---- the host-to-device link (design §19.3.12: bandwidth-dependent choices follow the machine) ----
     // The rate at which the prefill and prefix cost constants were fitted (RTX 5090 at PCIe 5.0 x8).
     static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
+    // The reference transfer rate for unified memory (GB10 UMA).
+    static constexpr double kReferenceUmaLinkBytesPerSecond = 19.4e9;
+    [[nodiscard]] double reference_link_bytes_per_second() const noexcept {
+        const bool integrated = (vram_ != nullptr && vram_->query().integrated) ||
+                                (options_.prefix_cost.h2d_bytes_per_second <= 20.0e9);
+        return integrated ? kReferenceUmaLinkBytesPerSecond : kReferenceLinkBytesPerSecond;
+    }
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
     // Measures the link once, by copying expert records from the pinned banks (the SSD tier's pinned
     // slots when the banks stay in the artifact) into the staging slots before any call uses them
@@ -6178,21 +6186,27 @@ private:
     // rescales the link-bound costs: the prefix cost's restore rate and the walk-span cost (one pass
     // of the experts over the link).
     void measure_link() {
+        const double ref_link = reference_link_bytes_per_second();
         double rate = options_.link_bytes_per_second;
         const void* source = parameters_.layers.front().moe.bank->planes.records;
         if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
         if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && plan_.staging > 0) {
             rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3);
         }
-        if (rate <= 0.0) { return; } // no frames to probe with: keep the reference rate
+        if (rate <= 0.0) {
+            link_bytes_per_second_ = ref_link;
+            return;
+        } // no frames to probe with: keep the reference rate
         link_bytes_per_second_ = rate;
         options_.prefix_cost.h2d_bytes_per_second = rate;
-        options_.prefix_span_seconds *= kReferenceLinkBytesPerSecond / rate;
+        options_.prefix_span_seconds *= ref_link / rate;
         if (prefix_) { prefix_->index().set_cost(options_.prefix_cost); }
+        const bool integrated = ref_link == kReferenceUmaLinkBytesPerSecond;
         char text[256];
         std::snprintf(text, sizeof(text),
-                      "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
+                      "%s to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
                       "%d columns",
+                      integrated ? "UMA link" : "PCIe link",
                       rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
                       static_cast<unsigned long long>(promotion_interval()),
                       options_.prefill_cpu_split ? split_columns() : 0);
@@ -6284,7 +6298,7 @@ private:
     // The widest call the prefill CPU split takes (ProgramOptions::cpu_split_columns on the reference
     // link, inversely to the measured one; at most the CPU channel's call width): runtime::expert_offload::split_width.
     [[nodiscard]] std::int32_t split_columns() const noexcept {
-        return runtime::expert_offload::split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond,
+        return runtime::expert_offload::split_width(options_.cpu_split_columns, reference_link_bytes_per_second(),
                                                     link_bytes_per_second_);
     }
 

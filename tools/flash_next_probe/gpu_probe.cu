@@ -298,12 +298,17 @@ __global__ void tiny_kernel(float* x, int pdl) {
 void pdl_chain() {
     std::printf("\n== pdl: per-kernel time of a 507-kernel chain replayed as a CUDA Graph\n");
     constexpr int kKernels = 507;
+    int sms = 0;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (sms <= 0) { sms = 48; }
     float* x               = nullptr;
-    CUDA_CHECK(cudaMalloc(&x, 170 * 128 * sizeof(float)));
-    CUDA_CHECK(cudaMemset(x, 0, 170 * 128 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&x, sms * 128 * sizeof(float)));
+    CUDA_CHECK(cudaMemset(x, 0, sms * 128 * sizeof(float)));
     cudaStream_t s;
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    for (const int blocks : {1, 170}) {
+    for (const int blocks : {1, sms}) {
         for (const int pdl : {0, 1}) {
             cudaGraph_t graph;
             CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));

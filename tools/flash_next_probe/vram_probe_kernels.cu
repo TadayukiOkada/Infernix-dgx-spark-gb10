@@ -51,7 +51,12 @@ cudaError_t probe_spin(long long cycles, cudaStream_t stream) {
 }
 
 cudaError_t probe_stream_read(const void* data, std::size_t bytes, unsigned* sink, cudaStream_t stream) {
-    stream_kernel<<<170 * 4, 512, 0, stream>>>(static_cast<const uint4*>(data), bytes / 16, sink);
+    int sms = 0;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (sms <= 0) { sms = 48; }
+    stream_kernel<<<sms * 4, 512, 0, stream>>>(static_cast<const uint4*>(data), bytes / 16, sink);
     return cudaGetLastError();
 }
 

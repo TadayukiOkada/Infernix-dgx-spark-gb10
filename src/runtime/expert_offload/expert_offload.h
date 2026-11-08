@@ -179,6 +179,9 @@ public:
     static constexpr std::uint32_t kStreamReadSlots = 1280;
     // The rate the link-bound constants were fitted at (RTX 5090 on PCIe 5.0 x8).
     static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
+    // The reference transfer rate for unified memory (GB10 UMA).
+    static constexpr double kReferenceUmaLinkBytesPerSecond = 19.4e9;
+    [[nodiscard]] double reference_link_bytes_per_second() const noexcept;
     // Promotions per layer and token at the decode rate (a forced-token call takes one).
     static constexpr std::size_t kDecodePromotionsPerLayer = 1;
 

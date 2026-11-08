@@ -4,7 +4,7 @@
 
 - **Base Commit:** `8834c95ff` (`dev-rebased-20261028`, rebased on `origin/main`)
 - **Task Reference:** [`docs/tasks/20261108-src-ops-audit-tasks.md`](../tasks/20261108-src-ops-audit-tasks.md) (Section 1.1)
-- **Total Files Changed:** 42 source/test files (`173` insertions, `168` deletions) + 2 documentation files (`docs/tasks/20261108-src-ops-audit-tasks.md`, `docs/gb10/20261108-changelog.md`). (`cuda-kernel-toolkit/` is an integrated toolkit and excluded from file-by-file enumeration.)
+- **Total Files Changed:** 48 source/test/bench/tool files (`217` insertions, `192` deletions) + 2 documentation files (`docs/tasks/20261108-src-ops-audit-tasks.md`, `docs/gb10/20261108-changelog.md`). (`cuda-kernel-toolkit/` is an integrated toolkit and excluded from file-by-file enumeration.)
 
 ---
 
@@ -56,8 +56,16 @@ Upstream Infernix targets NVIDIA GeForce RTX 5090 (`sm_120a`, 170 SMs, 96 MiB L2
 - `M` `src/ops/linear/fp8/shapes/{n1280_k2560,n2560_k640,n2560_k6144,n13312_k2560,n16384_k2560}.cu`: Cleaned up stale RTX 5090 `kPairMinTokens` comments.
 - `M` `src/ops/linear/bf16/shapes/{n48_k2560,n256_k5120,n1664_k2560,n2560_k2560,n5120_k6144,n14336_k5120,n248320_k2560}.cu`: Added GB10 attribution headers, removed unused schedule type aliases (`S0`, `S2..S6`, `S9`), and updated `S6` (`T >= 97`) in `n248320_k2560.cu` to `Bf16MmaRaster::Grouped, 8` for GB10's 24 MiB L2.
 - `M` `src/ops/linear/q4/shapes/n131072_k3072.cu`: Updated `T = 17..24` to `launch_q4_a16_sliced_r32_t24_w4_s2` and `T = 33..72` to `launch_q4_a16_mma_r64_t72`, while keeping `launch_q4_a16_mma_r64_t128` for `T > 112` (`1.23x` faster at `T=64`: `1354.50 -> 1100.61 us`; `1.43x` faster at `T=128`: `2411.33 -> 1687.49 us`).
-- `M` `src/ops/linear/q6/shapes/{n1152_k1536,n34816_k5120}.cpp`: Replaced fragmented 170-SM RTX 5090 schedules with 48-SM wave-aligned schedules.
+- `M` `src/ops/linear/q6/shapes/{n1152_k1536,n34816_k5120}.cpp`: Replaced fragmented 170-SM RTX 5090 schedules with 48-SM wave-aligned schedules. In `n34816_k5120.cpp`, updated $T > 256$ to `launch_q6_a16_mma_r64_t128` (2-stage activation pipeline with $K=64$ inner steps), accelerating $T=512$ from $3085.3\ \mu\text{s}$ ($59.2\text{ TF}$) to $2394.9\ \mu\text{s}$ ($76.2\text{ TF}$, $1.29\times$) and $T=4096$ from $30267.1\ \mu\text{s}$ ($48.25\text{ TF}$) to $20011.8\ \mu\text{s}$ ($72.97\text{ TF}$, $1.51\times$), completely eliminating the prefill L2 thrash flag.
+- `M` `src/ops/linear/nvfp4/shapes/n5120_k17408.cu`: Updated $T > 192$ in `select_a16` to retain `Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>` ($N$-block 128, 40 row tiles across 48 SMs) instead of switching to $N$-block 64 (80 row tiles) at $T > 256$. This reduced full-matrix weight re-streaming passes through GB10's 24 MiB L2, accelerating $T=4096$ from $10441.5\ \mu\text{s}$ ($69.9\text{ TF}$) to $9083.7\ \mu\text{s}$ ($80.4\text{ TF}$, $1.15\times$), eliminating the L2 thrashing flag.
 - `M` `tests/ops/test_gdn_input_proj_conv_snapshot.cpp`: Updated NVFP4 `AllowA4` route-boundary assertions from `T = 3/4` to `T = 16/17` to match `nvfp4_gdn_snapshot_plan.cpp` and `test_gdn_input_proj.cpp`.
+
+### 3.5 `bench/`, `src/runtime/`, `src/models/`, and `tools/` GB10 Alignment
+- `M` `bench/ops/roofline.h`: Aliased roofline hardware reference constants directly to `gpu_reference.h` (GB10 273 GB/s spec, 246 GB/s sustained read, 97/99/220/440 TFLOP/s). Replaces obsolete RTX 5090 GB202 numbers (1792 GB/s spec, 1674.5 GB/s sustained, 838/419/209.5 TF) that caused `infernix_mxfp8_flash_next_sweep` to understate GB10 efficiency by ~6.5x.
+- `M` `src/runtime/expert_offload/expert_offload.h` & `src/runtime/expert_offload/expert_offload.cpp`: Added `kReferenceUmaLinkBytesPerSecond = 19.4e9` and `reference_link_bytes_per_second()` helper. When running on GB10 integrated UMA (`vram_->query().integrated`), link probing falls back to 19.4 GB/s rather than PCIe 27.5 GB/s when unallocated staging buffers are absent, and diagnostic logs report "UMA link" instead of "PCIe link".
+- `M` `src/models/qwen4_exp/program/program_impl.h`: Added `kReferenceUmaLinkBytesPerSecond = 19.4e9` and `reference_link_bytes_per_second()` in `ProgramImpl`, scaling prefix costs, promotion intervals, and CPU split widths against 19.4 GB/s when integrated memory is detected.
+- `M` `tools/flash_next_probe/vram_probe_kernels.cu`: Dynamically queries `cudaDevAttrMultiProcessorCount` instead of hardcoding `170 * 4` grid blocks in `probe_stream_read`.
+- `M` `tools/flash_next_probe/gpu_probe.cu`: Dynamically queries `cudaDevAttrMultiProcessorCount` instead of hardcoding `170` blocks in `pdl_chain`.
 
 ---
 
@@ -66,10 +74,12 @@ Upstream Infernix targets NVIDIA GeForce RTX 5090 (`sm_120a`, 170 SMs, 96 MiB L2
 - **CUDA Stack-Spill Ratchet Gate (`infernix_cuda_stack_check`):** Passed (`0` new `STACK > 0` or `LOCAL > 0` symbols in `infernix-serve`).
 - **Static SASS Verification (`ckt static --sass`):** Confirmed `fp8_a8_tma_mma_kernel` emits native `QMMA` instructions (`tc=64 (int=0, flt=0, fp8=64, fp4=0)`) on `sm_121a`.
 - **`ckt shapes list` Coverage:** All `111/111` linear shape files in `src/ops/linear/*/shapes/` now report `origin = GB10`.
-- **Unit & Oracle Tests (`29/29` CTest suites + targeted shape tests passed):**
+- **Unit & Oracle Tests (`29/29` CTest suites + targeted shape tests + `19/19` offloaded_moe tests passed):**
   - `infernix_lossless_ops_test`, `infernix_argmax_test`, `infernix_add_bias_test`, `infernix_rope_test`, `infernix_rmsnorm_rope_test`, `infernix_vision_pos_embed_test`, `infernix_gelu_test`, `infernix_kv_cache_append_test`, `infernix_sliding_window_attention_test`, `infernix_kv_cache_vq_test`, `infernix_softmax_attention_fp8_test`, `infernix_softmax_attention_test`
   - `infernix_embedding_test`, `infernix_ggml_linear_a8_wide_test`, `infernix_linear_f16_accumulate_test`, `infernix_offloaded_moe_ggml_test`, `infernix_ggml_linear_a8_test`, `infernix_attn_input_proj_test`, `infernix_offloaded_moe_ggml_a8_test`, `infernix_linear_fp8_a8_test`, `infernix_ggml_linear_test`, `infernix_sparse_moe_test`, `infernix_offloaded_moe_plan_test`, `infernix_gdn_input_proj_test`, `infernix_linear_nvfp4_a4_test`, `infernix_offloaded_moe_layer_test`, `infernix_gdn_input_proj_conv_snapshot_test`, `infernix_linear_add_fp8_test`, `infernix_linear_swiglu_fp8_test`
   - `infernix_ops_linear_test`: `linear_bf16_a16 --shape 248320 2560`, `linear_q4_a16 --shape 131072 3072`, `linear_q6_a16 --shape 1152 1536`, `linear_q6_a16 --shape 34816 5120`, `linear_mxfp8_a16`.
+  - All 19 tests in `offloaded_moe` suite passed: `offloaded_moe_ggml_test`, `offloaded_moe_ggml_a8_test`, `offloaded_moe_w4a8_test`, `offloaded_moe_a8_wide_test`, `offloaded_moe_fp8_test`, `offloaded_moe_qwen3_5_122b_test`, `offloaded_moe_a4_residual_122b_test`, `offloaded_moe_cpu_test`, `offloaded_moe_a16_cpu_test`, `offloaded_moe_a4r_cpu_test`, `offloaded_moe_ggml_cpu_test`, `offloaded_moe_ggml_a8_cpu_test`, `offloaded_moe_w4a8_cpu_test`, `offloaded_moe_team_test`, `offloaded_moe_cuda_test`, `offloaded_moe_layer_test`, `offloaded_moe_plan_test`, `offloaded_moe_wide_test`, `offloaded_moe_layer_idle_test`.
+- **Benchmark Roofline Verification (`infernix_mxfp8_flash_next_sweep`):** Confirmed `mxfp8_flash_next_sweep` uses honest GB10 denominators (`273 GB/s` spec bandwidth floor, `246 GB/s` sustained read ceiling, and `220 TFLOP/s` dense Tensor Core rate), correctly reporting `weight-read floor 158.44 us at 273 GB/s` for `gdnqkvz [16384, 2560]`.
 
 ---
 

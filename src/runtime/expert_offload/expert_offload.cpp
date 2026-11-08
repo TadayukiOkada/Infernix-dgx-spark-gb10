@@ -177,6 +177,7 @@ ExpertOffload::ExpertOffload(OffloadSetup setup, OffloadOptions options, Diagnos
         throw std::invalid_argument("expert offload: one bank and one scale array per offloaded layer");
     }
     vram_          = open_vram_budget_source(setup_.device, options_.vram_past_budget);
+    link_bytes_per_second_ = reference_link_bytes_per_second();
     record_stride_ = record_stride(setup_);
     std::vector<const std::uint8_t*> banks; // the promotions' copy sources: where the device reads the banks
     for (const ExpertBank* bank : setup_.banks) {
@@ -397,19 +398,30 @@ const std::uint8_t* ExpertOffload::host_record(std::uint32_t layer, std::uint32_
 
 // ------------------------------------------------------------------------------------- link and CPU
 
+double ExpertOffload::reference_link_bytes_per_second() const noexcept {
+    const bool integrated = vram_ != nullptr && vram_->query().integrated;
+    return integrated ? kReferenceUmaLinkBytesPerSecond : kReferenceLinkBytesPerSecond;
+}
+
 void ExpertOffload::measure_link() {
+    const double ref_link = reference_link_bytes_per_second();
     double rate        = options_.link_bytes_per_second;
     const void* source = setup_.banks.front()->planes.records;
     if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
     if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && staging_.bytes > 0) {
         rate = measure_h2d_bytes_per_second(source, staging_.p, staging_.bytes, 3);
     }
-    if (rate <= 0.0) { return; } // nothing to probe with: keep the reference rate
+    if (rate <= 0.0) {
+        link_bytes_per_second_ = ref_link;
+        return;
+    } // nothing to probe with: keep the reference rate
     link_bytes_per_second_ = rate;
+    const bool integrated = ref_link == kReferenceUmaLinkBytesPerSecond;
     char text[256];
     std::snprintf(text, sizeof(text),
-                  "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to %d "
+                  "%s to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to %d "
                   "columns",
+                  integrated ? "UMA link" : "PCIe link",
                   rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
                   static_cast<unsigned long long>(promotion_interval()), options_.prefill_cpu_split ? split_columns() : 0);
     diagnostic(text, DiagnosticLevel::Debug);
@@ -460,11 +472,11 @@ std::int32_t split_width(double configured, double reference_bytes_per_second, d
 }
 
 std::int32_t ExpertOffload::split_columns() const noexcept {
-    return split_width(options_.cpu_split_columns, kReferenceLinkBytesPerSecond, link_bytes_per_second_);
+    return split_width(options_.cpu_split_columns, reference_link_bytes_per_second(), link_bytes_per_second_);
 }
 
 std::uint64_t ExpertOffload::promotion_interval() const noexcept {
-    const double scaled = static_cast<double>(kDecodePromotionInterval) * kReferenceLinkBytesPerSecond / link_bytes_per_second_;
+    const double scaled = static_cast<double>(kDecodePromotionInterval) * reference_link_bytes_per_second() / link_bytes_per_second_;
     return static_cast<std::uint64_t>(std::clamp(std::lround(scaled), 1L, 8L));
 }
 
