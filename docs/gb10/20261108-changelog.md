@@ -224,3 +224,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 32. **Commit `990c26a36` (`perf(engine): convert engine status checks to wait-free atomics`):**
     - Converted `stopping_`, `failed_`, and `execution_failed_` in `EngineCore` to `std::atomic<bool>` in `src/runtime/engine/engine_core.h:438-447, 2972-2975`, allowing `is_available()` and `has_failed()` to perform wait-free acquire loads without holding `queue_mutex_`, eliminating lock contention from health probes and engine watch threads.
     - Validation: `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,199 ms).
+
+33. **Commit `407f52950` (`perf(serve): convert RequestCapacity to wait-free atomic counter`):**
+    - Replaced `std::mutex mutex` and `std::size_t active` in `RequestCapacity` in `src/serve/generation_service.cpp:22-45, 422-450` with `std::atomic<std::size_t> active{0}`, using a lock-free compare-and-swap loop on ingress and `fetch_sub` on egress, eliminating mutex serialization on connection admission across all 20 Grace cores.
+    - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,193 ms).

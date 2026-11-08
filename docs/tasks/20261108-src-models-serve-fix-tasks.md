@@ -111,10 +111,11 @@
 - **Commit**: `990c26a36` (`perf(engine): convert engine status checks to wait-free atomics`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,199 ms).
 
-#### Task 2.2: Convert `RequestCapacity` to Wait-Free Atomic Counter in [`src/serve/generation_service.cpp`](file:///opt/etc/Infernix/src/serve/generation_service.cpp)
+#### Task 2.2: Convert `RequestCapacity` to Wait-Free Atomic Counter in [`src/serve/generation_service.cpp`](file:///opt/etc/Infernix/src/serve/generation_service.cpp) [COMPLETED]
 - **Problem**: `RequestCapacity` uses `std::mutex mutex` to guard `active` count during both request admission (`acquire_lifetime`) and destruction (`~RequestLifetime()`), serializing connection handoffs across all 20 Grace cores.
-- **Action**: Replace `mutex` and `std::size_t active` with `std::atomic<std::size_t> active_`, using a wait-free compare-and-swap loop on ingress and `fetch_sub(1, std::memory_order_release)` on egress.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Converted `RequestCapacity` to use `std::atomic<std::size_t> active{0}`, replacing `std::mutex` with a lock-free CAS loop on ingress (`compare_exchange_weak`) and atomic decrement on egress (`fetch_sub(1, std::memory_order_release)`), completely eliminating mutex contention during request lifecycle management.
+- **Commit**: `407f52950` (`perf(serve): convert RequestCapacity to wait-free atomic counter`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,193 ms).
 
 #### Task 2.3: Zero-Allocation Pre-Formatted SSE Chunk Writer in [`src/serve/openai_chat_response.cpp`](file:///opt/etc/Infernix/src/serve/openai_chat_response.cpp)
 - **Problem**: On every generated token in streaming mode, `content_delta` creates an `nlohmann::json` object, formats choice/delta dictionaries on the heap, and calls `payload.dump()`, causing thousands of dynamic allocations per second across concurrent streams.
