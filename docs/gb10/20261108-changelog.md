@@ -192,3 +192,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 24. **Commit `2136a6252` (`perf(runtime): right-size settled CPU rate measurement duration on integrated UMA`):**
     - Checked `vram_->query().integrated` in `src/runtime/expert_offload/expert_offload.cpp` during `measure_cpu_rate_settled()`, reducing settle sleep delay to 200 ms and maximum readings to 2 on integrated UMA (GB10), saving up to 7.8s of idle sleep.
     - Validation: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,171 ms).
+
+25. **Commit `9ae107104` (`perf(core): replace std::map with contiguous interval vector in CopyBatch`):**
+    - Replaced `std::map<std::uintptr_t, std::uintptr_t> ranges_` with contiguous `std::vector<Range>` and linear interval overlap detection in `src/core/copy_batch.cpp` and `copy_batch.h`, eliminating heap node allocations and deallocations across batches.
+    - Validation: `infernix_copy_batch_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,164 ms).

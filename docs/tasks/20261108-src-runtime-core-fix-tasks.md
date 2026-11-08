@@ -167,10 +167,11 @@
 - **Commit**: `2136a6252` (`perf(runtime): right-size settled CPU rate measurement duration on integrated UMA`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,171 ms).
 
-#### Task 3.7: Optimize `CopyBatch::add()` Overlap Checking in [`src/core/copy_batch.cpp`](file:///opt/etc/Infernix/src/core/copy_batch.cpp)
-- **Problem**: `ranges_` is a `std::map` performing dynamic tree allocations per add.
-- **Action**: Use a flat contiguous vector of intervals sorted on flush, avoiding node allocations.
-- **Verification**: Verify batch copy correctness with `infernix_tests`.
+#### Task 3.7: Optimize `CopyBatch::add()` Overlap Checking in [`src/core/copy_batch.cpp`](file:///opt/etc/Infernix/src/core/copy_batch.cpp) [COMPLETED]
+- **Problem**: `CopyBatch` used a `std::map<std::uintptr_t, std::uintptr_t> ranges_` to check interval overlap, allocating and deallocating red-black tree nodes on the heap on every copy add and batch flush.
+- **Action**: Replaced `std::map` with a contiguous `std::vector<Range> ranges_` using interval overlap condition (`begin < r.end && end > r.begin`). Calling `ranges_.clear()` retains vector capacity across batches without dynamic heap node churn.
+- **Commit**: `9ae107104` (`perf(core): replace std::map with contiguous interval vector in CopyBatch`)
+- **Verification**: `infernix_copy_batch_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,164 ms).
 
 ---
 
