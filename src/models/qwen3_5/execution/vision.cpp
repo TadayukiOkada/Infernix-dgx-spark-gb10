@@ -462,14 +462,19 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             }
             const PinnedVisionResult& ready = preencoded_[active->prepared_item_index];
             const std::size_t output_bytes  = output.bytes();
-            if (ready.buffer == nullptr || ready.bytes != output_bytes) {
+            if ((ready.buffer == nullptr && ready.device_buffer == nullptr) || ready.bytes != output_bytes) {
                 throw std::logic_error("preencoded vision embeddings do not match the item");
             }
             handoff_.owner_ = nullptr;
             ++handoff_.generation_;
-            // Pinned and read by the SMs, so another request's image never waits on the copy engine
-            // behind expert transfers (W7).
-            upload_pinned(output.data, ready.buffer->data(), ready.bytes, device_.stream);
+            if (ready.device_buffer != nullptr) {
+                CUDA_CHECK(cudaMemcpyAsync(output.data, ready.device_buffer->p, ready.bytes,
+                                           cudaMemcpyDeviceToDevice, device_.stream));
+            } else {
+                // Pinned and read by the SMs, so another request's image never waits on the copy engine
+                // behind expert transfers (W7).
+                upload_pinned(output.data, ready.buffer->data(), ready.bytes, device_.stream);
+            }
         } else {
             const auto& payload = prompt_.media_payloads[active->prepared_item_index];
             if (!payload) {

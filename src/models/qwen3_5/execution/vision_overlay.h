@@ -16,11 +16,12 @@
 
 namespace infernix::models::qwen3_5::execution {
 
-// One vision item's merged embeddings, parked in pinned host memory by an overlay window and
-// re-uploaded into the request transient when prefill consumes the item.
+// One vision item's merged embeddings, parked in device memory (on integrated UMA) or pinned host
+// memory by an overlay window and re-uploaded into the request transient when prefill consumes the item.
 struct PinnedVisionResult {
-    std::unique_ptr<PinnedHostBuffer> buffer = nullptr;  // null for prefix-reused items
-    std::size_t bytes                        = 0;
+    std::unique_ptr<PinnedHostBuffer> buffer    = nullptr;  // null for prefix-reused or UMA device items
+    std::unique_ptr<DeviceBuffer> device_buffer = nullptr;  // on integrated UMA
+    std::size_t bytes                           = 0;
 };
 
 struct VisionOverlayWindowStats {

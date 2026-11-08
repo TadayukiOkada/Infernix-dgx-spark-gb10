@@ -134,13 +134,28 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
                            window_plan, &stream);
 
             const std::size_t embedding_bytes = output.bytes();
-            results.push_back(PinnedVisionResult{
-                std::make_unique<PinnedHostBuffer>(embedding_bytes), embedding_bytes});
-            CUDA_CHECK(cudaMemcpyAsync(results.back().buffer->data(), output.data, embedding_bytes,
-                                       cudaMemcpyDeviceToHost, device.stream));
+            if (device.props.integrated != 0) {
+                results.push_back(PinnedVisionResult{
+                    .buffer        = nullptr,
+                    .device_buffer = std::make_unique<DeviceBuffer>(embedding_bytes),
+                    .bytes         = embedding_bytes,
+                });
+                CUDA_CHECK(cudaMemcpyAsync(results.back().device_buffer->p, output.data, embedding_bytes,
+                                           cudaMemcpyDeviceToDevice, device.stream));
+            } else {
+                results.push_back(PinnedVisionResult{
+                    .buffer        = std::make_unique<PinnedHostBuffer>(embedding_bytes),
+                    .device_buffer = nullptr,
+                    .bytes         = embedding_bytes,
+                });
+                CUDA_CHECK(cudaMemcpyAsync(results.back().buffer->data(), output.data, embedding_bytes,
+                                           cudaMemcpyDeviceToHost, device.stream));
+            }
         }
         stream.finish(device.stream);
-        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        if (device.props.integrated == 0) {
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        }
         staged_bytes = stream.uploaded_bytes();
     }
 
