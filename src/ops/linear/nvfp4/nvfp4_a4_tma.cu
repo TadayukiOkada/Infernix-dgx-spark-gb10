@@ -56,6 +56,9 @@ void launch_nvfp4_a4_tma_linear_narrow(const Nvfp4A4Operands& p, __nv_bfloat16* 
     case 2560:
         launch<2560, 128, 4>(p, output, stream);
         return;
+    case 5120:
+        launch<5120, 128, 4>(p, output, stream);
+        return;
     case 6144:
         launch<6144, 128, 4>(p, output, stream);
         return;
