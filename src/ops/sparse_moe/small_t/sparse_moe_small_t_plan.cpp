@@ -16,20 +16,19 @@ namespace {
 constexpr std::size_t kNextWeightPrefetchLimit = std::size_t{8} << 20;
 
 std::size_t device_prefetch_limit() {
-    thread_local int cached_device        = -1;
-    thread_local std::size_t cached_limit = kNextWeightPrefetchLimit;
-    int current                           = 0;
+    static std::size_t cached_limit = 0;
+    if (cached_limit != 0) { return cached_limit; }
+    int current = 0;
     if (cudaGetDevice(&current) == cudaSuccess) {
-        if (current != cached_device) {
-            int l2 = 0;
-            if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, current) == cudaSuccess && l2 > 0) {
-                cached_limit = std::clamp<std::size_t>(static_cast<std::size_t>(l2) / 12,
-                                                       std::size_t{2} << 20, kNextWeightPrefetchLimit);
-            } else {
-                cached_limit = kNextWeightPrefetchLimit;
-            }
-            cached_device = current;
+        int l2 = 0;
+        if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, current) == cudaSuccess && l2 > 0) {
+            cached_limit = std::clamp<std::size_t>(static_cast<std::size_t>(l2) / 12,
+                                                   std::size_t{2} << 20, kNextWeightPrefetchLimit);
+        } else {
+            cached_limit = kNextWeightPrefetchLimit;
         }
+    } else {
+        cached_limit = kNextWeightPrefetchLimit;
     }
     return cached_limit;
 }
