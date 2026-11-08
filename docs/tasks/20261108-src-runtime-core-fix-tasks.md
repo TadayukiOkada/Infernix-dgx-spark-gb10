@@ -80,10 +80,11 @@
 
 ### Work Package 1: Tier 1 - High-Impact Driver, Topology & Telemetry Repairs (Low Risk)
 
-#### Task 1.1: Cache `device_max_copy_pitch()` in [`src/core/paged_kv_cache.cpp`](file:///opt/etc/Infernix/src/core/paged_kv_cache.cpp)
+#### Task 1.1: Cache `device_max_copy_pitch()` in [`src/core/paged_kv_cache.cpp`](file:///opt/etc/Infernix/src/core/paged_kv_cache.cpp) [COMPLETED]
 - **Problem**: `device_max_copy_pitch()` is called on every `copy_to_host_records` and `copy_from_host_records` invocation. It calls `cudaGetDevice` and `cudaDeviceGetAttribute(&pitch, cudaDevAttrMaxPitch, device)` synchronously during active KV swapping.
-- **Action**: Cache the maximum pitch statically (e.g. `static const std::size_t kMaxPitch = [] { ... }();`) or store it as an immutable field of `DeviceKVPagePool` initialized at construction.
-- **Verification**: Verify `build-native/tests/infernix_paged_kv_cache_test` passes; confirm zero driver query overhead in profiling.
+- **Action**: Cached the maximum pitch statically in the anonymous namespace via thread-safe static initialization, shared between `initialize_host_transfer_plan()`, `copy_to_host_records()`, and `copy_from_host_records()`.
+- **Commit**: `5fee04a37` (`perf(core): cache device_max_copy_pitch in paged kv cache to eliminate driver queries`)
+- **Verification**: `infernix_kv_cache_test` passed; `infernix_cuda_stack_check` passed (1.49s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,223 ms).
 
 #### Task 1.2: Fix Grace Hybrid CPU Fallback Bug in [`src/core/cpu_topology.cpp`](file:///opt/etc/Infernix/src/core/cpu_topology.cpp)
 - **Problem**: In `performance_cpus()` ([`lines 240-244`](file:///opt/etc/Infernix/src/core/cpu_topology.cpp#L240-L244)), the loop iterates over all CPUs. When it encounters the first efficiency core (A725), `!arm_performance_part(midr)` triggers `return {};`, immediately aborting and returning an empty list instead of skipping non-performance cores.

@@ -148,3 +148,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 13. **Commit `0037b6ad4` (`perf(ops): align full-vocabulary argmax block schedule to 256 for GB10`):**
     - Checked `kFullPhysicalRows` and `kFullValidRows` before `t_count <= kSmallAggregateColumns` in `src/ops/launcher/argmax.cu`, launching 61 CTAs (1.27 waves on 48 SMs) instead of 31 CTAs (leaving 17 SMs idle) for full vocabulary reductions at `T = 1..8`.
     - Validation: `infernix_cuda_stack_check` passed (1.46s); `infernix_argmax_test` passed (3.54s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~81–121ms, median turn 2.0s).
+
+14. **Commit `5fee04a37` (`perf(core): cache device_max_copy_pitch in paged kv cache to eliminate driver queries`):**
+    - Cached `device_max_copy_pitch()` statically in `src/core/paged_kv_cache.cpp` across `initialize_host_transfer_plan()`, `copy_to_host_records()`, and `copy_from_host_records()`, eliminating synchronous `cudaGetDevice` and `cudaDeviceGetAttribute` driver syscalls on every KV page spill/restore round.
+    - Validation: `infernix_kv_cache_test` passed; `infernix_cuda_stack_check` passed (1.49s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,223 ms).
