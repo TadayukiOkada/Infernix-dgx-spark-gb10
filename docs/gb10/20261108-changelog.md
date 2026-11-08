@@ -248,3 +248,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 38. **Commit `aa37a36b8` (`perf(models): eliminate per-round vector heap allocation in MtpDraftPolicy::step`):**
     - In `src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp:146-155`, replaced per-round heap allocation of `std::vector<std::uint32_t> candidates` with stack-allocated `std::array<std::uint32_t, kMtpPolicyMaximumDrafts>` and `std::span<const std::uint32_t>`, eliminating vector allocation in the hot inner MTP drafting loop.
     - Validation: `infernix_qwen3_5_mtp_draft_policy_test` passed; `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,194 ms).
+
+39. **Commit `fb64385be` (`perf(serve): right-size default concurrency and clamp http server thread pool for Grace CPU`):**
+    - Set default `max_concurrency = 4` in `src/serve/serve_options.h:61` and clamped `worker_count` to `std::min<std::size_t>(std::thread::hardware_concurrency(), 24)` in `src/serve/http_server.cpp:218-223`, preventing connection queueing from over-subscribing Grace 20-core threads.
+    - Validation: `infernix_serve_options_test` passed; `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).

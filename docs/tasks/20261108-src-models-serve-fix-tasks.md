@@ -151,10 +151,11 @@
 - **Commit**: `aa37a36b8` (`perf(models): eliminate per-round vector heap allocation in MtpDraftPolicy::step`)
 - **Verification**: `infernix_qwen3_5_mtp_draft_policy_test` passed; `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,194 ms).
 
-#### Task 3.3: Right-Size Default Concurrency & Clamp HTTP Thread Pool for Grace 20-Core in [`src/serve/serve_options.h`](file:///opt/etc/Infernix/src/serve/serve_options.h) & [`http_server.cpp`](file:///opt/etc/Infernix/src/serve/http_server.cpp)
+#### Task 3.3: Right-Size Default Concurrency & Clamp HTTP Thread Pool for Grace 20-Core in [`src/serve/serve_options.h`](file:///opt/etc/Infernix/src/serve/serve_options.h) & [`http_server.cpp`](file:///opt/etc/Infernix/src/serve/http_server.cpp) [COMPLETED]
 - **Problem**: `max_concurrency = 1` defaults to single-lane execution on a 128 GiB unified device capable of 4–8 concurrent lanes. Meanwhile, `worker_count = queued_requests + 1` scales HTTP worker threads 1:1 with queue depth, spawning hundreds of threads that thrash Grace 20-core CPU.
-- **Action**: Set default `max_concurrency = 4` on GB10, and clamp `cpp-httplib` worker threads to `std::min<std::size_t>(std::thread::hardware_concurrency(), 24)` so connection queueing does not over-subscribe CPU cores.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Set default `max_concurrency = 4` in `ServeOptions` and clamped `worker_count` in `HttpServer` to `std::min<std::size_t>(std::thread::hardware_concurrency(), 24)`, preventing connection queueing from over-subscribing Grace 20-core threads while maintaining native 4-lane concurrency.
+- **Commit**: `fb64385be` (`perf(serve): right-size default concurrency and clamp http server thread pool for Grace CPU`)
+- **Verification**: `infernix_serve_options_test` passed; `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).
 
 #### Task 3.4: Rate-Limit Console Stats Panel and Redundant Telemetry Queries in [`src/serve/console_stats.cpp`](file:///opt/etc/Infernix/src/serve/console_stats.cpp) & [`http_server.cpp`](file:///opt/etc/Infernix/src/serve/http_server.cpp)
 - **Problem**: `ConsoleStatsPanel::request_done` executes synchronous ANSI terminal redraws on every completed request. `run_stats_reporter` executes double NVML sweeps every 5 seconds.
