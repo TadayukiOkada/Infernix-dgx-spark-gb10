@@ -5,6 +5,7 @@
 #include "serve/translate.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <exception>
@@ -22,8 +23,7 @@ namespace infernix::serve {
 struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
 
-    std::mutex mutex;
-    std::size_t active = 0;
+    std::atomic<std::size_t> active{0};
     const std::size_t maximum;
 };
 
@@ -34,8 +34,7 @@ struct RequestLifetime {
         : capacity(std::move(owner)), started(begin), deadline(limit) {}
 
     ~RequestLifetime() {
-        std::lock_guard lock(capacity->mutex);
-        --capacity->active;
+        capacity->active.fetch_sub(1, std::memory_order_release);
     }
 
     std::shared_ptr<RequestCapacity> capacity;
@@ -425,15 +424,23 @@ GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capa
                                     DeadlinePolicy deadline_policy, const char* full_message,
                                     bool admitted) const {
     const auto started = Clock::now();
-    {
-        std::lock_guard lock(capacity->mutex);
-        // An admitted request continuing after a server-side tool already holds a slot until its
-        // response is released, so its next generation is never refused by the bound it counts in.
-        if (!admitted && capacity->active >= capacity->maximum) {
-            throw_request_error(infernix::RequestError(RequestErrorKind::Overloaded, full_message),
-                                "structured_outputs.grammar", {}, queue_retry_after_seconds());
+    // An admitted request continuing after a server-side tool already holds a slot until its
+    // response is released, so its next generation is never refused by the bound it counts in.
+    if (!admitted) {
+        std::size_t current = capacity->active.load(std::memory_order_relaxed);
+        while (true) {
+            if (current >= capacity->maximum) {
+                throw_request_error(infernix::RequestError(RequestErrorKind::Overloaded, full_message),
+                                    "structured_outputs.grammar", {}, queue_retry_after_seconds());
+            }
+            if (capacity->active.compare_exchange_weak(current, current + 1,
+                                                      std::memory_order_acquire,
+                                                      std::memory_order_relaxed)) {
+                break;
+            }
         }
-        ++capacity->active;
+    } else {
+        capacity->active.fetch_add(1, std::memory_order_acquire);
     }
     try {
         const Clock::time_point deadline =
@@ -442,8 +449,7 @@ GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capa
                 : started + std::chrono::milliseconds(options_.pending_timeout_ms);
         return std::make_shared<RequestLifetime>(capacity, started, deadline);
     } catch (...) {
-        std::lock_guard lock(capacity->mutex);
-        --capacity->active;
+        capacity->active.fetch_sub(1, std::memory_order_release);
         throw;
     }
 }
