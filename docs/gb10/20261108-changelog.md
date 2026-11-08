@@ -88,3 +88,35 @@ Upstream Infernix targets NVIDIA GeForce RTX 5090 (`sm_120a`, 170 SMs, 96 MiB L2
 - **L2 Cache & Wave Constants (`src/ops/**`):** Preserve GB10 24 MiB L2 limits (`device_prefetch_limit()` clamping to `2 MiB` on GB10, `kBf16x8CacheSizedMaxElements = 8M`, `kPlaneBytes = 16 MiB`, `total_blocks > 256` CTA reversal) and 48-SM wave constants (`kAdaptiveD3Blocks = 768`, `kTargetCtas = 144`, `kSmallPTargetBlocks = 1152`, `kContextQueryMaxSplit = 64`) over upstream 170-SM / 96-MiB-L2 constants.
 - **FP8 Tensor Core MMA (`src/ops/common/mma.cuh`):** Preserve `__CUDA_ARCH__ == 1210` native `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` (`QMMA`) path on `sm_121a`.
 - **Linear `/shapes/` (`src/ops/linear/*/shapes/*`):** Preserve GB10-tuned tile schedules and `Grouped, 8` L2 rasters over upstream RTX 5090 ladders.
+
+---
+
+## 5. Verified Atomic Optimizations (Session 2026-11-08 Post-Revert)
+
+Every atomic change below was individually compiled, verified with the `infernix_cuda_stack_check` one-way ratchet gate, stamped with its git commit ID into `infernix-serve`, and validated against the full 15-scenario `tool-eval-bench run --short` suite, achieving **100/100 Quality (30/30 points, 0 failures, 0 partials)** on every commit:
+
+1. **Commit `c338bfea1` (`perf(ops): cache cudaFuncSetAttribute calls on linear-attention and context-kv launch paths`):**
+   - Replaced per-launch `cudaFuncSetAttribute` calls in `gated_delta_net/chunked/recurrence.cu`, `kimi_delta_attention/chunked/recurrence.cu`, and `context_kv_materialize/materialize.cu` with thread-safe `static const cudaError_t` attributes executed once per process.
+   - Validation: `infernix_cuda_stack_check` passed (1.45s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~88–122ms, median turn 2.0s).
+
+2. **Commit `2a9c4ac5c` (`perf(ops): cache multiprocessor query in causal_softmax_attention_prompt_wave_tokens`):**
+   - Cached `cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device)` behind a thread-local check in `causal_softmax_attention_prompt_wave_tokens` to eliminate redundant driver queries on the causal attention prefill path.
+   - Validation: `infernix_cuda_stack_check` passed (1.47s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~88–122ms, median turn 2.0s).
+
+3. **Commit `238a4126c` (`perf(ops): right-size lossless attention target CTAs and eliminate heap allocation in shared projections`):**
+   - Lowered `kTargetCtas` in `lossless_attention.cu` from `384` (170 SMs) to `96` (`2 * 48` SMs on GB10), preventing split-KV over-partitioning and combine overhead.
+   - Replaced heap-allocated `std::vector<Projection>` with `std::array<Projection, 8>` in `lossless_linear.cu` to eliminate runtime memory allocation on hot paths.
+   - Validation: `infernix_cuda_stack_check` passed (1.47s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~88–122ms, median turn 2.0s).
+
+4. **Commit `86f3838d0` (`perf(ops): clamp qsa_select pass_clear_words to active columns`):**
+   - Clamped `pass_clear_words = n * (1 + kScoreBins)` in `qsa_select.cu` instead of zeroing the entire maximum batch capacity, avoiding redundant global memory zeroing traffic.
+   - Validation: `infernix_cuda_stack_check` passed (1.49s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~88–122ms, median turn 2.0s).
+
+5. **Commit `2d021ee21` (`perf(ops): eliminate unused context attention partials and causal staged kv allocations`):**
+   - Guarded `allocate_workspace` in `context_softmax_attention.cpp` on `plan.route == SplitKv` and returned `0` from `context_softmax_attention_workspace_capacity_bytes` when `plan.route == Direct`.
+   - Passed `stage_kv = !verify_rows_attention(storage)` to `stage_columns` in `causal_softmax_attention.cpp` so `staged.k` and `staged.v` are not allocated when KV tokens are appended in-place.
+   - Validation: `infernix_cuda_stack_check` passed (1.48s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~88–122ms, median turn 2.0s).
+
+6. **Commit `1b3d74a3a` (`perf(ops): cache uncached cudaGetDevice and driver queries on hot launch paths`):**
+   - Cached `cudaGetDevice` and device attribute queries behind thread-local checks in `sliced_k_pipelined.cuh` (`sliced_k_multiprocessors`), `ggml_linear_a8.cuh` (`device`), `ggml_linear_tiled.cu` (`tiled_device`), and `screened_head.cu` (`narrow_ring_device`, `screen_grid`).
+   - Validation: `infernix_cuda_stack_check` passed (1.51s); `tool-eval-bench` 100/100 (30/30 pts, TTFT ~86–124ms, median turn 2.0s).
