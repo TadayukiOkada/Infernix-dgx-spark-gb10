@@ -148,12 +148,13 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                                                 &value_record,
                                                 &gate_record,
                                                 &out};
-    std::vector<MemoryRange> ranges;
-    ranges.reserve(tensors.size());
+    std::array<MemoryRange, 12> ranges{};
+    std::size_t range_count = 0;
     for (const Tensor* tensor : tensors) {
-        if (tensor->data != nullptr) { ranges.push_back(tensor_range(*tensor, kOp)); }
+        if (tensor->data != nullptr) { ranges[range_count++] = tensor_range(*tensor, kOp); }
     }
-    require_pairwise_disjoint(ranges, "gated_delta_net_replay_record: tensors must not overlap");
+    require_pairwise_disjoint(std::span(ranges.data(), range_count),
+                              "gated_delta_net_replay_record: tensors must not overlap");
 }
 
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
