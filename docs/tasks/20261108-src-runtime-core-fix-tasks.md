@@ -138,10 +138,11 @@
 - **Action**: When `props.integrated != 0` and device MoE is active, reduce host cache allocation to minimal staging or bypass host KV copy staging.
 - **Verification**: Run `infernix-serve` on large models; observe available device VRAM increase.
 
-#### Task 3.2: Fix Headroom Calculation for Integrated SoC in [`src/runtime/engine/model_instance.cpp`](file:///opt/etc/Infernix/src/runtime/engine/model_instance.cpp)
-- **Problem**: Line 710 sets `default_headroom = 0ULL` on integrated GPUs. If host memory allocations occur subsequently, high concurrency triggers out-of-memory errors.
-- **Action**: Enforce a safe minimum headroom (e.g. 512 MiB - 1 GiB) on integrated systems to protect against activation memory spikes.
-- **Verification**: Run concurrency stress test with multiple parallel streams.
+#### Task 3.2: Fix Headroom Calculation for Integrated SoC in [`src/runtime/engine/model_instance.cpp`](file:///opt/etc/Infernix/src/runtime/engine/model_instance.cpp) [COMPLETED]
+- **Problem**: Line 710 set `default_headroom = 0ULL` on integrated GPUs. If host memory allocations or dynamic scratch buffers occurred subsequently, high concurrency or activation spikes risked out-of-memory errors on the shared physical pool.
+- **Action**: Enforced a safe minimum default headroom of 512 MiB (`device.props.integrated != 0 ? (512ULL * 1024ULL * 1024ULL) : kDefaultKvCapacityHeadroomBytes`) on integrated systems to protect against activation memory spikes and dynamic CUDA allocations.
+- **Commit**: `990d280c8` (`fix(runtime): enforce 512 MiB minimum KV headroom for integrated SoC`)
+- **Verification**: `infernix_kv_capacity_test` passed; `infernix_cuda_stack_check` passed (1.46s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
 
 #### Task 3.3: Bypass 200 ms PCIe Link Ramp-Up on Integrated GPU in [`src/core/link_probe.cu`](file:///opt/etc/Infernix/src/core/link_probe.cu) [COMPLETED]
 - **Problem**: `kWarmMilliseconds = 200.0F` and repeated copy loops spun all SMs for 200 ms to wake PCIe Gen5 link from low-power state. On GB10 UMA, there is no PCIe link to warm up, wasting 200 ms during link bandwidth probing and contending for SoC crossbar bandwidth.

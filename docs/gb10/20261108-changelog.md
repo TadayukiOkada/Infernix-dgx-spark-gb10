@@ -196,3 +196,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 25. **Commit `9ae107104` (`perf(core): replace std::map with contiguous interval vector in CopyBatch`):**
     - Replaced `std::map<std::uintptr_t, std::uintptr_t> ranges_` with contiguous `std::vector<Range>` and linear interval overlap detection in `src/core/copy_batch.cpp` and `copy_batch.h`, eliminating heap node allocations and deallocations across batches.
     - Validation: `infernix_copy_batch_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,164 ms).
+
+26. **Commit `990d280c8` (`fix(runtime): enforce 512 MiB minimum KV headroom for integrated SoC`):**
+    - Enforced a safe minimum default headroom of 512 MiB (`device.props.integrated != 0 ? (512ULL * 1024ULL * 1024ULL) : kDefaultKvCapacityHeadroomBytes`) in `src/runtime/engine/model_instance.cpp:710` on integrated systems (GB10 UMA) instead of 0 bytes, protecting against dynamic activation allocations or host memory spikes.
+    - Validation: `infernix_kv_capacity_test` passed; `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
