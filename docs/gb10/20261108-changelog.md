@@ -204,3 +204,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 27. **Commit `688122732` (`perf(runtime): right-size auto host prefix-cache tier floor on integrated UMA with device MoE`):**
     - Right-sized `tier_floor` on integrated UMA when device MoE is active (`device_experts = true`) in `src/runtime/engine/qwen4_exp_instance.cpp:431` to `kMinAutoHostContextBytes` (1 GiB) instead of `kDefaultHybridHostCacheBytes` (8 GiB), matching `auto_host_context_bytes` and allowing n-gram tables to stay resident in RAM without requiring an unnecessary 8 GiB floor.
     - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).
+
+28. **Commit `b91192b46` (`perf(serve): enable TCP_NODELAY on http server client sockets`):**
+    - Called `server_.set_tcp_nodelay(true);` in `src/serve/http_server.cpp:224` to disable Nagle's algorithm on all accepted client TCP sockets, eliminating up to 40 ms Linux delayed-ACK stalls during streaming SSE chunk transmission.
+    - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,179 ms).

@@ -77,10 +77,11 @@
 
 ### Work Package 1: Tier 1 - Critical Pipeline Stalls, Networking & L2 Cache Fixes (P0)
 
-#### Task 1.1: Enable `TCP_NODELAY` on Client Sockets in [`src/serve/http_server.cpp`](file:///opt/etc/Infernix/src/serve/http_server.cpp)
+#### Task 1.1: Enable `TCP_NODELAY` on Client Sockets in [`src/serve/http_server.cpp`](file:///opt/etc/Infernix/src/serve/http_server.cpp) [COMPLETED]
 - **Problem**: `cpp-httplib` defaults `tcp_nodelay_` to `false`. Without explicit `set_tcp_nodelay(true)`, accepted client TCP connections use Nagle's algorithm. For small streaming SSE chunks (40–100 bytes), the Linux TCP stack delays transmission waiting for delayed ACKs (up to 40 ms), inflating TTFT and stalling token streaming.
-- **Action**: Call `server_.set_tcp_nodelay(true);` in `HttpServer::HttpServer` after `server_.set_socket_options(...)` in `src/serve/http_server.cpp:224`.
-- **Verification**: Verify clean stack check; launch server and run `tool-eval-bench run --scenarios TC-14`, verifying 100/100 and lower TTFT / smoother token streaming.
+- **Action**: Called `server_.set_tcp_nodelay(true);` in `HttpServer::HttpServer` after `server_.set_socket_options(...)` in `src/serve/http_server.cpp:224`.
+- **Commit**: `b91192b46` (`perf(serve): enable TCP_NODELAY on http server client sockets`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.48s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,179 ms).
 
 #### Task 1.2: Segment `penalty_host_` Per Lane in [`src/models/qwen4_exp/program/program_impl.h`](file:///opt/etc/Infernix/src/models/qwen4_exp/program/program_impl.h)
 - **Problem**: In `program_impl.h:2056-2067`, `penalty_host_` is a single shared `PinnedHostBuffer`. Because multiple execution lanes could overwrite it, line 2066 executes `CUDA_CHECK(cudaStreamSynchronize(s));`, completely stalling the host CPU thread on every decode round whenever presence/frequency penalty is active.
