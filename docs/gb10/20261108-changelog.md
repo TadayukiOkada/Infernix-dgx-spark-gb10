@@ -208,3 +208,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 28. **Commit `b91192b46` (`perf(serve): enable TCP_NODELAY on http server client sockets`):**
     - Called `server_.set_tcp_nodelay(true);` in `src/serve/http_server.cpp:224` to disable Nagle's algorithm on all accepted client TCP sockets, eliminating up to 40 ms Linux delayed-ACK stalls during streaming SSE chunk transmission.
     - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,179 ms).
+
+29. **Commit `bf873b329` (`perf(models): segment penalty host buffer per lane to eliminate stream synchronization`):**
+    - Segmented `penalty_host_` buffer by `kMaximumConcurrency * bytes` in `src/models/qwen4_exp/program/program_impl.h:2050-2070` so each execution lane writes to its own isolated offset (`lane_idx * token_domain_`), completely eliminating the blocking `CUDA_CHECK(cudaStreamSynchronize(s));` on every decode round.
+    - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).

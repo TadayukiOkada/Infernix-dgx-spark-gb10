@@ -83,10 +83,11 @@
 - **Commit**: `b91192b46` (`perf(serve): enable TCP_NODELAY on http server client sockets`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.48s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,179 ms).
 
-#### Task 1.2: Segment `penalty_host_` Per Lane in [`src/models/qwen4_exp/program/program_impl.h`](file:///opt/etc/Infernix/src/models/qwen4_exp/program/program_impl.h)
+#### Task 1.2: Segment `penalty_host_` Per Lane in [`src/models/qwen4_exp/program/program_impl.h`](file:///opt/etc/Infernix/src/models/qwen4_exp/program/program_impl.h) [COMPLETED]
 - **Problem**: In `program_impl.h:2056-2067`, `penalty_host_` is a single shared `PinnedHostBuffer`. Because multiple execution lanes could overwrite it, line 2066 executes `CUDA_CHECK(cudaStreamSynchronize(s));`, completely stalling the host CPU thread on every decode round whenever presence/frequency penalty is active.
-- **Action**: Replace single `penalty_host_` buffer with per-lane buffers `std::array<PinnedHostBuffer, kMaximumConcurrency> lane_penalty_host_` (or segmented sub-ranges), eliminating the need for `cudaStreamSynchronize(s)`.
-- **Verification**: `infernix_cuda_stack_check` passes (0 spills); `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Segmented `penalty_host_` buffer by `kMaximumConcurrency * bytes` so each lane indexes into its own non-overlapping slice (`lane_idx * token_domain_`), completely eliminating the blocking `CUDA_CHECK(cudaStreamSynchronize(s));`.
+- **Commit**: `bf873b329` (`perf(models): segment penalty host buffer per lane to eliminate stream synchronization`)
+- **Verification**: `infernix_cuda_stack_check` passes (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).
 
 #### Task 1.3: Decouple Synchronous `output_.flush()` from Engine Worker Thread in [`src/serve/request_log.cpp`](file:///opt/etc/Infernix/src/serve/request_log.cpp)
 - **Problem**: When JSONL request logging is active, `HttpServer::scheduling_observer` calls `JsonlRequestLog::append()`, which directly executes `output_.flush()`. This forces the primary Engine worker thread to block synchronously on disk I/O inside its admission/scheduling loop.
