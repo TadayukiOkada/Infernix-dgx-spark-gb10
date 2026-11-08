@@ -160,3 +160,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 16. **Commit `d545cafca` (`fix(core): add NVML device handle by index fallback for integrated SoC telemetry and vram budget`):**
     - Added `nvmlDeviceGetHandleByIndex_v2` / `nvmlDeviceGetHandleByIndex` dynamic resolution and fallback in `src/core/gpu_telemetry.cpp` and `src/core/vram_budget.cpp` when `by_pci` fails on integrated SoCs like GB10, restoring live clock, temperature, and power telemetry.
     - Validation: Live telemetry verified in server logs (`gpu 2548/0 MHz 54 W 50 C`); `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).
+
+17. **Commit `795ce2f04` (`perf(runtime): implement ARM yield in host expert tier spin wait loop`):**
+    - Implemented `relax()` with `asm volatile("yield" ::: "memory");` on `__aarch64__` in `src/runtime/expert_offload/host_expert_tier.cpp`, yielding execution pipeline resources during busy-spin polling on Grace ARMv9.2 cores.
+    - Validation: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,190 ms).

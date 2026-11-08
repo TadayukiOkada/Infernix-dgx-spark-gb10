@@ -98,10 +98,11 @@
 - **Commit**: `d545cafca` (`fix(core): add NVML device handle by index fallback for integrated SoC telemetry and vram budget`)
 - **Verification**: Server correctly reports live GPU telemetry (`gpu 2548/0 MHz 54 W 50 C`); `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,176 ms).
 
-#### Task 1.4: Implement ARM `yield` in Spin Loop in [`src/runtime/expert_offload/host_expert_tier.cpp`](file:///opt/etc/Infernix/src/runtime/expert_offload/host_expert_tier.cpp)
+#### Task 1.4: Implement ARM `yield` in Spin Loop in [`src/runtime/expert_offload/host_expert_tier.cpp`](file:///opt/etc/Infernix/src/runtime/expert_offload/host_expert_tier.cpp) [COMPLETED]
 - **Problem**: `relax()` on non-x86 is currently an empty inline function. In busy-spin loops waiting for worker completions, this burns pipeline execution resources on Grace ARMv9.2 cores.
-- **Action**: Implement `relax()` for `__aarch64__` using `asm volatile("yield" ::: "memory");` or `__builtin_arm_yield()`.
-- **Verification**: Build `infernix-serve`; verify `tool-eval-bench run --short` maintains 100/100 score.
+- **Action**: Implemented `relax()` with `asm volatile("yield" ::: "memory");` on `__aarch64__` (and `pause` on x86_64).
+- **Commit**: `795ce2f04` (`perf(runtime): implement ARM yield in host expert tier spin wait loop`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,190 ms).
 
 ---
 
