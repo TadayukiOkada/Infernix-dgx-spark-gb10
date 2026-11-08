@@ -321,8 +321,12 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
 template <int DV>
 void launch(const Arguments& args, const Chunk* workspace, cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+    static bool configured = false;
+    if (!configured) {
+        CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+        configured = true;
+    }
     chunk_recurrence_kernel<DV>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args,
                                                                                     workspace);

@@ -518,8 +518,12 @@ template <int DV, bool Fp16, class State>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV, Fp16>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16, State>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+    static bool configured = false;
+    if (!configured) {
+        CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV, Fp16, State>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+        configured = true;
+    }
     chunk_recurrence_kernel<DV, Fp16, State>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);
