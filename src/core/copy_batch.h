@@ -15,7 +15,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <vector>
 
 namespace infernix {
@@ -34,11 +33,16 @@ private:
     // Whether a pending copy writes any of [destination, destination + bytes).
     [[nodiscard]] bool pending(const void* destination, std::size_t bytes) const;
 
+    struct Range {
+        std::uintptr_t begin = 0;
+        std::uintptr_t end   = 0;
+    };
+
     cudaStream_t stream_;
     std::vector<void*> destinations_;
     std::vector<const void*> sources_;
     std::vector<std::size_t> sizes_;
-    std::map<std::uintptr_t, std::uintptr_t> ranges_; // pending destinations: begin -> end
+    std::vector<Range> ranges_; // pending destinations: [begin, end)
 };
 
 } // namespace infernix

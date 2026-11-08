@@ -9,10 +9,10 @@ namespace infernix {
 bool CopyBatch::pending(const void* destination, std::size_t bytes) const {
     if (bytes == 0) { return false; }
     const auto begin = reinterpret_cast<std::uintptr_t>(destination), end = begin + bytes;
-    // Overlap: the first pending range starting after `begin` starts before `end`, or the last one
-    // starting at or before `begin` ends after it.
-    const auto next = ranges_.upper_bound(begin);
-    return (next != ranges_.end() && next->first < end) || (next != ranges_.begin() && std::prev(next)->second > begin);
+    for (const auto& r : ranges_) {
+        if (begin < r.end && end > r.begin) { return true; }
+    }
+    return false;
 }
 
 void CopyBatch::add(void* destination, const void* source, std::size_t bytes) {
@@ -22,7 +22,7 @@ void CopyBatch::add(void* destination, const void* source, std::size_t bytes) {
     destinations_.push_back(destination);
     sources_.push_back(source);
     sizes_.push_back(bytes);
-    ranges_.emplace(begin, end);
+    ranges_.push_back({begin, end});
 }
 
 void CopyBatch::flush() {
