@@ -7,6 +7,7 @@
 #include "infernix/ops/residual_add.h"
 
 #include <algorithm>
+#include <cuda_runtime.h>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -74,12 +75,32 @@ void dense_shared_expert(const Tensor& hidden, const DenseParameters& shared, Bu
     ops::linear(b.product, shared.down.weight, b.shared, shared.down.policy, scratch, s);
 }
 
+std::size_t device_l2_cache_bytes() {
+    static std::size_t cached_l2 = 0;
+    if (cached_l2 != 0) { return cached_l2; }
+    int current = 0;
+    if (cudaGetDevice(&current) == cudaSuccess) {
+        int l2 = 0;
+        if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, current) == cudaSuccess && l2 > 0) {
+            cached_l2 = static_cast<std::size_t>(l2);
+            return cached_l2;
+        }
+    }
+    cached_l2 = std::size_t{96} << 20;
+    return cached_l2;
+}
+
 // While the host computes the call's misses, the CPU wait warms the next layer's weights into L2 in the
 // order its chain reads them (Flash-Next §19.3.20b: a one-column call warms up to 40 MiB of the
 // chain, +1.2 % plain decode; a wider call 16 MiB of its input projection, more measured slower; the
-// 122B's 64 and 80 MiB chain caps measured 0.8 and 2 % slower, design §0.2).
+// 122B's 64 and 80 MiB chain caps measured 0.8 and 2 % slower, design §0.2). On hardware with smaller
+// L2 cache (such as GB10's 24 MiB L2), chain and input warm caps are right-sized proportionally
+// to prevent evicting active KV and activation lines.
 void warm_next(const BlockParameters& next, std::int32_t columns, ops::MoeExpertSource& source) {
-    constexpr std::size_t kChainWarm = std::size_t{40} << 20, kInputWarm = std::size_t{16} << 20;
+    constexpr std::size_t kRefChainWarm = std::size_t{40} << 20, kRefInputWarm = std::size_t{16} << 20;
+    const std::size_t l2_bytes = device_l2_cache_bytes();
+    const std::size_t chain_warm = std::min(kRefChainWarm, l2_bytes * 5 / 12);
+    const std::size_t input_warm = std::min(kRefInputWarm, l2_bytes / 6);
     const bool whole_chain = columns == 1;
     std::array<std::pair<const void*, std::size_t>, 12> chain{};
     std::size_t spans = 0;
@@ -97,12 +118,12 @@ void warm_next(const BlockParameters& next, std::int32_t columns, ops::MoeExpert
     };
     const LinearParameters* output = nullptr;
     if (const auto* g = std::get_if<GdnParameters>(&next.mixer)) {
-        add_projection(g->projection, whole_chain ? ~std::size_t{0} : kInputWarm);
+        add_projection(g->projection, whole_chain ? ~std::size_t{0} : input_warm);
         if (whole_chain) { add_projection(g->control, ~std::size_t{0}); }
         output = &g->output;
     } else {
         const auto& a = std::get<AttentionParameters>(next.mixer);
-        add_projection(a.projection, whole_chain ? ~std::size_t{0} : kInputWarm);
+        add_projection(a.projection, whole_chain ? ~std::size_t{0} : input_warm);
         output = &a.output;
     }
     if (whole_chain) {
@@ -112,7 +133,7 @@ void warm_next(const BlockParameters& next, std::int32_t columns, ops::MoeExpert
             add(m->shared_score.data, m->shared_score.bytes());
         }
     }
-    std::size_t left = whole_chain ? kChainWarm : ~std::size_t{0};
+    std::size_t left = whole_chain ? chain_warm : ~std::size_t{0};
     int i            = 0;
     for (std::size_t n = 0; n < spans && i < ops::MoeL2Warm::kSpans && left >= 16; ++n) {
         const auto [data, bytes] = chain[n];
