@@ -90,6 +90,9 @@ infernix::SamplingOverrides resolve_sampling_overrides(const SamplingParams& req
 }
 
 std::string render_tool_definition(const ToolDefinition& tool) {
+    if (!tool.cached_rendered_json.empty()) {
+        return tool.cached_rendered_json;
+    }
     using Json  = RequestJson;
     Json schema = Json::parse(tool.input_schema_json);
     Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
@@ -97,7 +100,8 @@ std::string render_tool_definition(const ToolDefinition& tool) {
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);
     }
-    return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
+    tool.cached_rendered_json = Json{{"type", "function"}, {"function", std::move(function)}}.dump();
+    return tool.cached_rendered_json;
 }
 
 bool has_rendered_content(const infernix::ChatMessage& message) {

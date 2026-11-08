@@ -22,6 +22,7 @@ std::size_t estimate_turn_bytes(const ChatTurn& turn) {
     for (const ToolDefinition& tool : turn.loaded_tools) {
         bytes += sizeof(ToolDefinition) + tool.name.size() + tool.description.size() +
                  tool.input_schema_json.size() + tool.schema_param.size() +
+                 tool.cached_rendered_json.size() +
                  (tool.input_examples_json ? tool.input_examples_json->size() : 0U);
     }
     return bytes;

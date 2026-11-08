@@ -99,6 +99,7 @@ struct ToolDefinition {
     bool deferred = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
+    mutable std::string cached_rendered_json;
 };
 
 struct ToolCall {
