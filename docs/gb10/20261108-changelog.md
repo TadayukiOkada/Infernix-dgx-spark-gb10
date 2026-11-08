@@ -164,3 +164,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 17. **Commit `795ce2f04` (`perf(runtime): implement ARM yield in host expert tier spin wait loop`):**
     - Implemented `relax()` with `asm volatile("yield" ::: "memory");` on `__aarch64__` in `src/runtime/expert_offload/host_expert_tier.cpp`, yielding execution pipeline resources during busy-spin polling on Grace ARMv9.2 cores.
     - Validation: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,190 ms).
+
+18. **Commit `186246401` (`perf(runtime): eliminate duplicate publish_runtime_stats call in run_decode_batch`):**
+    - Removed redundant intermediate `publish_runtime_stats();` call inside `run_decode_batch()` in `src/runtime/engine/engine_core.h`, eliminating duplicate `queue_mutex_` acquisition, prefix index table scans, and 1.5 KiB struct copies per decode round. Unified publication remains at worker loop boundary.
+    - Validation: `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
