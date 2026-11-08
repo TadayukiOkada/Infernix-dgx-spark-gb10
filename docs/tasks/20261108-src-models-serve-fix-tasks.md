@@ -89,10 +89,11 @@
 - **Commit**: `bf873b329` (`perf(models): segment penalty host buffer per lane to eliminate stream synchronization`)
 - **Verification**: `infernix_cuda_stack_check` passes (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).
 
-#### Task 1.3: Decouple Synchronous `output_.flush()` from Engine Worker Thread in [`src/serve/request_log.cpp`](file:///opt/etc/Infernix/src/serve/request_log.cpp)
+#### Task 1.3: Decouple Synchronous `output_.flush()` from Engine Worker Thread in [`src/serve/request_log.cpp`](file:///opt/etc/Infernix/src/serve/request_log.cpp) [COMPLETED]
 - **Problem**: When JSONL request logging is active, `HttpServer::scheduling_observer` calls `JsonlRequestLog::append()`, which directly executes `output_.flush()`. This forces the primary Engine worker thread to block synchronously on disk I/O inside its admission/scheduling loop.
-- **Action**: Remove the synchronous `output_.flush()` call from per-request scheduling records in `JsonlRequestLog::append()`, relying on stream buffering and flushing periodically or on file close/rotation.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Added `bool flush = true` parameter to `JsonlRequestLog::append()` and passed `/*flush=*/false` for `write_request_scheduling()`, eliminating blocking synchronous disk flushes on every scheduling round while retaining timely flushes on request start/done/rejected/error lifecycle milestones.
+- **Commit**: `1a624698e` (`perf(serve): decouple synchronous flush from per-request scheduling records in request log`)
+- **Verification**: `infernix_request_log_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,206 ms).
 
 #### Task 1.4: Right-Size L2 Weight Warming for 24 MiB L2 in [`src/models/qwen3_5/execution/offloaded_moe.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/execution/offloaded_moe.cpp)
 - **Problem**: `warm_next` hardcodes `kChainWarm = std::size_t{40} << 20` (40 MiB). On DGX Spark GB10 (`24 MiB` L2 cache), warming 40 MiB of weight data completely flushes the entire L2 cache, destroying active KV cache and activation cache lines.

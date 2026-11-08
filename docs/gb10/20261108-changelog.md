@@ -212,3 +212,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 29. **Commit `bf873b329` (`perf(models): segment penalty host buffer per lane to eliminate stream synchronization`):**
     - Segmented `penalty_host_` buffer by `kMaximumConcurrency * bytes` in `src/models/qwen4_exp/program/program_impl.h:2050-2070` so each execution lane writes to its own isolated offset (`lane_idx * token_domain_`), completely eliminating the blocking `CUDA_CHECK(cudaStreamSynchronize(s));` on every decode round.
     - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).
+
+30. **Commit `1a624698e` (`perf(serve): decouple synchronous flush from per-request scheduling records in request log`):**
+    - Added `bool flush = true` parameter to `JsonlRequestLog::append()` and passed `/*flush=*/false` for `write_request_scheduling()` in `src/serve/request_log.h` and `src/serve/request_log.cpp`, preventing the primary Engine worker thread from synchronously blocking on disk I/O inside its admission/scheduling loop.
+    - Validation: `infernix_request_log_test` passed; `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,206 ms).
