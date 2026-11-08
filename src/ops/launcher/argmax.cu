@@ -26,10 +26,10 @@ int tiled_block_for(std::int32_t physical_rows, std::int32_t valid_rows, std::in
     if (physical_rows == kShortlistRows && valid_rows == kShortlistRows) {
         return kShortlistAggregateBlock;
     }
-    if (t_count <= kSmallAggregateColumns) { return kArgmaxBlock; }
     if (physical_rows == kFullPhysicalRows && valid_rows == kFullValidRows) {
         return kFullAggregateBlock;
     }
+    if (t_count <= kSmallAggregateColumns) { return kArgmaxBlock; }
     return kArgmaxBlock;
 }
 
