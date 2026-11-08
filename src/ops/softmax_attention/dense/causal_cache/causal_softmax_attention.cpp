@@ -366,13 +366,15 @@ void* column_rows(const Tensor& staged, std::int32_t column, std::int32_t batch,
 
 std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
     require_causal_geometry(geometry, "causal_softmax_attention prompt wave");
-    int device          = 0;
-    int multiprocessors = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    static int cached_multiprocessors = 0;
+    if (cached_multiprocessors == 0) {
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&cached_multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    }
     // The fast prompt kernel runs one CTA per SM over at most kPromptWaveRows query rows of one
     // head, and kPromptWaveRows is a multiple of the tiled kernel's 64-row query tile.
-    const std::int32_t row_blocks = std::max(1, multiprocessors / geometry.query_heads);
+    const std::int32_t row_blocks = std::max(1, cached_multiprocessors / geometry.query_heads);
     return row_blocks * kPromptWaveRows;
 }
 
