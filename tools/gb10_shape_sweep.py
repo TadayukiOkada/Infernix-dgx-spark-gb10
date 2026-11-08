@@ -620,44 +620,56 @@ def run_production_audit(
                 if len(vals) != len(tokens):
                     continue
 
-                g1, _, u1 = vals.get(1, (0.0, 0.0, 1.0))
-                g2, _, u2 = vals.get(2, vals.get(1, (0.0, 0.0, 1.0)))
-                g5, _, u5 = vals.get(5, vals.get(8, (0.0, 0.0, 1.0)))
-                g8, _, u8 = vals.get(8, (0.0, 0.0, 1.0))
-                _, tf512, _ = vals.get(512, (0.0, 0.0, 1.0))
-                _, tf4096, _ = vals.get(4096, (0.0, 0.0, 1.0))
-
                 reasons: List[str] = []
                 w_mib = weight_bytes_for_shape(qt, n, k) / (1024.0 * 1024.0)
-                min_decode_gbs = min(g2, g5, g8)
-                if pol != "a4" and w_mib >= 4.0 and g1 > 0 and (g1 - min_decode_gbs) / g1 > 0.25 and min_decode_gbs < 145.0:
-                    reasons.append(f"T=1->2..8 drop ({g1:.0f}->{min_decode_gbs:.0f} GB/s)")
-                if tf512 > 0 and tf4096 < tf512 * 0.88:
-                    reasons.append(f"L2 thrash T=512->4096 ({tf512:.1f}->{tf4096:.1f} TF)")
+
+                # Decode drop check across small tokens
+                if 1 in vals:
+                    g1 = vals[1][0]
+                    decodes = [vals[t][0] for t in tokens if 1 < t <= 8 and t in vals]
+                    if decodes:
+                        min_decode_gbs = min(decodes)
+                        if pol != "a4" and w_mib >= 4.0 and g1 > 0 and (g1 - min_decode_gbs) / g1 > 0.25 and min_decode_gbs < 145.0:
+                            reasons.append(f"T=1->2..8 drop ({g1:.0f}->{min_decode_gbs:.0f} GB/s)")
+
+                # Thrashing check across consecutive large token steps
+                large_t = [t for t in sorted(tokens) if t >= 512 and t in vals]
+                for i in range(len(large_t) - 1):
+                    t_a, t_b = large_t[i], large_t[i + 1]
+                    tf_a, tf_b = vals[t_a][1], vals[t_b][1]
+                    if tf_a > 0 and tf_b < tf_a * 0.88:
+                        reasons.append(f"L2 thrash T={t_a}->{t_b} ({tf_a:.1f}->{tf_b:.1f} TF)")
+
                 qt_key = "nvfp4_a4" if (qt == "nvfp4" and pol == "a4") else qt
-                # Physical roofline ceiling at T=4096 accounting for mixed DRAM read/write bandwidth
-                t4k = 4096
-                w_bytes = weight_bytes_for_shape(qt, n, k)
-                x_bytes = k * t4k * (0.5 if pol == "a4" else 2.0)
-                y_bytes = n * t4k * 2.0
-                tot_bytes = w_bytes + x_bytes + y_bytes
-                intensity = (2.0 * n * k * t4k) / tot_bytes
-                read_frac = (w_bytes + x_bytes) / tot_bytes
-                write_frac = y_bytes / tot_bytes
-                effective_bw = 1.0 / (read_frac / GB10_SUSTAINED_READ_GBPS + write_frac / 150.0)
-                pipe_eff = 0.90 if k > 1152 else 0.80
-                roofline_tf = (effective_bw * intensity) / 1000.0
-                target_tf = min(GB10_HEALTHY_TFLOPS.get(qt_key, 45.0), roofline_tf * pipe_eff)
-                if n >= 1024 and tf4096 > 0 and tf4096 < target_tf:
-                    reasons.append(f"Low T=4096 ({tf4096:.1f} < {target_tf:.0f} TF)")
+                # Compute physical roofline on the largest token count
+                max_t = max(tokens)
+                if max_t >= 512 and max_t in vals:
+                    tf_max = vals[max_t][1]
+                    w_bytes = weight_bytes_for_shape(qt, n, k)
+                    x_bytes = k * max_t * (0.5 if pol == "a4" else 2.0)
+                    y_bytes = n * max_t * 2.0
+                    tot_bytes = w_bytes + x_bytes + y_bytes
+                    intensity = (2.0 * n * k * max_t) / tot_bytes
+                    read_frac = (w_bytes + x_bytes) / tot_bytes
+                    write_frac = y_bytes / tot_bytes
+                    effective_bw = 1.0 / (read_frac / GB10_SUSTAINED_READ_GBPS + write_frac / 150.0)
+                    pipe_eff = 0.90 if k > 1152 else 0.80
+                    roofline_tf = (effective_bw * intensity) / 1000.0
+                    target_tf = min(GB10_HEALTHY_TFLOPS.get(qt_key, 45.0), roofline_tf * pipe_eff)
+                    if n >= 1024 and tf_max > 0 and tf_max < target_tf:
+                        reasons.append(f"Low T={max_t} ({tf_max:.1f} < {target_tf:.0f} TF)")
 
                 status = "FLAG: " + "; ".join(reasons) if reasons else "OK"
                 label = f"{qt}/{pol}" if qt == "nvfp4" else qt
-                print(
-                    f"{label:9s} {n:6d}x{k:<6d} ({w_mib:5.1f} MiB) | "
-                    f"T=1:{g1:5.1f} | T=2:{g2:5.1f} | T=5:{g5:5.1f} | T=8:{g8:5.1f} GB/s | "
-                    f"T=512:{tf512:5.1f} | T=4096:{tf4096:5.1f} TF | {status}"
-                )
+                token_parts = []
+                for t in tokens:
+                    gbs, tflops, _ = vals.get(t, (0.0, 0.0, 0.0))
+                    if t <= 16:
+                        token_parts.append(f"T={t}:{gbs:5.1f} GB/s")
+                    else:
+                        token_parts.append(f"T={t}:{tflops:5.1f} TF")
+                line_tokens = " | ".join(token_parts)
+                print(f"{label:9s} {n:6d}x{k:<6d} ({w_mib:5.1f} MiB) | {line_tokens} | {status}")
                 if reasons:
                     flagged.append((qt_key, n, k, "; ".join(reasons)))
     finally:
@@ -685,7 +697,7 @@ def main() -> int:
     parser.add_argument("--k", type=int, default=2560, help="Input cols K (for analytical/explore modes)")
     parser.add_argument(
         "--tokens",
-        default="1,2,4,5,8,16,32,64,128,256,512,4096",
+        default=None,
         help="Comma-separated token counts T",
     )
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations per point")
@@ -696,7 +708,12 @@ def main() -> int:
     parser.add_argument("--auto-explore", action="store_true", help="Automatically run --mode explore on flagged audit shapes")
     args = parser.parse_args()
 
-    tokens = [int(x.strip()) for x in args.tokens.split(",") if x.strip()]
+    if args.tokens is not None:
+        tokens = [int(x.strip()) for x in args.tokens.split(",") if x.strip()]
+    elif args.mode == "audit":
+        tokens = [1, 2, 5, 8, 512, 4096]
+    else:
+        tokens = [1, 2, 4, 5, 8, 16, 32, 64, 128, 256, 512, 4096]
 
     if args.mode == "analytical":
         print_analytical_report(args.qtype, args.n, args.k, tokens, emit_cpp=args.emit_cpp)
@@ -717,7 +734,7 @@ def main() -> int:
         run_production_audit(
             args.build_dir,
             q_filter,
-            tokens=[1, 2, 5, 8, 512, 4096],
+            tokens=tokens,
             warmup=args.warmup,
             repeat=args.repeat,
             auto_explore=args.auto_explore,

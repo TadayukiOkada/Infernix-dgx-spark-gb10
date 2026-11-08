@@ -43,7 +43,6 @@ Bf16Launch select_bf16_n10240_k320(std::int32_t tokens) {
     if (tokens <= 256) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3>>; // tma_r64t64k64s3 (1.09x at 256)
     if (tokens <= 384) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>>; // tail_r64t64s3 (1.03x at 384)
     if (tokens <= 2048) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2>>; // tma_r64t128k64s2 (1.05x at 512; HEAD wins 768..2048)
-    if (tokens <= 4096) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>; // tma_r64t128k64s2_rows (1.03-1.08x at 3072..4096)
-    return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2>>; // tma_r64t128k64s2 (HEAD wins 8192)
+    return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>;
 }
 } // namespace infernix::ops::detail
