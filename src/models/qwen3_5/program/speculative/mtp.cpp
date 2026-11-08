@@ -226,13 +226,17 @@ public:
         Tensor position               = ar_positions_.slice(1, at, 1).view({1, batch_});
         Tensor rope                   = ar_rope_positions_.slice(1, at, 1).view({1, batch_});
         Tensor valid                  = ar_valid_columns_.slice(1, at, 1).view({batch_});
-        Tensor hidden_batch           = ar_hidden_.view({hidden, 1, batch_});
-        Tensor next_hidden_batch      = next_hidden_.view({hidden, 1, batch_});
+
+        // Ping-pong between ar_hidden_ and next_hidden_ across draft steps to eliminate D2D memcpy.
+        const bool ping_pong          = (step % 2U == 0U);
+        const Tensor& in_hidden       = ping_pong ? next_hidden_ : ar_hidden_;
+        const Tensor& out_hidden      = ping_pong ? ar_hidden_ : next_hidden_;
+
+        Tensor hidden_batch           = in_hidden.view({hidden, 1, batch_});
+        Tensor next_hidden_batch      = out_hidden.view({hidden, 1, batch_});
         card_->mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid, mtp_rows_,
                                         state_destinations_, envelopes_.ar[step - 1U], next_hidden_batch);
-        draft(step, next_hidden_);
-        CUDA_CHECK(cudaMemcpyAsync(ar_hidden_.data, next_hidden_.data, ar_hidden_.bytes(), cudaMemcpyDeviceToDevice,
-                                   stream()));
+        draft(step, out_hidden);
     }
 
     // The proposal chain's gate after step `step`: the next step runs while the round's proposal
