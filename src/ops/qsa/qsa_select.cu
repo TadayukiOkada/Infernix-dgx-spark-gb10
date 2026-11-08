@@ -919,8 +919,6 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
     auto* state                   = reinterpret_cast<std::uint32_t*>(base + l.scores);
     auto* arrivals                = state;
     auto* histograms              = state + l.group;
-    // The score kernel zeroes the arrival counters and the histograms.
-    const int clear_words = l.group * (1 + kScoreBins);
 
     // Dynamic shared memory: candidates (aliasing the histogram) and the column bitmap.
     const std::size_t smem = kCandidateBytes + sizeof(unsigned) * 4 * static_cast<std::size_t>(ceil_div(max_blocks + 1, 128));
@@ -940,6 +938,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
     if (wide) { reserve_shared(qsa_score_wide_kernel, kWideSharedBytes, g_wide_reserved); }
     for (std::int32_t begin = 0; begin < columns; begin += l.group) {
         const std::int32_t n   = std::min(l.group, columns - begin);
+        const int pass_clear_words = n * (1 + kScoreBins);
         const ScoreTiles tiles = score_tiles(begin, n, batch.width);
         if (wide) {
             const int ctas = std::clamp(ceil_div(std::int64_t{kWideCtasPerSm} * sms, tiles.count), 1,
@@ -948,7 +947,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                 {dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)), dim3(kWideThreads),
                  kWideSharedBytes, stream},
                 qsa_score_wide_kernel, index, geometry.index_heads, pooled, tables, table_stride, rows, positions,
-                batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, state, clear_words, spaces));
+                batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, state, pass_clear_words, spaces));
         } else {
             const int ctas = std::clamp(ceil_div(std::int64_t{kScoreCtasPerSm} * sms, tiles.count), 1,
                                         std::max(1, ceil_div(max_steps, kScoreWarps)));
@@ -956,7 +955,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                                              dim3(kScoreThreads), 0, stream},
                                             qsa_score_kernel, index, geometry.index_heads, pooled, tables,
                                             table_stride, rows, positions, batch.width, geometry.ratio, top_blocks,
-                                            begin, tiles, scores, l.stride, state, clear_words, spaces));
+                                            begin, tiles, scores, l.stride, state, pass_clear_words, spaces));
         }
         const int slices = std::clamp(std::min(ceil_div(max_blocks, kSliceBlocks), ceil_div(std::int64_t{16} * sms, n)),
                                       1, kMaxSlices);
