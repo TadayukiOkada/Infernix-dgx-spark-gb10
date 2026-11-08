@@ -220,7 +220,7 @@ public:
     void stop() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
-            stopping_ = true;
+            stopping_.store(true, std::memory_order_release);
         }
         queue_cv_.notify_all();
     }
@@ -435,15 +435,13 @@ public:
         return published_stats_;
     }
 
-    [[nodiscard]] bool is_available() const {
-        std::lock_guard lock(queue_mutex_);
-        return !stopping_ && !failed_;
+    [[nodiscard]] bool is_available() const noexcept {
+        return !stopping_.load(std::memory_order_acquire) && !failed_.load(std::memory_order_acquire);
     }
 
     // failed_ also ends an orderly stop; execution_failed_ only an execution failure.
-    [[nodiscard]] bool has_failed() const {
-        std::lock_guard lock(queue_mutex_);
-        return execution_failed_;
+    [[nodiscard]] bool has_failed() const noexcept {
+        return execution_failed_.load(std::memory_order_acquire);
     }
 
     void reset_memory_peaks() noexcept {
@@ -2394,8 +2392,10 @@ private:
         std::optional<NextTurnCandidate> next_turn_candidate;
         {
             std::lock_guard lock(queue_mutex_);
-            failed_ = true;
-            execution_failed_ |= !shutdown;
+            failed_.store(true, std::memory_order_release);
+            if (!shutdown) {
+                execution_failed_.store(true, std::memory_order_release);
+            }
             pending.swap(pending_);
             if (next_turn_candidate_) {
                 next_turn_candidate.emplace(std::move(*next_turn_candidate_));
@@ -2449,8 +2449,7 @@ private:
             if (prefix_save_interval_.count() == 0 || Clock::now() < next_prefix_save_) { return; }
             const auto started = Clock::now();
             const auto saved   = instance_.program->save_prefix_cache_now(CancellationView([this] {
-                std::lock_guard lock(queue_mutex_);
-                return stopping_;
+                return stopping_.load(std::memory_order_relaxed);
             }));
             next_prefix_save_ = Clock::now() + prefix_save_interval_;
             if (!saved) { return; }
@@ -2969,10 +2968,10 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
-    bool stopping_ = false;
+    std::atomic<bool> stopping_{false};
     bool maintenance_requested_ = false; // guarded by queue_mutex_
-    bool failed_   = false;
-    bool execution_failed_ = false; // guarded by queue_mutex_
+    std::atomic<bool> failed_{false};
+    std::atomic<bool> execution_failed_{false}; // guarded by queue_mutex_
 
     // Next-turn prefill: the idle-time pass over a finished turn's history (hybrid-prefix-cache-spec
     // §7.9). Unrelated to the idle-wide-prefill fast path.
