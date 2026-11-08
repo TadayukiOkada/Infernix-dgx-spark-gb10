@@ -2574,14 +2574,10 @@ public:
                                      static_cast<std::uint32_t>(std::max<std::int32_t>(
                                          pair_k,
                                          batch == 2 ? kPairNgramMaxDrafts
-                                                    : (kMultiRowDrafts > 0.5 ? std::min(kMultiRowNgramMaxDrafts, 32 / batch - 1) : 0))));
+                                                    : (kMultiRowDrafts > 0.5 ? std::min(kMultiRowNgramMaxDrafts, 64 / batch - 1) : 0))));
                 const auto tail = std::span<const std::int32_t>(lane.history)
                                       .last(std::min<std::size_t>(qwen3_5::kNgramMatchHistoryTokens, lane.history.size()));
-                std::uint32_t min_match = options_.ngram_min_match;
-                if (min_match == 12) {
-                    min_match = lane.history.size() > 1024 ? 6U : (lane.history.size() <= 512 ? 4U : 5U);
-                }
-                auto match       = lane.proposer->propose(tail, ngram_limit, min_match);
+                auto match       = lane.proposer->propose(tail, ngram_limit, options_.ngram_min_match);
                 const int bucket = ngram_bucket(match.matched);
                 const float copy_width_cost = kNgramWidthCost;
                 if (!match.tokens.empty() && options_.auto_draft_length) {
@@ -5310,14 +5306,11 @@ private:
                 stats.ngram_drafted_tokens += n;
                 stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
                 // The bucket's acceptance per position.
-                if (ngram_bucket_[b] >= 0 && n > 0) {
+                if (ngram_bucket_[b] >= 0) {
                     double& a = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
-                    if (A == 0) {
-                        a = std::max(0.01, (1.0 - 2.0 * kAcceptanceWeight) * a);
-                    } else {
-                        const auto trials       = std::min<std::uint64_t>(A + 1, n);
-                        const double trial_rate = static_cast<double>(A) / static_cast<double>(trials);
-                        a                       = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * trial_rate;
+                    for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
+                        const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
+                        a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
                     }
                 }
             }
@@ -5581,9 +5574,7 @@ private:
         const double cost      = width_cost();
         const double tile_cost = std::min(cost, 0.10);
         for (std::int32_t k = 1; k <= most; ++k) {
-            const double p = lane.mtp_accept[static_cast<std::size_t>(k - 1)];
-            if (p < 0.12 && k > 2) { break; }
-            reach *= p;
+            reach *= lane.mtp_accept[static_cast<std::size_t>(k - 1)];
             tokens += reach;
             const double round_cost = k <= 3 ? tile_cost * k : tile_cost * 3 + cost * (k - 3);
             const double score      = tokens / (1.0 + round_cost);
@@ -5592,11 +5583,7 @@ private:
                 best       = k;
             }
         }
-        if (best == 0 && lane.mtp_accept[0] >= 0.35) { best = 1; }
-        if (round % kProbeInterval == 0 &&
-            (best == 0 || lane.mtp_accept[static_cast<std::size_t>(best - 1)] >= 0.15)) {
-            best = std::min(best + 1, most);
-        }
+        if (round % kProbeInterval == 0) { best = std::min(best + 1, most); }
         return best;
     }
 
@@ -5686,12 +5673,7 @@ private:
                 best       = k;
             }
         }
-        if (best == 0 && (a.mtp_accept[0] + b.mtp_accept[0]) >= 0.70) { best = 1; }
-        if (round % kProbeInterval == 0 &&
-            (best == 0 || (a.mtp_accept[static_cast<std::size_t>(best - 1)] +
-                           b.mtp_accept[static_cast<std::size_t>(best - 1)]) >= 0.30)) {
-            best = std::min(best + 1, most);
-        }
+        if (round % kProbeInterval == 0) { best = std::min(best + 1, most); }
         return best;
     }
 
@@ -6829,7 +6811,7 @@ private:
     // acceptance learned per match-length bucket (4-7, 8-11, 12-15, 16+ tokens; Strata's priors).
     // IQ3_S import, 4K + 512 tokens, MTP 4 and 7 n-gram drafts: 190.2 -> 194.2 tok/s (2026-10-15).
     static int ngram_bucket(std::uint32_t matched) { return matched < 8 ? 0 : matched < 12 ? 1 : matched < 16 ? 2 : 3; }
-    static constexpr std::array<double, 4> kNgramAcceptancePriors{0.75, 0.88, 0.93, 0.96};
+    static constexpr std::array<double, 4> kNgramAcceptancePriors{0.85, 0.92, 0.96, 0.985};
     std::array<int, kMaximumConcurrency> ngram_bucket_{};
     // A copy proposal the neural chain won before the round was drafted, kept for the round's cut: when
     // the cut leaves the row fewer drafts than this copy, the round verifies the copy instead of
@@ -6856,7 +6838,7 @@ private:
     // ~40 tok/s (optimum), <=0.20 overshoots (positions 4+ accept ~0). Default lowered to 0.25;
     // INFERNIX_WIDTH_COST still overrides for per-workload tuning.
     static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.18);
-    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.10);
+    static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.025);
     static constexpr std::uint64_t kProbeInterval = 8;
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in
     // plain one-row rounds. Measured on the 5090 with the NVFP4 Dense8 import, greedy code, INT8 KV
@@ -6892,8 +6874,8 @@ private:
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kMultiRowMaxDrafts =
         static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 3.0));
-    static constexpr std::int32_t kPairNgramMaxDrafts     = 15;
-    static constexpr std::int32_t kMultiRowNgramMaxDrafts = 7;
+    static constexpr std::int32_t kPairNgramMaxDrafts     = 31;
+    static constexpr std::int32_t kMultiRowNgramMaxDrafts = 21;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
     // same bits whatever the call boundaries (request invariance's resume grid).
     static constexpr std::uint32_t kResumeGrid = 16;

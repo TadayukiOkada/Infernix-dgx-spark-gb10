@@ -357,13 +357,8 @@ __global__ void __launch_bounds__(kThreads, MaxCols == 1 ? 3 : 2)
                     if (chunk < chunks) {
                         // Read once per call (a full-vocabulary head is 636 MB): it leaves L2 first.
                         loaded[i + u] = ld_nc_na_evict_first(w + chunk);
+                        s[u]          = srow[chunk / 4];
                     }
-                    const int src_lane = lane & ~3;
-                    __half su          = __ushort_as_half(0);
-                    if (lane == src_lane && (src_lane + 32 * (i + u)) < chunks) {
-                        su = srow[(src_lane + 32 * (i + u)) / 4];
-                    }
-                    s[u] = __shfl_sync(0xFFFFFFFFU, su, src_lane);
                 }
                 loaded_scale[i / 2] = __halves2half2(s[0], s[1]);
             }
@@ -470,13 +465,8 @@ __global__ void __launch_bounds__(kThreads, 3)
                     const int chunk = lane + 32 * (i + u);
                     if (chunk < chunks) {
                         loaded[i + u] = ld_nc_na_evict_first_u32(w + chunk);
+                        s[u]          = srow[chunk / 8];
                     }
-                    const int src_lane = lane & ~7;
-                    __half su          = __ushort_as_half(0);
-                    if (lane == src_lane && (src_lane + 32 * (i + u)) < chunks) {
-                        su = srow[(src_lane + 32 * (i + u)) / 8];
-                    }
-                    s[u] = __shfl_sync(0xFFFFFFFFU, su, src_lane);
                 }
                 loaded_scale[i / 2] = __halves2half2(s[0], s[1]);
             }
@@ -575,16 +565,9 @@ struct TallQ8 {
         __half scale;
     };
     __device__ Chunk load(int row, int chunk) const {
-        const int lane     = static_cast<int>(threadIdx.x) & 31;
-        const int src_lane = lane & ~3;
-        __half scale       = __ushort_as_half(0);
-        if (lane == src_lane) {
-            scale = scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4];
-        }
-        scale = __shfl_sync(0xFFFFFFFFU, scale, src_lane);
         return {ld_nc_na_evict_first(
                     reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k) + chunk),
-                scale};
+                scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4]};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const auto* v     = reinterpret_cast<const std::int8_t*>(&c.code);
@@ -603,17 +586,10 @@ struct TallQ4 {
         __half scale;
     };
     __device__ Chunk load(int row, int chunk) const {
-        const int lane     = static_cast<int>(threadIdx.x) & 31;
-        const int src_lane = lane & ~7;
-        __half scale       = __ushort_as_half(0);
-        if (lane == src_lane) {
-            scale = scales[static_cast<std::size_t>(row) * (padded_k / 64) + chunk / 8];
-        }
-        scale = __shfl_sync(0xFFFFFFFFU, scale, src_lane);
         return {ld_nc_na_evict_first_u32(
                     reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::size_t>(row) * (padded_k / 2)) +
                     chunk),
-                scale};
+                scales[static_cast<std::size_t>(row) * (padded_k / 64) + chunk / 8]};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const float scale = __half2float(c.scale);
@@ -646,7 +622,6 @@ __global__ void __launch_bounds__(
             if (chunk < chunks) { w[r][i] = codec.load(row, chunk); }
         }
     }
-    pdl::enter();
     for (int i = static_cast<int>(threadIdx.x); i < MaxCols * chunks; i += kTallThreads) {
         const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(reinterpret_cast<const uint4*>(x) + i)
@@ -697,7 +672,6 @@ __global__ void __launch_bounds__(
     const int lane      = static_cast<int>(threadIdx.x) % 32;
     const int first_row = (static_cast<int>(blockIdx.x) * kTallWarps + static_cast<int>(threadIdx.x) / 32) *
                           kTallRowsPerWarp;
-    pdl::enter();
     if constexpr (SingleStage) {
         for (int i = static_cast<int>(threadIdx.x); i < columns * chunks; i += kTallThreads) {
             const auto dst  = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
@@ -781,9 +755,8 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
     const std::size_t staged_exact = static_cast<std::size_t>(columns) * k * sizeof(bf16);
     const std::size_t staged_pass  = static_cast<std::size_t>(columns) * kTallPassChunks * sizeof(uint4);
     const auto launch_exact = [&]<int MaxCols>() {
-        CUDA_CHECK(pdl::launch_consumer({dim3(blocks), dim3(kTallThreads), staged_exact, stream},
-            projection_tall_exact_kernel<Codec, MaxCols>,
-            static_cast<const bf16*>(x.data), k, rows, codec, static_cast<float*>(out.data)));
+        projection_tall_exact_kernel<Codec, MaxCols><<<blocks, kTallThreads, staged_exact, stream>>>(
+            static_cast<const bf16*>(x.data), k, rows, codec, static_cast<float*>(out.data));
     };
     const auto launch_pass = [&]<int MaxCols>() {
         if (staged_exact <= 49152U) {
@@ -792,9 +765,8 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 49152) == cudaSuccess;
             }();
             require(configured_single, "the single-stage tall kernel's shared memory could not be configured");
-            CUDA_CHECK(pdl::launch_consumer({dim3(blocks), dim3(kTallThreads), staged_exact, stream},
-                projection_tall_kernel<Codec, MaxCols, true>,
-                static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data)));
+            projection_tall_kernel<Codec, MaxCols, true><<<blocks, kTallThreads, staged_exact, stream>>>(
+                static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
             return;
         }
         static const bool configured = [] {
@@ -803,9 +775,8 @@ void launch_tall(const Tensor& x, int k, int columns, int rows, const Codec& cod
                                         static_cast<int>(kTallMaxSharedBytes)) == cudaSuccess;
         }();
         require(configured, "the tall kernel's shared memory could not be configured");
-        CUDA_CHECK(pdl::launch_consumer({dim3(blocks), dim3(kTallThreads), staged_pass, stream},
-            projection_tall_kernel<Codec, MaxCols, false>,
-            static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data)));
+        projection_tall_kernel<Codec, MaxCols, false><<<blocks, kTallThreads, staged_pass, stream>>>(
+            static_cast<const bf16*>(x.data), k, columns, rows, codec, static_cast<float*>(out.data));
     };
     switch (columns) {
     case 1:

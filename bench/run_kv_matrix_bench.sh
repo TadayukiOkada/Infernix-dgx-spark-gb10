@@ -70,7 +70,7 @@ fi
 run() { # run <model-tag> <weights> <ngram> <residency> <kv> <mode>
     local tag="$1" weights="$2" ngram="$3" residency="$4" kv="$5" mode="$6"
     local spec=()
-    [ "$mode" = mtp ] && spec=(--spec mtp --draft-tokens auto --lm-head-draft)
+    [ "$mode" = mtp ] && spec=(--spec mtp --draft-tokens auto --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 4)
     local name="${tag}_${kv}_${mode}"
     INFERNIX_EXPERTS_ON_GPU=1 "$BENCH" \
         --weights "$weights" --ngram-volume "$ngram" --ngram-residency "$residency" \
@@ -88,7 +88,7 @@ for kv in $KV_DTYPES; do
             case "$model" in
                 iq3s)   run iq3s   "$MI" "$NI" ram    "$kv" "$mode" ;;
                 dense8) run dense8 "$MD" "$ND" volume "$kv" "$mode" ;;
-                nvfp4)  run nvfp4  "$M4" "$N4" volume "$kv" "$mode" ;;
+                nvfp4)  run nvfp4  "$M4" "$N4" ram    "$kv" "$mode" ;;
                 *) echo "Unknown model $model" >&2; exit 1 ;;
             esac
         done

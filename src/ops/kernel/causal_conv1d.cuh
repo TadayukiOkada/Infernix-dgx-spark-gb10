@@ -20,7 +20,6 @@ __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bf
 }
 
 inline constexpr int kCausalConvChannelTile = 32;
-inline constexpr int kCausalConvMaxSmallT   = 32;
 
 namespace detail {
 
@@ -196,7 +195,6 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
                                             std::int32_t C, std::int32_t T) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
-    __shared__ __nv_bfloat16 s_x[kCausalConvMaxSmallT][kCausalConvChannelTile];
 
     const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x);
     const std::int32_t t    = static_cast<std::int32_t>(threadIdx.y);
@@ -214,19 +212,20 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
                 valid ? weight[static_cast<std::int64_t>(r) * C64 + c64] : __float2bfloat16(0.0f);
         }
     }
-    if (t < T && t < kCausalConvMaxSmallT) {
-        s_x[t][lane] = valid ? x[static_cast<std::int64_t>(t) * C64 + c64] : __float2bfloat16(0.0f);
-    }
     __syncthreads();
     if (!valid) { return; }
 
     const std::int32_t p0 = t - 3;
     const std::int32_t p1 = t - 2;
     const std::int32_t p2 = t - 1;
-    const __nv_bfloat16 x0 = p0 < 0 ? history[p0 + 3][lane] : s_x[p0][lane];
-    const __nv_bfloat16 x1 = p1 < 0 ? history[p1 + 3][lane] : s_x[p1][lane];
-    const __nv_bfloat16 x2 = p2 < 0 ? history[p2 + 3][lane] : s_x[p2][lane];
-    const __nv_bfloat16 x3 = s_x[t][lane];
+    const __nv_bfloat16 x0 =
+        p0 < 0 ? history[p0 + 3][lane] : x[static_cast<std::int64_t>(p0) * C64 + c64];
+    const __nv_bfloat16 x1 =
+        p1 < 0 ? history[p1 + 3][lane] : x[static_cast<std::int64_t>(p1) * C64 + c64];
+    const __nv_bfloat16 x2 =
+        p2 < 0 ? history[p2 + 3][lane] : x[static_cast<std::int64_t>(p2) * C64 + c64];
+    const std::int64_t x_idx = static_cast<std::int64_t>(t) * C64 + c64;
+    const __nv_bfloat16 x3   = x[x_idx];
 
     float acc = 0.0f;
     acc += __bfloat162float(weights[0][lane]) * __bfloat162float(x0);
@@ -239,7 +238,7 @@ __global__ void causal_conv1d_smallt_kernel(const __nv_bfloat16* x, const __nv_b
         for (std::int32_t s = 0; s < 3; ++s) {
             const std::int32_t pos = T - 3 + s;
             conv_state_out[static_cast<std::int64_t>(s) * C64 + c64] =
-                pos < 0 ? history[pos + 3][lane] : s_x[pos][lane];
+                pos < 0 ? history[pos + 3][lane] : x[static_cast<std::int64_t>(pos) * C64 + c64];
         }
     }
 }
@@ -487,7 +486,6 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
                                      std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
-    __shared__ __nv_bfloat16 s_x[kCausalConvMaxSmallT][kCausalConvChannelTile];
 
     const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x);
     const std::int32_t t    = static_cast<std::int32_t>(threadIdx.y);
@@ -507,19 +505,20 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
                 valid ? weight[static_cast<std::int64_t>(r) * C64 + c64] : __float2bfloat16(0.0f);
         }
     }
-    if (t < T && t < kCausalConvMaxSmallT) {
-        s_x[t][lane] = valid ? x[static_cast<std::int64_t>(t) * C64 + c64] : __float2bfloat16(0.0f);
-    }
     __syncthreads();
     if (!valid) { return; }
 
     const std::int32_t p0 = t - 3;
     const std::int32_t p1 = t - 2;
     const std::int32_t p2 = t - 1;
-    const __nv_bfloat16 x0 = p0 < 0 ? history[p0 + 3][lane] : s_x[p0][lane];
-    const __nv_bfloat16 x1 = p1 < 0 ? history[p1 + 3][lane] : s_x[p1][lane];
-    const __nv_bfloat16 x2 = p2 < 0 ? history[p2 + 3][lane] : s_x[p2][lane];
-    const __nv_bfloat16 x3 = s_x[t][lane];
+    const __nv_bfloat16 x0 =
+        p0 < 0 ? history[p0 + 3][lane] : x[static_cast<std::int64_t>(p0) * C64 + c64];
+    const __nv_bfloat16 x1 =
+        p1 < 0 ? history[p1 + 3][lane] : x[static_cast<std::int64_t>(p1) * C64 + c64];
+    const __nv_bfloat16 x2 =
+        p2 < 0 ? history[p2 + 3][lane] : x[static_cast<std::int64_t>(p2) * C64 + c64];
+    const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;
+    const __nv_bfloat16 x3     = x[out_idx];
 
     float acc = 0.0f;
     acc += __bfloat162float(weights[0][lane]) * __bfloat162float(x0);
@@ -533,7 +532,7 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
     for (std::int32_t s = 0; s < 3; ++s) {
         const std::int32_t pos = t - 2 + s;
         snapshot[static_cast<std::int64_t>(s) * C64 + c64] =
-            pos < 0 ? history[pos + 3][lane] : s_x[pos][lane];
+            pos < 0 ? history[pos + 3][lane] : x[static_cast<std::int64_t>(pos) * C64 + c64];
     }
 }
 
@@ -545,7 +544,6 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
-    __shared__ __nv_bfloat16 s_x[kCausalConvMaxSmallT][kCausalConvChannelTile];
 
     const std::int32_t batch  = static_cast<std::int32_t>(blockIdx.y);
     const std::int32_t lane   = static_cast<std::int32_t>(threadIdx.x);
@@ -566,15 +564,12 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
                                              : __float2bfloat16(0.0f);
         }
     }
-    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
-    if (column < width && column < kCausalConvMaxSmallT) {
-        s_x[column][lane] = channel_valid ? x[row_base + static_cast<std::int64_t>(column) * C64 + c64]
-                                          : __float2bfloat16(0.0f);
-    }
     __syncthreads();
     if (!channel_valid) { return; }
 
     const std::int32_t valid    = Masked ? valid_columns[batch] : width;
+    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
+    const std::int64_t out_idx  = row_base + static_cast<std::int64_t>(column) * C64 + c64;
     __nv_bfloat16* const y      = out.column(c64).at(batch * width + column);
     if (column >= valid) {
         *y = __float2bfloat16(0.0f);
@@ -584,10 +579,13 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     const std::int32_t p0 = column - 3;
     const std::int32_t p1 = column - 2;
     const std::int32_t p2 = column - 1;
-    const __nv_bfloat16 x0 = p0 < 0 ? history[p0 + 3][lane] : s_x[p0][lane];
-    const __nv_bfloat16 x1 = p1 < 0 ? history[p1 + 3][lane] : s_x[p1][lane];
-    const __nv_bfloat16 x2 = p2 < 0 ? history[p2 + 3][lane] : s_x[p2][lane];
-    const __nv_bfloat16 x3 = s_x[column][lane];
+    const __nv_bfloat16 x0 =
+        p0 < 0 ? history[p0 + 3][lane] : x[row_base + static_cast<std::int64_t>(p0) * C64 + c64];
+    const __nv_bfloat16 x1 =
+        p1 < 0 ? history[p1 + 3][lane] : x[row_base + static_cast<std::int64_t>(p1) * C64 + c64];
+    const __nv_bfloat16 x2 =
+        p2 < 0 ? history[p2 + 3][lane] : x[row_base + static_cast<std::int64_t>(p2) * C64 + c64];
+    const __nv_bfloat16 x3 = x[out_idx];
 
     float acc = 0.0f;
     acc += __bfloat162float(weights[0][lane]) * __bfloat162float(x0);
@@ -601,7 +599,8 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     for (std::int32_t s = 0; s < 3; ++s) {
         const std::int32_t pos = column - 2 + s;
         snapshot[static_cast<std::int64_t>(s) * C64 + c64] =
-            pos < 0 ? history[pos + 3][lane] : s_x[pos][lane];
+            pos < 0 ? history[pos + 3][lane]
+                    : x[row_base + static_cast<std::int64_t>(pos) * C64 + c64];
     }
 }
 

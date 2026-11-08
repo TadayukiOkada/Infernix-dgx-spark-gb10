@@ -20,7 +20,7 @@ namespace infernix::ops::detail {
 // 45.2 fused), for BF16 weights to 4 (T=4 64.1 fused against 67.1 composed; T=5 68.7 against 71.0),
 // because the BF16 linear reads 2x the bytes. The previous 16 left the speculative widths (MTP's 4,
 // DFlash2's 8/9 and 16) on the losing side of that crossover.
-inline constexpr std::int32_t kHcMixFusedMaxColumnsQ8   = 3;
+inline constexpr std::int32_t kHcMixFusedMaxColumnsQ8   = 4;
 inline constexpr std::int32_t kHcMixFusedMaxColumnsBf16 = 4;
 
 // Upper bound of the fused band across the codecs: sizes the kernels' shared arrays, the fused

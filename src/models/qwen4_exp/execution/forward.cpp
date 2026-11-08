@@ -1515,7 +1515,8 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
         // copy and the near-best ones exactly (ops::screened_head_top), so the draft is the exact head's
         // argmax unless the screen misses it, and a sampled draft's ranks carry exact logits with an
         // approximate normalizer. Draft-only: verification is unchanged.
-        const bool screened = head.rows && head.screen;
+        const bool screened = head.rows && head.screen &&
+                              (call.sample_configs == nullptr || call.sample_rows.ne[0] <= 4);
         Tensor drafts = call.drafts;
         Tensor narrow;
         if (!screened) {

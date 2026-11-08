@@ -361,6 +361,24 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
               "Generation request duration through settlement, including cancellation.");
     histogram("request_queue_seconds", requests.queue,
               "Initial Engine queue wait of settled generation requests.");
+    const std::uint64_t spec_row_drafts =
+        (stats.decode_row_rounds - baseline_.decode_row_rounds) >
+                (stats.speculative_fallback_steps - baseline_.speculative_fallback_steps)
+            ? (stats.decode_row_rounds - baseline_.decode_row_rounds) -
+                  (stats.speculative_fallback_steps - baseline_.speculative_fallback_steps)
+            : (stats.speculative_rounds - baseline_.speculative_rounds);
+    out << "vllm:num_requests_running " << stats.running_requests << '\n'
+        << "vllm:num_requests_waiting " << stats.waiting_requests << '\n'
+        << "vllm:request_success_total " << requests.completed << '\n'
+        << "vllm:spec_decode_num_drafts_total " << spec_row_drafts << '\n'
+        << "vllm:spec_decode_num_draft_tokens_total "
+        << (stats.speculative_draft_tokens - baseline_.speculative_draft_tokens) << '\n'
+        << "vllm:spec_decode_num_accepted_tokens_total "
+        << (stats.speculative_accepted_tokens - baseline_.speculative_accepted_tokens) << '\n'
+        << "vllm:prefix_cache_hits_total "
+        << (stats.reused_prompt_tokens - baseline_.reused_prompt_tokens) << '\n'
+        << "vllm:prefix_cache_queries_total "
+        << (stats.prompt_tokens - baseline_.prompt_tokens) << '\n';
     return out.str();
 }
 

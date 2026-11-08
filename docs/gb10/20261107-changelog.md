@@ -1915,3 +1915,69 @@ Measured with `BENCH_BIN=./build-native/bench/infernix_bench REPS=5 WARMUP=2 ./b
 | **`iq3s pp8192+tg512`** | `113.2` / `0.956` | `70.3` / `0.749` | **`112.4` / `0.957`** | `-0.7%` / `+0.1pp` (**recovered `+42.1 tok/s`**) | `[(72,449,439), (74,460,438) × 4]` |
 | **`nvfp4 tg512`** | `76.8` / `0.731` | `95.5` / `0.832` | **`76.9` / `0.731`** | **`+0.1%` / `0.0pp`** | `[(168, 431, 315) × 5]` (bit-exact to `c591b202`) |
 | **`nvfp4 pp8192+tg512`** | `122.8` / `0.982` | `78.3` / `0.745` | **`123.2` / `0.984`** | **`+0.3%` / `+0.2pp`** (**recovered `+44.9 tok/s`**) | `[(74,446,438) × 3, (72,444,440), (74,446,438)]` |
+
+---
+
+# GB10 (`sm_121a`) Branch Changelog — 2026-11-07 — Multi-Stream Copy & Concurrency `N=1..4` Speculative Decode Optimization
+
+Scope: Outperform the external framework benchmark on `Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix` (`N=1..4` concurrency on `bench_copy_streams.py` and `llama-benchy --pp 2048 --tg 128 --concurrency 1 2 3 4 --runs 3`) while restoring the clean `862eadc6ec` kernel baseline and maintaining zero CUDA stack spills.
+
+## 1. Accounting & Subsystem Breakdown
+
+- **Base commit**: `a0382dd98` (restored kernel/op files to `862eadc6ec` baseline).
+- **Changed files**:
+  - `src/ops/ candidate_selector, hyper_connection, kernel, linear, linear_attention, offloaded_sparse_moe, projection_fp32, screened_head` (M/D): Restored the clean `862eadc6ec` kernel baseline across all 20 kernel files that commits `171ea4207` and `a0382dd98` had regressed (`c591b202` / `862eadc6ec` split).
+  - `src/ops/kernel/top_logprobs.cuh` (M): Kept the register-cached `k <= 4` top-logprob pass reuse (`else if (k3 < previous)`) so `top_logprobs` reuses the 4-element warp register cache when `ranks <= 4`.
+  - `src/models/qwen4_exp/execution/forward.cpp` (M): Added `(call.sample_configs == nullptr || call.sample_rows.ne[0] <= 4)` guard on `screened` in `Forward::mtp_block`.
+  - `src/models/qwen4_exp/program/program_impl.h` & `src/models/qwen4_exp/program/graph_set.cpp` (M):
+    - Lowered `kNgramWidthCost` default from `0.10` to `0.025` and raised `kNgramAcceptancePriors` from `{0.75, 0.88, 0.93, 0.96}` to `{0.85, 0.92, 0.96, 0.985}` so zero-draft-step N-gram copy proposals select full 20–31 token verification spans on confirmed matches instead of truncating at 8–10 tokens.
+    - Raised `kPairNgramMaxDrafts` from `15` to `31` (`batch == 2`) and `kMultiRowNgramMaxDrafts` from `7` to `21` with multi-row column cap `std::min(kMultiRowNgramMaxDrafts, 64 / batch - 1)` (`20` drafts / `21` columns per row at `batch == 3`, `15` drafts / `16` columns per row at `batch == 4`), keeping total multi-row verification columns within the 64-column decode/verify envelope (`batch * W <= 64`).
+    - Kept `kSampledDraftRanks = 4` and `k <= 3` in `draft_length_at` so `batch == 1` sampled MTP rounds do not over-draft a 4th sequential step (`40.1 ms/round` vs `46.0 ms/round`).
+  - `src/serve/metrics.cpp` (M): Exposed `vllm:` Prometheus metric aliases (`vllm:num_requests_running`, `vllm:num_requests_waiting`, `vllm:request_success_total`, `vllm:spec_decode_num_drafts_total`, `vllm:spec_decode_num_draft_tokens_total`, `vllm:spec_decode_num_accepted_tokens_total`, `vllm:prefix_cache_hits_total`, `vllm:prefix_cache_queries_total`) alongside native `infernix_*` metrics so external benchmark harnesses (`bench_copy_streams.py`) read live speculative-decoding `tps` (`1 + accepted/drafts`) and prefix-cache telemetry.
+
+## 2. Verification & Benchmark Results
+
+- **CTest verification**:
+  - `infernix_cuda_stack_check`, `infernix_metrics_test`, `infernix_metrics_contract_test`, and `infernix_qwen4_exp_speculative_test`: `4 / 4` passed (`1.45 s`).
+- **Multi-Stream Copy Benchmark (`bench_copy_streams.py --streams 1 2 3 4`)**:
+
+| Concurrency | Metric | External Target | Infernix Run 1 (`v1`) | Infernix Run 2 (`v2`, Shipped) | Speedup (`v2` vs Target) |
+|---|---|---:|---:|---:|---:|
+| **`N=1`** | `peak` (tok/s) | `69.91` | `260.44` | **`268.00`** | **`3.83x` (`+283.4%`)** |
+| **`N=1`** | `median` (tok/s) | `69.53` | `259.35` | **`262.04`** | **`3.77x` (`+276.9%`)** |
+| **`N=1`** | `per-stream` (tok/s) | `69.58` | `259.56` | **`262.25`** | **`3.77x` (`+276.9%`)** |
+| **`N=1`** | `tps` (tok/step) | `3.960` | `22.712` | **`23.062`** | **`5.82x`** |
+| **`N=1`** | `ttft` (s) | `1.361` | `0.646` | **`0.650`** | **`2.09x` faster** |
+| **`N=2`** | `peak` (tok/s) | `115.28` | `356.26` | **`370.50`** | **`3.21x` (`+221.4%`)** |
+| **`N=2`** | `median` (tok/s) | `114.02` | `355.90` | **`367.15`** | **`3.22x` (`+222.0%`)** |
+| **`N=2`** | `per-stream` (tok/s) | `56.93` | `177.99` | **`183.67`** | **`3.23x` (`+222.6%`)** |
+| **`N=2`** | `tps` (tok/step) | `3.970` | `23.422` | **`22.712`** | **`5.72x`** |
+| **`N=2`** | `ttft` (s) | `1.031` | `0.794` | **`0.798`** | **`1.29x` faster** |
+| **`N=3`** | `peak` (tok/s) | `149.00` | `314.74` | **`379.25`** | **`2.55x` (`+154.5%`)** |
+| **`N=3`** | `median` (tok/s) | `138.51` | `314.36` | **`374.30`** | **`2.70x` (`+170.2%`)** |
+| **`N=3`** | `per-stream` (tok/s) | `46.12` | `106.23` | **`124.81`** | **`2.71x` (`+170.6%`)** |
+| **`N=3`** | `tps` (tok/step) | `3.971` | `13.794` | **`16.843`** | **`4.24x`** |
+| **`N=3`** | `ttft` (s) | `1.322` | `0.253` | **`0.250`** | **`5.29x` faster** |
+| **`N=4`** | `peak` (tok/s) | `177.86` | `390.57` | **`377.96`** | **`2.12x` (`+112.5%`)** |
+| **`N=4`** | `median` (tok/s) | `175.41` | `378.37` | **`373.32`** | **`2.13x` (`+112.8%`)** |
+| **`N=4`** | `per-stream` (tok/s) | `43.95` | `95.11` | **`94.40`** | **`2.15x` (`+114.8%`)** |
+| **`N=4`** | `tps` (tok/step) | `3.974` | `13.721` | **`13.566`** | **`3.41x`** |
+| **`N=4`** | `ttft` (s) | `1.637` | `0.330` | **`0.328`** | **`4.99x` faster** |
+
+- **`llama-benchy` (`--pp 2048 --tg 128 --concurrency 1 2 3 4 --runs 3`)**:
+
+| Concurrency | `pp2048` Total (t/s) | `tg128` Mean Total (t/s) | `tg128` Per-Req (t/s) | `tg128` Peak Total (t/s) | `ttfr` (ms) | `e2e_ttft` (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| **`c=1` (`v2`)** | `38,099.68 ± 1,021.96` | **`78.19 ± 4.89`** | **`78.19 ± 4.89`** | **`79.00 ± 4.97`** | `50.21 ± 0.19` | `622.53 ± 2.79` |
+| **`c=2` (`v2`)** | `3,001.59 ± 29.23` | **`101.13 ± 7.98`** | **`51.27 ± 3.88`** | **`103.67 ± 7.76`** | `356.98 ± 306.89` | `1,273.89 ± 18.59` |
+| **`c=3` (`v2`)** | `2,999.96 ± 34.77` | **`109.04 ± 2.75`** | **`38.05 ± 2.12`** | **`115.67 ± 2.62`** | `645.92 ± 493.22` | `1,869.64 ± 11.44` |
+| **`c=4` (`v2`)** | `3,027.33 ± 26.24` | **`122.74 ± 7.52`** | **`35.65 ± 5.17`** | **`144.67 ± 8.22`** | `936.07 ± 699.69` | `2,459.93 ± 17.80` |
+
+## 3. Adverse Findings & Rejected Candidates
+
+- **Run 1 (`v1`) `kSampledDraftRanks = 16` + `k <= 4` in `draft_length_at`**: Setting `kSampledDraftRanks = 16` and allowing 4-step MTP chains at `batch == 1` increased single-stream round latency from `40.1 ms` to `46.0 ms` (`llama-benchy` `c=1`: `71.79 ± 6.73 t/s` vs `78.19 ± 4.89 t/s`). Disposition: Reverted `kSampledDraftRanks` to `4` and `k <= 3` in `Run 2` (`v2`), recovering `+6.40 t/s` (`+8.9%`) at `c=1` while also raising `bench_copy_streams.py` `N=3` from `314.36` to `374.30 tok/s` (`+19.1%`).
+- **Run 3 (`v3`) `128 / batch - 1` multi-row N-gram cap + `bucket < 2` width-cost split**: Raising the multi-row (`batch >= 3`) N-gram column limit from `64 / batch - 1` to `128 / batch - 1` (`batch * W = 96..128` columns) and splitting `copy_width_cost = 0.10f` for `bucket < 2` (`matched < 12`) had two adverse effects: (1) on `llama-benchy` `c=1` and `c=2`, initial book-quote matches start at `4..11` tokens (`bucket < 2`) before continuing for `15..25` tokens, so `copy_width_cost = 0.10f` truncated those quote proposals and lowered `llama-benchy` `c=1` from `78.19` to `65.90 t/s` and `c=2` from `101.13` to `91.11 t/s`; (2) on `bench_copy_streams.py` `N=3`, launching `batch = 3, W = 32` (`96 > 64` columns) with mixed MTP + N-gram rows exceeded the 64-column gated verification envelope and trapped in `upload_pinned_when_kernel` after `kPinnedGateTimeoutNs`. Disposition: Rejected and restored the `Run 2` (`v2`) `64 / batch - 1` (`kMultiRowNgramMaxDrafts = 21`) configuration.
+
+## 4. Rebase Conflict Resolution Policy
+
+- Preserve the `862eadc6ec` clean kernel baseline, the `else if (k3 < previous)` 4-rank register-cache guard in `src/ops/kernel/top_logprobs.cuh`, the `kNgramWidthCost = 0.025`, `kPairNgramMaxDrafts = 31`, `kMultiRowNgramMaxDrafts = 21` (`64 / batch - 1`) speculative parameters in `src/models/qwen4_exp/program/{program_impl.h,graph_set.cpp}`, and the `vllm:` compatibility metrics in `src/serve/metrics.cpp`.

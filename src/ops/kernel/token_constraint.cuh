@@ -31,7 +31,6 @@ __launch_bounds__(BlockSize) __global__
 
     __shared__ std::int32_t permitted[kTokenConstraintChoices];
     __shared__ Logit saved[kTokenConstraintChoices];
-    __shared__ float probs[kTokenConstraintChoices];
     __shared__ std::int32_t count;
     if (threadIdx.x == 0) {
         std::int32_t n = 0;
@@ -88,17 +87,14 @@ __launch_bounds__(BlockSize) __global__
         }
         float sum = 0.0f;
         for (std::int32_t i = 0; i < n; ++i) {
-            const float p = expf(logprob_logit(saved[i]) - maximum);
-            probs[i]      = p;
-            sum += p;
+            sum += expf(logprob_logit(saved[i]) - maximum);
         }
-        const float inv_sum = 1.0f / sum;
         float* record = records + static_cast<std::int64_t>(column) * kTokenConstraintRecord;
         for (std::int32_t i = 0; i < kTokenConstraintChoices; ++i) {
-            record[i] = i < n ? probs[i] * inv_sum : 0.0f;
+            record[i] = i < n ? expf(logprob_logit(saved[i]) - maximum) / sum : 0.0f;
         }
         record[kTokenConstraintChoices] =
-            fminf(1.0f, sum * expf(maximum - full.maximum - full.log_sum));
+            fminf(1.0f, expf(maximum + logf(sum) - full.maximum - full.log_sum));
         if (argmax != nullptr) { argmax[column] = permitted[best]; }
     }
     __syncthreads();

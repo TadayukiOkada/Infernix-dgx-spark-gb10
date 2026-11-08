@@ -43,6 +43,7 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     __syncthreads();
     float total = 0.0F;
     for (int w = 0; w < blockDim.x / 32; ++w) { total += scratch[w]; }
+    __syncthreads();
     return total;
 }
 
@@ -103,15 +104,10 @@ __global__ void __launch_bounds__(kThreads) inject_norm_kernel(const bf16* __res
                                                                bf16* __restrict__ out) {
     pdl::enter();
     __shared__ float scratch[kThreads / 32];
-    __shared__ float s_sc;
     const int s     = blockIdx.x;
     const int t     = gridDim.y > 1024 ? (static_cast<int>(gridDim.y) - 1 - static_cast<int>(blockIdx.y))
                                        : static_cast<int>(blockIdx.y);
-    if (threadIdx.x == 0) {
-        s_sc = inject[static_cast<std::size_t>(t) * streams + s];
-    }
-    __syncthreads();
-    const float sc  = s_sc;
+    const float sc  = inject[static_cast<std::size_t>(t) * streams + s];
     const bf16* yin = y_in + static_cast<std::size_t>(t) * hidden;
     bf16* x         = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
     bf16* y         = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
@@ -201,16 +197,11 @@ __global__ void __launch_bounds__(kVec8Threads) inject_norm_vec8_kernel(const bf
                                                                         bf16* __restrict__ out) {
     pdl::enter();
     __shared__ float scratch[kVec8Threads / 32];
-    __shared__ float s_sc;
     const int s     = blockIdx.x;
     const int t     = gridDim.y > 1024 ? (static_cast<int>(gridDim.y) - 1 - static_cast<int>(blockIdx.y))
                                        : static_cast<int>(blockIdx.y);
     const int d     = threadIdx.x * 8;
-    if (threadIdx.x == 0) {
-        s_sc = inject[static_cast<std::size_t>(t) * streams + s];
-    }
-    __syncthreads();
-    const float sc  = s_sc;
+    const float sc  = inject[static_cast<std::size_t>(t) * streams + s];
     const bf16* yin = y_in + static_cast<std::size_t>(t) * hidden + d;
     bf16* x         = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
     bf16* y         = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
@@ -333,29 +324,21 @@ __global__ void collapse_kernel(const bf16* __restrict__ logits, const bf16* __r
         const std::size_t i = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
         sum += sigmoidf(__bfloat162float(logits[i])) * __bfloat162float(normalized[i]);
     }
-    const float inv_streams = 1.0F / static_cast<float>(streams);
-    out[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum * inv_streams);
+    out[static_cast<std::size_t>(t) * hidden + d] = __float2bfloat16_rn(sum / static_cast<float>(streams));
 }
 
 __global__ void inject_kernel(const bf16* __restrict__ y, const float* __restrict__ inject, int hidden,
                               int streams, int columns, bf16* __restrict__ residual) {
     // A programmatic dependent; its small grid lets the next mixer launch and fetch its weights at once.
     pdl::enter();
-    const int t = blockIdx.y;
-    if (t >= columns) { return; }
-    __shared__ float s_inject[16];
-    if (threadIdx.x < static_cast<unsigned>(streams) && threadIdx.x < 16U) {
-        s_inject[threadIdx.x] = inject[static_cast<std::size_t>(t) * streams + threadIdx.x];
-    }
-    __syncthreads();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= hidden) { return; }
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
     const float v           = __bfloat162float(y[static_cast<std::size_t>(t) * hidden + d]);
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
     for (int s = 0; s < streams; ++s) {
-        const float inj = (s < 16) ? s_inject[s] : inject[static_cast<std::size_t>(t) * streams + s];
         bf16& r = residual[static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d];
-        r       = __float2bfloat16_rn(__bfloat162float(r) + inj * v);
+        r       = __float2bfloat16_rn(__bfloat162float(r) + inject[static_cast<std::size_t>(t) * streams + s] * v);
     }
 }
 
@@ -391,11 +374,11 @@ __launch_bounds__(320) __global__ void collapse_vec8_kernel(const bf16* __restri
             sum[j] += sigmoidf(__bfloat162float(l_bf16[j])) * __bfloat162float(n_bf16[j]);
         }
     }
-    const float inv_streams = 1.0F / static_cast<float>(streams);
+    const float inv_streams = static_cast<float>(streams);
     uint4 out_packed;
     bf16* out_bf16 = reinterpret_cast<bf16*>(&out_packed);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) { out_bf16[j] = __float2bfloat16_rn(sum[j] * inv_streams); }
+    for (int j = 0; j < 8; ++j) { out_bf16[j] = __float2bfloat16_rn(sum[j] / inv_streams); }
     *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(t) * hidden + d) = out_packed;
 }
 
@@ -403,15 +386,9 @@ __launch_bounds__(320) __global__ void inject_vec8_kernel(const bf16* __restrict
                                                           int hidden, int streams, int columns,
                                                           bf16* __restrict__ residual) {
     pdl::enter();
-    const int t = blockIdx.y;
-    if (t >= columns) { return; }
-    __shared__ float s_inject[16];
-    if (threadIdx.x < static_cast<unsigned>(streams) && threadIdx.x < 16U) {
-        s_inject[threadIdx.x] = inject[static_cast<std::size_t>(t) * streams + threadIdx.x];
-    }
-    __syncthreads();
     const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
-    if (d >= hidden) { return; }
+    const int t = blockIdx.y;
+    if (d >= hidden || t >= columns) { return; }
     const uint4 y_packed = *reinterpret_cast<const uint4*>(y + static_cast<std::size_t>(t) * hidden + d);
     const bf16* y_bf16   = reinterpret_cast<const bf16*>(&y_packed);
     float v[8];
@@ -419,7 +396,7 @@ __launch_bounds__(320) __global__ void inject_vec8_kernel(const bf16* __restrict
     for (int j = 0; j < 8; ++j) { v[j] = __bfloat162float(y_bf16[j]); }
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
     for (int s = 0; s < streams; ++s) {
-        const float inj = (s < 16) ? s_inject[s] : inject[static_cast<std::size_t>(t) * streams + s];
+        const float inj = inject[static_cast<std::size_t>(t) * streams + s];
         uint4* r_ptr    = reinterpret_cast<uint4*>(
             residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
         uint4 r_packed = *r_ptr;
@@ -461,8 +438,7 @@ __global__ void stream_mean_kernel(const bf16* __restrict__ residual, int hidden
     const bf16* column      = residual + static_cast<std::size_t>(t) * width + d;
     float sum               = 0.0F;
     for (int s = 0; s < streams; ++s) { sum += __bfloat162float(column[static_cast<std::size_t>(s) * hidden]); }
-    const float inv_streams = 1.0F / static_cast<float>(streams);
-    out[static_cast<std::size_t>(t) * pitch + d] = __float2bfloat16_rn(sum * inv_streams);
+    out[static_cast<std::size_t>(t) * pitch + d] = __float2bfloat16_rn(sum / static_cast<float>(streams));
 }
 
 __launch_bounds__(320) __global__ void stream_mean_vec8_kernel(const bf16* __restrict__ residual, int hidden,
