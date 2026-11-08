@@ -139,10 +139,11 @@
 
 ### Work Package 3: Tier 3 - Speculative Drafting, N-Gram & UMA Memory Optimizations (P1/P2)
 
-#### Task 3.1: Preallocate N-Gram Proposal Buffers in [`src/models/qwen3_5/ngram.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/ngram.cpp) & [`decode.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/decode.cpp)
+#### Task 3.1: Preallocate N-Gram Proposal Buffers in [`src/models/qwen3_5/ngram.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/ngram.cpp) & [`decode.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/decode.cpp) [COMPLETED]
 - **Problem**: `propose_ngram` allocates `std::vector<NgramProposer::Match> matches` on every round, and `NgramMatch` owns a dynamic `std::vector<TokenId> tokens`, causing continuous heap allocation and deallocation during speculative decode.
-- **Action**: Preallocate `matches_` in `ProgramImpl` and use `std::span<const TokenId>` or an inline fixed-capacity buffer (`std::array<TokenId, 64>`) in `NgramMatch`.
-- **Verification**: `infernix_cuda_stack_check` passes; `tool-eval-bench run --scenarios TC-14` scores 100/100.
+- **Action**: Preallocated `std::array<NgramProposer::Match, kMaximumConcurrency> ngram_matches_` inside `ProgramImpl` and returned `std::span<const NgramProposer::Match>` from `propose_ngram`, reusing match and token buffers across speculative decode steps and completely eliminating per-round vector allocations.
+- **Commit**: `870bef2c7` (`perf(models): preallocate n-gram proposal buffers in ProgramImpl`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,159 ms).
 
 #### Task 3.2: Eliminate Per-Round Heap Allocation in `MtpDraftPolicy::lengths` in [`src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp`](file:///opt/etc/Infernix/src/models/qwen3_5/program/speculative/mtp_draft_policy.cpp)
 - **Problem**: `MtpDraftPolicy::lengths()` allocates and returns a `std::vector<std::uint32_t>` on every speculative round.
