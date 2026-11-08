@@ -20,20 +20,6 @@ constexpr ContextPrefillCost kNvfp4Fp8Prefill{
     .vision_item_ns        = 5'860'255,
     .vision_patch_ns_q32   = 23'832'529'381'413,
 };
-constexpr ContextPrefillCost kGb10Groupwise27bPrefill{
-    .chunk_ns              = 163'254'280,
-    .token_ns_q32          = 4'049'092'617'647'804,
-    .attention_pair_ns_q32 = 121'989'586'060,
-    .vision_item_ns        = 23'946'340,
-    .vision_patch_ns_q32   = 94'840'851'418'776,
-};
-constexpr ContextPrefillCost kGb10Nvfp4Fp8Prefill{
-    .chunk_ns              = 138'097'163,
-    .token_ns_q32          = 1'579'929'730'021'409,
-    .attention_pair_ns_q32 = 27'930'392'335,
-    .vision_item_ns        = 0,
-    .vision_patch_ns_q32   = 0,
-};
 
 } // namespace
 
@@ -102,18 +88,13 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults() {
                     ContextTransferCost{
                         .batch_ns = 10'441, .operation_ns = 2'539, .ns_per_byte_q32 = 30'671'379},
                 },
-            // Calibrated for NVIDIA GB10 (sm_121a, 24 MiB L2, 273 GB/s LPDDR5X UMA).
-            .prefill =
-                {
-                    {"200f57efee7b0fe1172dfd4a06b1e6e0b2dbc36dfcd6a242fea35338bb5ff0d2",
-                     kGb10Groupwise27bPrefill},
-                    {"badf2271162e72c8c51a91da02cbb4343d4b7574d037a014ca6862ff2862638b",
-                     kGb10Groupwise27bPrefill},
-                    {"e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
-                     kGb10Nvfp4Fp8Prefill},
-                    {"953e22d9b9a6639c09f7389d49084b059dea07720bc0121dfd9c154002459915",
-                     kGb10Nvfp4Fp8Prefill},
-                },
+            // No compiled prefill binding: the RTX 5090 signature entries copied here priced
+            // recomputation 3.5..6x below GB10's actual prefill, and no artifact whose prefill is
+            // measurable on this machine reproduces those signatures (measured 2026-10-29; a
+            // Qwen3.8-Flash-Next fit was rejected by the calibration's own error gate). Text
+            // configs on GB10 resolve the generic prefill estimate until
+            // infernix_context_cost_bench --suite prefill --preset-out records a real one.
+            .prefill = {},
         },
     };
     return defaults;
