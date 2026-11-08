@@ -123,10 +123,11 @@
 - **Commit**: `40e293a7f` (`perf(runtime): eliminate vector heap allocations in hold_queued_sources`)
 - **Verification**: `infernix_cuda_stack_check` passed (1.48s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,159 ms).
 
-#### Task 2.4: Optimize `PrefixCacheIndex::stats()` in [`src/runtime/prefix_cache/prefix_index.cpp`](file:///opt/etc/Infernix/src/runtime/prefix_cache/prefix_index.cpp)
-- **Problem**: `PrefixCacheIndex::stats()` performs full linear scans over `holds_` and slabs (up to 4,096 entries) on every stats publication.
-- **Action**: Maintain running incremental counters for active holds and slab residency instead of re-scanning arrays.
-- **Verification**: Run `ctest -R infernix_prefix_cache_test` and verify stats consistency.
+#### Task 2.4: Optimize `PrefixCacheIndex::stats()` in [`src/runtime/prefix_cache/prefix_index.cpp`](file:///opt/etc/Infernix/src/runtime/prefix_cache/prefix_index.cpp) [COMPLETED]
+- **Problem**: `PrefixCacheIndex::stats()` performed a linear `std::count_if` scan over `holds_` on every stats publication.
+- **Action**: Maintained a running incremental `held_snapshots_` counter in `PrefixCacheIndex` updated upon queue hold reservation and release, making `stats()` pure $O(1)$. Added verification assertion in `check_invariants()`.
+- **Commit**: `3522bddc5` (`perf(runtime): maintain running counter for held snapshots in prefix cache index`)
+- **Verification**: `infernix_prefix_cache_index_test` passed; `infernix_cuda_stack_check` passed (1.51s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,196 ms).
 
 ---
 

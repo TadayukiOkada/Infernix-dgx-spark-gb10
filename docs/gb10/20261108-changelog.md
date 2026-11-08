@@ -172,3 +172,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 19. **Commit `40e293a7f` (`perf(runtime): eliminate vector heap allocations in hold_queued_sources`):**
     - Added `scratch_hold_ids_` and `scratch_hold_bases_` member vectors pre-reserved in `EngineCore` and replaced temporary `std::vector<std::shared_ptr<Request>>` heap vector with direct iteration over `paused_` and `pending_` in `src/runtime/engine/engine_core.h`, removing dynamic allocations and shared_ptr atomic refcount churn from `hold_queued_sources()`.
     - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,159 ms).
+
+20. **Commit `3522bddc5` (`perf(runtime): maintain running counter for held snapshots in prefix cache index`):**
+    - Added running incremental `held_snapshots_` counter in `PrefixCacheIndex` in `src/runtime/prefix_cache/prefix_index.cpp` and `prefix_index.h`, replacing linear `std::count_if` scans with $O(1)$ gauge reads in `stats()`, and added invariant checking in `check_invariants()`.
+    - Validation: `infernix_prefix_cache_index_test` passed; `infernix_cuda_stack_check` passed (1.51s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,196 ms).
