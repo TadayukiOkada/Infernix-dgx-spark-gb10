@@ -14,7 +14,7 @@ struct BlockCopies {
     std::uint32_t source[kDeviceBlockCopiesPerLaunch];
 };
 constexpr int kThreads = 256;
-constexpr int kSlices  = 16; // CTAs per block (gridDim.x); the block is blockIdx.y
+constexpr int kSlices  = 48; // CTAs per block (gridDim.x), sized for 48 SMs on GB10; the block is blockIdx.y
 constexpr int kUnroll  = 4;  // 16-byte loads in flight per thread
 
 // Streaming loads and stores: a moved block is read once and not read again soon.
@@ -44,12 +44,14 @@ void copy_device_blocks(void* base, std::size_t block_bytes, const std::uint32_t
     if ((reinterpret_cast<std::uintptr_t>(base) | block_bytes) % 16 != 0) {
         throw std::invalid_argument("copy_device_blocks needs 16-byte aligned blocks");
     }
+    const std::size_t vectors = block_bytes / 16;
+    const int slices = std::max(1, std::min<int>(kSlices, static_cast<int>((vectors + kThreads - 1) / kThreads)));
     for (std::uint32_t first = 0; first < count; first += kDeviceBlockCopiesPerLaunch) {
         const std::uint32_t n = std::min(kDeviceBlockCopiesPerLaunch, count - first);
         BlockCopies copies;
         std::copy_n(destinations + first, n, copies.destination);
         std::copy_n(sources + first, n, copies.source);
-        copy_device_blocks_kernel<<<dim3(kSlices, n), kThreads, 0, stream>>>(static_cast<unsigned char*>(base),
+        copy_device_blocks_kernel<<<dim3(slices, n), kThreads, 0, stream>>>(static_cast<unsigned char*>(base),
                                                                            block_bytes, copies);
         CUDA_CHECK(cudaGetLastError());
     }
