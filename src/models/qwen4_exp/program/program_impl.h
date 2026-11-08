@@ -2053,17 +2053,18 @@ public:
             CUDA_CHECK(cudaMemsetAsync(counts, 0, 4ULL * token_domain_, s));
             return;
         }
-        // A pinned table read by the SMs (upload_pinned), so the upload never waits on the copy engine.
-        const std::size_t bytes = 4ULL * static_cast<std::size_t>(token_domain_);
-        if (penalty_host_.size() < bytes) { penalty_host_ = PinnedHostBuffer(bytes); }
-        auto* host = static_cast<std::int32_t*>(penalty_host_.data());
+        // Segmented pinned tables per lane so upload_pinned runs asynchronously without CPU stream sync.
+        const std::size_t lane_idx = static_cast<std::size_t>(&lane - lanes_.data());
+        const std::size_t bytes    = 4ULL * static_cast<std::size_t>(token_domain_);
+        const std::size_t total_bytes = static_cast<std::size_t>(kMaximumConcurrency) * bytes;
+        if (penalty_host_.size() < total_bytes) { penalty_host_ = PinnedHostBuffer(total_bytes); }
+        auto* host = static_cast<std::int32_t*>(penalty_host_.data()) + lane_idx * token_domain_;
         std::fill(host, host + token_domain_, 0);
         for (std::size_t i = lane.prompt_tokens; i < lane.history.size(); ++i) {
             const std::int32_t token = lane.history[i];
             if (token >= 0 && token < token_domain_) { ++host[static_cast<std::size_t>(token)]; }
         }
         upload_pinned(counts, host, bytes, s);
-        CUDA_CHECK(cudaStreamSynchronize(s)); // the table is read before the next lane's rewrites it
     }
 
     // Pauses a resident at its committed boundary (design §19.3.13): the prefix cache receives the
