@@ -240,17 +240,7 @@ void kv_cache_append_batch(const Tensor& k, const Tensor& v, const Tensor& posit
         detail::kv_cache_append_vq_batch_launch(k, v, positions, Tensor{}, table_rows, cache, nullptr, stream);
         return;
     }
-    // INT8-G64 and FP8-row storage have a multi-row kernel; the other storages' batched launch
-    // addresses one table row, so each row gets its own launch (its row still chosen on the device).
-    if (batch == 1 || cache.storage == KvCacheStorage::Int8Group64 ||
-        cache.storage == KvCacheStorage::Fp8E4M3Row256) {
-        detail::kv_cache_append_batch_launch(k, v, positions, Tensor{}, table_rows, cache, stream);
-        return;
-    }
-    for (std::int32_t b = 0; b < batch; ++b) {
-        detail::kv_cache_append_batch_launch(k.slice(3, b, 1), v.slice(3, b, 1), positions.slice(1, b, 1), Tensor{},
-                                             table_rows.slice(0, b, 1), cache, stream);
-    }
+    detail::kv_cache_append_batch_launch(k, v, positions, Tensor{}, table_rows, cache, stream);
 }
 
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,

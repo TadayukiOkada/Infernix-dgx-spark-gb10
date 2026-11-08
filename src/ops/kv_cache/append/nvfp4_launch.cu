@@ -19,7 +19,7 @@ void launch_nvfp4_for(const Tensor& k, const Tensor& v, const Tensor& positions,
     auto* cache_v     = static_cast<std::uint8_t*>(cache.v_pages.data);
     auto* scale_k     = static_cast<std::uint8_t*>(cache.k_scale_pages.data);
     auto* scale_v     = static_cast<std::uint8_t*>(cache.v_scale_pages.data);
-    if (tokens >= 128 && Geometry::KVHeads == 2) {
+    if (tokens >= 128) {
         constexpr int TokensPerTile = 8;
         const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
         const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(Geometry::KVHeads));

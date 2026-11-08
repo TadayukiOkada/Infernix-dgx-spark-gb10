@@ -207,7 +207,7 @@ template <class Geometry>
 __device__ __forceinline__ void store_nvfp4_row(const float (&x)[8], std::uint8_t* codes, std::uint8_t* scales,
                                                 int page, int head, int slot, int lane, float* scratch) {
 #pragma unroll
-    for (int r = 0; r < 8; ++r) { scratch[lane + 32 * r] = x[r]; }
+    for (int r = 0; r < 8; ++r) { scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = x[r]; }
     __syncwarp();
     const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
     if (lane < kKVCacheNvfp4Groups) {

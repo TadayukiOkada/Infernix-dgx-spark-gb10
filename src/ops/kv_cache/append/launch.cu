@@ -22,7 +22,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
+        if (tokens >= 128) {
             constexpr int TokensPerTile = 8;
             const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
@@ -55,7 +55,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     if (cache.storage == KvCacheStorage::Int8Group64) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
+        if (tokens >= 128) {
             constexpr int TokensPerTile = 8;
             const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),

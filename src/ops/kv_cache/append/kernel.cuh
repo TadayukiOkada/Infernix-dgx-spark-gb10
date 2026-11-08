@@ -372,32 +372,6 @@ __device__ __forceinline__ void kv_cache_append_prefix_copy_cyclic_unit(
     *reinterpret_cast<int4*>(&cache_v[dst]) = value;
 }
 
-__device__ __forceinline__ void kv_cache_append_prefix_copy_paged_unit(
-    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    __nv_bfloat16* __restrict__ cache_k, __half* __restrict__ cache_v, int token, int unit_in_token,
-    int page_offset, int physical_page, int physical_pages) {
-    constexpr int ElementsPerUnit = 16;
-    constexpr int UnitsPerHead    = kKVCacheAppendPrefixHeadDim / ElementsPerUnit;
-    const int kv_head             = unit_in_token / UnitsPerHead;
-    const int d                   = (unit_in_token - kv_head * UnitsPerHead) * ElementsPerUnit;
-    const std::int64_t src =
-        static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
-                                           (kv_head + kKVCacheAppendPrefixHeads * token);
-    const std::int64_t dst =
-        static_cast<std::int64_t>(d) +
-        static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
-            (page_offset + kKVCacheAppendPrefixPage * (physical_page + physical_pages * kv_head));
-
-    const int4 k0 = *reinterpret_cast<const int4*>(&k[src]);
-    const int4 v0 = bf16x8_bits_to_f16x8_bits(*reinterpret_cast<const int4*>(&v[src]));
-    *reinterpret_cast<int4*>(&cache_k[dst]) = k0;
-    *reinterpret_cast<int4*>(&cache_v[dst]) = v0;
-    const int4 k1                           = *reinterpret_cast<const int4*>(&k[src + 8]);
-    const int4 v1 = bf16x8_bits_to_f16x8_bits(*reinterpret_cast<const int4*>(&v[src + 8]));
-    *reinterpret_cast<int4*>(&cache_k[dst + 8]) = k1;
-    *reinterpret_cast<int4*>(&cache_v[dst + 8]) = v1;
-}
-
 template <int Capacity, int Threads>
 __global__ void kv_cache_append_prefix_cyclic_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
@@ -453,23 +427,40 @@ __global__ void kv_cache_append_prefix_paged_kernel(
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(logical_pages) * table_rows[batch];
 
-    const int local         = static_cast<int>(threadIdx.x);
-    const int local_token   = local / UnitsPerToken;
-    const int unit_in_token = local - local_token * UnitsPerToken;
-    const int lane          = local & 31;
-    const int token         = static_cast<int>(blockIdx.x) * TokensPerBlock + local_token;
-    int position            = 0;
-    int physical_page       = 0;
-    if (lane == 0 && token < count) {
-        position      = positions[token];
-        physical_page = block_table[position >> 6];
-    }
-    position      = __shfl_sync(0xffffffffu, position, 0);
-    physical_page = __shfl_sync(0xffffffffu, physical_page, 0);
-    if (token < count) {
-        kv_cache_append_prefix_copy_paged_unit(k, v, cache_k, cache_v, token, unit_in_token,
-                                               position & (kKVCacheAppendPrefixPage - 1),
-                                               physical_page, physical_pages);
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    constexpr int TotalTasks    = TokensPerBlock * kKVCacheAppendPrefixHeads;
+    constexpr int WarpsPerBlock = 256 / 32;
+
+#pragma unroll
+    for (int task = warp; task < TotalTasks; task += WarpsPerBlock) {
+        const int token_in_block = task / kKVCacheAppendPrefixHeads;
+        const int kv_head        = task % kKVCacheAppendPrefixHeads;
+        const int token          = static_cast<int>(blockIdx.x) * TokensPerBlock + token_in_block;
+        int position             = 0;
+        int physical_page        = 0;
+        if (lane == 0 && token < count) {
+            position      = positions[token];
+            physical_page = block_table[position >> 6];
+        }
+        position      = __shfl_sync(0xffffffffu, position, 0);
+        physical_page = __shfl_sync(0xffffffffu, physical_page, 0);
+        if (token < count) {
+            const int page_offset = position & (kKVCacheAppendPrefixPage - 1);
+            const int d           = lane * 4;
+            const std::int64_t src =
+                static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
+                                                   (kv_head + kKVCacheAppendPrefixHeads * token);
+            const std::int64_t dst =
+                static_cast<std::int64_t>(d) +
+                static_cast<std::int64_t>(kKVCacheAppendPrefixHeadDim) *
+                    (page_offset + kKVCacheAppendPrefixPage * (physical_page + physical_pages * kv_head));
+
+            *reinterpret_cast<uint2*>(&cache_k[dst]) = *reinterpret_cast<const uint2*>(&k[src]);
+            const uint2 v_raw                        = *reinterpret_cast<const uint2*>(&v[src]);
+            *reinterpret_cast<uint2*>(&cache_v[dst]) =
+                make_uint2(bf16x2_bits_to_f16x2_bits(v_raw.x), bf16x2_bits_to_f16x2_bits(v_raw.y));
+        }
     }
 }
 

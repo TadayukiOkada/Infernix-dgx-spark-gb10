@@ -122,6 +122,10 @@ kv_cache_nvfp4_group16_targets(const float (&values)[16], float max_abs, int fir
     }
 }
 
+__device__ __forceinline__ int kv_cache_nvfp4_swizzle(int d) {
+    return (d & ~15) | ((d & 15) ^ ((d >> 4) & 15));
+}
+
 // Encodes the 16 groups of a D256 row held in `row` (FP32, shared or global) with a whole warp:
 // lanes 0-15 try the first three targets of group `lane`, lanes 16-31 the remaining ones of group
 // `lane - 16`, and the lower half keeps the better of the two (ties to the lower half, whose
@@ -136,7 +140,7 @@ kv_cache_nvfp4_quantize_group16_warp(const float* row, int lane) {
     float max_abs = 0.0F;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-        values[i] = row[group * kKVCacheNvfp4Group + i];
+        values[i] = row[kv_cache_nvfp4_swizzle(group * kKVCacheNvfp4Group + i)];
         max_abs   = fmaxf(max_abs, fabsf(values[i]));
     }
     KVCacheNvfp4QuantizedGroup16 best{};

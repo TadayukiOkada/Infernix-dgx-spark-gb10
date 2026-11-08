@@ -204,14 +204,14 @@ __device__ __forceinline__ float kv_cache_q4_encode_warp(KVCacheVqRowShared& row
 // Where an append row goes: its paged codes and scale, and its window slot or staging row (null
 // window pointers: none).
 struct KVCacheVqRowTarget {
-    const __nv_bfloat16* source  = nullptr;
-    int position                 = 0;
-    bool value                   = false;
-    std::uint8_t* codes          = nullptr;
-    __half* scale                = nullptr;
-    std::int8_t* window_codes    = nullptr;
-    __half* window_scales        = nullptr;
-    std::int32_t* window_tag     = nullptr;
+    const __nv_bfloat16* source;
+    int position;
+    bool value;
+    std::uint8_t* codes;
+    __half* scale;
+    std::int8_t* window_codes;
+    __half* window_scales;
+    std::int32_t* window_tag;
 };
 
 // One warp, after the row's codes are in row.code_words and each lane holds its word's sum(y * c):
@@ -394,6 +394,7 @@ __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_ke
     __shared__ KVCacheVqCodebookShared book;
     __shared__ KVCacheVqRowShared row;
     __shared__ KVCacheVqBlockShared block;
+    __shared__ KVCacheVqRowTarget target;
     // The attention that follows may launch beside this append: only its window CTAs read what
     // the append writes, and they wait for this grid (vq_kv_grouped_kernel).
     pdl::trigger_dependents();
@@ -407,10 +408,12 @@ __launch_bounds__(kKVCacheVqAppendThreads) __global__ void kv_cache_append_vq_ke
     kv_cache_vq2_stage_encoder_codebook_f32(book, static_cast<int>(threadIdx.x), static_cast<int>(blockDim.x));
     for (int item = static_cast<int>(blockIdx.x); item < items;
          item += static_cast<int>(gridDim.x)) {
-        const KVCacheVqRowTarget target =
-            kv_cache_append_vq_target<Geometry, Metadata, KeyCodec, Mode>(
+        if (threadIdx.x == 0) {
+            target = kv_cache_append_vq_target<Geometry, Metadata, KeyCodec, Mode>(
                 item, batch, tokens, k, v, positions, metadata, cache_k, cache_v, scale_k, scale_v,
                 window, width);
+        }
+        __syncthreads();
         kv_cache_vq_append_row_block<KeyCodec>(target, book, row, block);
         __syncthreads();
     }
@@ -486,6 +489,7 @@ __host__ __device__ constexpr int kv_cache_vq_split_pass_rows(int split) {
 struct KVCacheVqSplitShared {
     KVCacheVqCodebookShared book;
     KVCacheVqRowShared row[kKVCacheVqSplitSlots];
+    KVCacheVqRowTarget target[kKVCacheVqSplitSlots];
     float to_units[kKVCacheVqSplitSlots];
     std::uint8_t negative[kKVCacheVqSplitSlots][kKVCacheVq2Words];
     // Word ids (slot * 32 + word) of the even- and odd-parity lists, and their lengths.
@@ -667,7 +671,11 @@ __launch_bounds__(kKVCacheVqSplitThreads, 2) __global__ void kv_cache_append_vq_
 
         // 1. Rotate; finish Q4 key rows; list each VQ2 row's words by parity.
         for (int slot = warp; slot < rows; slot += kKVCacheVqSplitWarps) {
-            const KVCacheVqRowTarget target = target_of(base + slot);
+            if (lane == 0) {
+                s.target[slot] = target_of(base + slot);
+            }
+            __syncwarp();
+            const KVCacheVqRowTarget& target = s.target[slot];
             KVCacheVqRowShared& row         = s.row[slot];
             kv_cache_vq_rotate_row(target.source, row, lane);
             __syncwarp();
@@ -743,7 +751,7 @@ __launch_bounds__(kKVCacheVqSplitThreads, 2) __global__ void kv_cache_append_vq_
         // next pass's lists may start here.
         if (thread < 2) s.count[thread] = 0;
         for (int slot = warp; slot < rows; slot += kKVCacheVqSplitWarps) {
-            const KVCacheVqRowTarget target = target_of(base + slot);
+            const KVCacheVqRowTarget& target = s.target[slot];
             if (KeyCodec == KVCacheVqKeyCodec::Q4 && !target.value) continue;
             KVCacheVqRowShared& row = s.row[slot];
             const float sigma       = sqrtf(row.sum_square * (1.0f / 256.0f));

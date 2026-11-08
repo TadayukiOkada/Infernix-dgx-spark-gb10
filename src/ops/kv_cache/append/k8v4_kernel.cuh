@@ -55,7 +55,7 @@ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
     }
     normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
-    for (int r = 0; r < 8; ++r) scratch[lane + 32 * r] = values[r];
+    for (int r = 0; r < 8; ++r) scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = values[r];
     __syncwarp();
     const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
     if (lane < kKVCacheNvfp4Groups) {

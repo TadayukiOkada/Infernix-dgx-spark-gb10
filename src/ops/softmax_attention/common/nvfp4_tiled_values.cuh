@@ -50,15 +50,22 @@ struct Nvfp4G16TiledValues {
     // Eight values as E4M3 bytes: exact FP16 products (as expand) rounded once to E4M3.
     __device__ __forceinline__ static uint2 expand_e4m3(const std::uint8_t* codes, Scale scale,
                                                         __half mul) {
-        const int4 h    = expand(codes, scale, mul);
-        const auto pair = [](int bits) {
-            __half2_raw raw;
-            raw.x = static_cast<unsigned short>(static_cast<unsigned>(bits) & 0xFFFFU);
-            raw.y = static_cast<unsigned short>(static_cast<unsigned>(bits) >> 16);
-            return static_cast<unsigned>(
-                __nv_cvt_halfraw2_to_fp8x2(raw, __NV_SATFINITE, __NV_E4M3));
-        };
-        return make_uint2(pair(h.x) | (pair(h.y) << 16), pair(h.z) | (pair(h.w) << 16));
+        const std::uint32_t packed = load_vec<std::uint32_t>(codes);
+        __nv_fp8_e4m3 encoded_scale;
+        encoded_scale.__x    = scale;
+        const __half value   = __hmul(static_cast<__half>(encoded_scale), mul);
+        const __half2 scale2 = __halves2half2(value, value);
+        unsigned p[4];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            __nv_fp4x2_e2m1 encoded;
+            encoded.__x     = static_cast<std::uint8_t>(packed >> (8 * pair));
+            const __half2 v = __hmul2(static_cast<__half2>(encoded), scale2);
+            p[pair] = static_cast<unsigned>(
+                __nv_cvt_halfraw2_to_fp8x2(*reinterpret_cast<const __half2_raw*>(&v),
+                                           __NV_SATFINITE, __NV_E4M3));
+        }
+        return make_uint2(p[0] | (p[1] << 16), p[2] | (p[3] << 16));
     }
 
     // `mul` is the tile's exact power-of-two shift (at least 1/4): every E2M1 code times a

@@ -161,7 +161,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             }
             normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
-            for (int r = 0; r < 8; ++r) append_scratch[warp * D + lane + 32 * r] = values[r];
+            for (int r = 0; r < 8; ++r)
+                append_scratch[warp * D + kv_cache_nvfp4_swizzle(lane + 32 * r)] = values[r];
             __syncwarp();
             const auto quantized =
                 kv_cache_nvfp4_quantize_group16_warp(append_scratch + warp * D, lane);
