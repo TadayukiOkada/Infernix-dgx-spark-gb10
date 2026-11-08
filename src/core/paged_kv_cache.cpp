@@ -52,6 +52,18 @@ void increment_generation(std::uint32_t& generation) noexcept {
     if (generation == 0) { ++generation; }
 }
 
+// Largest source or destination pitch cudaMemcpy2DAsync accepts on the current device.
+std::size_t device_max_copy_pitch() {
+    static const std::size_t cached_pitch = [] {
+        int device = 0;
+        int pitch  = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&pitch, cudaDevAttrMaxPitch, device));
+        return static_cast<std::size_t>(pitch);
+    }();
+    return cached_pitch;
+}
+
 } // namespace
 
 PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cache) {
@@ -272,12 +284,8 @@ void DeviceKVPagePool::set_backed_pages(std::uint32_t pages) {
 void DeviceKVPagePool::initialize_host_transfer_plan() {
     const HostKVPageLayout host = plan_host_kv_page_layout(geometry());
     host_page_stride_           = host.page_stride;
-    int device                  = 0;
-    int maximum_pitch           = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&maximum_pitch, cudaDevAttrMaxPitch, device));
-    const auto pitch_limit = static_cast<std::size_t>(maximum_pitch);
-    const bool page_major  = geometry().device_plane_order == PagedKVPlaneOrder::PageMajor;
+    const auto pitch_limit      = device_max_copy_pitch();
+    const bool page_major       = geometry().device_plane_order == PagedKVPlaneOrder::PageMajor;
     std::size_t maximum_short_dimension = 1;
     host_transfer_planes_.reserve(planes_.size());
     for (std::size_t index = 0; index < planes_.size(); ++index) {
@@ -879,15 +887,6 @@ std::size_t DeviceKVPagePool::host_record_run_end(std::span<const DeviceKVPageHa
 }
 
 namespace {
-
-// Largest source or destination pitch cudaMemcpy2DAsync accepts on the current device.
-std::size_t device_max_copy_pitch() {
-    int device = 0;
-    int pitch  = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&pitch, cudaDevAttrMaxPitch, device));
-    return static_cast<std::size_t>(pitch);
-}
 
 void validate_record_groups(std::span<const std::uint32_t> groups, std::size_t records,
                             const char* op) {
