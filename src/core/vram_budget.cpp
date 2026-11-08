@@ -28,16 +28,20 @@ std::function<VramSnapshot()>& fake_source() {
 // NVML through the driver's library, loaded at runtime so its absence never stops startup.
 class Nvml {
 public:
-    explicit Nvml(const cudaDeviceProp& props) {
+    explicit Nvml(const cudaDeviceProp& props, int cuda_device = 0) {
         library_ = ::dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
         if (library_ == nullptr) { return; }
         const auto symbol = [&](const char* name) { return ::dlsym(library_, name); };
         init_         = reinterpret_cast<int (*)()>(symbol("nvmlInit_v2"));
         shutdown_     = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
         by_pci_       = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
+        by_index_     = reinterpret_cast<int (*)(unsigned, void**)>(symbol("nvmlDeviceGetHandleByIndex_v2"));
+        if (by_index_ == nullptr) {
+            by_index_ = reinterpret_cast<int (*)(unsigned, void**)>(symbol("nvmlDeviceGetHandleByIndex"));
+        }
         display_      = reinterpret_cast<int (*)(void*, int*)>(symbol("nvmlDeviceGetDisplayActive"));
         memory_       = reinterpret_cast<int (*)(void*, MemoryV2*)>(symbol("nvmlDeviceGetMemoryInfo_v2"));
-        if (init_ == nullptr || shutdown_ == nullptr || by_pci_ == nullptr || display_ == nullptr ||
+        if (init_ == nullptr || shutdown_ == nullptr || (by_pci_ == nullptr && by_index_ == nullptr) || display_ == nullptr ||
             init_() != 0) {
             release();
             return;
@@ -45,7 +49,15 @@ public:
         initialized_ = true;
         char bus[32];
         std::snprintf(bus, sizeof(bus), "%08x:%02x:%02x.0", props.pciDomainID, props.pciBusID, props.pciDeviceID);
-        if (by_pci_(bus, &device_) != 0) { device_ = nullptr; }
+        if (by_pci_ == nullptr || by_pci_(bus, &device_) != 0 || device_ == nullptr) {
+            if (by_index_ != nullptr) {
+                if (by_index_(static_cast<unsigned>(cuda_device), &device_) != 0) {
+                    device_ = nullptr;
+                }
+            } else {
+                device_ = nullptr;
+            }
+        }
     }
 
     ~Nvml() { release(); }
@@ -88,6 +100,7 @@ private:
     int (*init_)()                         = nullptr;
     int (*shutdown_)()                     = nullptr;
     int (*by_pci_)(const char*, void**)    = nullptr;
+    int (*by_index_)(unsigned, void**)     = nullptr;
     int (*display_)(void*, int*)           = nullptr;
     int (*memory_)(void*, MemoryV2*)       = nullptr;
     void* device_                          = nullptr;
@@ -100,7 +113,7 @@ public:
         if (cudaGetDeviceProperties(&props_, device) != cudaSuccess) {
             throw std::runtime_error("VRAM budget: cannot read the device's properties");
         }
-        nvml_ = std::make_unique<Nvml>(props_);
+        nvml_ = std::make_unique<Nvml>(props_, device);
     }
 
     ~DeviceSource() override = default;

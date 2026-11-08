@@ -50,6 +50,7 @@ struct GpuTelemetry::Library {
     int (*init)()                                          = nullptr;
     int (*shutdown)()                                      = nullptr;
     int (*by_pci)(const char*, void**)                     = nullptr;
+    int (*by_index)(unsigned, void**)                      = nullptr;
     int (*clock)(void*, unsigned, unsigned*)               = nullptr;
     int (*power)(void*, unsigned*)                         = nullptr;
     int (*energy)(void*, unsigned long long*)              = nullptr;
@@ -78,6 +79,10 @@ struct GpuTelemetry::Library {
         init        = reinterpret_cast<int (*)()>(symbol("nvmlInit_v2"));
         shutdown    = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
         by_pci      = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
+        by_index    = reinterpret_cast<int (*)(unsigned, void**)>(symbol("nvmlDeviceGetHandleByIndex_v2"));
+        if (by_index == nullptr) {
+            by_index = reinterpret_cast<int (*)(unsigned, void**)>(symbol("nvmlDeviceGetHandleByIndex"));
+        }
         clock       = reinterpret_cast<int (*)(void*, unsigned, unsigned*)>(symbol("nvmlDeviceGetClockInfo"));
         power       = reinterpret_cast<int (*)(void*, unsigned*)>(symbol("nvmlDeviceGetPowerUsage"));
         energy      = reinterpret_cast<int (*)(void*, unsigned long long*)>(symbol("nvmlDeviceGetTotalEnergyConsumption"));
@@ -96,14 +101,22 @@ struct GpuTelemetry::Library {
             reasons = reinterpret_cast<int (*)(void*, unsigned long long*)>(
                 symbol("nvmlDeviceGetCurrentClocksThrottleReasons"));
         }
-        if (init == nullptr || shutdown == nullptr || by_pci == nullptr || init() != 0) {
+        if (init == nullptr || shutdown == nullptr || (by_pci == nullptr && by_index == nullptr) || init() != 0) {
             release();
             return;
         }
         initialized = true;
         char bus[32];
         std::snprintf(bus, sizeof(bus), "%08x:%02x:%02x.0", props.pciDomainID, props.pciBusID, props.pciDeviceID);
-        if (by_pci(bus, &device) != 0) { device = nullptr; }
+        if (by_pci == nullptr || by_pci(bus, &device) != 0 || device == nullptr) {
+            if (by_index != nullptr) {
+                if (by_index(static_cast<unsigned>(cuda_device), &device) != 0) {
+                    device = nullptr;
+                }
+            } else {
+                device = nullptr;
+            }
+        }
     }
 
     ~Library() { release(); }
