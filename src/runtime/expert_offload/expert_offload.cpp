@@ -606,9 +606,12 @@ void ExpertOffload::measure_cpu_rate_settled() {
     int readings        = 1;
     const bool measured = measure_cpu_rate();
     if (measured) {
+        const bool integrated = vram_ != nullptr && vram_->query().integrated;
+        const auto settle_time = integrated ? std::chrono::milliseconds{200} : std::chrono::duration_cast<std::chrono::milliseconds>(kRateSettle);
+        const int max_readings = integrated ? 2 : kRateSettleReadings;
         double best_experts = cpu_expert_rate_, best_columns = cpu_column_rate_;
-        while (readings < kRateSettleReadings) {
-            std::this_thread::sleep_for(kRateSettle);
+        while (readings < max_readings) {
+            std::this_thread::sleep_for(settle_time);
             (void)measure_cpu_rate();
             ++readings;
             const bool improved = cpu_expert_rate_ > best_experts * (1.0 + kRateSettleGain);
