@@ -200,3 +200,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 26. **Commit `990d280c8` (`fix(runtime): enforce 512 MiB minimum KV headroom for integrated SoC`):**
     - Enforced a safe minimum default headroom of 512 MiB (`device.props.integrated != 0 ? (512ULL * 1024ULL * 1024ULL) : kDefaultKvCapacityHeadroomBytes`) in `src/runtime/engine/model_instance.cpp:710` on integrated systems (GB10 UMA) instead of 0 bytes, protecting against dynamic activation allocations or host memory spikes.
     - Validation: `infernix_kv_capacity_test` passed; `infernix_cuda_stack_check` passed (1.46s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,189 ms).
+
+27. **Commit `688122732` (`perf(runtime): right-size auto host prefix-cache tier floor on integrated UMA with device MoE`):**
+    - Right-sized `tier_floor` on integrated UMA when device MoE is active (`device_experts = true`) in `src/runtime/engine/qwen4_exp_instance.cpp:431` to `kMinAutoHostContextBytes` (1 GiB) instead of `kDefaultHybridHostCacheBytes` (8 GiB), matching `auto_host_context_bytes` and allowing n-gram tables to stay resident in RAM without requiring an unnecessary 8 GiB floor.
+    - Validation: `infernix_cuda_stack_check` passed (1.48s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).

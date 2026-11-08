@@ -133,10 +133,11 @@
 
 ### Work Package 3: Tier 3 - GB10 UMA Memory Sizing, PCIe Bypass & Grid Sizing
 
-#### Task 3.1: Right-Size / Bypass 8 GiB Pinned Host Cache on Integrated UMA in [`src/runtime/engine/model_instance.cpp`](file:///opt/etc/Infernix/src/runtime/engine/model_instance.cpp)
-- **Problem**: On GB10 UMA, allocating an 8 GiB pinned host cache wastes 8 GiB of the shared 128 GiB physical LPDDR5X pool. Moving pages between "host" and "device" transfers across the same memory bus.
-- **Action**: When `props.integrated != 0` and device MoE is active, reduce host cache allocation to minimal staging or bypass host KV copy staging.
-- **Verification**: Run `infernix-serve` on large models; observe available device VRAM increase.
+#### Task 3.1: Right-Size Auto Host Prefix-Cache Tier Floor on Integrated UMA in [`src/runtime/engine/qwen4_exp_instance.cpp`](file:///opt/etc/Infernix/src/runtime/engine/qwen4_exp_instance.cpp) [COMPLETED]
+- **Problem**: In `qwen4_exp_instance.cpp:431`, `tier_floor` was set to `kDefaultHybridHostCacheBytes` (8 GiB) on integrated GPUs, enforcing that the n-gram table could only reside in RAM if at least 8 GiB remained for the host prefix cache, even though `auto_host_context_bytes` requires only 1 GiB (`kMinAutoHostContextBytes`) as its floor and all experts are already resident on device (`device_experts = true`). This artificially starved RAM and evicted n-gram tables to disk.
+- **Action**: Right-sized `tier_floor` on integrated UMA when device MoE is active (`device_experts = true`) to `kMinAutoHostContextBytes` (1 GiB), matching `auto_host_context_bytes` and allowing n-gram tables to stay resident in RAM without requiring an unnecessary 8 GiB floor.
+- **Commit**: `688122732` (`perf(runtime): right-size auto host prefix-cache tier floor on integrated UMA with device MoE`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.48s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,188 ms).
 
 #### Task 3.2: Fix Headroom Calculation for Integrated SoC in [`src/runtime/engine/model_instance.cpp`](file:///opt/etc/Infernix/src/runtime/engine/model_instance.cpp) [COMPLETED]
 - **Problem**: Line 710 set `default_headroom = 0ULL` on integrated GPUs. If host memory allocations or dynamic scratch buffers occurred subsequently, high concurrency or activation spikes risked out-of-memory errors on the shared physical pool.
