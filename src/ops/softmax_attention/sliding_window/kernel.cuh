@@ -72,7 +72,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__ void sliding_window_attentio
     pdl::enter();
     const int length =
         positions[static_cast<std::int64_t>(Tokens) * static_cast<int>(blockIdx.z)];
-    context_query_reduce_body<float, Tokens, KeyBlock, WarpsPerBlock, kContextQueryMaxSplit>(
+    context_query_reduce_body<float, Tokens, KeyBlock, WarpsPerBlock, 32>(
         partial_acc, partial_m, partial_l, length, min(length, window_mask), valid_columns,
         max_context, split_capacity, out);
 }

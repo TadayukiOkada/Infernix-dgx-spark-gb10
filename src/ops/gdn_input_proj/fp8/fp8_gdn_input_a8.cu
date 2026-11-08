@@ -101,7 +101,11 @@ void launch_a8_schedule(Fp8GdnInputScheduleId schedule, const Tensor& x, const W
 } // namespace
 
 std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens) {
-    return max_tokens > 256 ? Bulk::kPartialBytes : 0;
+    // No production route in kRoutes reaches a split-K schedule on GB10 (all three bands use plain
+    // MMA/TMA tiles), so production needs no partial plane. Candidates reserve their own partials
+    // via fp8_gdn_input_candidate_partial_capacity_bytes().
+    (void)max_tokens;
+    return 0;
 }
 
 std::size_t fp8_gdn_input_candidate_partial_capacity_bytes() {
@@ -163,11 +167,12 @@ void fp8_gdn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Ten
         launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(
             fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream);
     };
-    // 32x128 tiles at 65-96 run 87-91 against 91-99 us for 64x64 (RTX 5090).
+    // GB10 (sm_121a, 48 SMs): 32x64 up to 32, 64x64 up to 64, and 64x128 above 64 (128 row tiles =
+    // 2.67 waves per token tile on 48 SMs, avoiding the 170-SM 65..96 32x128 detour that re-reads
+    // the 80 MiB weight matrix 3x instead of 2x).
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 32) return launch.template operator()<Fp8A8ResidualT32R64>();
     if (tokens <= 64) return launch.template operator()<Fp8A8ResidualT64R64>();
-    if (tokens <= 96) return launch.template operator()<Fp8A8ResidualT32R128>();
     launch.template operator()<Fp8A8ResidualT64R128>();
 }
 

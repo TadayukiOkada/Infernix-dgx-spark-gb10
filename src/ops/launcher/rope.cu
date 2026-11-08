@@ -16,7 +16,7 @@ constexpr int kLargeBlock               = 256;
 constexpr int kFullChunkBlock           = 192;
 constexpr int kSmallBlock               = 128;
 constexpr int kDefaultChunkTargetTokens = 1024;
-// Qualified residency of this 256-thread instance on the sm_120a target.
+// Qualified residency of this 256-thread instance on the sm_121a (GB10, 1536 threads/SM) target.
 constexpr int kLargeBlockResidentCtasPerSm = 6;
 
 template <RopeKernelMode Mode>
@@ -97,7 +97,7 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
         const int tokens = positions.ne[0];
         if (tokens <= 16) {
             launch_dflash_split<5, 32, 8>(positions, &q, &k, stream, coefficients);
-        } else if (tokens <= 400) {
+        } else if (tokens <= 128) {
             launch_dflash_split<8, 32, 8>(positions, &q, &k, stream, coefficients);
         } else {
             launch_fixed_block<RopeKernelMode::DflashText1D, 32, 8>(positions, &q, &k, 160,

@@ -1,12 +1,9 @@
+// GB10 (sm_121a, 48 SMs): Qwen3.8-Flash-Next GDN beta/alpha projection [48, 2560].
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"
 
 namespace infernix::ops::detail {
 namespace {
-using S0 = Bf16ScheduleInstance<
-    Bf16A16GemvSchedule<4, 2, 1, 8, 4, Bf16ActivationAccess::Direct, Bf16WeightCache::Default,
-                        Bf16PhaseOrder::Sequential, 1, 1, 4, 2>,
-    2560>;
 using S1 = Bf16ScheduleInstance<
     Bf16A16SimtSchedule<4, 2, 1, 8, 4, 2, Bf16SimtActivationAccess::WarpPacked,
                         Bf16WeightCache::Default, Bf16PhaseOrder::Sequential, 1, 4, 1, 2, 2>,

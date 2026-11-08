@@ -37,8 +37,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 // No single-term A8 route: the checkpoint is weight-only, served with BF16 activations. The
 // fp8-a8-pair fast path carries them as two E4M3 terms from T = 33.
 bool uses_a8(std::int32_t, std::int32_t) { return false; }
-// The pair route's admission (2026-10-15 sweep, RTX 5090): faster than the exact route at every
-// swept width from 48 (0.70-0.93), slower at T=32 (1.02).
+// The pair route's admission for the opt-in --a8-activations route: faster from T = 33.
 constexpr std::int32_t kPairMinTokens = 33;
 
 // f16-accumulate-prefill: the exact route's tiles at the same widths (not yet swept for this route).

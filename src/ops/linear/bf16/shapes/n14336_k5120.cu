@@ -1,3 +1,4 @@
+// GB10 (sm_121a, 48 SMs): Qwen3.5 attention input projection [14336, 5120].
 #include "ops/linear/bf16/bf16_instances.cuh"
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"

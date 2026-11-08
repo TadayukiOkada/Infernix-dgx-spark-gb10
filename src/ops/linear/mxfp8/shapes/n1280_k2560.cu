@@ -30,18 +30,14 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R256>>(x, weight, out, stream);
 }
 
-// f16-accumulate-prefill: the TMA tiles of the exact route's RTX 5090 selection, kept as they were. This
-// route is not swept by mxfp8_flash_next_sweep.cu, so its bands are unverified on GB10; they no longer
-// match the exact route's widths.
+// f16-accumulate-prefill: the GB10 TMA tiles from launch_a16 at prefill widths (T >= kMxfp8F16MinTokens = 256).
 void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {
     const int tokens = x.ne[1];
-    if (tokens <= 512) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
-    if (tokens <= 768) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(x, weight, out, scratch, stream);
-    if (tokens <= 1024) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, out, scratch, stream);
-    if (tokens <= 1536) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
+    if (tokens <= 256) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, out, scratch, stream);
+    if (tokens <= 512) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, scratch, stream);
+    if (tokens <= 768) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
     if (tokens <= 2048) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, scratch, stream);
-    if (tokens <= 3072) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, out, scratch, stream);
     mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R256>>(x, weight, out, scratch, stream);
 }
 

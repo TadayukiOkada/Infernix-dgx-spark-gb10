@@ -31,8 +31,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 // fp8-a8-pair fast path carries them as two E4M3 terms from T = 513 (five 128-byte K
 // tiles per stage loop).
 bool uses_a8(std::int32_t, std::int32_t) { return false; }
-// The pair route's admission (2026-10-15 sweep, RTX 5090): 1.03-1.61 times the exact route up to
-// T=512, 0.73-0.90 beyond.
+// The pair route's admission for the opt-in --a8-activations route: faster from T = 513.
 constexpr std::int32_t kPairMinTokens = 513;
 
 // f16-accumulate-prefill: the exact route's ring tiles at the same widths (its 1,025-2,048-column

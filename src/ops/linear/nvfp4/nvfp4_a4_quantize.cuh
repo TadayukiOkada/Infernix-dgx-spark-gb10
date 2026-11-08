@@ -169,8 +169,10 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
 
     pdl::enter();
     const int total_blocks = static_cast<int>(gridDim.x);
-    const int token = total_blocks > 1024 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
-                                          : static_cast<int>(blockIdx.x);
+    // GB10 (24 MiB L2, 1/4 of RTX 5090's 96 MiB L2): reverse CTA order past 256 tokens so the
+    // last-executing CTAs leave token 0's quantized plane hot in L2 for the first TMA consumer band.
+    const int token = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
+                                         : static_cast<int>(blockIdx.x);
     const int tid   = static_cast<int>(threadIdx.x);
     if (token >= tokens) {
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {

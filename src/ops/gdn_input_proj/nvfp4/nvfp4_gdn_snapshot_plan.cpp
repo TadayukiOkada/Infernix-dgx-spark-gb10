@@ -49,7 +49,10 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=64");
     }
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
-    if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
+    // GB10 (sm_121a, 48 SMs): match nvfp4_gdn_input_plan.cpp's T <= 16 A16 hand-over so the fused
+    // A16 projection + conv snapshot path covers the full small-T decode/speculative verification
+    // domain (T = 2..16) without allocating the materialized 10240xT workspace or A4 quantizer.
+    if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     return {Nvfp4GdnConvScheduleId::Materialized};
 }
 

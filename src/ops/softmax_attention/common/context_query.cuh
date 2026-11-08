@@ -17,7 +17,9 @@ inline constexpr int kContextQueryHeadDim  = 128;
 inline constexpr int kContextQueryQHeads   = 32;
 inline constexpr int kContextQueryKVHeads  = 8;
 inline constexpr int kContextQueryGroup    = 4;
-inline constexpr int kContextQueryMaxSplit = 85;
+// Maximum split-KV partitions for context attention (capped at 64 in dense/context/launch.cu;
+// replaces the 85 = 170/2 RTX 5090 SM constant).
+inline constexpr int kContextQueryMaxSplit = 64;
 // One warp merges one (query head, token) row, so a reduce CTA runs this many rows.
 inline constexpr int kContextQueryReduceWarps = 4;
 

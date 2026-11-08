@@ -19,16 +19,16 @@ constexpr std::int32_t kFullPhysicalRows      = 248320;
 constexpr std::int32_t kFullValidRows         = 248077;
 constexpr std::int32_t kShortlistRows         = 131072;
 constexpr std::int32_t kSmallAggregateColumns = 8;
-constexpr int kFullAggregateBlock             = 128;
+constexpr int kFullAggregateBlock             = 256;
 constexpr int kShortlistAggregateBlock        = 256;
 
 int tiled_block_for(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t_count) {
+    if (physical_rows == kShortlistRows && valid_rows == kShortlistRows) {
+        return kShortlistAggregateBlock;
+    }
     if (t_count <= kSmallAggregateColumns) { return kArgmaxBlock; }
     if (physical_rows == kFullPhysicalRows && valid_rows == kFullValidRows) {
         return kFullAggregateBlock;
-    }
-    if (physical_rows == kShortlistRows && valid_rows == kShortlistRows) {
-        return kShortlistAggregateBlock;
     }
     return kArgmaxBlock;
 }

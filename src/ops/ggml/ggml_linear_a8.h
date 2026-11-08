@@ -29,8 +29,9 @@ inline constexpr std::int32_t kA8MaxColumns = 31;
 inline constexpr std::int32_t kA8WideMinColumns = 128;
 // Columns the wide route encodes at once (a call of more runs its tiles batch by batch over the same planes).
 inline constexpr std::int32_t kA8WideBatchColumns = 2048;
-// Workspace of the wide route's decoded planes (the exact and BF16 wide routes' kPlaneBytes).
-inline constexpr std::size_t kA8WidePlaneBytes = 64ULL << 20;
+// Workspace of the wide route's decoded planes (the exact and BF16 wide routes' kPlaneBytes,
+// right-sized to 16 MiB for GB10's 24 MiB L2 cache).
+inline constexpr std::size_t kA8WidePlaneBytes = 16ULL << 20;
 
 // ggml_linear's arguments, already validated by it (shapes, formats, layouts, outputs, permutation). Each
 // column of x (input element j at x[perm(j)]) is encoded once by ops/ggml/ggml_a8.h's codec into

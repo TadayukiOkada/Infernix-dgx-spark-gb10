@@ -116,11 +116,11 @@ void fp8_attn_input_a8_residual_launch(const Tensor& x, const Weight& weight, Te
             fp8_a8_operands(weight, workspace, x.ne[1]), output, LinearIdentityEpilogue{}, stream,
             {}, pdl::Dependency::Programmatic);
     };
-    // 32-token tiles to 32 columns, 32x128 tiles at 65-104 (58-62 against 78-83 us for 32x64 at
-    // 65-96, 89-91 against 105 for 64x128 at 97-104), and 64x128 tiles otherwise (RTX 5090).
+    // GB10 (sm_121a, 48 SMs): 32-token tiles up to 32 columns, and 64x128 tiles above 32
+    // (112 row tiles = 2.33 waves per token tile on 48 SMs, avoiding the 170-SM 65..104 32x128
+    // detour that re-reads the 70 MiB weight matrix 3x instead of 2x).
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 32) return launch.template operator()<Fp8A8ResidualT32R64>();
-    if (tokens > 64 && tokens <= 104) return launch.template operator()<Fp8A8ResidualT32R128>();
     launch.template operator()<Fp8A8ResidualT64R128>();
 }
 

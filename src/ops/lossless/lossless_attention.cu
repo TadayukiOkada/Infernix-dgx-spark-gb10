@@ -66,7 +66,7 @@ constexpr int kScoreShift = 272;   // q k 2^-4 = M_q M_k 2^(e_q + e_k - 272)
 constexpr int kNonFinite  = -1;    // kmax marker: the key column's k or v holds an Inf or NaN
 constexpr std::uint16_t kNaN = 0x7FC0U;
 constexpr int kPage         = 64;  // paged cache: positions per page (kPagedKVPageSize)
-constexpr int kTargetCtas   = 384; // key ranges split until a call has about this many CTAs
+constexpr int kTargetCtas   = 144; // GB10 (48 SMs): 3 waves of 48 SMs (replaces 384 for 170-SM RTX 5090)
 constexpr int kMinSplitKeys = 256; // ... of at least this many keys each
 constexpr int kMaximaKeys   = 64;  // keys per warp item of the maxima kernel
 // kMaxima: pass A over the CTA's key range, its partial maximum stored (launched with only pass A's shared

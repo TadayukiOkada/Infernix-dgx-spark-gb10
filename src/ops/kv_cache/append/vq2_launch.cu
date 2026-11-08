@@ -46,21 +46,12 @@ std::atomic<int>& forced_split() {
     return value;
 }
 
-// The split encoder's pattern ranges. From 512 to 8,192 rows the fastest measured (append bench, both
-// geometries, 2026-10-24, RTX 5090; time against the v1 kernels): Q4 keys 8 to 1,024 rows (0.51-0.61x), 4 to 2,048
-// (0.92-0.93x; the rule below took 8 there, 1.08x), then 2 (0.85-0.89x); VQ2 keys 4 to 512 rows (0.61x), then 2
-// (0.58-0.90x; the rule took 0.69-0.95x). Outside that range: the fewest whose passes give every SM two CTAs, else 8.
+// The split encoder's pattern ranges on GB10 (48 SMs): pick the fewest pattern splits whose passes
+// give every SM at least two CTAs (2 * multiprocessors = 96 CTAs on GB10), else 8.
 template <KVCacheVqKeyCodec Codec>
 int vq_append_split(int rows, int forced, int multiprocessors) {
     constexpr int least = Codec == KVCacheVqKeyCodec::Q4 ? 2 : 1;
     if (forced != 0) return std::max(forced, least);
-    if (rows >= 512 && rows <= 8192) {
-        if constexpr (Codec == KVCacheVqKeyCodec::Q4) {
-            return rows <= 1024 ? 8 : rows <= 2048 ? 4 : 2;
-        } else {
-            return rows <= 512 ? 4 : 2;
-        }
-    }
     for (int split = least; split < 8; split *= 2) {
         const int pass_rows = kv_cache_vq_split_pass_rows<Codec>(split);
         if ((rows + pass_rows - 1) / pass_rows >= 2 * multiprocessors) return split;

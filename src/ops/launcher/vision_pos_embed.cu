@@ -12,7 +12,9 @@ namespace infernix::ops::detail {
 namespace {
 
 constexpr int kD1152Pairs         = 1152 / 2;
-constexpr int kSmallPTargetBlocks = 4096;
+// GB10 (48 SMs): 24 warps/SM * 48 SMs = 1152 target single-warp blocks; switch to 128-thread
+// patch-per-CTA blocks at 6 CTAs/SM * 48 SMs = 288 patches.
+constexpr int kSmallPTargetBlocks = 1152;
 constexpr int kWarpPairs          = 32;
 
 int small_p_tiles(int patches) {
@@ -30,7 +32,7 @@ void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, con
         ((reinterpret_cast<std::uintptr_t>(table.data) | reinterpret_cast<std::uintptr_t>(x.data)) &
          0x3u) == 0;
     if (paired) {
-        if (x.ne[1] < 1024) {
+        if (x.ne[1] < 288) {
             const int tiles     = small_p_tiles(x.ne[1]);
             const unsigned grid = static_cast<unsigned>(x.ne[1] * tiles);
             vision_pos_embed_add_d1152_warp_kernel<<<grid, 32, 0, stream>>>(

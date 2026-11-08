@@ -247,12 +247,10 @@ struct ResidualTerms {
 
 // GGUF banks' kGgmlBf16 route (ggml_expert.cuh): calls of at least kGgmlStageDecodeMinColumns columns
 // run their wide jobs on the BF16 stage-decode tiles (each K stage's GGUF codes decoded into shared
-// memory; no workspace of their own), narrower calls on the exact tiles. RTX 5090, IQ3_S prefill
-// against the exact tiles below 14,336 columns and the decoded BF16 planes (removed 2026-10-28) from
-// there: pp512 +5.6 %, pp2048 +4.8 %, pp4096 1.13x, pp8192 +11.6 %, pp12288 +26.7 %, pp16384 +14.6 %,
-// pp32768 and pp65536 +9.1 % (pp1024 +1.8 %, two of three pairs; design §19.3.29). Narrower calls were
-// not timed.
-inline constexpr int kGgmlStageDecodeMinColumns = 512;
+// memory; no workspace of their own), narrower calls on the exact tiles. On GB10 (sm_121a), BF16
+// Tensor Cores have 1:1 FP32 accumulation throughput parity (124.7 TFLOP/s), matching
+// ggml_linear.cu's kBf16WideMinColumns = 128.
+inline constexpr int kGgmlStageDecodeMinColumns = 128;
 
 // The layout of moe_experts' workspace, the single place that defines it. The bookkeeping comes
 // first, so its offsets depend only on max_jobs and entries; the activation planes follow.

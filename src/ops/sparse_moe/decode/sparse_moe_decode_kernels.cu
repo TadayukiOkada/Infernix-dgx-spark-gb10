@@ -29,8 +29,10 @@ constexpr int kRouterRows       = kExperts + 1;
 constexpr int kTopK             = 8;
 constexpr int kIntermediate     = 512;
 constexpr int kD1Warps          = kSparseMoeRouterWarps;
-constexpr int kAdaptiveD3Blocks = 5 * kIntermediate;
-constexpr int kAdaptiveD4Blocks = 5 * (kHidden / 4);
+// GB10 (sm_121a, 48 SMs): 16 waves of 48 SMs (768 CTAs) instead of RTX 5090's 2560 CTAs, cutting
+// empty-CTA wave launch overhead by 3.33x when the prefill adaptive route stays on expert GEMM.
+constexpr int kAdaptiveD3Blocks = 16 * 48;
+constexpr int kAdaptiveD4Blocks = 16 * 48;
 static_assert(kSparseMoeRouterHidden == kHidden);
 
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,

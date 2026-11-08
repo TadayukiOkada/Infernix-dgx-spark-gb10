@@ -39,7 +39,9 @@ constexpr int kTileMinColumns = 32;
 // (861.0 against 1037.2), so it starts at its tile width rather than at the exact route's.
 constexpr int kBf16WideMinColumns = 128;
 constexpr int kEncodeColumns  = 2048;
-constexpr std::size_t kPlaneBytes = 64ULL << 20;
+// GB10 (24 MiB L2): 16 MiB decoded weight plane keeps each pass's plane L2-resident alongside the
+// encoded activation while reducing workspace by 48 MiB compared to the 64 MiB RTX 5090 setting.
+constexpr std::size_t kPlaneBytes = 16ULL << 20;
 
 // Encodes one column with the whole CTA (Threads threads): its exponent (returned to every thread),
 // then its limbs and slice sums into `column`. `warp_key` and `broadcast` are shared scratch.

@@ -42,14 +42,13 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     select(mxfp8_operands(x, weight), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, stream);
 }
 
-// f16-accumulate-prefill: the TMA tiles of the exact route's RTX 5090 selection, kept as they were. This
-// route is not swept by mxfp8_flash_next_sweep.cu, so its bands are unverified on GB10; they no longer
-// match the exact route's widths.
+// f16-accumulate-prefill: the GB10 tiles from select at prefill widths (T >= kMxfp8F16MinTokens = 256).
 template <class Output>
 void select_f16(const Tensor& x, const Weight& weight, Output output, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {
-    if (x.ne[1] <= 3072) return mxfp8_f16acc<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(x, weight, output, scratch, stream);
-    mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, output, scratch, stream);
+    if (x.ne[1] <= 3072) return mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, output, scratch, stream);
+    if (x.ne[1] <= 4096) return mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R256>>(x, weight, output, scratch, stream);
+    mxfp8_f16acc<Geometry, Mxfp8P4<Mxfp8TmaT64R256>>(x, weight, output, scratch, stream);
 }
 
 void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,

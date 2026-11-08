@@ -74,7 +74,7 @@ void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor&
     const std::int32_t T = ids.ne[0];
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
-    if (route == Q8EmbedRoute::Auto) { route = T <= 6 ? Q8EmbedRoute::Grouped : Q8EmbedRoute::Row; }
+    if (route == Q8EmbedRoute::Auto) { route = T <= 24 ? Q8EmbedRoute::Grouped : Q8EmbedRoute::Row; }
     // The row kernel loads eight codes as one uint2 and stores BF16 pairs; every row and column
     // offset it adds is a multiple of 16 bytes, so the base pointers decide. A code plane off an
     // 8-byte boundary or an output off a 4-byte one takes the grouped kernel: same bits.
@@ -142,7 +142,7 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     // scalar reader and preserve two-byte output alignment through the packed kernel's stores.
     if (d == 5120 && table.padded_shape[1] == 5120 &&
         reinterpret_cast<std::uintptr_t>(table.qdata) % 4 == 0) {
-        if (T <= 128)
+        if (T <= 48)
             launch_q8_packed<10, 128>(ids, table, out, stream);
         else
             launch_q8_packed<5, 128>(ids, table, out, stream);
@@ -160,7 +160,7 @@ void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
 void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out,
                              cudaStream_t stream) {
     const std::int32_t T = ids.ne[0];
-    if (T <= 176)
+    if (T <= 48)
         launch_fp8<10, 128>(ids, table, out, stream);
     else
         launch_fp8<5, 128>(ids, table, out, stream);
