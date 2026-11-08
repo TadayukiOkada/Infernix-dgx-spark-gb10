@@ -28,29 +28,42 @@ constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
 struct AddressRange {
     std::uintptr_t begin = 0;
     std::uintptr_t end   = 0;
-    std::string name;
+    const char* name     = nullptr;
+};
+
+struct AddressRangeList {
+    std::array<AddressRange, 24> data{};
+    std::size_t count = 0;
+
+    void push_back(AddressRange range) {
+        if (count < data.size()) {
+            data[count++] = range;
+        }
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
+    [[nodiscard]] const AddressRange& operator[](std::size_t i) const noexcept { return data[i]; }
 };
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
-AddressRange address_range(const void* pointer, std::size_t bytes, std::string name) {
+AddressRange address_range(const void* pointer, std::size_t bytes, const char* name) {
     if (pointer == nullptr || bytes == 0) {
-        throw std::invalid_argument("sparse_moe: " + name + " storage must be non-empty");
+        throw std::invalid_argument(std::string("sparse_moe: ") + name + " storage must be non-empty");
     }
     const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(pointer);
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
-        throw std::overflow_error("sparse_moe: " + name + " address range overflows");
+        throw std::overflow_error(std::string("sparse_moe: ") + name + " address range overflows");
     }
-    return {begin, begin + bytes, std::move(name)};
+    return {begin, begin + bytes, name};
 }
 
-void require_disjoint(const std::vector<AddressRange>& ranges) {
+void require_disjoint(const AddressRangeList& ranges) {
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         for (std::size_t j = i + 1; j < ranges.size(); ++j) {
             if (ranges[i].begin < ranges[j].end && ranges[j].begin < ranges[i].end) {
-                throw std::invalid_argument("sparse_moe: " + ranges[i].name + " overlaps " +
+                throw std::invalid_argument(std::string("sparse_moe: ") + ranges[i].name + " overlaps " +
                                             ranges[j].name);
             }
         }
@@ -76,7 +89,7 @@ void require_matrix_metadata(const Weight& weight, std::int32_t n, std::int32_t 
     }
 }
 
-void require_router(const Weight& weight, std::vector<AddressRange>& ranges) {
+void require_router(const Weight& weight, AddressRangeList& ranges) {
     require_matrix_metadata(weight, kRouterRows, kHidden, "router_shared_gate");
     const std::size_t bytes = static_cast<std::size_t>(kRouterRows) * kHidden * 2;
     if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
@@ -110,7 +123,7 @@ QuantGeometry quant_geometry(QType qtype) {
 }
 
 void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, const char* name,
-                       std::vector<AddressRange>& ranges) {
+                       AddressRangeList& ranges) {
     require_matrix_metadata(weight, n, k, name);
     const QuantGeometry geometry       = quant_geometry(weight.qtype);
     const std::size_t groups           = static_cast<std::size_t>(n) * k / geometry.group_size;
@@ -130,14 +143,14 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
         (high_bytes != 0 && (weight.qhigh == nullptr || !aligned_to(weight.qhigh, 16)))) {
         throw std::invalid_argument(std::string("sparse_moe: invalid high plane for ") + name);
     }
-    ranges.push_back(address_range(weight.qdata, code_bytes, std::string(name) + " code"));
+    ranges.push_back(address_range(weight.qdata, code_bytes, name));
     if (high_bytes != 0) {
-        ranges.push_back(address_range(weight.qhigh, high_bytes, std::string(name) + " high"));
+        ranges.push_back(address_range(weight.qhigh, high_bytes, name));
     }
-    ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
+    ranges.push_back(address_range(weight.scales, scale_bytes, name));
 }
 
-void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
+void validate_weights(const SparseMoeWeights& weights, AddressRangeList& ranges) {
     require_router(weights.router_shared_gate, ranges);
     if (weights.routed_gate_up.qtype != QType::Q4_G64_FP16 &&
         weights.routed_gate_up.qtype != QType::Q8_G32_FP16) {
@@ -241,8 +254,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         throw std::invalid_argument("sparse_moe: x and destination token counts must match");
     }
 
-    std::vector<AddressRange> ranges;
-    ranges.reserve(16);
+    AddressRangeList ranges;
     ranges.push_back(address_range(x.data, x.bytes(), "x"));
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights(weights, ranges);
