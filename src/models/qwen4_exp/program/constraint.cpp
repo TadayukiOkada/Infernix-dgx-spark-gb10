@@ -161,15 +161,16 @@ void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, st
                                                          sets_total * (kChoices + 1) + constraint_host_.size()) +
                           first_column * kRecord;
     std::vector<float> host(tokens.size() * kRecord);
-    CUDA_CHECK(cudaMemcpy(host.data(), records, 4ULL * host.size(), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), records, 4ULL * host.size(), cudaMemcpyDeviceToHost, device_.stream));
     std::vector<float> observed;
     if (!plan.observe.empty()) {
         observed.resize(tokens.size() * kObserved);
         const auto* values = reinterpret_cast<const float*>(static_cast<const std::int32_t*>(constraint_.p) +
                                                             observe_offset() + constraint_host_.size() * kObserve) +
                              first_column * kObserved;
-        CUDA_CHECK(cudaMemcpy(observed.data(), values, 4ULL * observed.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(observed.data(), values, 4ULL * observed.size(), cudaMemcpyDeviceToHost, device_.stream));
     }
+    CUDA_CHECK(cudaStreamSynchronize(device_.stream));
     const std::size_t first = lane.history.size() - lane.prompt_tokens;
     lane.constraint_round.clear();
     for (std::size_t i = 0; i < tokens.size(); ++i) {

@@ -118,19 +118,22 @@ ProgramImpl::read_constraint_draws(const RequestConstraintPlan& plan, std::uint3
     }
     constexpr std::size_t kRecord = ops::kTokenConstraintRecord;
     std::vector<float> records(tokens.size() * kRecord);
-    CUDA_CHECK(cudaMemcpy(records.data(),
-                          static_cast<const float*>(io.constraint->records.data) +
-                              first_column * kRecord,
-                          records.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(records.data(),
+                               static_cast<const float*>(io.constraint->records.data) +
+                                   first_column * kRecord,
+                               records.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                               device.stream));
     constexpr std::size_t kObserved = ops::kTokenObserveRecord;
     std::vector<float> observed;
     if (!plan.observe.empty()) {
         observed.resize(tokens.size() * kObserved);
-        CUDA_CHECK(cudaMemcpy(observed.data(),
-                              static_cast<const float*>(io.constraint->observed.data) +
-                                  first_column * kObserved,
-                              observed.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(observed.data(),
+                                   static_cast<const float*>(io.constraint->observed.data) +
+                                       first_column * kObserved,
+                                   observed.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                   device.stream));
     }
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
     std::vector<ConstrainedDraw> draws;
     draws.reserve(tokens.size());
     for (std::size_t index = 0; index < tokens.size(); ++index) {
