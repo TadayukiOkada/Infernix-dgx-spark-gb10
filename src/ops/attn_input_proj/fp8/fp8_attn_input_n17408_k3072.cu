@@ -78,8 +78,6 @@ void fp8_attn_input_n17408_a16_launch(const Tensor& x, const Weight& weight, Ten
     if (tokens <= 32) return sliced<Fp8SlicedInstance<32, 4, 1>>(x, weight, output, stream);
     if (tokens <= 64)
         return gemm<Fp8A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>(x, weight, output, stream);
-    if (tokens <= 80 || (tokens >= 129 && tokens <= 160))
-        return gemm<Fp8A16MmaSchedule<32, 80, 128, 32, 16, 1, 3>>(x, weight, output, stream);
     if (tokens <= 96)
         return gemm<Fp8A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>(x, weight, output, stream);
     gemm<Fp8A16MmaSchedule<64, 128, 64, 32, 16, 2, 2>>(x, weight, output, stream);
