@@ -86,10 +86,11 @@
 - **Commit**: `5fee04a37` (`perf(core): cache device_max_copy_pitch in paged kv cache to eliminate driver queries`)
 - **Verification**: `infernix_kv_cache_test` passed; `infernix_cuda_stack_check` passed (1.49s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,223 ms).
 
-#### Task 1.2: Fix Grace Hybrid CPU Fallback Bug in [`src/core/cpu_topology.cpp`](file:///opt/etc/Infernix/src/core/cpu_topology.cpp)
+#### Task 1.2: Fix Grace Hybrid CPU Fallback Bug in [`src/core/cpu_topology.cpp`](file:///opt/etc/Infernix/src/core/cpu_topology.cpp) [COMPLETED]
 - **Problem**: In `performance_cpus()` ([`lines 240-244`](file:///opt/etc/Infernix/src/core/cpu_topology.cpp#L240-L244)), the loop iterates over all CPUs. When it encounters the first efficiency core (A725), `!arm_performance_part(midr)` triggers `return {};`, immediately aborting and returning an empty list instead of skipping non-performance cores.
-- **Action**: Replace `if (!arm_performance_part(midr)) { return {}; }` with `if (!arm_performance_part(midr)) { continue; }`.
-- **Verification**: Run `ctest -R infernix_cpu_topology_test`; verify `core::performance_cpus()` correctly returns the 10 Cortex-X925 cores on Grace.
+- **Action**: Replaced the combined error/check with `if (!arm_performance_part(midr)) { continue; }`, allowing all Cortex-X925 performance cores to be discovered and registered.
+- **Commit**: `0279d6dbf` (`fix(core): skip efficiency cores instead of aborting in ARM hybrid cpu fallback`)
+- **Verification**: `infernix_cpu_topology_test` passed (reported `hybrid=yes, big cpus: 5 6 7 8 9 15 16 17 18 19`); `infernix_cuda_stack_check` passed (1.45s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).
 
 #### Task 1.3: Add NVML Handle Fallback for Integrated SoC in [`src/core/gpu_telemetry.cpp`](file:///opt/etc/Infernix/src/core/gpu_telemetry.cpp) & [`src/core/vram_budget.cpp`](file:///opt/etc/Infernix/src/core/vram_budget.cpp)
 - **Problem**: Calling `nvmlDeviceGetHandleByPciBusId_v2` with formatted PCIe bus string fails on integrated GB10 SoC. This sets `device_ = nullptr` and causes telemetry to report all zeros or invalid data.

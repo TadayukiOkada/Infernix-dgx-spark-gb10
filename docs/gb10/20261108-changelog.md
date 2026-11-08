@@ -152,3 +152,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 14. **Commit `5fee04a37` (`perf(core): cache device_max_copy_pitch in paged kv cache to eliminate driver queries`):**
     - Cached `device_max_copy_pitch()` statically in `src/core/paged_kv_cache.cpp` across `initialize_host_transfer_plan()`, `copy_to_host_records()`, and `copy_from_host_records()`, eliminating synchronous `cudaGetDevice` and `cudaDeviceGetAttribute` driver syscalls on every KV page spill/restore round.
     - Validation: `infernix_kv_cache_test` passed; `infernix_cuda_stack_check` passed (1.49s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,223 ms).
+
+15. **Commit `0279d6dbf` (`fix(core): skip efficiency cores instead of aborting in ARM hybrid cpu fallback`):**
+    - In `src/core/cpu_topology.cpp`, replaced premature `return {};` on `!arm_performance_part(midr)` with `continue;`, enabling the fallback path to collect all 10 Grace Cortex-X925 cores instead of aborting when evaluating Cortex-A725 efficiency cores.
+    - Validation: `infernix_cpu_topology_test` passed (`hybrid=yes, big cpus: 5 6 7 8 9 15 16 17 18 19`); `infernix_cuda_stack_check` passed (1.45s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,166 ms).
