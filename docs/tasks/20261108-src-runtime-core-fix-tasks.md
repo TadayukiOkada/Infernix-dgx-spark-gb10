@@ -143,10 +143,11 @@
 - **Action**: Enforce a safe minimum headroom (e.g. 512 MiB - 1 GiB) on integrated systems to protect against activation memory spikes.
 - **Verification**: Run concurrency stress test with multiple parallel streams.
 
-#### Task 3.3: Bypass 200 ms PCIe Link Ramp-Up on Integrated GPU in [`src/core/link_probe.cu`](file:///opt/etc/Infernix/src/core/link_probe.cu)
-- **Problem**: `kWarmMilliseconds = 200.0F` spins all SMs for 200 ms to wake PCIe Gen5 link from low-power state. On GB10 UMA, there is no PCIe link to warm up.
-- **Action**: Guard the warm-up spin: if `device_is_integrated`, set warm-up time to 0 ms.
-- **Verification**: Measure engine startup latency reduction (~200 ms faster).
+#### Task 3.3: Bypass 200 ms PCIe Link Ramp-Up on Integrated GPU in [`src/core/link_probe.cu`](file:///opt/etc/Infernix/src/core/link_probe.cu) [COMPLETED]
+- **Problem**: `kWarmMilliseconds = 200.0F` and repeated copy loops spun all SMs for 200 ms to wake PCIe Gen5 link from low-power state. On GB10 UMA, there is no PCIe link to warm up, wasting 200 ms during link bandwidth probing and contending for SoC crossbar bandwidth.
+- **Action**: Queried `cudaDevAttrIntegrated`. On integrated devices, bypassed the 200 ms spin kernel and background busy stream, executing a single untimed warm-up copy to prime stream and page tables before timing.
+- **Commit**: `a206e1bad` (`perf(core): bypass PCIe link warmup spin and stream contention on integrated UMA`)
+- **Verification**: `infernix_cuda_stack_check` passed (1.47s, 0 spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,173 ms).
 
 #### Task 3.4: Right-Size Block Copy Slice Count for 48 SMs in [`src/core/block_copy.cu`](file:///opt/etc/Infernix/src/core/block_copy.cu)
 - **Problem**: `kSlices = 16` leaves 32 of 48 SMs idle when copying a single block.

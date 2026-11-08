@@ -176,3 +176,7 @@ Every atomic change below was individually compiled, verified with the `infernix
 20. **Commit `3522bddc5` (`perf(runtime): maintain running counter for held snapshots in prefix cache index`):**
     - Added running incremental `held_snapshots_` counter in `PrefixCacheIndex` in `src/runtime/prefix_cache/prefix_index.cpp` and `prefix_index.h`, replacing linear `std::count_if` scans with $O(1)$ gauge reads in `stats()`, and added invariant checking in `check_invariants()`.
     - Validation: `infernix_prefix_cache_index_test` passed; `infernix_cuda_stack_check` passed (1.51s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,196 ms).
+
+21. **Commit `a206e1bad` (`perf(core): bypass PCIe link warmup spin and stream contention on integrated UMA`):**
+    - Queried `cudaDevAttrIntegrated` in `src/core/link_probe.cu`. On integrated devices, bypassed the 200 ms spin kernel and background busy stream, executing a single untimed warm-up copy to prime stream and page tables before timing.
+    - Validation: `infernix_cuda_stack_check` passed (1.47s, 0 stack spills); `tool-eval-bench run --scenarios TC-14` scored **100 / 100** (2/2 points, 0 partial, 0 failed, TTFT 1,173 ms).
