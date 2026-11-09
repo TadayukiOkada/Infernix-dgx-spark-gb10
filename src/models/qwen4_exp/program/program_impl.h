@@ -1805,7 +1805,6 @@ public:
         }
         lane.next_call = 0;
         clear_prompt_uses(lane);
-        lane.mtp_accept.fill(kAcceptancePrior);
         lane.mtp_policy_rounds = 0;
         lane.mtp_cumulative.reset();
         lane.dflash_calibration = dflash_process_calibration_;
@@ -1836,8 +1835,17 @@ public:
             lane.ngram_accept[1] = kNgramAcceptancePriors[1] * std::clamp(std::exp(-1.0 * t), 0.30, 1.0);
             lane.ngram_accept[2] = kNgramAcceptancePriors[2] * std::clamp(std::exp(-0.7 * t), 0.45, 1.0);
             lane.ngram_accept[3] = kNgramAcceptancePriors[3] * std::clamp(std::exp(-0.4 * t), 0.65, 1.0);
+            const bool is_nvfp4_kv = options_.kv_cache == KvCacheStorage::Nvfp4Group16;
+            const double base_mtp  = (is_nvfp4_kv ? 0.65 : kAcceptancePrior) * std::clamp(std::exp(-0.5 * t), 0.35, 1.0);
+            const double pos_decay = is_nvfp4_kv ? 0.65 : 0.80;
+            double reach = base_mtp;
+            for (std::size_t j = 0; j < lane.mtp_accept.size(); ++j) {
+                lane.mtp_accept[j] = reach;
+                reach *= pos_decay;
+            }
         } else {
-            lane.ngram_accept   = kNgramAcceptancePriors;
+            lane.ngram_accept = kNgramAcceptancePriors;
+            lane.mtp_accept.fill(kAcceptancePrior);
         }
         lane.readout        = b.readout_tokens;
         lane.prompt         = b.prompt;
@@ -5954,6 +5962,9 @@ private:
         auto* configs = reinterpret_cast<ops::SamplingConfig*>(mtp_host(mtp_io_.configs));
         for (std::size_t b = 0; b < lanes.size(); ++b) {
             configs[b]           = lanes_[lanes[b]].sampling;
+            if (configs[b].temperature > 0.0F) {
+                configs[b].temperature *= 0.85F;
+            }
             configs[b].mask      = {};
             configs[b].nonfinite = nullptr; // a draft's selection never fails the request
         }
