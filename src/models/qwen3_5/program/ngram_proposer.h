@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/ngram.h"
+#include "models/qwen3_5/program/suffix_automaton.h"
 
 #include <algorithm>
 #include <array>
@@ -30,7 +31,8 @@ public:
                            std::size_t bucket_count   = 1U << 19)
         : tokens_(power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 0, -1),
           buckets_(power_of_two(bucket_count) ? bucket_count : 0),
-          token_mask_(token_capacity - 1U) {
+          token_mask_(token_capacity - 1U),
+          sa_(token_capacity && power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 64) {
         if (tokens_.empty() || buckets_.empty()) {
             throw std::invalid_argument("invalid ngram corpus capacity");
         }
@@ -38,14 +40,18 @@ public:
 
     [[nodiscard]] std::size_t capacity() const noexcept { return tokens_.size(); }
 
-    void boundary() { append(-1); }
+    void boundary() {
+        append(-1);
+    }
 
     void set_boundaries(std::vector<Token> tokens) {
+        sa_.set_boundaries(tokens);
         boundaries_ = std::move(tokens);
         std::sort(boundaries_.begin(), boundaries_.end());
     }
 
     void append(Token token) {
+        sa_.append(token);
         if (!store(token)) { return; }
         for (const auto n : widths_) {
             if (insertable(n)) { insert(hash_at(end_ - n, n), n); }
@@ -167,6 +173,11 @@ public:
                 }
             }
         }
+        const auto sa_match = sa_.propose(history, maximum, minimum_match);
+        if (sa_match.matched > best.matched ||
+            (sa_match.matched == best.matched && sa_match.tokens.size() > best.tokens.size())) {
+            best = sa_match;
+        }
         return best;
     }
 
@@ -177,6 +188,7 @@ private:
     };
 
     static constexpr std::array<std::uint32_t, 3> widths_{16, 8, 4};
+    SuffixAutomaton sa_;
     std::vector<Token> tokens_;
     std::vector<Token> boundaries_;
     std::vector<std::array<Entry, 4>> buckets_;

@@ -1,6 +1,9 @@
 infernix_add_test(infernix_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp")
 
+infernix_add_test(infernix_suffix_automaton_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_suffix_automaton.cpp")
+
 infernix_add_test(infernix_ngram_archive_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/ngram.cpp")
