@@ -1809,7 +1809,6 @@ public:
         lane.mtp_policy_rounds = 0;
         lane.mtp_cumulative.reset();
         lane.dflash_calibration = dflash_process_calibration_;
-        lane.ngram_accept       = kNgramAcceptancePriors;
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
                 if (b.ngram_index && *b.ngram_index &&
@@ -1831,6 +1830,15 @@ public:
             lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(max_width_ - 1), 0);
         }
         lane.sampling       = q.sampling;
+        if (lane.sampling.temperature > 0.0F) {
+            const double t = static_cast<double>(lane.sampling.temperature);
+            lane.ngram_accept[0] = kNgramAcceptancePriors[0] * std::clamp(std::exp(-1.5 * t), 0.15, 1.0);
+            lane.ngram_accept[1] = kNgramAcceptancePriors[1] * std::clamp(std::exp(-1.0 * t), 0.30, 1.0);
+            lane.ngram_accept[2] = kNgramAcceptancePriors[2] * std::clamp(std::exp(-0.7 * t), 0.45, 1.0);
+            lane.ngram_accept[3] = kNgramAcceptancePriors[3] * std::clamp(std::exp(-0.4 * t), 0.65, 1.0);
+        } else {
+            lane.ngram_accept   = kNgramAcceptancePriors;
+        }
         lane.readout        = b.readout_tokens;
         lane.prompt         = b.prompt;
         lane.constraint     = b.constraint;
@@ -5410,10 +5418,8 @@ private:
                 // The bucket's acceptance per position.
                 if (ngram_bucket_[b] >= 0) {
                     double& a = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
-                    for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
-                        const double hit = j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0;
-                        a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
-                    }
+                    const double hit = n > 0 ? static_cast<double>(A) / static_cast<double>(n) : 0.0;
+                    a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
                 }
             }
             for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
