@@ -32,7 +32,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODEL_PATH="${MODEL_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix}"
 NGRAM_PATH="${NGRAM_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4.ngram}"
 NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
-KV_DTYPE="${KV_DTYPE:-nvfp4}"
+KV_DTYPE="${KV_DTYPE:-int8}"
 DIST_DIR="${REPO_ROOT}/dist/milestones"
 DRAFT_PATH="/opt/etc/models/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
 # DFlash2 vs MTP on GB10 (pp2048+tg128, fp8 KV, medians, decode out t/s):
@@ -172,17 +172,16 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
     --ngram-cache-mib 4096 \
-    --prefill-chunk 8192 \
     --kv-dtype "${KV_DTYPE}" \
     --spec mtp \
     --draft-tokens auto \
     --temperature 1.0 \
     --ngram-draft-tokens 31 \
     --ngram-min-match 4 \
-    --top-p 0.95 \
+    --top-p 0.9 \
+    --min-p 0.1 \
     --top-k 20 \
     --lm-head-draft \
-    --restore-tool-reasoning \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --host "${HOST}" \
