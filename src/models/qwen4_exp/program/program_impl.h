@@ -6078,20 +6078,28 @@ private:
             // probability, and its rounds were measured faster without a cut).
             mtp_confident_[b] = steps;
             mtp_executed_[b]  = steps;
-            if (!need_logprobs || (sampled && lane.sampling.temperature > 0.0F)) { continue; }
+            if (!need_logprobs) { continue; }
             const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
             auto& kept           = mtp_draft_logprobs_[static_cast<std::size_t>(b)];
             for (std::int32_t j = 0; j < steps; ++j) { kept[static_cast<std::size_t>(j)] = logprobs[j * batch + nb]; }
-            // The gated chain ran steps 0..its cut, so the drafts beyond mtp_executed_[b] are stale
-            // words a skipped gated step left behind and must not be read; the round's cost fit stays
-            // fed the drafted count of uncut rounds only (decode, where the fit is described).
-            const auto cut = options_.auto_draft_length
-                                 ? mtp_cumulative_cut(logprobs + nb, batch, steps,
-                                                      mtp_cumulative_threshold_[static_cast<std::size_t>(nb)],
-                                                      kMtpCumulativeBins, gated)
-                                 : mtp_min_logprob_cut(logprobs + nb, batch, steps, draft_min_logprob_, gated);
-            mtp_confident_[b] = cut.kept;
-            mtp_executed_[b]  = cut.executed;
+            if (sampled && lane.sampling.temperature > 0.0F) {
+                // Sampled draft early-exit: verify only drafts exceeding the confidence floor.
+                // Drafts with p < 12% on NVFP4 have near-zero empirical acceptance and waste verify GEMM width.
+                const float min_lp = std::isfinite(draft_min_logprob_)
+                                         ? static_cast<float>(draft_min_logprob_)
+                                         : -2.12026F; // log(0.12)
+                const auto cut    = mtp_min_logprob_cut(logprobs + nb, batch, steps, min_lp, gated);
+                mtp_confident_[b] = cut.kept;
+                mtp_executed_[b]  = cut.executed;
+            } else {
+                const auto cut = options_.auto_draft_length
+                                     ? mtp_cumulative_cut(logprobs + nb, batch, steps,
+                                                          mtp_cumulative_threshold_[static_cast<std::size_t>(nb)],
+                                                          kMtpCumulativeBins, gated)
+                                     : mtp_min_logprob_cut(logprobs + nb, batch, steps, draft_min_logprob_, gated);
+                mtp_confident_[b] = cut.kept;
+                mtp_executed_[b]  = cut.executed;
+            }
         }
     }
 
