@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -54,6 +56,7 @@ __launch_bounds__(Block) __global__
     void layer_norm_d1152_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                         const __nv_bfloat162* bias, __nv_bfloat162* out,
                                         std::int64_t rows, float eps) {
+    pdl::enter();
     constexpr int d        = 1152;
     constexpr int pairs    = d / 2;
     constexpr int warps    = Block / 32;
@@ -61,9 +64,14 @@ __launch_bounds__(Block) __global__
     if (row >= rows) { return; }
     const std::int64_t base = row * pairs;
 
+    constexpr int kMaxPairsPerThread = (pairs + Block - 1) / Block;
+    __nv_bfloat162 cached_x[kMaxPairsPerThread];
+    int count = 0;
     LayerNormMoments local{0.0f, 0.0f, 0};
     for (int pair = static_cast<int>(threadIdx.x); pair < pairs; pair += Block) {
-        const float2 values = __bfloat1622float2(x[base + pair]);
+        const __nv_bfloat162 val = x[base + pair];
+        cached_x[count++]        = val;
+        const float2 values      = __bfloat1622float2(val);
         layer_norm_update(local, values.x);
         layer_norm_update(local, values.y);
     }
@@ -88,8 +96,9 @@ __launch_bounds__(Block) __global__
     }
     __syncthreads();
 
+    count = 0;
     for (int pair = static_cast<int>(threadIdx.x); pair < pairs; pair += Block) {
-        const float2 values = __bfloat1622float2(x[base + pair]);
+        const float2 values = __bfloat1622float2(cached_x[count++]);
         const float2 scales = __bfloat1622float2(weight[pair]);
         const float2 shifts = __bfloat1622float2(bias[pair]);
         out[base + pair] =
@@ -103,6 +112,7 @@ __launch_bounds__(Block) __global__
     void layer_norm_d1152_warp_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                       const __nv_bfloat162* bias, __nv_bfloat162* out,
                                       std::int64_t rows, float eps) {
+    pdl::enter();
     constexpr int d        = 1152;
     constexpr int pairs    = d / 2;
     constexpr int warps    = Block / 32;
@@ -112,9 +122,14 @@ __launch_bounds__(Block) __global__
     if (row >= rows) { return; }
     const std::int64_t base = row * pairs;
 
+    constexpr int kMaxPairsPerLane = (pairs + 31) / 32; // 18 pairs
+    __nv_bfloat162 cached_x[kMaxPairsPerLane];
+    int count = 0;
     LayerNormMoments local{0.0f, 0.0f, 0};
     for (int pair = lane; pair < pairs; pair += 32) {
-        const float2 values = __bfloat1622float2(x[base + pair]);
+        const __nv_bfloat162 val = x[base + pair];
+        cached_x[count++]        = val;
+        const float2 values      = __bfloat1622float2(val);
         layer_norm_update(local, values.x);
         layer_norm_update(local, values.y);
     }
@@ -124,8 +139,9 @@ __launch_bounds__(Block) __global__
     const float m2          = __shfl_sync(mask, local.m2, 0);
     const float inv         = rsqrtf(m2 / static_cast<float>(d) + eps);
 
+    count = 0;
     for (int pair = lane; pair < pairs; pair += 32) {
-        const float2 values = __bfloat1622float2(x[base + pair]);
+        const float2 values = __bfloat1622float2(cached_x[count++]);
         const float2 scales = __bfloat1622float2(weight[pair]);
         const float2 shifts = __bfloat1622float2(bias[pair]);
         out[base + pair]    = __floats2bfloat162_rn((values.x - mean) * inv * scales.x + shifts.x,
@@ -137,6 +153,7 @@ template <int Block>
 __global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                   const __nv_bfloat16* bias, __nv_bfloat16* out, std::int32_t d,
                                   std::int64_t rows, float eps) {
+    pdl::enter();
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
     const std::int64_t base = row * d;
@@ -150,29 +167,27 @@ __global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* w
         local.m2 += delta * (value - local.mean);
     }
 
-    __shared__ float means[Block];
-    __shared__ float m2s[Block];
-    __shared__ int counts[Block];
-    means[threadIdx.x]  = local.mean;
-    m2s[threadIdx.x]    = local.m2;
-    counts[threadIdx.x] = local.count;
+    local = layer_norm_warp_reduce(local);
+
+    constexpr int kWarps = Block / 32;
+    __shared__ LayerNormMoments warp_moments[kWarps > 0 ? kWarps : 1];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0 && warp < kWarps) { warp_moments[warp] = local; }
     __syncthreads();
 
-    for (int offset = Block / 2; offset > 0; offset >>= 1) {
-        if (static_cast<int>(threadIdx.x) < offset) {
-            const LayerNormMoments a{means[threadIdx.x], m2s[threadIdx.x], counts[threadIdx.x]};
-            const LayerNormMoments b{means[threadIdx.x + offset], m2s[threadIdx.x + offset],
-                                     counts[threadIdx.x + offset]};
-            const LayerNormMoments merged = layer_norm_merge(a, b);
-            means[threadIdx.x]            = merged.mean;
-            m2s[threadIdx.x]              = merged.m2;
-            counts[threadIdx.x]           = merged.count;
+    if (warp == 0) {
+        LayerNormMoments block_value =
+            lane < kWarps ? warp_moments[lane] : LayerNormMoments{0.0f, 0.0f, 0};
+        block_value = layer_norm_warp_reduce(block_value);
+        if (lane == 0) {
+            warp_moments[0] = block_value;
         }
-        __syncthreads();
     }
+    __syncthreads();
 
-    const float mean = means[0];
-    const float inv  = rsqrtf(m2s[0] / static_cast<float>(d) + eps);
+    const float mean = warp_moments[0].mean;
+    const float inv  = rsqrtf(warp_moments[0].m2 / static_cast<float>(d) + eps);
     for (std::int32_t i = static_cast<std::int32_t>(threadIdx.x); i < d; i += Block) {
         const float value = (__bfloat162float(x[base + i]) - mean) * inv;
         out[base + i] =

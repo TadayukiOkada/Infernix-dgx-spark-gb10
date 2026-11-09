@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -15,8 +17,10 @@ __device__ __forceinline__ std::uint32_t round_fp24(std::uint32_t bits) {
 }
 
 // Four values per thread: one float4 in, three packed 32-bit words out.
-__global__ void pack_fp24_kernel(const float4* source, std::uint32_t* packed,
-                                 std::int64_t groups) {
+__launch_bounds__(256) __global__
+void pack_fp24_kernel(const float4* source, std::uint32_t* packed,
+                      std::int64_t groups) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t g = start; g < groups; g += stride) {
@@ -32,8 +36,10 @@ __global__ void pack_fp24_kernel(const float4* source, std::uint32_t* packed,
     }
 }
 
-__global__ void unpack_fp24_kernel(const std::uint32_t* packed, float4* destination,
-                                   std::int64_t groups) {
+__launch_bounds__(256) __global__
+void unpack_fp24_kernel(const std::uint32_t* packed, float4* destination,
+                        std::int64_t groups) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t g = start; g < groups; g += stride) {
@@ -48,8 +54,10 @@ __global__ void unpack_fp24_kernel(const std::uint32_t* packed, float4* destinat
     }
 }
 
-__global__ void pack_bf16_kernel(const float4* source, __nv_bfloat162* packed,
-                                 std::int64_t groups) {
+__launch_bounds__(256) __global__
+void pack_bf16_kernel(const float4* source, __nv_bfloat162* packed,
+                      std::int64_t groups) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t g = start; g < groups; g += stride) {
@@ -59,8 +67,10 @@ __global__ void pack_bf16_kernel(const float4* source, __nv_bfloat162* packed,
     }
 }
 
-__global__ void unpack_bf16_kernel(const __nv_bfloat162* packed, float4* destination,
-                                   std::int64_t groups) {
+__launch_bounds__(256) __global__
+void unpack_bf16_kernel(const __nv_bfloat162* packed, float4* destination,
+                        std::int64_t groups) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t g = start; g < groups; g += stride) {

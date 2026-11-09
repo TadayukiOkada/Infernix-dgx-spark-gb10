@@ -8,6 +8,7 @@
 
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/memory.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -27,6 +28,7 @@ template <int Block>
 __launch_bounds__(Block) __global__
     void add_bias_bf16x8_stream_kernel(const Bf16x8Pack* bias, Bf16x8Pack* x, std::uint32_t packs,
                                        std::uint32_t total) {
+    pdl::enter();
     const std::uint32_t index = blockIdx.x * static_cast<std::uint32_t>(Block) + threadIdx.x;
     if (index >= total) { return; }
     const Bf16x8Pack bv = load_vec<Bf16x8Pack>(bias + index % packs);
@@ -40,6 +42,7 @@ template <int Block>
 __launch_bounds__(Block) __global__
     void add_bias_bf16x2_kernel(const __nv_bfloat162* bias, __nv_bfloat162* x, std::int32_t pairs,
                                 std::int32_t rows) {
+    pdl::enter();
     const std::int32_t first =
         (static_cast<std::int32_t>(blockIdx.x) * Block + static_cast<std::int32_t>(threadIdx.x)) *
         kAddBiasPairsPerThread;
@@ -54,8 +57,10 @@ __launch_bounds__(Block) __global__
     }
 }
 
-__global__ void add_bias_kernel(const __nv_bfloat16* bias, __nv_bfloat16* x, std::int32_t d,
-                                std::int64_t n) {
+__launch_bounds__(256) __global__
+void add_bias_kernel(const __nv_bfloat16* bias, __nv_bfloat16* x, std::int32_t d,
+                     std::int64_t n) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {

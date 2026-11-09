@@ -77,7 +77,7 @@ constexpr KnownNvfp4Volume kKnownNvfp4Volumes[] = {
 
 struct NgramVolume::ReaderPool {
     std::mutex mutex;
-    std::condition_variable start_cv;
+    std::vector<std::unique_ptr<std::condition_variable>> worker_cv;
     std::condition_variable done_cv;
     std::vector<std::thread> workers;
     std::vector<std::exception_ptr> errors;
@@ -90,6 +90,10 @@ struct NgramVolume::ReaderPool {
     explicit ReaderPool(std::size_t total_threads) : errors(total_threads) {
         if (total_threads <= 1) { return; }
         workers.reserve(total_threads - 1);
+        worker_cv.reserve(total_threads - 1);
+        for (std::size_t t = 1; t < total_threads; ++t) {
+            worker_cv.push_back(std::make_unique<std::condition_variable>());
+        }
         for (std::size_t t = 1; t < total_threads; ++t) {
             workers.emplace_back([this, t] {
                 std::uint64_t seen = 0;
@@ -98,7 +102,7 @@ struct NgramVolume::ReaderPool {
                     std::size_t n = 0;
                     {
                         std::unique_lock<std::mutex> lock(mutex);
-                        start_cv.wait(lock, [&] { return stop || epoch != seen; });
+                        worker_cv[t - 1]->wait(lock, [&] { return stop || epoch != seen; });
                         if (stop) { return; }
                         seen = epoch;
                         if (t < active) {
@@ -122,8 +126,8 @@ struct NgramVolume::ReaderPool {
         {
             std::lock_guard<std::mutex> lock(mutex);
             stop = true;
+            for (auto& cv : worker_cv) { cv->notify_one(); }
         }
-        start_cv.notify_all();
         for (auto& w : workers) {
             if (w.joinable()) { w.join(); }
         }
@@ -141,8 +145,10 @@ struct NgramVolume::ReaderPool {
             active  = threads;
             pending = threads - 1;
             ++epoch;
+            for (std::size_t t = 1; t < threads; ++t) {
+                worker_cv[t - 1]->notify_one();
+            }
         }
-        start_cv.notify_all();
         try {
             fn(0, threads);
         } catch (...) { errors[0] = std::current_exception(); }
@@ -252,7 +258,7 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     }
 }
 
-std::size_t NgramVolume::find_slot(std::uint32_t row) const noexcept {
+std::size_t NgramVolume::find_slot(std::uint32_t row) noexcept {
     const std::size_t base = set_of(row) * kCacheWays;
     for (std::size_t w = 0; w < kCacheWays; ++w) {
         if (tags_[base + w] == row) { return base + w; }
@@ -260,7 +266,7 @@ std::size_t NgramVolume::find_slot(std::uint32_t row) const noexcept {
     return std::numeric_limits<std::size_t>::max();
 }
 
-void NgramVolume::insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) const noexcept {
+void NgramVolume::insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) noexcept {
     const std::size_t set  = set_of(row);
     const std::size_t base = set * kCacheWays;
     for (std::size_t w = 0; w < kCacheWays; ++w) {
@@ -272,7 +278,7 @@ void NgramVolume::insert_cache(std::uint32_t row, const std::byte* data, std::si
     std::memcpy(cache_.data() + (base + way) * row_bytes, data, row_bytes);
 }
 
-void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) const {
+void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) {
     if (out.size() != rows.size() * table_.row_bytes) {
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
     }
@@ -428,7 +434,7 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 }
 
-bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
+bool NgramVolume::cached(std::span<const std::uint32_t> rows) noexcept {
     if (resident_) {
         for (const std::uint32_t row : rows) {
             if (row >= table_.rows) { return false; }
@@ -441,7 +447,7 @@ bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
     return true;
 }
 
-NgramVolume::ReadProbe NgramVolume::probe_reads(std::size_t reads, double max_seconds) const {
+NgramVolume::ReadProbe NgramVolume::probe_reads(std::size_t reads, double max_seconds) {
     ReadProbe probe;
     if (resident_ || table_.blocks == 0 || reads == 0) { return probe; }
     // A different set of blocks each start, so the drive's own cache cannot answer the same ones.

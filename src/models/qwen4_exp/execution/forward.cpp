@@ -214,6 +214,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
         split_priced_.assign(E, 0);
         guess_columns_.assign(E, 0);
         CUDA_CHECK(cudaEventCreateWithFlags(&split_ready_, cudaEventDisableTiming | cudaEventBlockingSync));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_ready_, cudaEventDisableTiming | cudaEventBlockingSync));
     }
     if (const auto& dflash2 = parameters_.model.config().dflash2) { draft_taps_ = dflash2->target_layer_ids; }
     scan_ = ActivationScan::from_environment(config_.num_hidden_layers);
@@ -221,6 +222,7 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
 
 Forward::~Forward() {
     if (split_ready_ != nullptr) { (void)cudaEventDestroy(split_ready_); }
+    if (guess_ready_ != nullptr) { (void)cudaEventDestroy(guess_ready_); }
 }
 
 void Forward::scan_input(const Tensor& x, std::uint32_t layer, ActivationScan::Site site) {
@@ -653,7 +655,8 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
         value = work_.alloc(DType::BF16, {H, T});
         const std::int32_t bounds[] = {0, W, W + H};
         Tensor* parts[]             = {&key, &value};
-        ops::ggml_linear(e, ops::ggml_split_segments(p.projection.ggml, e.ne[0], bounds), parts, nullptr, 0, work_, s);
+        ops::ggml_linear(e, ops::ggml_split_segments(p.projection.ggml, e.ne[0], bounds), parts, nullptr, 0, work_, s,
+                         dense_routes());
     } else {
         Tensor kv = work_.alloc(DType::BF16, {W + H, T});
         project(e, p.projection, kv, work_, s, dense_routes());
@@ -1250,6 +1253,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         auto* offsets = static_cast<std::int32_t*>(split_offsets_.data());
         CUDA_CHECK(cudaMemcpyAsync(offsets, dispatch.offsets, (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaEventRecord(split_ready_, s));
         if (ahead) {
             // The route has read `logits`, so the guess reuses them. It decides placement only, so the
             // router's tensor-core form serves every model (a gated call has at least 256 columns).
@@ -1263,8 +1267,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             ops::moe_route_dispatch(logits, K, guess, guessed, nullptr, s);
             CUDA_CHECK(cudaMemcpyAsync(offsets + E + 1, guessed.offsets, (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaEventRecord(guess_ready_, s));
         }
-        CUDA_CHECK(cudaEventRecord(split_ready_, s));
         CUDA_CHECK(cudaEventSynchronize(split_ready_));
         for (std::int32_t e = 0; e < E; ++e) { split_columns_[static_cast<std::size_t>(e)] = offsets[e + 1] - offsets[e]; }
         std::fill(split_cpu_.begin(), split_cpu_.end(), std::uint8_t{0});
@@ -1330,6 +1334,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                      /*x_prepared=*/early);
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
     if (ahead) {
+        CUDA_CHECK(cudaEventSynchronize(guess_ready_));
         // The next layer's guessed experts follow this layer's copies on the link.
         const auto* guessed = static_cast<const std::int32_t*>(split_offsets_.data()) + E + 1;
         for (std::int32_t e = 0; e < E; ++e) { guess_columns_[static_cast<std::size_t>(e)] = guessed[e + 1] - guessed[e]; }
@@ -1463,7 +1468,11 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
         const std::int32_t E = dim(m.experts), K = dim(m.top_k), I = dim(m.intermediate);
         Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
         const Tensor* router_rows[] = {&p.router, &p.shared_score};
-        ops::projection_fp32(xm, router_rows, logits, s);
+        if (fast_.router_mma && T >= kRouterMmaMinColumns) {
+            ops::projection_fp32_router_mma(xm, router_rows, logits, s);
+        } else {
+            ops::projection_fp32(xm, router_rows, logits, s);
+        }
         ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                                 work_.alloc(DType::FP32, {T})};
         Tensor outputs = work_.alloc(DType::BF16, {H, K * T});

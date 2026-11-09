@@ -8,6 +8,7 @@
 // use the semantically identical single-block fallback.
 
 #include "ops/kernel/sampling_device.cuh"
+#include "core/pdl.cuh"
 
 namespace infernix::ops {
 
@@ -17,6 +18,7 @@ __launch_bounds__(kSamplerBlock) __global__
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
                            std::int32_t purpose, std::int32_t token_domain,
                            std::int32_t physical_rows) {
+    pdl::enter();
     const int row            = static_cast<int>(blockIdx.x);
     const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
     const int tid            = threadIdx.x;
@@ -114,6 +116,7 @@ __launch_bounds__(kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
                                       SamplingWorkspace workspace) {
+    pdl::enter();
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = cfg_ptr[col];
@@ -169,6 +172,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
     std::int32_t group_count, SamplingWorkspace workspace) {
+    pdl::enter();
     const int group          = static_cast<int>(blockIdx.x);
     const int col            = static_cast<int>(blockIdx.y);
     const int tid            = threadIdx.x;

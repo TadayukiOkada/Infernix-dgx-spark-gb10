@@ -157,20 +157,22 @@ void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, st
         throw std::logic_error("Qwen4Exp: constraint records are outside the round");
     }
     const std::size_t sets_total = static_cast<std::size_t>(options_.max_concurrency) * kSets;
-    const auto* records = reinterpret_cast<const float*>(static_cast<const std::int32_t*>(constraint_.p) +
-                                                         sets_total * (kChoices + 1) + constraint_host_.size()) +
-                          first_column * kRecord;
-    std::vector<float> host(tokens.size() * kRecord);
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), records, 4ULL * host.size(), cudaMemcpyDeviceToHost, device_.stream));
-    std::vector<float> observed;
+    const std::size_t record_word_offset =
+        sets_total * (kChoices + 1) + constraint_host_.size() + first_column * kRecord;
+    const auto* records = reinterpret_cast<const float*>(static_cast<const std::int32_t*>(constraint_.p) + record_word_offset);
+    auto* pinned = static_cast<std::int32_t*>(constraint_pinned_.data());
+    auto* host   = reinterpret_cast<float*>(pinned + record_word_offset);
+    CUDA_CHECK(cudaMemcpyAsync(host, records, 4ULL * tokens.size() * kRecord, cudaMemcpyDeviceToHost, device_.stream));
+    const float* observed = nullptr;
     if (!plan.observe.empty()) {
-        observed.resize(tokens.size() * kObserved);
-        const auto* values = reinterpret_cast<const float*>(static_cast<const std::int32_t*>(constraint_.p) +
-                                                            observe_offset() + constraint_host_.size() * kObserve) +
-                             first_column * kObserved;
-        CUDA_CHECK(cudaMemcpyAsync(observed.data(), values, 4ULL * observed.size(), cudaMemcpyDeviceToHost, device_.stream));
+        const std::size_t observe_word_offset =
+            observe_offset() + constraint_host_.size() * kObserve + first_column * kObserved;
+        const auto* values = reinterpret_cast<const float*>(static_cast<const std::int32_t*>(constraint_.p) + observe_word_offset);
+        auto* obs_host = reinterpret_cast<float*>(pinned + observe_word_offset);
+        CUDA_CHECK(cudaMemcpyAsync(obs_host, values, 4ULL * tokens.size() * kObserved, cudaMemcpyDeviceToHost, device_.stream));
+        observed = obs_host;
     }
-    CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+    device_.synchronize();
     const std::size_t first = lane.history.size() - lane.prompt_tokens;
     lane.constraint_round.clear();
     for (std::size_t i = 0; i < tokens.size(); ++i) {
@@ -179,12 +181,12 @@ void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, st
         }
         const std::int32_t d     = plan.steps[first + i];
         const std::size_t count  = d >= 0 ? plan.sets[static_cast<std::size_t>(d)].size() : 1U;
-        const float* record      = host.data() + i * kRecord;
+        const float* record      = host + i * kRecord;
         ConstrainedDraw draw{.token         = tokens[i],
                              .probabilities = std::vector<float>(record, record + count),
                              .mass          = record[kChoices]};
-        if (!plan.observe.empty()) {
-            const float* values = observed.data() + i * kObserved;
+        if (!plan.observe.empty() && observed != nullptr) {
+            const float* values = observed + i * kObserved;
             draw.observed_logprobs.assign(values, values + plan.observe[first + i].size());
             draw.top_logprob = values[kObserve];
         }
@@ -214,15 +216,22 @@ PromptReadout ProgramImpl::read_prompt_frontier(const Lane& lane) {
     Tensor logprobs     = work_->alloc(DType::FP32, {count, 1});
     Tensor top_id       = work_->alloc(DType::I32, {1, 1});
     Tensor top_logprob  = work_->alloc(DType::FP32, {1, 1});
-    CUDA_CHECK(cudaMemcpyAsync(ids.data, lane.readout.data(), 4ULL * n, cudaMemcpyHostToDevice, s));
+    auto* pinned        = static_cast<std::int32_t*>(constraint_pinned_.data());
+    std::memcpy(pinned, lane.readout.data(), 4ULL * n);
+    CUDA_CHECK(cudaMemcpyAsync(ids.data, pinned, 4ULL * n, cudaMemcpyHostToDevice, s));
     ops::target_logprobs(logits, ids, token_domain_, logprobs, s);
     ops::top_logprobs(logits, token_domain_, top_id, top_logprob, s);
-    PromptReadout readout;
-    readout.logprobs.resize(n);
-    CUDA_CHECK(cudaMemcpyAsync(readout.logprobs.data(), logprobs.data, 4ULL * n, cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaMemcpyAsync(&readout.top_token, top_id.data, sizeof(TokenId), cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaMemcpyAsync(&readout.top_logprob, top_logprob.data, sizeof(float), cudaMemcpyDeviceToHost, s));
+    auto* pinned_logprobs    = reinterpret_cast<float*>(pinned + n);
+    auto* pinned_top_id      = reinterpret_cast<TokenId*>(pinned_logprobs + n);
+    auto* pinned_top_logprob = reinterpret_cast<float*>(pinned_top_id + 1);
+    CUDA_CHECK(cudaMemcpyAsync(pinned_logprobs, logprobs.data, 4ULL * n, cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(pinned_top_id, top_id.data, sizeof(TokenId), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(pinned_top_logprob, top_logprob.data, sizeof(float), cudaMemcpyDeviceToHost, s));
     device_.synchronize();
+    PromptReadout readout;
+    readout.logprobs.assign(pinned_logprobs, pinned_logprobs + n);
+    readout.top_token   = *pinned_top_id;
+    readout.top_logprob = *pinned_top_logprob;
     return readout;
 }
 

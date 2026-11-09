@@ -7,6 +7,7 @@
 
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/memory.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -22,8 +23,10 @@ __device__ __forceinline__ __nv_bfloat162 residual_add_pair(__nv_bfloat162 y, __
     return __floats2bfloat162_rn(r0, r1);
 }
 
-__global__ void residual_add_scalar_kernel(const __nv_bfloat16* y, __nv_bfloat16* x,
-                                           std::int64_t n) {
+__launch_bounds__(256) __global__
+void residual_add_scalar_kernel(const __nv_bfloat16* y, __nv_bfloat16* x,
+                                   std::int64_t n) {
+    pdl::enter();
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
@@ -33,6 +36,7 @@ __global__ void residual_add_scalar_kernel(const __nv_bfloat16* y, __nv_bfloat16
 
 __launch_bounds__(256) __global__
     void residual_add_bf16x8_kernel(const Bf16x8Pack* y, Bf16x8Pack* x, std::int64_t packs) {
+    pdl::enter();
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < packs; i += stride) {
@@ -48,6 +52,7 @@ __launch_bounds__(256) __global__
 
 __launch_bounds__(256) __global__
     void residual_add_bf16x2_kernel(const __nv_bfloat16* y, __nv_bfloat16* x, std::int64_t n) {
+    pdl::enter();
     const std::int64_t tid = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride =
         static_cast<std::int64_t>(gridDim.x) * blockDim.x * kResidualAddPairsPerThread;

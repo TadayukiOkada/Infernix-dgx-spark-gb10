@@ -20,8 +20,10 @@ __global__ void scatter_bf16x8_kernel(const uint4* src, const std::int32_t* indi
     }
 }
 
-__global__ void scatter_bf16x2_kernel(const __nv_bfloat162* src, const std::int32_t* indices,
-                                      __nv_bfloat162* dst, std::int32_t pairs) {
+__launch_bounds__(256) __global__
+void scatter_bf16x2_kernel(const __nv_bfloat162* src, const std::int32_t* indices,
+                           __nv_bfloat162* dst, std::int32_t pairs) {
+    pdl::enter();
     const std::int32_t src_col = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t dst_col = indices[src_col];
 
@@ -33,8 +35,10 @@ __global__ void scatter_bf16x2_kernel(const __nv_bfloat162* src, const std::int3
     }
 }
 
-__global__ void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32_t* indices,
-                                      __nv_bfloat16* dst, std::int32_t d) {
+__launch_bounds__(256) __global__
+void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32_t* indices,
+                           __nv_bfloat16* dst, std::int32_t d) {
+    pdl::enter();
     const std::int32_t src_col = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t dst_col = indices[src_col];
 

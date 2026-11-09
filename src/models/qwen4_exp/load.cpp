@@ -523,11 +523,22 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
                 }
                 const auto& tensor =
                     reader.directory().tensor(bindings.weights.at(ids.front().index).reference.binding.parts.front().object);
-                const auto g = weight_geometry(artifact::parse_format(tensor.format), artifact::parse_layout(tensor.layout),
-                                               tensor.shape);
+                const auto format0 = artifact::parse_format(tensor.format);
+                const auto layout0 = artifact::parse_layout(tensor.layout);
+                const auto shape0  = tensor.shape;
+                const auto g = weight_geometry(format0, layout0, shape0);
                 if (g.layout != QuantLayout::RowSplit || g.high_bytes_per_row != 0) {
                     throw ArtifactError("the drafter pool needs the MTP drafter's experts as "
                                         "row-split Q2/Q4/Q8 banks");
+                }
+                for (std::size_t k = 1; k < ids.size(); ++k) {
+                    const auto& t = reader.directory().tensor(
+                        bindings.weights.at(ids[k].index).reference.binding.parts.front().object);
+                    if (artifact::parse_format(t.format) != format0 ||
+                        artifact::parse_layout(t.layout) != layout0 ||
+                        t.shape != shape0) {
+                        throw ArtifactError("the drafter pool requires all pooled experts to share format, layout and shape");
+                    }
                 }
                 return g.code_bytes_per_row + g.scale_bytes_per_row;
             };

@@ -10,6 +10,7 @@
 // memory orders them. Both select the same rows in the same order and compute the same outputs.
 
 #include "ops/kernel/target_logprobs.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -74,6 +75,7 @@ template <int BlockSize, class Logit>
 __launch_bounds__(BlockSize) __global__
     void top_logprobs_one_kernel(const Logit* logits, std::int32_t* ids, float* output,
                                  std::int32_t valid_rows, std::int32_t physical_rows) {
+    pdl::enter();
     __shared__ TargetLogprobsShared<BlockSize> lse_shared;
     __shared__ unsigned long long warp_maxima[BlockSize / kWarpSize];
     __shared__ unsigned long long best_shared;
@@ -85,15 +87,19 @@ __launch_bounds__(BlockSize) __global__
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
         const float value = logprob_logit(values[row]);
-        if (value > local_max) {
-            local_sum *= expf(local_max - value);
-            local_max = value;
-            best_row  = row;
+        if (value > -CUDART_INF_F) {
+            if (value > local_max) {
+                local_sum *= expf(local_max - value);
+                local_max = value;
+                best_row  = row;
+            }
+            local_sum += expf(value - local_max);
         }
-        local_sum += expf(value - local_max);
     }
     const float maximum = target_logprobs_block_max<BlockSize>(local_max, lse_shared);
-    local_sum *= expf(local_max - maximum);
+    if (maximum > -CUDART_INF_F) {
+        local_sum *= expf(local_max - maximum);
+    }
     const float sum = block_reduce_sum<BlockSize>(local_sum, lse_shared.warp_scratch);
     const unsigned long long first_key =
         static_cast<std::int32_t>(threadIdx.x) < valid_rows ? top_logprobs_key(local_max, best_row) : 0ULL;
@@ -101,7 +107,9 @@ __launch_bounds__(BlockSize) __global__
     if (threadIdx.x == 0) {
         const auto row = static_cast<std::int32_t>(0xffffffffu - static_cast<unsigned>(best));
         ids[column]    = row;
-        output[column] = logprob_logit(values[row]) - maximum - logf(sum);
+        output[column] = (maximum > -CUDART_INF_F && sum > 0.0f)
+                             ? (logprob_logit(values[row]) - maximum - logf(sum))
+                             : 0.0f;
     }
 }
 
@@ -110,6 +118,7 @@ __launch_bounds__(BlockSize) __global__
     void top_logprobs_kernel(const Logit* logits, std::int32_t* ids, float* output,
                              std::int32_t valid_rows, std::int32_t physical_rows,
                              std::int32_t count) {
+    pdl::enter();
     __shared__ TargetLogprobsShared<BlockSize> lse_shared;
     __shared__ unsigned long long warp_maxima[BlockSize / kWarpSize];
     __shared__ unsigned long long best_shared;
@@ -124,12 +133,14 @@ __launch_bounds__(BlockSize) __global__
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
         const float value   = logprob_logit(values[row]);
-        const float new_max = fmaxf(local_max, value);
-        if (new_max > local_max) {
-            local_sum *= expf(local_max - new_max);
+        if (value > -CUDART_INF_F) {
+            const float new_max = fmaxf(local_max, value);
+            if (new_max > local_max) {
+                local_sum *= expf(local_max - new_max);
+            }
+            local_max = new_max;
+            local_sum += expf(value - local_max);
         }
-        local_max = new_max;
-        local_sum += expf(value - local_max);
         const unsigned long long key = top_logprobs_key(value, row);
         if (key > k3) {
             if (key > k0) {
@@ -150,9 +161,11 @@ __launch_bounds__(BlockSize) __global__
         }
     }
     const float maximum = target_logprobs_block_max<BlockSize>(local_max, lse_shared);
-    local_sum *= expf(local_max - maximum);
+    if (maximum > -CUDART_INF_F) {
+        local_sum *= expf(local_max - maximum);
+    }
     const float sum = block_reduce_sum<BlockSize>(local_sum, lse_shared.warp_scratch);
-    if (threadIdx.x == 0) { lse_shared.scalar = logf(sum); }
+    if (threadIdx.x == 0) { lse_shared.scalar = (maximum > -CUDART_INF_F && sum > 0.0f) ? logf(sum) : 0.0f; }
     __syncthreads();
     const TargetLogprobsColumn lse{maximum, lse_shared.scalar};
 
@@ -221,6 +234,8 @@ __launch_bounds__(BlockSize) __global__
     void top_logprobs_select_kernel(const Logit* logits, std::int32_t* ids, float* output,
                                     std::int32_t valid_rows, std::int32_t physical_rows,
                                     std::int32_t count) {
+    pdl::enter();
+    if (count > valid_rows) { count = valid_rows; }
     constexpr int kBins = 1 << kTopLogprobsDigitBits;
     __shared__ unsigned histogram[kBins];
     __shared__ unsigned long long keys[kTopLogprobsSelectMaximum];

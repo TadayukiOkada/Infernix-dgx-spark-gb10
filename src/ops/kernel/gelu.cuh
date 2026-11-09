@@ -6,6 +6,7 @@
 
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/memory.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -34,6 +35,7 @@ __device__ __forceinline__ __nv_bfloat162 gelu_pair(__nv_bfloat162 input) {
 
 template <bool TanhApprox, int Block>
 __launch_bounds__(Block) __global__ void gelu_bf16x8_kernel(Bf16x8Pack* x, std::int64_t packs) {
+    pdl::enter();
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < packs; i += stride) {
@@ -50,6 +52,7 @@ template <bool TanhApprox, int Block>
 __launch_bounds__(Block) __global__
     void gelu_bf16x2_kernel(__nv_bfloat162* x, std::int64_t pairs, __nv_bfloat16* scalar,
                             bool has_scalar) {
+    pdl::enter();
     const std::int64_t first =
         (static_cast<std::int64_t>(blockIdx.x) * Block + threadIdx.x) * kGeluPairsPerThread;
 #pragma unroll
@@ -63,7 +66,9 @@ __launch_bounds__(Block) __global__
 }
 
 template <bool TanhApprox>
-__global__ void gelu_kernel(__nv_bfloat16* x, std::int64_t n) {
+__launch_bounds__(256) __global__
+void gelu_kernel(__nv_bfloat16* x, std::int64_t n) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {

@@ -2,6 +2,15 @@
 
 namespace infernix::models::qwen4_exp {
 
+namespace detail {
+
+ProgramImpl::~ProgramImpl() noexcept {
+    if (device_.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device_.transfer_stream); }
+    if (device_.stream != nullptr) { (void)cudaStreamSynchronize(device_.stream); }
+}
+
+} // namespace detail
+
 RequestBasePlan::RequestBasePlan(std::unique_ptr<detail::BasePlanImpl> impl) noexcept : impl_(std::move(impl)) {}
 RequestBasePlan::RequestBasePlan(RequestBasePlan&&) noexcept            = default;
 RequestBasePlan& RequestBasePlan::operator=(RequestBasePlan&&) noexcept = default;

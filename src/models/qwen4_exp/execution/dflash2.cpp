@@ -103,7 +103,7 @@ void DFlash2::materialize(const DFlash2ContextCall& call) {
         throw std::invalid_argument("Qwen4Exp DFlash2: context call geometry is invalid");
     }
     const nvtx::ScopedRange range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash, static_cast<std::uint64_t>(W * B));
-    work_.reset();
+    auto scope = work_.scope();
     Tensor projected = work_.alloc(DType::BF16, {H, W * B});
     project(call.features.view({call.features.ne[0], W * B}), p_.feature_projection, projected, work_, s);
     Tensor context = work_.alloc(DType::BF16, {H, W, B});
@@ -168,7 +168,7 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
         throw std::invalid_argument("Qwen4Exp DFlash2: proposal geometry is invalid");
     }
     const nvtx::ScopedRange range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash, static_cast<std::uint64_t>(columns));
-    work_.reset();
+    auto scope = work_.scope();
     Tensor ids       = call.ids;
     Tensor positions = call.positions;
     ops::prepare_masked_block(call.anchors, call.frontiers, call.valid_columns, dim(config_.mask_token_id), ids,
@@ -276,18 +276,16 @@ std::size_t DFlash2::workspace_bytes(const TextConfig& text, const DFlash2Config
     const std::size_t W = static_cast<std::size_t>(max_width), B = static_cast<std::size_t>(max_batch);
     const std::size_t cells = W * B, masks = (W - 1) * B;
     const std::size_t branch = (H * cells * 2 + kSlack) + (G * 2 * cells * 2 + kSlack);
-    std::size_t prepare = 0, add_attention = 0, add_mlp = 0, window = 0;
-    for (std::int32_t w = 2; w <= max_width; ++w) {
-        for (std::int32_t b = 1; b <= max_batch; ++b) {
-            prepare = std::max(prepare, ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(dim(H), w, w, b, b));
-            add_attention =
-                std::max(add_attention, ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(dim(H), dim(q), w, w, b, b));
-            add_mlp = std::max(add_mlp, ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(dim(H), dim(I), w, w, b, b));
-            window  = std::max(window, ops::sliding_window_attention_workspace_capacity_bytes(
-                                           {dim(D), dim(config.attention.heads), dim(config.attention.kv_heads)},
-                                           config.window, {0, max_context}, w, w, b));
-        }
-    }
+    const std::size_t prepare =
+        ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(dim(H), 2, max_width, 1, max_batch);
+    const std::size_t add_attention =
+        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(dim(H), dim(q), 2, max_width, 1, max_batch);
+    const std::size_t add_mlp =
+        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(dim(H), dim(I), 2, max_width, 1, max_batch);
+    const std::size_t window =
+        ops::sliding_window_attention_workspace_capacity_bytes(
+            {dim(D), dim(config.attention.heads), dim(config.attention.kv_heads)},
+            config.window, {0, max_context}, 2, max_width, max_batch);
     const std::size_t swiglu = ops::linear_swiglu_workspace_capacity_bytes(kQ8, dim(2 * I), dim(H), kA16, 1, dim(cells));
     const std::size_t attention = branch + (q + 2 * kv) * cells * 2 + 3 * kSlack + (q * cells * 2 + kSlack) +
                                   std::max(prepare, window) + add_attention + 2 * kSlack;

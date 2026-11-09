@@ -448,6 +448,7 @@ private:
     // copied ahead masked) and the guessed columns.
     PinnedHostBuffer split_offsets_{1};
     cudaEvent_t split_ready_ = nullptr;
+    cudaEvent_t guess_ready_ = nullptr;
     std::vector<std::int32_t> split_columns_;
     std::vector<std::uint8_t> split_cpu_;
     std::vector<std::int32_t> split_priced_;

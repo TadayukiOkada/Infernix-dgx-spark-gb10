@@ -18,8 +18,8 @@ using artifact::require_members;
 
 std::uint32_t integer(const Json& value, std::string_view label, bool positive = true) {
     const auto n = artifact::require_u64(value, label, positive);
-    if (n > std::numeric_limits<std::uint32_t>::max()) {
-        throw ArtifactError(std::string(label) + ": config dimension exceeds u32");
+    if (n > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw ArtifactError(std::string(label) + ": config dimension exceeds int32 range");
     }
     return static_cast<std::uint32_t>(n);
 }
@@ -162,7 +162,7 @@ TextConfig text(const Json& value) {
     out.max_position_embeddings = dimension(value, "max_position_embeddings");
     out.rms_norm_eps            = positive_float(value, "rms_norm_eps");
     out.eos_token_id            = static_cast<std::int32_t>(integer(value.at("eos_token_id"), "eos", false));
-    if (static_cast<std::uint32_t>(out.eos_token_id) >= out.vocab_size) {
+    if (out.eos_token_id < 0 || static_cast<std::uint32_t>(out.eos_token_id) >= out.vocab_size) {
         throw ArtifactError("eos_token_id exceeds the vocabulary");
     }
     const auto& layers = value.at("layer_types");

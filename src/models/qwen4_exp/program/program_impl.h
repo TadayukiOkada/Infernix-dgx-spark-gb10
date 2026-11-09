@@ -264,11 +264,13 @@ inline std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 // `mtp_block_rope` the MTP chunk's per sub-chunk (execution::MtpChunk). `gate` is the U32 a gated
 // verification round's rows wait for (design §12.3): it precedes `ngram`, so the round uploads it
 // with the prefix and its rows go through the gate instead.
+inline constexpr std::size_t kFlushWords = 10; // an MR3 flush call's staging words
+
 struct IoLayout {
     std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, slots = 0, rows = 0, columns = 0, gate = 0, divisor = 0,
                 ngram = 0,
                 mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0, vision_columns = 0,
-                mtp_vision_columns = 0, bytes = 0;
+                mtp_vision_columns = 0, flush = 0, bytes = 0;
 };
 
 // A request's verification rounds whose rows were read behind the n-gram gate, and those reads.
@@ -621,7 +623,8 @@ public:
         d.io.mtp_block_rope = align(d.io.mtp_rope + 12ULL * (columns + 1));
         d.io.vision_columns     = align(d.io.mtp_block_rope + 12ULL * mtp_subchunks);
         d.io.mtp_vision_columns = align(d.io.vision_columns + 4ULL * columns);
-        d.io.bytes              = align(d.io.mtp_vision_columns + 4ULL * (columns + 1));
+        d.io.flush              = align(d.io.mtp_vision_columns + 4ULL * (columns + 1));
+        d.io.bytes              = align(d.io.flush + (d.mtp ? 4ULL * kFlushWords * lanes : 0));
         if (d.io.block_rope + 12ULL * lanes > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
             throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
         }
@@ -1508,12 +1511,29 @@ public:
             // Dense8's probe read 9,377 experts/s there and 18,942 5 s later in the same process, on the same records
             // (2026-10-27), and the low reading kept half the decode misses on the link instead of a third for the
             // whole session (decode -26 %). The rates are measured again after a pause; the better reading stands.
-            measure_cpu_rate(record_stride);
-            const double first_experts = cpu_expert_rate_, first_columns = cpu_column_rate_;
-            std::this_thread::sleep_for(kTierRateSettle);
-            measure_cpu_rate(record_stride);
-            cpu_expert_rate_ = std::max(cpu_expert_rate_, first_experts);
-            cpu_column_rate_ = std::max(cpu_column_rate_, first_columns);
+            struct CalibratedRates {
+                double expert_rate = 0.0;
+                double column_rate = 0.0;
+            };
+            static std::unordered_map<std::uint64_t, CalibratedRates> cached_rates;
+            static std::mutex rates_mutex;
+            std::lock_guard<std::mutex> lock(rates_mutex);
+            auto it = cached_rates.find(record_stride);
+            if (it != cached_rates.end() && it->second.expert_rate > 0.0) {
+                cpu_expert_rate_ = it->second.expert_rate;
+                cpu_column_rate_ = it->second.column_rate;
+            } else {
+                measure_cpu_rate(record_stride);
+                const double first_experts = cpu_expert_rate_, first_columns = cpu_column_rate_;
+                const char* skip_settle = std::getenv("INFERNIX_SKIP_TIER_SETTLE");
+                if (!skip_settle) {
+                    std::this_thread::sleep_for(kTierRateSettle);
+                    measure_cpu_rate(record_stride);
+                }
+                cpu_expert_rate_ = std::max(cpu_expert_rate_, first_experts);
+                cpu_column_rate_ = std::max(cpu_column_rate_, first_columns);
+                cached_rates[record_stride] = {cpu_expert_rate_, cpu_column_rate_};
+            }
             for (auto& channel : experts.cpu) {
                 channel.pcie_divisor = pcie_divisor();
                 channel.pcie_share   = pcie_share();
@@ -1540,6 +1560,8 @@ public:
         device_.synchronize();
         report_lane_cost(lanes, residency_->frame_bytes());
     }
+
+    ~ProgramImpl() noexcept;
 
     const DeviceLayout& device_layout() const noexcept { return plan_; }
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
@@ -2797,7 +2819,7 @@ public:
         }
         run_decode(batch, round_positions[0], graph, screened);
         if (gated) {
-            read_behind_gate(lanes_[lanes[0]], word, io_prefix(batch) - io_layout_.ngram,
+            read_behind_gate(round_lanes, word, io_prefix(batch) - io_layout_.ngram,
                              [&] { stage_decode_rows(round_lanes, round_positions); });
         }
         // The route download stays in run_decode (GB10 placement, guarded by track_routes()).
@@ -3853,7 +3875,7 @@ private:
     // that serves them slowly (a DRAM-less SSD at 5,000 reads/s against 17,000-80,000 on the owner's
     // drives and 230,000 on a Samsung 9100 PRO) makes a long prompt spend minutes reading n-gram rows.
     // It never changes placement; the table stays where the ledger put it.
-    void probe_ngram_volume() const noexcept {
+    void probe_ngram_volume() noexcept {
         constexpr double kSlowReadsPerSecond = 15000.0;
         if (options_.ngram_in_ram) {
             try {
@@ -4151,10 +4173,18 @@ private:
             }
         }
         const NgramVolume::Counters& after = volume_.counters();
-        lanes_[lanes[0]].ngram.rows += after.rows - before.rows;
-        lanes_[lanes[0]].ngram.hits += after.hits - before.hits;
-        lanes_[lanes[0]].ngram.reads += after.reads - before.reads;
-        lanes_[lanes[0]].ngram.read_ns += after.read_ns - before.read_ns;
+        const std::uint64_t d_rows = after.rows - before.rows;
+        const std::uint64_t d_hits = after.hits - before.hits;
+        const std::uint64_t d_reads = after.reads - before.reads;
+        const std::uint64_t d_read_ns = after.read_ns - before.read_ns;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const std::int32_t count = std::max(0, to[b] - from[b]);
+            if (count == 0) { continue; }
+            lanes_[lanes[b]].ngram.rows += (d_rows * count) / total_cols;
+            lanes_[lanes[b]].ngram.hits += (d_hits * count) / total_cols;
+            lanes_[lanes[b]].ngram.reads += (d_reads * count) / total_cols;
+            lanes_[lanes[b]].ngram.read_ns += (d_read_ns * count) / total_cols;
+        }
     }
 
     // Reads the rows of the `count` positions whose tokens (with their context) are in window_ into
@@ -4237,10 +4267,17 @@ private:
         volume_.read_rows(row_ids_,
                           std::span<std::byte>(host_io() + io_layout_.ngram, lanes.size() * heads * row_bytes));
         const NgramVolume::Counters& after = volume_.counters();
-        lanes_[lanes[0]].ngram.rows += after.rows - before.rows;
-        lanes_[lanes[0]].ngram.hits += after.hits - before.hits;
-        lanes_[lanes[0]].ngram.reads += after.reads - before.reads;
-        lanes_[lanes[0]].ngram.read_ns += after.read_ns - before.read_ns;
+        const std::uint64_t d_rows = after.rows - before.rows;
+        const std::uint64_t d_hits = after.hits - before.hits;
+        const std::uint64_t d_reads = after.reads - before.reads;
+        const std::uint64_t d_read_ns = after.read_ns - before.read_ns;
+        const std::size_t n = lanes.size();
+        for (std::size_t b = 0; b < n; ++b) {
+            lanes_[lanes[b]].ngram.rows += d_rows / n;
+            lanes_[lanes[b]].ngram.hits += d_hits / n;
+            lanes_[lanes[b]].ngram.reads += d_reads / n;
+            lanes_[lanes[b]].ngram.read_ns += d_read_ns / n;
+        }
     }
 
     // Whether every n-gram row of a verification round's unstaged columns [staged[b], W) is in the host row cache.
@@ -4294,7 +4331,8 @@ private:
     // driver loads its code then and, with the process past its OS budget, waits for the device
     // to do so (the sampler and acceptance kernels queued here before 2026-10-30: the gate trapped
     // after kPinnedGateTimeoutNs in 5 of 7 --vram-past-budget starts).
-    void read_behind_gate(Lane& lane, std::uint32_t word, std::size_t bytes, const std::function<void()>& read) {
+    void read_behind_gate(std::span<const std::uint32_t> lanes, std::uint32_t word, std::size_t bytes,
+                          const std::function<void()>& read) {
         GateRelease release_gate{this, word, bytes};
         device_.flush();
         const NgramVolume::Counters before = volume_.counters();
@@ -4302,14 +4340,25 @@ private:
         const NgramVolume::Counters& after = volume_.counters();
         release_gate.owner = nullptr;
         publish_pinned_word(gate_ready(), word);
-        ++lane.gate.rounds;
-        lane.gate.reads += after.reads - before.reads;
-        lane.gate.read_ns += after.read_ns - before.read_ns;
-        if (after.read_ns - before.read_ns > kSlowGatedReadNs) {
-            diagnostic("n-gram rows behind the gate took " + std::to_string((after.read_ns - before.read_ns) / 1000000) +
+        const std::uint64_t d_reads = after.reads - before.reads;
+        const std::uint64_t d_read_ns = after.read_ns - before.read_ns;
+        const std::size_t n = std::max<std::size_t>(1, lanes.size());
+        for (const std::uint32_t l : lanes) {
+            Lane& lane = lanes_[l];
+            ++lane.gate.rounds;
+            lane.gate.reads += d_reads / n;
+            lane.gate.read_ns += d_read_ns / n;
+        }
+        if (d_read_ns > kSlowGatedReadNs) {
+            diagnostic("n-gram rows behind the gate took " + std::to_string(d_read_ns / 1000000) +
                            " ms (the GPU waited at layer 1)",
                        DiagnosticLevel::Warning);
         }
+    }
+
+    void read_behind_gate(Lane& lane, std::uint32_t word, std::size_t bytes, const std::function<void()>& read) {
+        const auto l = static_cast<std::uint32_t>(&lane - lanes_.data());
+        read_behind_gate(std::span<const std::uint32_t>(&l, 1), word, bytes, read);
     }
 
     // Runs one eager Forward call over the staged inputs (prefill chunks, forced tokens); logits of
@@ -4370,6 +4419,57 @@ private:
     // thread touches none of them meanwhile, and its own host waits (a split call's routing, the stream's
     // bounce) cannot block the helper's publish. A failed read publishes zero rows (the call's results are
     // discarded with its error). The same rows and the same arithmetic: no bit changes.
+    struct PrefillReader {
+        std::thread worker;
+        std::mutex mutex;
+        std::condition_variable start_cv;
+        std::condition_variable done_cv;
+        std::function<void()> task;
+        bool stop = false;
+        bool done = true;
+
+        PrefillReader() : worker([this] { loop(); }) {}
+        ~PrefillReader() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop = true;
+            }
+            start_cv.notify_one();
+            if (worker.joinable()) { worker.join(); }
+        }
+        void run(std::function<void()> t) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                task = std::move(t);
+                done = false;
+            }
+            start_cv.notify_one();
+        }
+        void wait() {
+            std::unique_lock<std::mutex> lock(mutex);
+            done_cv.wait(lock, [this] { return done; });
+        }
+    private:
+        void loop() {
+            for (;;) {
+                std::function<void()> current_task;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    start_cv.wait(lock, [this] { return stop || task; });
+                    if (stop) { return; }
+                    current_task = std::move(task);
+                }
+                if (current_task) { current_task(); }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    done = true;
+                }
+                done_cv.notify_one();
+            }
+        }
+    };
+    PrefillReader prefill_reader_;
+
     void run_rows_behind(Lane& lane, std::int32_t begin, std::int32_t width, const execution::MtpChunk* chunk,
                          const execution::VisionInput* vision, bool streamed) {
         const std::uint32_t word = next_gate_word();
@@ -4378,7 +4478,7 @@ private:
             .ready       = gate_ready(),
             .expected    = reinterpret_cast<const std::uint32_t*>(static_cast<std::byte*>(io_device_.p) + io_layout_.gate)};
         std::exception_ptr failed;
-        std::thread reader([&, word] {
+        prefill_reader_.run([&, word] {
             try {
                 const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                    static_cast<std::uint64_t>(width));
@@ -4392,10 +4492,10 @@ private:
         try {
             run(1, width, 1, chunk, vision, streamed, &gate);
         } catch (...) {
-            reader.join();
+            prefill_reader_.wait();
             throw;
         }
-        reader.join();
+        prefill_reader_.wait();
         if (failed) { std::rethrow_exception(failed); }
     }
 
@@ -5146,7 +5246,7 @@ private:
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         if (!options_.device_experts) { residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active); }
         replay(graph, [&] { verify_graph_body(batch, W, screened); });
-        if (gated) { read_behind_gate(lanes_[lanes[0]], word, io_prefix(batch * W) - io_layout_.ngram, read_rows); }
+        if (gated) { read_behind_gate(lanes, word, io_prefix(batch * W) - io_layout_.ngram, read_rows); }
         if (track_routes()) { residency_->enqueue_route_download(s, batch * W); }
 
         // Acceptance on the device, from the logits plain decode samples (FP32, or BF16: design 16.5); the
@@ -7128,9 +7228,6 @@ private:
     std::unique_ptr<prefix::PrefixCache> prefix_;
     std::uint64_t next_capture_ = 0;
     std::array<std::span<const cudaEvent_t>, 2> next_waits_{};
-    PinnedHostBuffer flush_host_{1};
-    DeviceBuffer flush_device_;
-    cudaEvent_t flush_uploaded_ = nullptr;
 
     // Last: its thread reads the source, the control law and the residency, so it stops first.
     std::unique_ptr<VramMonitor> monitor_;

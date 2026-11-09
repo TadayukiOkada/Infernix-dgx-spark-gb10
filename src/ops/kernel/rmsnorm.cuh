@@ -221,6 +221,7 @@ __launch_bounds__(512) __global__
     void rmsnorm_d2048_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                      const __nv_bfloat162* z, __nv_bfloat162* out,
                                      std::int64_t rows, float eps) {
+    pdl::enter();
     constexpr int kBlock       = 512;
     constexpr int kPairsPerRow = 1024;
     const std::int64_t row     = static_cast<std::int64_t>(blockIdx.x);
@@ -264,16 +265,12 @@ inline constexpr std::int32_t kRmsPreloadMinD = 8192;
 inline constexpr std::int32_t kRmsPreloadMidD = 10240;
 inline constexpr std::int32_t kRmsPreloadMaxD = 16384;
 
-// The generic kernel's reduction: the 256 per-thread sums by a fixed shared tree, then the inverse
-// RMS. Every thread of the CTA calls it with the kernel's 256-float scratch.
+// The generic kernel's reduction: warp-shuffle sum reduction, then inverse RMS.
 __device__ __forceinline__ float rmsnorm_generic_inv(float sum, float* scratch, std::int32_t d, float eps) {
-    scratch[threadIdx.x] = sum;
+    const float block_sum = block_reduce_sum<256>(sum, scratch);
+    if (threadIdx.x == 0) { scratch[0] = rsqrtf(block_sum / static_cast<float>(d) + eps); }
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) { scratch[threadIdx.x] += scratch[threadIdx.x + stride]; }
-        __syncthreads();
-    }
-    return rsqrtf(scratch[0] / static_cast<float>(d) + eps);
+    return scratch[0];
 }
 
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
@@ -289,6 +286,7 @@ __launch_bounds__(256) __global__
     void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                 const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
                                 std::int64_t rows, float eps) {
+    pdl::enter();
     static_assert(Preload >= 0 && (Preload == 0 || !rms_gated(Epilogue)),
                   "the preloading instance serves the ungated epilogues");
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);

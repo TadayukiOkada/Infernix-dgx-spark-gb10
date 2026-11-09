@@ -1,16 +1,20 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
 
 namespace infernix::ops {
 
-__global__ void vision_pos_embed_add_d1152_warp_kernel(const __nv_bfloat162* table,
-                                                       const std::int32_t* indices,
-                                                       const float* weights, __nv_bfloat162* x,
-                                                       std::int32_t patches,
-                                                       std::int32_t tiles_per_patch) {
+__launch_bounds__(32) __global__
+void vision_pos_embed_add_d1152_warp_kernel(const __nv_bfloat162* table,
+                                            const std::int32_t* indices,
+                                            const float* weights, __nv_bfloat162* x,
+                                            std::int32_t patches,
+                                            std::int32_t tiles_per_patch) {
+    pdl::enter();
     constexpr int pairs = 1152 / 2;
     const int lane      = static_cast<int>(threadIdx.x);
     const int patch     = static_cast<int>(blockIdx.x) / tiles_per_patch;
@@ -50,6 +54,7 @@ __launch_bounds__(Block) __global__
     void vision_pos_embed_add_d1152_kernel(const __nv_bfloat162* table, const std::int32_t* indices,
                                            const float* weights, __nv_bfloat162* x,
                                            std::int32_t patches) {
+    pdl::enter();
     constexpr int d     = 1152;
     constexpr int pairs = d / 2;
     const int patch     = static_cast<int>(blockIdx.x);
@@ -80,10 +85,12 @@ __launch_bounds__(Block) __global__
     }
 }
 
-__global__ void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const std::int32_t* indices,
-                                            const float* weights, __nv_bfloat16* x, std::int32_t d,
-                                            std::int32_t patches, std::int32_t table_rows,
-                                            std::int64_t n) {
+__launch_bounds__(256) __global__
+void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const std::int32_t* indices,
+                                 const float* weights, __nv_bfloat16* x, std::int32_t d,
+                                 std::int32_t patches, std::int32_t table_rows,
+                                 std::int64_t n) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t linear = start; linear < n; linear += stride) {

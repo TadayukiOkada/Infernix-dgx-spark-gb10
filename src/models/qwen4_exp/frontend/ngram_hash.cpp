@@ -1,8 +1,11 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <exception>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -32,6 +35,118 @@ bool is_prime(std::uint64_t v) {
 }
 
 } // namespace
+
+struct NgramHash::HashPool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<std::condition_variable>> worker_cv;
+    std::condition_variable done_cv;
+    std::vector<std::thread> workers;
+    std::vector<std::exception_ptr> errors;
+    const std::function<void(std::size_t, std::size_t)>* task = nullptr;
+    std::size_t active  = 0;
+    std::size_t pending = 0;
+    std::uint64_t epoch = 0;
+    bool stop           = false;
+
+    explicit HashPool(std::size_t total_threads) : errors(total_threads) {
+        if (total_threads <= 1) { return; }
+        workers.reserve(total_threads - 1);
+        worker_cv.reserve(total_threads - 1);
+        for (std::size_t t = 1; t < total_threads; ++t) {
+            worker_cv.push_back(std::make_unique<std::condition_variable>());
+        }
+        for (std::size_t t = 1; t < total_threads; ++t) {
+            workers.emplace_back([this, t] {
+                std::uint64_t seen = 0;
+                for (;;) {
+                    const std::function<void(std::size_t, std::size_t)>* fn = nullptr;
+                    std::size_t n = 0;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        worker_cv[t - 1]->wait(lock, [&] { return stop || epoch != seen; });
+                        if (stop) { return; }
+                        seen = epoch;
+                        if (t < active) {
+                            fn = task;
+                            n  = active;
+                        }
+                    }
+                    if (fn != nullptr) {
+                        try {
+                            (*fn)(t, n);
+                        } catch (...) { errors[t] = std::current_exception(); }
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (--pending == 0) { done_cv.notify_one(); }
+                    }
+                }
+            });
+        }
+    }
+
+    ~HashPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+            for (auto& cv : worker_cv) { cv->notify_one(); }
+        }
+        for (auto& w : workers) {
+            if (w.joinable()) { w.join(); }
+        }
+    }
+
+    void run(std::size_t threads, const std::function<void(std::size_t, std::size_t)>& fn) {
+        if (threads <= 1 || workers.empty()) {
+            fn(0, 1);
+            return;
+        }
+        for (std::size_t t = 0; t < threads; ++t) { errors[t] = nullptr; }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            task    = &fn;
+            active  = threads;
+            pending = threads - 1;
+            ++epoch;
+            for (std::size_t t = 1; t < threads; ++t) {
+                worker_cv[t - 1]->notify_one();
+            }
+        }
+        try {
+            fn(0, threads);
+        } catch (...) { errors[0] = std::current_exception(); }
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            done_cv.wait(lock, [&] { return pending == 0; });
+            task = nullptr;
+        }
+        for (std::size_t t = 0; t < threads; ++t) {
+            if (errors[t]) { std::rethrow_exception(errors[t]); }
+        }
+    }
+};
+
+NgramHash::~NgramHash()                                = default;
+NgramHash::NgramHash(NgramHash&&) noexcept            = default;
+NgramHash& NgramHash::operator=(NgramHash&&) noexcept = default;
+
+NgramHash::NgramHash(const NgramHash& other)
+    : config_(other.config_),
+      multipliers_(other.multipliers_),
+      sizes_(other.sizes_),
+      offsets_(other.offsets_),
+      padded_rows_(other.padded_rows_),
+      pool_(nullptr) {}
+
+NgramHash& NgramHash::operator=(const NgramHash& other) {
+    if (this != &other) {
+        config_      = other.config_;
+        multipliers_ = other.multipliers_;
+        sizes_       = other.sizes_;
+        offsets_     = other.offsets_;
+        padded_rows_ = other.padded_rows_;
+        pool_.reset();
+    }
+    return *this;
+}
 
 NgramHash::NgramHash(const NgramConfig& config, std::uint32_t layer) : config_(config) {
     if (config.ngram_size < 2 || config.heads_per_ngram == 0 || config.vocab_size == 0 ||
@@ -95,22 +210,14 @@ void NgramHash::row_ids(std::span<const std::int32_t> history, std::size_t count
         compute_range(0, count);
         return;
     }
-    std::vector<std::exception_ptr> errors(kParallelHashThreads);
-    std::vector<std::thread> threads;
-    threads.reserve(kParallelHashThreads);
-    for (std::size_t t = 0; t < kParallelHashThreads; ++t) {
-        const std::size_t lo = count * t / kParallelHashThreads;
-        const std::size_t hi = count * (t + 1) / kParallelHashThreads;
-        threads.emplace_back([&, t, lo, hi] {
-            try {
-                compute_range(lo, hi);
-            } catch (...) { errors[t] = std::current_exception(); }
-        });
+    if (!pool_) {
+        pool_ = std::make_unique<HashPool>(kParallelHashThreads);
     }
-    for (auto& thread : threads) { thread.join(); }
-    for (const auto& error : errors) {
-        if (error) { std::rethrow_exception(error); }
-    }
+    pool_->run(kParallelHashThreads, [&](std::size_t t, std::size_t n_threads) {
+        const std::size_t lo = count * t / n_threads;
+        const std::size_t hi = count * (t + 1) / n_threads;
+        compute_range(lo, hi);
+    });
 }
 
 } // namespace infernix::models::qwen4_exp

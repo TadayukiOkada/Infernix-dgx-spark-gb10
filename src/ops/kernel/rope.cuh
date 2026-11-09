@@ -123,6 +123,7 @@ template <RopeKernelMode Mode, int QHeads, int KHeads, class Coefficients = Nati
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
                                   std::int64_t k_token_stride, Coefficients coefficients = {}) {
+    pdl::enter();
     constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? 72
                              : Mode == RopeKernelMode::DflashText1D ? 128
                                                                     : 256;
@@ -168,6 +169,7 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
                                         __nv_bfloat16* k, std::int32_t tokens,
                                         std::int64_t q_token_stride, std::int64_t k_token_stride,
                                         Coefficients coefficients = {}) {
+    pdl::enter();
     static_assert(Mode == RopeKernelMode::DflashText1D);
     constexpr int kHeadDim       = 128;
     constexpr int kHalf          = 64;
@@ -225,7 +227,7 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
     pdl::enter(); // launched as a programmatic dependent
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
-    const int half = rotary_dim / 2;
+    const int half = min(rotary_dim / 2, kRopeMaxHalf);
     __shared__ float cos_cache[kRopeMaxHalf];
     __shared__ float sin_cache[kRopeMaxHalf];
     if (threadIdx.x < static_cast<unsigned>(half)) {
@@ -240,7 +242,7 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
             int axis       = 0;
             float exponent = 0.0F;
             generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            const float frequency = powf(theta, exponent);
+            const float frequency = exp2f(exponent * log2f(theta));
             const double angle =
                 static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
                 static_cast<double>(frequency);

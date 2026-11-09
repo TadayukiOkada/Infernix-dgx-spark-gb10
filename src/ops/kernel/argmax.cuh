@@ -63,11 +63,12 @@ template <class Logit>
 __launch_bounds__(kArgmaxBlock) __global__
     void argmax_kernel(const Logit* logits, std::int32_t* out, std::int32_t valid_rows,
                        std::int32_t physical_rows) {
+    pdl::enter();
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.x);
     const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
 
-    float best_value        = argmax_logit(logits[base]);
-    std::int32_t best_index = 0;
+    float best_value        = -CUDART_INF_F;
+    std::int32_t best_index = INT32_MAX;
     for (std::int32_t v = static_cast<std::int32_t>(threadIdx.x); v < valid_rows; v += blockDim.x) {
         const float value = argmax_logit(logits[base + v]);
         if (argmax_better(value, v, best_value, best_index)) {
@@ -76,26 +77,11 @@ __launch_bounds__(kArgmaxBlock) __global__
         }
     }
 
-    __shared__ float values[kArgmaxBlock];
-    __shared__ std::int32_t indices[kArgmaxBlock];
-    values[threadIdx.x]  = best_value;
-    indices[threadIdx.x] = best_index;
-    __syncthreads();
+    __shared__ float warp_values[16];
+    __shared__ std::int32_t warp_indices[16];
+    argmax_block_reduce(best_value, best_index, warp_values, warp_indices);
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            const float other_value        = values[threadIdx.x + stride];
-            const std::int32_t other_index = indices[threadIdx.x + stride];
-            if (argmax_better(other_value, other_index, values[threadIdx.x],
-                              indices[threadIdx.x])) {
-                values[threadIdx.x]  = other_value;
-                indices[threadIdx.x] = other_index;
-            }
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) { out[t] = indices[0]; }
+    if (threadIdx.x == 0) { out[t] = best_index == INT32_MAX ? 0 : best_index; }
 }
 
 // argmax_with_probability: the running argmax of the rows seen with its softmax denominator,

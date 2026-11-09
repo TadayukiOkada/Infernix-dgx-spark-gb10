@@ -25,6 +25,7 @@ __launch_bounds__(BlockSize) __global__
                                  const std::int32_t* choice_counts, std::int32_t sets,
                                  std::int32_t valid_rows, std::int32_t physical_rows,
                                  float* records, const std::int32_t* observe, float* observed) {
+    pdl::enter();
     const std::int32_t column     = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t descriptor = descriptors[column];
     if (descriptor == -1) { return; }

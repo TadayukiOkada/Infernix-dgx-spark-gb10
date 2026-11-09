@@ -51,10 +51,10 @@ public:
     [[nodiscard]] const NgramTableConfig& table() const noexcept { return table_; }
 
     // Copies each row's codes to out[i * row_bytes, (i + 1) * row_bytes).
-    void read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) const;
+    void read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out);
 
     // Whether every row is in the host cache, so read_rows would read nothing from the volume.
-    [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) const noexcept;
+    [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) noexcept;
 
     // Times up to `reads` unbuffered reads of random blocks, one at a time (the latency a missed row
     // costs), for a startup warning about a drive too slow to serve the table. It stops after
@@ -65,7 +65,7 @@ public:
         double seconds    = 0.0;
         [[nodiscard]] double reads_per_second() const noexcept { return seconds > 0.0 ? static_cast<double>(reads) / seconds : 0.0; }
     };
-    [[nodiscard]] ReadProbe probe_reads(std::size_t reads = 256, double max_seconds = 2.0) const;
+    [[nodiscard]] ReadProbe probe_reads(std::size_t reads = 256, double max_seconds = 2.0);
 
     // Row traffic since the volume was opened: rows requested, rows served by the host cache, 4 KiB
     // blocks read from the volume, and the wall time of the calls' volume reads.
@@ -114,29 +114,29 @@ private:
     [[nodiscard]] std::size_t set_of(std::uint32_t row) const noexcept {
         return static_cast<std::size_t>((row * 2654435761U) >> cache_set_shift_);
     }
-    [[nodiscard]] std::size_t find_slot(std::uint32_t row) const noexcept;
-    void insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) const noexcept;
+    [[nodiscard]] std::size_t find_slot(std::uint32_t row) noexcept;
+    void insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) noexcept;
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
     std::unique_ptr<ResidentHostBuffer> resident_; // the whole table's blocks (RAM mode)
-    mutable std::unique_ptr<ReaderPool> pool_;     // persistent worker threads for multi-issuer volume reads
-    mutable std::vector<std::byte> ring_storage_; // kInFlight blocks, 4 KiB-aligned at ring_
-    mutable std::byte* ring_ = nullptr;
-    mutable std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks
-    mutable std::byte* parallel_ring_ = nullptr;
-    mutable std::vector<std::uint32_t> tags_; // row id per cache slot, UINT32_MAX when empty
-    mutable std::vector<std::uint8_t> hand_;  // next way to replace per cache set
-    mutable std::vector<std::byte> cache_;    // row codes per slot
+    std::unique_ptr<ReaderPool> pool_;     // persistent worker threads for multi-issuer volume reads
+    std::vector<std::byte> ring_storage_; // kInFlight blocks, 4 KiB-aligned at ring_
+    std::byte* ring_ = nullptr;
+    std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks
+    std::byte* parallel_ring_ = nullptr;
+    std::vector<std::uint32_t> tags_; // row id per cache slot, UINT32_MAX when empty
+    std::vector<std::uint8_t> hand_;  // next way to replace per cache set
+    std::vector<std::byte> cache_;    // row codes per slot
     // One call's misses as (block << 32 | output index), sorted so each block's rows are adjacent;
     // the distinct blocks' offsets and where each block's misses begin.
-    mutable std::vector<std::uint64_t> misses_;
-    mutable std::vector<std::uint64_t> offsets_;
-    mutable std::vector<std::size_t> first_miss_;
+    std::vector<std::uint64_t> misses_;
+    std::vector<std::uint64_t> offsets_;
+    std::vector<std::size_t> first_miss_;
     // INFERNIX_TMP_NGRAM_SCATTER: the blocks' offsets in reading order, and each one's sorted index.
-    mutable std::vector<std::uint64_t> scattered_offsets_;
-    mutable std::vector<std::size_t> scattered_blocks_;
-    mutable Counters counters_;
+    std::vector<std::uint64_t> scattered_offsets_;
+    std::vector<std::size_t> scattered_blocks_;
+    Counters counters_;
 };
 
 // The volume beside the artifact: `<artifact>.ngram`.

@@ -5,6 +5,7 @@
 // Specification and fixture generator: tools/flash_next/ngram.py.
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -23,6 +24,11 @@ struct NgramConfig {
 class NgramHash {
 public:
     NgramHash(const NgramConfig& config, std::uint32_t ple_layer_index);
+    ~NgramHash();
+    NgramHash(const NgramHash&);
+    NgramHash& operator=(const NgramHash&);
+    NgramHash(NgramHash&&) noexcept;
+    NgramHash& operator=(NgramHash&&) noexcept;
 
     [[nodiscard]] std::uint32_t heads() const { return static_cast<std::uint32_t>(sizes_.size()); }
     [[nodiscard]] std::uint64_t table_rows() const { return padded_rows_; }
@@ -36,11 +42,14 @@ public:
     void row_ids(std::span<const std::int32_t> history, std::size_t count, std::uint32_t* out) const;
 
 private:
+    struct HashPool;
+
     NgramConfig config_;
     std::vector<std::uint64_t> multipliers_; // [ngram_size]
     std::vector<std::uint64_t> sizes_;       // [heads], primes
     std::vector<std::uint64_t> offsets_;     // [heads]
     std::uint64_t padded_rows_ = 0;
+    mutable std::unique_ptr<HashPool> pool_;
 };
 
 } // namespace infernix::models::qwen4_exp

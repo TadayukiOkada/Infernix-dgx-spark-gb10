@@ -36,7 +36,6 @@ namespace pc = runtime::prefix_cache;
 namespace {
 
 constexpr std::uint32_t kBlock = pc::kBlockTokens;
-constexpr std::size_t kFlushWords = 10; // an MR3 flush call's staging words
 // Blocks one prefetch batch copies at most (one page each; 256 pages are ~240 MB, ~9 ms of H2D).
 constexpr std::uint32_t kPrefetchBatchBlocks = 256;
 
@@ -92,13 +91,6 @@ void ProgramImpl::create_prefix_cache() {
     config.kv_pages   = kv_pages_;
     prefix_           = std::make_unique<prefix::PrefixCache>(config, *pool_, kv_geometry_, *lane_image_,
                                                             options_.prefix_host_bytes);
-    if (mtp_) {
-        // The MR3 flush cell's inputs: token, cell, slot and table row.
-        // id, cell, slot, row, then the cell's RoPE position and its pooled-block start (3 each).
-        flush_host_   = PinnedHostBuffer(kFlushWords * sizeof(std::int32_t));
-        flush_device_ = DeviceBuffer(kFlushWords * sizeof(std::int32_t));
-        CUDA_CHECK(cudaEventCreateWithFlags(&flush_uploaded_, cudaEventDisableTiming));
-    }
 }
 
 PrefixCachePersistence ProgramImpl::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
@@ -169,19 +161,18 @@ void ProgramImpl::pc_make_room(std::uint32_t pages) {
 // and token history[state_tokens]), the cell the next round's step 0 or catch-up would write.
 void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
     const cudaStream_t stream = device_.stream;
-    CUDA_CHECK(cudaEventSynchronize(flush_uploaded_)); // the previous flush has read the staging words
-    auto* words      = static_cast<std::int32_t*>(flush_host_.data());
-    const auto cell  = lane.state_tokens - 1U;
-    words[0]         = lane.history[lane.state_tokens];
-    words[1]         = static_cast<std::int32_t>(cell);
-    words[2]         = static_cast<std::int32_t>(index);
-    words[3]         = static_cast<std::int32_t>(index);
+    const std::size_t offset  = io_layout_.flush + static_cast<std::size_t>(index) * kFlushWords * sizeof(std::int32_t);
+    auto* words               = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(host_io()) + offset);
+    const auto cell           = lane.state_tokens - 1U;
+    words[0]                  = lane.history[lane.state_tokens];
+    words[1]                  = static_cast<std::int32_t>(cell);
+    words[2]                  = static_cast<std::int32_t>(index);
+    words[3]                  = static_cast<std::int32_t>(index);
     stage_rope_value(rope_of(lane.rope, cell), std::span<std::int32_t>(words + 4, 3), 1, 0);
     stage_rope_value(block_start_rope(lane.rope, cell, static_cast<std::uint32_t>(r_)), std::span<std::int32_t>(words + 7, 3),
                      1, 0);
-    CUDA_CHECK(cudaMemcpyAsync(flush_device_.p, words, kFlushWords * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaEventRecord(flush_uploaded_, stream));
-    auto* device = static_cast<std::int32_t*>(flush_device_.p);
+    auto* device = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(io_device_.p) + offset);
+    CUDA_CHECK(cudaMemcpyAsync(device, words, kFlushWords * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     execution::MtpCall call{.residuals        = saved_column(index).view({width_, 1}),
                             .ids              = Tensor(device, DType::I32, {1}),
                             .positions        = Tensor(device + 1, DType::I32, {1}),

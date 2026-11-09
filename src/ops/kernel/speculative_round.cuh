@@ -89,9 +89,9 @@ speculative_store_accept_result(const std::int32_t* row_drafts, std::int32_t k, 
                                 std::int32_t* lengths, std::int32_t* anchors,
                                 std::int32_t* row_tokens, std::int32_t* licensed_counts,
                                 std::int32_t* accepted, const SamplingConfig* config) {
-    for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
     for (int i = 0; i < accepted_count; ++i) { row_tokens[i] = row_drafts[i]; }
     row_tokens[accepted_count] = terminal_token;
+    for (int i = accepted_count + 1; i <= k; ++i) { row_tokens[i] = 0; }
 
     const int produced   = accepted_count + 1;
     licensed_counts[row] = produced;
@@ -1386,7 +1386,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if ((greedy && !penalties) || token_domain <= kSamplerTileItems) { return; }
+    if ((greedy && !penalties && cfg.mask.words == nullptr) || token_domain <= kSamplerTileItems) {
+        return;
+    }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
@@ -1411,7 +1413,11 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
                 const int tile_index = item * blockDim.x + threadIdx.x;
                 const int v          = tile_start + tile_index;
                 keys[item] =
-                    v < token_domain ? sampling_bf16_tile_sort_key(logits[base + v], tile_index) : 0u;
+                    (v < token_domain &&
+                     (!cfg.mask.words ||
+                      (cfg.mask.words[col * cfg.mask.stride + v / 32] & (1u << (v % 32)))))
+                        ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
+                        : 0u;
             }
             sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
                                           topk_storage.bf16);
@@ -1430,7 +1436,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
         if (v < token_domain) {
             const float raw = sampling_logit(logits[base + v]);
             keys[item]      = sampling_sort_key(
-                penalties ? sampling_adjusted_logit(raw, v, cfg, overlay, overlay_len) : raw, v);
+                (penalties || cfg.mask.words)
+                    ? sampling_adjusted_logit(raw, v, cfg, penalties ? overlay : nullptr, penalties ? overlay_len : 0)
+                    : raw,
+                v);
         } else {
             keys[item] = 0ull;
         }
@@ -1480,7 +1489,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__
     const bool greedy    = !(cfg.temperature > 0.0f);
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
-    if (greedy && !penalties) {
+    if (greedy && !penalties && cfg.mask.words == nullptr) {
         if (tid < 32 && col == 0 && group == 0) {
             const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
             if (tree_row) {

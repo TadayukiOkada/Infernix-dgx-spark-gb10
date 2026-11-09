@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -11,8 +13,10 @@ struct alignas(8) Bf16x4 {
     __nv_bfloat162 hi;
 };
 
-__global__ void cast_fp32_to_bf16_x4_kernel(const float4* source, Bf16x4* destination,
-                                            std::int64_t vectors) {
+__launch_bounds__(256) __global__
+void cast_fp32_to_bf16_x4_kernel(const float4* source, Bf16x4* destination,
+                                 std::int64_t vectors) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < vectors; i += stride) {
@@ -22,8 +26,10 @@ __global__ void cast_fp32_to_bf16_x4_kernel(const float4* source, Bf16x4* destin
     }
 }
 
-__global__ void cast_fp32_to_bf16_x2_kernel(const float2* source, __nv_bfloat162* destination,
-                                            std::int64_t pairs) {
+__launch_bounds__(256) __global__
+void cast_fp32_to_bf16_x2_kernel(const float2* source, __nv_bfloat162* destination,
+                                 std::int64_t pairs) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < pairs; i += stride) {
@@ -32,8 +38,10 @@ __global__ void cast_fp32_to_bf16_x2_kernel(const float2* source, __nv_bfloat162
     }
 }
 
-__global__ void cast_fp32_to_bf16_scalar_kernel(const float* source, __nv_bfloat16* destination,
-                                                std::int64_t count) {
+__launch_bounds__(256) __global__
+void cast_fp32_to_bf16_scalar_kernel(const float* source, __nv_bfloat16* destination,
+                                     std::int64_t count) {
+    pdl::enter();
     const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < count; i += stride) {

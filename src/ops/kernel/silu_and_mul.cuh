@@ -6,6 +6,7 @@
 // docs/op-development.md §6 (no math approximation).
 
 #include "ops/common/math.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -21,8 +22,10 @@ __device__ __forceinline__ __nv_bfloat162 silu_mul_pair(__nv_bfloat162 g, __nv_b
     return __floats2bfloat162_rn(r0, r1);
 }
 
-__global__ void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,
-                                           __nv_bfloat16* out, std::int64_t n) {
+__launch_bounds__(256) __global__
+void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                                __nv_bfloat16* out, std::int64_t n) {
+    pdl::enter();
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
@@ -30,11 +33,13 @@ __global__ void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv
     }
 }
 
-__global__ void silu_and_mul_strided_input_kernel(
+__launch_bounds__(256) __global__
+void silu_and_mul_strided_input_kernel(
     const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, std::int64_t n,
     std::int32_t ne0, std::int32_t ne1, std::int32_t ne2, std::int64_t gnb0, std::int64_t gnb1,
     std::int64_t gnb2, std::int64_t gnb3, std::int64_t unb0, std::int64_t unb1, std::int64_t unb2,
     std::int64_t unb3) {
+    pdl::enter();
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const auto* gate_bytes    = reinterpret_cast<const unsigned char*>(gate);
@@ -64,6 +69,7 @@ __launch_bounds__(256) __global__
     void silu_and_mul_dim0_split_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,
                                         __nv_bfloat16* out, std::int32_t rows,
                                         std::int64_t gate_col_stride, std::int64_t up_col_stride) {
+    pdl::enter();
     const int col            = blockIdx.y;
     const std::int64_t pair0 = (blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x) *
                                kSiluAndMulPairsPerThread;
@@ -82,6 +88,7 @@ __launch_bounds__(256) __global__
 __launch_bounds__(256) __global__
     void silu_and_mul_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out,
                              std::int64_t n) {
+    pdl::enter();
     const std::int64_t tid = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride =
         static_cast<std::int64_t>(gridDim.x) * blockDim.x * kSiluAndMulPairsPerThread;

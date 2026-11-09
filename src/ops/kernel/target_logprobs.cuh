@@ -5,6 +5,7 @@
 // Algorithm assumptions: one 256-thread CTA performs a single-pass online logsumexp per column.
 
 #include "ops/common/warp.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -61,19 +62,23 @@ target_logprobs_column(const Logit* values, std::int32_t valid_rows,
     float local_sum = 0.0f;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
-        const float value   = logprob_logit(values[row]);
-        const float new_max = fmaxf(local_max, value);
-        if (new_max > local_max) {
-            local_sum *= expf(local_max - new_max);
+        const float value = logprob_logit(values[row]);
+        if (value > -CUDART_INF_F) {
+            const float new_max = fmaxf(local_max, value);
+            if (new_max > local_max) {
+                local_sum *= expf(local_max - new_max);
+            }
+            local_max = new_max;
+            local_sum += expf(value - local_max);
         }
-        local_max = new_max;
-        local_sum += expf(value - local_max);
     }
     const float maximum = target_logprobs_block_max<BlockSize>(local_max, shared);
 
-    local_sum *= expf(local_max - maximum);
+    if (maximum > -CUDART_INF_F) {
+        local_sum *= expf(local_max - maximum);
+    }
     const float sum = block_reduce_sum<BlockSize>(local_sum, shared.warp_scratch);
-    if (threadIdx.x == 0) { shared.scalar = logf(sum); }
+    if (threadIdx.x == 0) { shared.scalar = (maximum > -CUDART_INF_F && sum > 0.0f) ? logf(sum) : 0.0f; }
     __syncthreads();
     return {maximum, shared.scalar};
 }
@@ -83,6 +88,7 @@ __launch_bounds__(BlockSize) __global__
     void target_logprobs_kernel(const Logit* logits, const std::int32_t* target_ids,
                                 float* output, std::int32_t valid_rows,
                                 std::int32_t physical_rows, std::int32_t targets) {
+    pdl::enter();
     __shared__ TargetLogprobsShared<BlockSize> shared;
     const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
     const Logit* values       = logits + static_cast<std::int64_t>(column) * physical_rows;
