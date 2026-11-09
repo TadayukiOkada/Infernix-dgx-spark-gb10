@@ -265,31 +265,47 @@ __device__ __forceinline__ void prepare_kv(const PrepareArgs& a, int column, int
         // Keys of every quantized storage, and NVFP4 values, take the normalized D256 Hadamard
         // preparation; the codecs read FP32 rows.
         normalized_hadamard_d256_inplace(key, lane);
-        float value[8];
-        load_row(a.v + row, value, lane);
-        if constexpr (Storage == KvCacheStorage::Int8Group64) {
-            store_int8_row<Geometry>(key, static_cast<std::int8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
-                                     page, head, slot, lane);
-            store_int8_row<Geometry>(value, static_cast<std::int8_t*>(a.v_pages), static_cast<__half*>(a.v_scales),
-                                     page, head, slot, lane);
-        } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256) {
-            store_fp8_row<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
-                                    page, head, slot, lane);
-            store_fp8_row<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages), static_cast<__half*>(a.v_scales),
-                                    page, head, slot, lane);
-        } else if constexpr (Storage == KvCacheStorage::Nvfp4Group16) {
-            store_nvfp4_row<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages),
-                                      static_cast<std::uint8_t*>(a.k_scales), page, head, slot, lane, scratch);
+        if constexpr (Storage == KvCacheStorage::Nvfp4Group16) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = key[r]; }
+            float value[8];
+            load_row(a.v + row, value, lane);
             normalized_hadamard_d256_inplace(value, lane);
-            store_nvfp4_row<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages),
-                                      static_cast<std::uint8_t*>(a.v_scales), page, head, slot, lane, scratch);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { scratch[kHeadDim + kv_cache_nvfp4_swizzle(lane + 32 * r)] = value[r]; }
+            __syncwarp();
+            const std::int64_t code_idx  = kv_cache_nvfp4_code_index<Geometry>(page, head, lane * kKVCacheNvfp4Group, slot);
+            const std::int64_t scale_idx = kv_cache_nvfp4_scale_index<Geometry>(page, head, lane, slot);
+#pragma unroll 1
+            for (int role = 0; role < 2; ++role) {
+                const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch + role * kHeadDim, lane);
+                if (lane < kKVCacheNvfp4Groups) {
+                    store_vec(static_cast<std::uint8_t*>(role ? a.v_pages : a.k_pages) + code_idx,
+                              make_uint2(quantized.codes_lo, quantized.codes_hi));
+                    static_cast<std::uint8_t*>(role ? a.v_scales : a.k_scales)[scale_idx] = quantized.scale;
+                }
+            }
         } else {
-            static_assert(Storage == KvCacheStorage::Fp8KeyNvfp4Value, "a storage without a fused prepare");
-            store_fp8_row<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
-                                    page, head, slot, lane);
-            normalized_hadamard_d256_inplace(value, lane);
-            store_nvfp4_row<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages),
-                                      static_cast<std::uint8_t*>(a.v_scales), page, head, slot, lane, scratch);
+            float value[8];
+            load_row(a.v + row, value, lane);
+            if constexpr (Storage == KvCacheStorage::Int8Group64) {
+                store_int8_row<Geometry>(key, static_cast<std::int8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
+                                         page, head, slot, lane);
+                store_int8_row<Geometry>(value, static_cast<std::int8_t*>(a.v_pages), static_cast<__half*>(a.v_scales),
+                                         page, head, slot, lane);
+            } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256) {
+                store_fp8_row<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
+                                        page, head, slot, lane);
+                store_fp8_row<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages), static_cast<__half*>(a.v_scales),
+                                        page, head, slot, lane);
+            } else {
+                static_assert(Storage == KvCacheStorage::Fp8KeyNvfp4Value, "a storage without a fused prepare");
+                store_fp8_row<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
+                                        page, head, slot, lane);
+                normalized_hadamard_d256_inplace(value, lane);
+                store_nvfp4_row<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages),
+                                          static_cast<std::uint8_t*>(a.v_scales), page, head, slot, lane, scratch);
+            }
         }
     }
 }
@@ -374,7 +390,8 @@ __device__ __forceinline__ void prepare_pool(const PrepareArgs& a, int column, i
 
 template <KvCacheStorage Storage, class Geometry>
 __global__ void __launch_bounds__(kThreads) qsa_prepare_kernel(const __grid_constant__ PrepareArgs a) {
-    __shared__ float scratch[kWarps][kHeadDim]; // the NVFP4 codec's rows
+    constexpr int kScratchStride = Storage == KvCacheStorage::Nvfp4Group16 ? 2 * kHeadDim : kHeadDim;
+    __shared__ float scratch[kWarps][kScratchStride]; // the NVFP4 codec's rows
     pdl::enter();                               // launched as a programmatic dependent
     const int warp   = static_cast<int>(threadIdx.x) / 32;
     const int lane   = static_cast<int>(threadIdx.x) % 32;

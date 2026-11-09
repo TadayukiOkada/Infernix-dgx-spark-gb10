@@ -93,15 +93,30 @@ kv_cache_nvfp4_group16_targets(const float (&values)[16], float max_abs, int fir
         const std::uint8_t scale_code = __nv_cvt_float_to_fp8(bounded, __NV_SATFINITE, __NV_E4M3);
         const float scale             = detail::decode_nvfp4_e4m3(scale_code);
         const float inverse           = __frcp_rn(scale);
-        float2 quotients[8];
-#pragma unroll
-        for (int pair = 0; pair < 8; ++pair) {
-            quotients[pair] = make_float2(__fmul_rn(values[2 * pair], inverse),
-                                          __fmul_rn(values[2 * pair + 1], inverse));
-        }
-        std::uint32_t codes_lo = 0;
-        std::uint32_t codes_hi = 0;
-        detail::pack_nvfp4_e2m1x16(quotients, codes_lo, codes_hi);
+        const auto pack4 = [&](int base) {
+            std::uint32_t word;
+            const float q0 = __fmul_rn(values[base + 0], inverse);
+            const float q1 = __fmul_rn(values[base + 1], inverse);
+            const float q2 = __fmul_rn(values[base + 2], inverse);
+            const float q3 = __fmul_rn(values[base + 3], inverse);
+            const float q4 = __fmul_rn(values[base + 4], inverse);
+            const float q5 = __fmul_rn(values[base + 5], inverse);
+            const float q6 = __fmul_rn(values[base + 6], inverse);
+            const float q7 = __fmul_rn(values[base + 7], inverse);
+            asm("{\n"
+                ".reg .b8 b0, b1, b2, b3;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n"
+                "mov.b32 %0, {b0,b1,b2,b3};\n"
+                "}\n"
+                : "=r"(word)
+                : "f"(q0), "f"(q1), "f"(q2), "f"(q3), "f"(q4), "f"(q5), "f"(q6), "f"(q7));
+            return word;
+        };
+        const std::uint32_t codes_lo = pack4(0);
+        const std::uint32_t codes_hi = pack4(8);
         float candidate = 0.0F;
 #pragma unroll
         for (int pair = 0; pair < 8; ++pair) {

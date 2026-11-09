@@ -418,7 +418,7 @@ __device__ __forceinline__ float e4m3_at(const unsigned char* p, int i) {
 // E2M1 element d of a packed row (dimension 2j in the low nibble of byte j).
 __device__ __forceinline__ float e2m1_at(const unsigned char* p, int d) {
     __nv_fp4_e2m1 v;
-    v.__x = static_cast<__nv_fp4_storage_t>((p[static_cast<unsigned>(d) >> 1] >> (4 * (d & 1))) & 0xFU);
+    v.__x = static_cast<__nv_fp4_storage_t>((p[d >> 1] >> (4 * (d & 1))) & 0xFU);
     return static_cast<float>(v);
 }
 
@@ -427,7 +427,7 @@ __device__ __forceinline__ float fp8_row_cell(const unsigned char* row, const un
     return e4m3_at(row, d) * fp16_at(scale, 0);
 }
 __device__ __forceinline__ float nvfp4_cell(const unsigned char* row, const unsigned char* scales, int d) {
-    return e2m1_at(row, d) * e4m3_at(scales, static_cast<unsigned>(d) >> 4);
+    return e2m1_at(row, d) * e4m3_at(scales, d >> 4);
 }
 
 template <KvCacheStorage Storage, int Stages = 2>
@@ -439,6 +439,9 @@ struct KVTile<KvCacheStorage::BFloat16, Stages> : StagePlanes<kHeadDim * 2, kHea
     using Base = StagePlanes<kHeadDim * 2, kHeadDim * 2, 0, 0, true>;
     static constexpr bool kRotatedKeys = false, kRotatedValues = false;
     __device__ static float key(const unsigned char* stage, int j, int d) { return bf16_at(Base::key_row(stage, j), d); }
+    __device__ static float key_lane(const unsigned char* stage, int j, int lane, int r) {
+        return bf16_at(Base::key_row(stage, j) + 2 * lane, 32 * r);
+    }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return fp16_at(Base::value_row(stage, j), d);
     }
@@ -450,11 +453,15 @@ struct KVTile<KvCacheStorage::Int8Group64, Stages> : StagePlanes<kHeadDim, kHead
     static constexpr bool kRotatedKeys = true, kRotatedValues = false;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(key_row(stage, j))[d]) *
-               fp16_at(key_scales(stage, j), static_cast<unsigned>(d) >> 6);
+               fp16_at(key_scales(stage, j), d >> 6);
+    }
+    __device__ static float key_lane(const unsigned char* stage, int j, int lane, int r) {
+        return static_cast<float>(reinterpret_cast<const std::int8_t*>(key_row(stage, j) + lane)[32 * r]) *
+               fp16_at(key_scales(stage, j), r >> 1);
     }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(value_row(stage, j))[d]) *
-               fp16_at(value_scales(stage, j), static_cast<unsigned>(d) >> 6);
+               fp16_at(value_scales(stage, j), d >> 6);
     }
 };
 
@@ -464,6 +471,9 @@ struct KVTile<KvCacheStorage::Fp8E4M3Row256, Stages> : StagePlanes<kHeadDim, kHe
     static constexpr bool kRotatedKeys = true, kRotatedValues = false;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return fp8_row_cell(key_row(stage, j), key_scales(stage, j), d);
+    }
+    __device__ static float key_lane(const unsigned char* stage, int j, int lane, int r) {
+        return fp8_row_cell(key_row(stage, j) + lane, key_scales(stage, j), 32 * r);
     }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return fp8_row_cell(value_row(stage, j), value_scales(stage, j), d);
@@ -477,6 +487,11 @@ struct KVTile<KvCacheStorage::Nvfp4Group16, Stages> : StagePlanes<kHeadDim / 2, 
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return nvfp4_cell(key_row(stage, j), key_scales(stage, j), d);
     }
+    __device__ static float key_lane(const unsigned char* stage, int j, int lane, int r) {
+        __nv_fp4_e2m1 v;
+        v.__x = static_cast<__nv_fp4_storage_t>(((key_row(stage, j) + (lane >> 1))[16 * r] >> (4 * (lane & 1))) & 0xFU);
+        return static_cast<float>(v) * e4m3_at(key_scales(stage, j) + (lane >> 4), 2 * r);
+    }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return nvfp4_cell(value_row(stage, j), value_scales(stage, j), d);
     }
@@ -488,6 +503,9 @@ struct KVTile<KvCacheStorage::Fp8KeyNvfp4Value, Stages> : StagePlanes<kHeadDim, 
     static constexpr bool kRotatedKeys = true, kRotatedValues = true;
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return fp8_row_cell(key_row(stage, j), key_scales(stage, j), d);
+    }
+    __device__ static float key_lane(const unsigned char* stage, int j, int lane, int r) {
+        return fp8_row_cell(key_row(stage, j) + lane, key_scales(stage, j), 32 * r);
     }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return nvfp4_cell(value_row(stage, j), value_scales(stage, j), d);
@@ -537,6 +555,10 @@ struct VqTile {
     __device__ static float key(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(key_row(stage, j))[d]) *
                fp16_at(key_scales(stage, j), static_cast<unsigned>(d) >> 6);
+    }
+    __device__ static float key_lane(const unsigned char* stage, int j, int lane, int r) {
+        return static_cast<float>(reinterpret_cast<const std::int8_t*>(key_row(stage, j) + lane)[32 * r]) *
+               fp16_at(key_scales(stage, j), r >> 1);
     }
     __device__ static float value(const unsigned char* stage, int j, int d) {
         return static_cast<float>(reinterpret_cast<const std::int8_t*>(value_row(stage, j))[d]) *
@@ -608,7 +630,7 @@ __global__ void __launch_bounds__(kAttentionThreads,
     constexpr int Half = Group / 2;
     pdl::enter();
     const int split = blockIdx.x, kv_head = blockIdx.y, t = blockIdx.z;
-    const int group = (!Tile::kRotatedValues && Exact) ? Group : heads / kv_heads;
+    const int group = Exact ? Group : heads / kv_heads;
     const int p = positions[t];
     const int count = counts[t];
     const int total = attended_count(count, ratio, p);
@@ -956,18 +978,18 @@ __global__ void __launch_bounds__(kAttentionThreads,
             if constexpr (!Tile::kShareKV) {
 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    k0[r] = Tile::key(stage, j0, (lane & 31) | (32 * r));
+                    k0[r] = Tile::key_lane(stage, j0, lane, r);
                     k1[r] = 0.0F;
                 }
                 if (has1) {
 #pragma unroll
-                    for (int r = 0; r < 8; ++r) { k1[r] = Tile::key(stage, j1, (lane & 31) | (32 * r)); }
+                    for (int r = 0; r < 8; ++r) { k1[r] = Tile::key_lane(stage, j1, lane, r); }
                 }
             } else {
 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    k0[r] = Tile::key(stage, j0, (lane & 31) | (32 * r));
-                    k1[r] = has1 ? Tile::key(stage, j1, (lane & 31) | (32 * r)) : 0.0F;
+                    k0[r] = Tile::key_lane(stage, j0, lane, r);
+                    k1[r] = has1 ? Tile::key_lane(stage, j1, lane, r) : 0.0F;
                 }
             }
             float part0[Group], part1[Group];
@@ -1023,7 +1045,7 @@ __global__ void __launch_bounds__(kAttentionThreads,
             l_run[h] = l;
         }
         const int d_own = threadIdx.x % kHeadDim, h_base = (threadIdx.x / kHeadDim) * Half;
-        const auto mine = [&](int u) { return (!Tile::kRotatedValues && Exact) || h_base + u < group; };
+        const auto mine = [&](int u) { return Exact || h_base + u < group; };
 #pragma unroll
         for (int u = 0; u < Half; ++u) {
             if (kSingleTile || i == 0) {
@@ -1067,7 +1089,10 @@ __global__ void __launch_bounds__(kAttentionThreads,
         __syncthreads();
     }
     const int d_own = threadIdx.x % kHeadDim, h_base = (threadIdx.x / kHeadDim) * Half;
-    const auto mine = [&](int i) { return (!Tile::kRotatedValues && Exact) || h_base + i < group; };
+    const auto mine = [&](int i) { return Exact || h_base + i < group; };
+    int split_e, kv_head_e, t_e;
+    asm volatile("mov.u32 %0, %%ctaid.x; mov.u32 %1, %%ctaid.y; mov.u32 %2, %%ctaid.z;"
+                 : "=r"(split_e), "=r"(kv_head_e), "=r"(t_e));
     if constexpr (Tile::kRotatedValues) {
         if (splits == 1) {
             // Values are stored in the normalized Hadamard domain (its own inverse): rotate back when
@@ -1084,19 +1109,15 @@ __global__ void __launch_bounds__(kAttentionThreads,
 #pragma unroll
                 for (int r = 0; r < 8; ++r) { v[r] = rows[h * kHeadDim + lane + 32 * r]; }
                 normalized_hadamard_d256_inplace(v, lane);
+                const float l  = l_run[h];
+                const int head = kv_head_e * group + h;
+                bf16* dst      = out + (static_cast<std::size_t>(t_e) * heads + head) * kHeadDim + lane;
 #pragma unroll
-                for (int r = 0; r < 8; ++r) { rows[h * kHeadDim + lane + 32 * r] = v[r]; }
+                for (int r = 0; r < 8; ++r) { dst[32 * r] = __float2bfloat16_rn(l > 0.0F ? v[r] / l : 0.0F); }
             }
-            __syncthreads();
-#pragma unroll
-            for (int i = 0; i < Half; ++i) {
-                if (mine(i)) { acc[i] = rows[(h_base + i) * kHeadDim + d_own]; }
-            }
+            return;
         }
     }
-    int split_e, kv_head_e, t_e;
-    asm volatile("mov.u32 %0, %%ctaid.x; mov.u32 %1, %%ctaid.y; mov.u32 %2, %%ctaid.z;"
-                 : "=r"(split_e), "=r"(kv_head_e), "=r"(t_e));
 #pragma unroll
     for (int i = 0; i < Half; ++i) {
         if (!mine(i)) { continue; }
@@ -1118,7 +1139,8 @@ __global__ void __launch_bounds__(kAttentionThreads,
 }
 
 template <bool RotateValues>
-__global__ void merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
+__global__ void __launch_bounds__(kHeadDim / 2)
+    merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
     pdl::enter();
     const int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     float m = -INFINITY;
@@ -1145,14 +1167,21 @@ __global__ void merge_kernel(const float* __restrict__ partial, int heads, int s
         __shared__ float smem[kHeadDim];
         reinterpret_cast<float2*>(smem)[d] = make_float2(val0, val1);
         __syncthreads();
-        if (d < 32) {
-            float v[8];
+        const int lane = d & 31, warp = d >> 5;
+        float v[2] = {smem[lane + 64 * warp], smem[lane + 64 * warp + 32]};
+        hadamard_d64_fragment_inplace(v, lane);
+        smem[lane + 64 * warp]      = v[0];
+        smem[lane + 64 * warp + 32] = v[1];
+        __syncthreads();
+        bf16* dst = out + (static_cast<std::size_t>(t) * heads + head) * kHeadDim;
 #pragma unroll
-            for (int r = 0; r < 8; ++r) { v[r] = smem[d + 32 * r]; }
-            normalized_hadamard_d256_inplace(v, d);
-            bf16* dst = out + (static_cast<std::size_t>(t) * heads + head) * kHeadDim;
-#pragma unroll
-            for (int r = 0; r < 8; ++r) { dst[d + 32 * r] = __float2bfloat16_rn(v[r]); }
+        for (int offset = 0; offset < 2; ++offset) {
+            const float x0 = smem[lane + 32 * offset];
+            const float x1 = smem[lane + 32 * (offset + 2)];
+            const float x2 = smem[lane + 32 * (offset + 4)];
+            const float x3 = smem[lane + 32 * (offset + 6)];
+            const float y  = normalized_hadamard_d256_group_value_from_h64(x0, x1, x2, x3, warp);
+            dst[lane + 64 * warp + 32 * offset] = __float2bfloat16_rn(y);
         }
     }
 }

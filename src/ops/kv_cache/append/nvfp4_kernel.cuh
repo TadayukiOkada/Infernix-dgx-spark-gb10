@@ -19,42 +19,29 @@ __device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token, int kv_head,
     int physical_page, int page_offset, int lane, float* scratch) {
-    float values[8];
+#pragma unroll 1
+    for (int role = 0; role < 2; ++role) {
+        const __nv_bfloat16* src = role ? v : k;
+        float values[8];
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(k[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
-    }
-    normalized_hadamard_d256_inplace(values, lane);
+        for (int r = 0; r < 8; ++r) {
+            const int d = lane + 32 * r;
+            values[r]   = __bfloat162float(src[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+        }
+        normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
-    for (int r = 0; r < 8; ++r) scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = values[r];
-    __syncwarp();
-    const auto quantized_k = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
-    if (lane < kKVCacheNvfp4Groups) {
-        const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
-        store_vec(cache_k + code_offset, make_uint2(quantized_k.codes_lo, quantized_k.codes_hi));
-        scale_k[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane, page_offset)] =
-            quantized_k.scale;
-    }
-    __syncwarp();
-
-#pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
-    }
-    normalized_hadamard_d256_inplace(values, lane);
-#pragma unroll
-    for (int r = 0; r < 8; ++r) scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = values[r];
-    __syncwarp();
-    const auto quantized_v = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
-    if (lane < kKVCacheNvfp4Groups) {
-        const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
-        store_vec(cache_v + code_offset, make_uint2(quantized_v.codes_lo, quantized_v.codes_hi));
-        scale_v[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane, page_offset)] =
-            quantized_v.scale;
+        for (int r = 0; r < 8; ++r) scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = values[r];
+        __syncwarp();
+        const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
+        if (lane < kKVCacheNvfp4Groups) {
+            const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
+                physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+            store_vec((role ? cache_v : cache_k) + code_offset,
+                      make_uint2(quantized.codes_lo, quantized.codes_hi));
+            (role ? scale_v : scale_k)[kv_cache_nvfp4_scale_index<Geometry>(
+                physical_page, kv_head, lane, page_offset)] = quantized.scale;
+        }
+        if (role == 0) { __syncwarp(); }
     }
 }
 
