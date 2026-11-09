@@ -1220,26 +1220,41 @@ __device__ __forceinline__ void quantize_pair_half_codes(const bf16* __restrict_
     }
 }
 
-// Quantizes a 16-element BF16 block (already unpacked to binary32 with precomputed `amax`) under
+// Quantizes a 16-element BF16 block (held in 8 packed uint32_t words with precomputed `amax`) under
 // both `gate_scale` (low nibbles of `packed`) and `up_scale` (high nibbles of `packed`) in one
 // pass using hardware `cvt.rn.satfinite.e2m1x2.f32`, bit-identical to `canon::quantize_a4_codes`.
-__device__ __forceinline__ void quantize_split_block_from_f32(const float (&v)[16], float amax, float gate_scale,
-                                                              float up_scale, std::uint32_t (&packed)[4],
-                                                              std::int32_t& s_gate, std::int32_t& s_up) {
+__device__ __forceinline__ void quantize_split_words_from_bf16(const uint4* src, float gate_scale, float up_scale,
+                                                               std::uint32_t (&packed)[4], std::uint8_t& s_word_gate,
+                                                               std::int32_t& s_gate, std::uint8_t& s_word_up,
+                                                               std::int32_t& s_up) {
+    const uint4 lo               = src[0], hi = src[1];
+    const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    float amax                   = 0.0F;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        const float a0 = canon::f32_from_bits((words[w] & 0x7FFFU) << 16);
+        const float a1 = canon::f32_from_bits((words[w] >> 16) << 16 & 0x7FFFFFFFU);
+        amax           = a0 > amax ? a0 : amax;
+        amax           = a1 > amax ? a1 : amax;
+    }
     float d_gate, inv_d_gate, d_up, inv_d_up;
     bool fast_gate, fast_up;
-    prepare_a4_scale(amax, gate_scale, s_gate, d_gate, inv_d_gate, fast_gate);
-    prepare_a4_scale(amax, up_scale, s_up, d_up, inv_d_up, fast_up);
+    canon::prepare_a4_scale_word(amax, gate_scale, s_word_gate, s_gate, d_gate, inv_d_gate, fast_gate);
+    canon::prepare_a4_scale_word(amax, up_scale, s_word_up, s_up, d_up, inv_d_up, fast_up);
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
-        const float g0 = s_gate != 0 ? scaled_q_value(v[4 * q + 0], d_gate, inv_d_gate, fast_gate) : 0.0F;
-        const float g1 = s_gate != 0 ? scaled_q_value(v[4 * q + 1], d_gate, inv_d_gate, fast_gate) : 0.0F;
-        const float g2 = s_gate != 0 ? scaled_q_value(v[4 * q + 2], d_gate, inv_d_gate, fast_gate) : 0.0F;
-        const float g3 = s_gate != 0 ? scaled_q_value(v[4 * q + 3], d_gate, inv_d_gate, fast_gate) : 0.0F;
-        const float u0 = s_up != 0 ? scaled_q_value(v[4 * q + 0], d_up, inv_d_up, fast_up) : 0.0F;
-        const float u1 = s_up != 0 ? scaled_q_value(v[4 * q + 1], d_up, inv_d_up, fast_up) : 0.0F;
-        const float u2 = s_up != 0 ? scaled_q_value(v[4 * q + 2], d_up, inv_d_up, fast_up) : 0.0F;
-        const float u3 = s_up != 0 ? scaled_q_value(v[4 * q + 3], d_up, inv_d_up, fast_up) : 0.0F;
+        const float v0 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q] & 0xFFFFU));
+        const float v1 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q] >> 16));
+        const float v2 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q + 1] & 0xFFFFU));
+        const float v3 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[2 * q + 1] >> 16));
+        const float g0 = s_gate != 0 ? scaled_q_value(v0, d_gate, inv_d_gate, fast_gate) : 0.0F;
+        const float g1 = s_gate != 0 ? scaled_q_value(v1, d_gate, inv_d_gate, fast_gate) : 0.0F;
+        const float g2 = s_gate != 0 ? scaled_q_value(v2, d_gate, inv_d_gate, fast_gate) : 0.0F;
+        const float g3 = s_gate != 0 ? scaled_q_value(v3, d_gate, inv_d_gate, fast_gate) : 0.0F;
+        const float u0 = s_up != 0 ? scaled_q_value(v0, d_up, inv_d_up, fast_up) : 0.0F;
+        const float u1 = s_up != 0 ? scaled_q_value(v1, d_up, inv_d_up, fast_up) : 0.0F;
+        const float u2 = s_up != 0 ? scaled_q_value(v2, d_up, inv_d_up, fast_up) : 0.0F;
+        const float u3 = s_up != 0 ? scaled_q_value(v3, d_up, inv_d_up, fast_up) : 0.0F;
         std::uint32_t w;
         asm("{\n\t"
             ".reg .b8 b0, b1, b2, b3;\n\t"
@@ -1257,37 +1272,24 @@ __device__ __forceinline__ void quantize_split_block_from_f32(const float (&v)[1
 
 // Quantizes blocks [0, blocks) of one column of entry `first` under both `gate_scale` (low nibbles)
 // and `up_scale` (high nibbles) into `acts`. Each thread `b < blocks` loads its 16 BF16 elements once
-// and encodes both scales together via `quantize_split_block_from_f32`.
+// and encodes both scales together via `quantize_split_words_from_bf16`.
 __device__ void quantize_split_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
                                      int top_k, float gate_scale, float up_scale, ActCodes* acts, int blocks,
                                      int b0 = 0) {
     const int t = entries[first] / top_k;
     for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const auto* source           = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (b0 + b));
-        const uint4 lo               = source[0], hi = source[1];
-        const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-        float v[16];
-        float amax = 0.0F;
-#pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            const float v0 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] & 0xFFFFU));
-            const float v1 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] >> 16));
-            v[2 * w]       = v0;
-            v[2 * w + 1]   = v1;
-            const float a0 = canon::f32_from_bits(canon::f32_bits(v0) & 0x7FFFFFFFU);
-            const float a1 = canon::f32_from_bits(canon::f32_bits(v1) & 0x7FFFFFFFU);
-            amax           = a0 > amax ? a0 : amax;
-            amax           = a1 > amax ? a1 : amax;
-        }
+        const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (b0 + b));
         ActCodes out;
-        quantize_split_block_from_f32(v, amax, gate_scale, up_scale, out.dup, out.scale, out.scale1);
+        std::uint8_t s_word_gate, s_word_up;
+        quantize_split_words_from_bf16(source, gate_scale, up_scale, out.dup, s_word_gate, out.scale, s_word_up,
+                                       out.scale1);
         acts[b] = out;
     }
 }
 
 // Quantizes `BLen` K-blocks `[B0, B0 + BLen)` (`2 * BLen <= kThreads`) of two columns (`t0`, `t1`)
 // under both `gate_scale` and `up_scale` into `acts`: thread `tid = 2 * db + col < 2 * BLen` loads
-// block `B0 + db` of column `col` once, encodes `(gate, up)` via `quantize_split_block_from_f32`,
+// block `B0 + db` of column `col` once, encodes `(gate, up)` via `quantize_split_words_from_bf16`,
 // and transposes with its partner lane `tid ^ 1` so `col = 0` writes `(col0_gate, col1_gate)` to
 // `acts[2 * db + 0]` and `col = 1` writes `(col0_up, col1_up)` to `acts[2 * db + 1]`.
 template <int B0, int BLen>
@@ -1296,28 +1298,14 @@ __device__ __forceinline__ void quantize_split_pair_half(const bf16* __restrict_
     static_assert(2 * BLen <= kThreads && (2 * BLen) % 32 == 0);
     const int tid = static_cast<int>(threadIdx.x);
     if (tid >= 2 * BLen) { return; }
-    const int db                 = tid >> 1;
-    const int col                = tid & 1;
-    const int t                  = col != 0 ? t1 : t0;
-    const auto* source           = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (B0 + db));
-    const uint4 lo               = source[0], hi = source[1];
-    const std::uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-    float v[16];
-    float amax = 0.0F;
-#pragma unroll
-    for (int w = 0; w < 8; ++w) {
-        const float v0 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] & 0xFFFFU));
-        const float v1 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] >> 16));
-        v[2 * w]       = v0;
-        v[2 * w + 1]   = v1;
-        const float a0 = canon::f32_from_bits(canon::f32_bits(v0) & 0x7FFFFFFFU);
-        const float a1 = canon::f32_from_bits(canon::f32_bits(v1) & 0x7FFFFFFFU);
-        amax           = a0 > amax ? a0 : amax;
-        amax           = a1 > amax ? a1 : amax;
-    }
+    const int db       = tid >> 1;
+    const int col      = tid & 1;
+    const int t        = col != 0 ? t1 : t0;
+    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * (B0 + db));
     std::uint32_t packed[4];
+    std::uint8_t s_word_gate, s_word_up;
     std::int32_t s_gate, s_up;
-    quantize_split_block_from_f32(v, amax, gate_scale, up_scale, packed, s_gate, s_up);
+    quantize_split_words_from_bf16(source, gate_scale, up_scale, packed, s_word_gate, s_gate, s_word_up, s_up);
     ActCodes out;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
@@ -1461,10 +1449,11 @@ __device__ __forceinline__ void unit_sums_quad_half(const std::uint8_t* matrix, 
         const DownActCodes& a       = acts[db];
         const std::uint32_t packed0 = a.dup01[q];
         const std::uint32_t packed1 = a.dup23[q];
-        const std::int32_t sa0      = canon::e4m3_scaled(a.scale_word[0]);
-        const std::int32_t sa1      = canon::e4m3_scaled(a.scale_word[1]);
-        const std::int32_t sa2      = canon::e4m3_scaled(a.scale_word[2]);
-        const std::int32_t sa3      = canon::e4m3_scaled(a.scale_word[3]);
+        const std::int32_t sa       = lane < 4 ? canon::e4m3_scaled(a.scale_word[lane]) : 0;
+        const std::int32_t sa0      = __shfl_sync(0xFFFFFFFFU, sa, 0);
+        const std::int32_t sa1      = __shfl_sync(0xFFFFFFFFU, sa, 1);
+        const std::int32_t sa2      = __shfl_sync(0xFFFFFFFFU, sa, 2);
+        const std::int32_t sa3      = __shfl_sync(0xFFFFFFFFU, sa, 3);
         std::uint32_t ah0[4], ah1[4], ah2[4], ah3[4];
         e2m1x2_word_to_half2(dup_nibbles(packed0 & 0x0F0F0F0FU), ah0);
         e2m1x2_word_to_half2(dup_nibbles((packed0 >> 4) & 0x0F0F0F0FU), ah1);
@@ -1570,7 +1559,6 @@ __global__ void __launch_bounds__(kThreads, 3)
             stage_gate_up_half(record_slice, sm.stage, 1);
             quantize_quad_half_codes<kHalf, kHalf>(x, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
             stage_wait();
-            if (c == 0) { pdl::trigger_dependents(); }
             __syncthreads();
             unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s);
 #pragma unroll 1
@@ -1613,7 +1601,6 @@ __global__ void __launch_bounds__(kThreads, 3)
             stage_gate_up_half(record_slice, sm.stage, 1);
             quantize_pair_half_codes<kHalf, kHalf>(x, hidden, t0, t1, scales.input_gate, sm.acts);
             stage_wait();
-            if (c == 0) { pdl::trigger_dependents(); }
             __syncthreads();
             unit_sums_pair<kGateUpGroups, true>(sm.stage, kHalf, sm.acts, s0, s1);
             __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
@@ -1655,7 +1642,6 @@ __global__ void __launch_bounds__(kThreads, 3)
             stage_gate_up_half(record_slice, sm.stage, 1);
             quantize_split_pair_half<kHalf, kHalf>(x, hidden, t0, t1, scales.input_gate, scales.input_up, sm.acts);
             stage_wait();
-            if (c == 0) { pdl::trigger_dependents(); }
             __syncthreads();
             unit_sums_split_pair_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts, lo, hi);
             std::int64_t s[kGateUpGroups][2];
@@ -1714,7 +1700,6 @@ __global__ void __launch_bounds__(kThreads, 3)
                                   kHalf);
         }
         stage_wait();
-        if (c == 0) { pdl::trigger_dependents(); }
         __syncthreads();
         if (split_input) {
             unit_sums<kGateUpGroups, true, true>(sm.stage, kHalf, sm.acts, s);
@@ -1741,6 +1726,8 @@ __global__ void __launch_bounds__(kThreads, 3)
                                    &h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + slice]);
         }
     }
+    __syncthreads();
+    pdl::trigger_dependents();
 }
 
 __device__ __forceinline__ void act_codes_quad_word_into(const canon::A4Block& a0, const canon::A4Block& a1,
@@ -1766,10 +1753,11 @@ __device__ void unit_sums_down_quad_pair_groups(const std::uint8_t* matrix, int 
         const DownActCodes& a       = acts[b];
         const std::uint32_t packed0 = a.dup01[q];
         const std::uint32_t packed1 = a.dup23[q];
-        const std::int32_t sa0      = canon::e4m3_scaled(a.scale_word[0]);
-        const std::int32_t sa1      = canon::e4m3_scaled(a.scale_word[1]);
-        const std::int32_t sa2      = canon::e4m3_scaled(a.scale_word[2]);
-        const std::int32_t sa3      = canon::e4m3_scaled(a.scale_word[3]);
+        const std::int32_t sa       = lane < 4 ? canon::e4m3_scaled(a.scale_word[lane]) : 0;
+        const std::int32_t sa0      = __shfl_sync(0xFFFFFFFFU, sa, 0);
+        const std::int32_t sa1      = __shfl_sync(0xFFFFFFFFU, sa, 1);
+        const std::int32_t sa2      = __shfl_sync(0xFFFFFFFFU, sa, 2);
+        const std::int32_t sa3      = __shfl_sync(0xFFFFFFFFU, sa, 3);
         std::uint32_t ah0[4], ah1[4], ah2[4], ah3[4];
         e2m1x2_word_to_half2(dup_nibbles(packed0 & 0x0F0F0F0FU), ah0);
         e2m1x2_word_to_half2(dup_nibbles((packed0 >> 4) & 0x0F0F0F0FU), ah1);
