@@ -172,14 +172,19 @@ if [[ "${EXPERT_A4_ACTIVATIONS:-1}" == "1" ]]; then
     EXPERT_A4_ARGS=(--expert-a4-activations)
 fi
 
+SPEC_BACKEND="${SPEC_BACKEND:-dflash2}"
+SPEC_ARGS=(--spec "${SPEC_BACKEND}" --draft-tokens auto)
+if [[ "${SPEC_BACKEND}" == "dflash2" ]]; then
+    SPEC_ARGS+=(--draft-model "${DRAFT_PATH}")
+fi
+
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
     "${EXPERT_A4_ARGS[@]}" \
+    "${SPEC_ARGS[@]}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
     --ngram-cache-mib 4096 \
     --kv-dtype "${KV_DTYPE}" \
-    --spec mtp \
-    --draft-tokens auto \
     --ngram-draft-tokens 31 \
     --ngram-min-match 4 \
     --temperature 1.0 \

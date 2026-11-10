@@ -2567,8 +2567,9 @@ public:
                                 (batch == 2 ? (mtp_ || dflash2_) : (dflash2_ && batch > 2 && batch <= dflash2_rows_));
         std::int32_t pair_k = 0;
         if (pair_round) {
-            pair_k = batch == 2 ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]])
-                                : std::min(kMultiRowMaxDrafts, neural_k());
+            pair_k = dflash2_ ? std::min(kDFlashPairMaxDrafts, neural_k())
+                              : (batch == 2 ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]])
+                                            : std::min(kMultiRowMaxDrafts, neural_k()));
         } else if (mtp_ && batch >= 3 && options_.pair_speculation && kMultiRowDrafts > 0.5) {
             pair_k = choose_multirow_draft_length(lanes, batch);
         }
@@ -6990,7 +6991,7 @@ private:
     // Re-checked on NVIDIA FP4-Local with the tensor-core narrow experts (2026-10-30, two runs each): 0.15 / 0.20 /
     // 0.25 / 0.40 / 0.50 against 0.31 after a 16K prompt 0.981 / 0.984 / 0.991 / 0.974 / 0.954x, at short context
     // 0.973 / 0.989 / 1.002 / 0.990 / 0.963x, on the struct fixture 0.982 / 0.988 / 0.993 / 1.016 / 1.019x.
-    static inline const double kDFlashDraftCost = policy_double("INFERNIX_DFLASH_DRAFT_COST", 0.31);
+    static inline const double kDFlashDraftCost = policy_double("INFERNIX_DFLASH_DRAFT_COST", 0.15);
     static constexpr double kDFlashProposalCost = 0.1;
     // The online draft cost (width_cost): sample decay (about 50 rounds), the rounds and the share of
     // K's variance (of the mean square) it needs, its ceiling, and the cycle that counts as a gap.
@@ -7032,7 +7033,7 @@ private:
     static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.16);
     static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.16);
     static inline const double kDFlashPairDraftCost =
-        policy_double("INFERNIX_PAIR_DRAFT_COST", 0.22);
+        policy_double("INFERNIX_PAIR_DRAFT_COST", 0.15);
     static constexpr double kDFlashPairProposalCost  = 0.1;
     // The cumulative cut's per-row thresholds and draft log-probabilities (the device gate's for row 0
     // of a one-row round, the host cut's for every row; MtpCumulative is always on).

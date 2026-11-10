@@ -189,49 +189,57 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             auto scope       = work_.scope();
             Tensor prepared  = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta     = work_.alloc(DType::BF16, {G, 2, W, B});
+            Tensor q         = work_.alloc(DType::BF16, {D, Hq, W, B});
+            Tensor k         = work_.alloc(DType::BF16, {D, Hk, W, B});
+            Tensor v         = work_.alloc(DType::BF16, {D, Hk, W, B});
+            Tensor attention = work_.alloc(DType::BF16, {D, Hq, W, B});
             {
+                auto scratch_scope = work_.scope();
                 WorkspaceArena scratch(work_.alloc_bytes(
                     ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
                 ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.input_norm, config_.rms_norm_eps,
                                                           layer.attention_base, layer.attention_projection.weight,
                                                           prepared, delta, scratch, s);
             }
-            Tensor q = work_.alloc(DType::BF16, {D, Hq, W, B});
-            Tensor k = work_.alloc(DType::BF16, {D, Hk, W, B});
-            Tensor v = work_.alloc(DType::BF16, {D, Hk, W, B});
             {
                 Tensor qf = q.view({D * Hq, columns}), kf = k.view({D * Hk, columns}), vf = v.view({D * Hk, columns});
                 ops::attn_input_proj(prepared.view({H, columns}), layer.query_key_value, qf, kf, vf, s);
             }
             ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, p_.rope, q, k, s);
-            Tensor attention = work_.alloc(DType::BF16, {D, Hq, W, B});
             ops::sliding_window_attention(q, k, v, positions, call.valid_columns, call.slots, {D, Hq, Hk},
                                           config_.window, scale, ring_[l], envelope, work_, attention, s);
-            WorkspaceArena scratch(work_.alloc_bytes(
-                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(H, D * Hq, W, W, B, B)));
-            ops::linear_dynamic_grouped_conv_add(attention.view({D * Hq, W, B}), layer.output.weight,
-                                                 layer.attention_base, delta, residual, scratch, s);
+            {
+                auto scratch_scope = work_.scope();
+                WorkspaceArena scratch(work_.alloc_bytes(
+                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(H, D * Hq, W, W, B, B)));
+                ops::linear_dynamic_grouped_conv_add(attention.view({D * Hq, W, B}), layer.output.weight,
+                                                     layer.attention_base, delta, residual, scratch, s);
+            }
         }
         {
             // MLP: prepare, SwiGLU(gate, up), then down, conv finish and residual add.
             auto scope      = work_.scope();
             Tensor prepared = work_.alloc(DType::BF16, {H, W, B});
             Tensor delta    = work_.alloc(DType::BF16, {G, 2, W, B});
+            Tensor product  = work_.alloc(DType::BF16, {I, W, B});
             {
+                auto scratch_scope = work_.scope();
                 WorkspaceArena scratch(work_.alloc_bytes(
                     ops::rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(H, W, W, B, B)));
                 ops::rmsnorm_dynamic_grouped_conv_prepare(residual, layer.post_attention_norm, config_.rms_norm_eps,
                                                           layer.mlp_base, layer.mlp_projection.weight, prepared, delta,
                                                           scratch, s);
             }
-            Tensor product = work_.alloc(DType::BF16, {I, W, B});
             {
                 Tensor flat = product.view({I, columns});
                 ops::linear_swiglu(prepared.view({H, columns}), layer.gate_up.weight, flat, layer.gate_up.policy, work_, s);
             }
-            WorkspaceArena scratch(
-                work_.alloc_bytes(ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(H, I, W, W, B, B)));
-            ops::linear_dynamic_grouped_conv_add(product, layer.down.weight, layer.mlp_base, delta, residual, scratch, s);
+            {
+                auto scratch_scope = work_.scope();
+                WorkspaceArena scratch(
+                    work_.alloc_bytes(ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(H, I, W, W, B, B)));
+                ops::linear_dynamic_grouped_conv_add(product, layer.down.weight, layer.mlp_base, delta, residual, scratch, s);
+            }
         }
     }
     // The mask columns' final hidden, their head candidates and the selector's conditional path.

@@ -99,7 +99,7 @@ void ProgramImpl::capture_graph_set() {
                         : 0;
                 if (rows == 2 ? (mtp_ || dflash2_) : (dflash2_ && rows <= dflash2_rows_)) {
                     const std::int32_t neural_width =
-                        rows == 2 ? pair_width : 1 + std::min(kMultiRowMaxDrafts, neural_k());
+                        dflash2_ ? pair_width : (rows == 2 ? pair_width : 1 + std::min(kMultiRowMaxDrafts, neural_k()));
                     const std::int32_t width = std::max(neural_width, 1 + ngram_max);
                     if (width > 1) { verified.emplace_back(rows, width); }
                 } else if (mtp_ && rows >= 3 && kMultiRowDrafts > 0.5) {
