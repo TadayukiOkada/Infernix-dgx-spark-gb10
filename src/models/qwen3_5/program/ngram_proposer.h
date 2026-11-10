@@ -78,6 +78,7 @@ public:
             hash_windows(end);
         }
         for (std::size_t end = 1; end <= tokens.size(); ++end) {
+            sa_.append(tokens[end - 1]);
             const std::array<std::uint64_t, widths_.size()> hashes = ahead[end % kLookahead];
             if (end + kLookahead <= tokens.size()) { hash_windows(end + kLookahead); }
             if (!store(tokens[end - 1])) { continue; }

@@ -764,7 +764,7 @@ void validate_policy(const ScreenedHeadPolicy& policy) {
 void validate_x(const Tensor& x) {
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[0] == kHidden && x.ne[2] == 1 &&
                 x.ne[3] == 1 && x.ne[1] >= 1 && x.ne[1] <= kScreenedHeadMaxColumns && aligned16(x.data),
-            "x must be contiguous, aligned BF16 [2560, T] with T in [1, 16]");
+            "x must be contiguous, aligned BF16 [2560, T] with T in [1, 32]");
 }
 
 void validate_screen(const Weight& screen) {

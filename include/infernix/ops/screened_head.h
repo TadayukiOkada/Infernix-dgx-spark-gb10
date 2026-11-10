@@ -30,8 +30,8 @@ struct ScreenedHeadPolicy {
     std::int32_t rescored  = 64; // a multiple of 32 in [32, 256]
 };
 
-// Columns a screened head serves in one call (1..16).
-inline constexpr std::int32_t kScreenedHeadMaxColumns = 16;
+// Columns a screened head serves in one call (1..32).
+inline constexpr std::int32_t kScreenedHeadMaxColumns = 32;
 // The ranks screened_head_top returns per column (1..4).
 inline constexpr std::int32_t kScreenedHeadMaxRanks = 4;
 
