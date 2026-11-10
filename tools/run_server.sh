@@ -186,7 +186,6 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --top-p 0.9 \
     --lm-head-draft \
     --kv-capacity 524288 \
-    --expert-a4-activations \
     --default-max-tokens 32768 \
     --preserve-thinking \
     --host-context-mib 1024 \
