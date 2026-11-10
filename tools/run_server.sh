@@ -35,17 +35,7 @@ NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
 KV_DTYPE="${KV_DTYPE:-k8v4}"
 DIST_DIR="${REPO_ROOT}/dist/milestones"
 DRAFT_PATH="/opt/etc/models/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
-# DFlash2 vs MTP on GB10 (pp2048+tg128, fp8 KV, medians, decode out t/s):
-#   c = 1: DFlash2 109.4 (dense8) / 115.5 (F4-Local) vs MTP 81.8 / 79.7 - DFlash2 ahead.
-#   c = 2: DFlash2 wins wherever its pair fast path is qualified - every dense kind since the
-#          NVFP4 entry of 2026-10-30 (kDFlashPairMaxDrafts default 8): dense8 67.9 vs MTP 53.8;
-#          the NVFP4-dense F4-Local MODEL_PATH below 71.8 vs MTP 60.3 (measured 2026-10-30;
-#          before that entry DFlash2 there decoded plain, 35.4). MTP only at c >= 4.
-#   c = 4: MTP 38.8 (dense8) beats DFlash2's 2-row default (20.6) and its INFERNIX_TMP_DFLASH2_ROWS=4
-#          probe (37.4): keep this server (MAX_CONCURRENCY=4) on MTP; prefer
-#          --spec dflash2 --draft-tokens auto --draft-model "$DRAFT_PATH" for c <= 2. The
-#          W4Dense artifact at c = 4 is not re-measured.
-# Server parameters
+
 HOST="0.0.0.0"
 PORT="8000"
 MAX_CONTEXT="262144"
@@ -172,7 +162,7 @@ if [[ "${EXPERT_A4_ACTIVATIONS:-1}" == "1" ]]; then
     EXPERT_A4_ARGS=(--expert-a4-activations)
 fi
 
-SPEC_BACKEND="${SPEC_BACKEND:-dflash2}"
+SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
 SPEC_ARGS=(--spec "${SPEC_BACKEND}" --draft-tokens auto)
 if [[ "${SPEC_BACKEND}" == "dflash2" ]]; then
     SPEC_ARGS+=(--draft-model "${DRAFT_PATH}")
