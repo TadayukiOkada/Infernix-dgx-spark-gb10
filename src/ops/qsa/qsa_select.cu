@@ -111,11 +111,10 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
                      int clear_words, QsaPageSpaces spaces) {
     pdl::enter_streaming();
     if (clear != nullptr) {
-        const std::int64_t ctas = static_cast<std::int64_t>(gridDim.x) * gridDim.y;
-        const std::int64_t cta  = static_cast<std::int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
-        const int begin         = static_cast<int>(clear_words * cta / ctas);
-        const int end           = static_cast<int>(clear_words * (cta + 1) / ctas);
-        for (int i = begin + static_cast<int>(threadIdx.x); i < end; i += kScoreThreads) { clear[i] = 0; }
+        const int total_threads = static_cast<int>(gridDim.x * gridDim.y) * kScoreThreads;
+        const int global_tid =
+            static_cast<int>(blockIdx.y * gridDim.x + blockIdx.x) * kScoreThreads + static_cast<int>(threadIdx.x);
+        for (int i = global_tid; i < clear_words; i += total_threads) { clear[i] = 0; }
     }
     __shared__ uint2 qs[kScoreTileColumns][kScoreHeadSlots][32]; // lane l: q[h][l + 32 j], j = 0..3 as 4 BF16s
     __shared__ int column_blocks[kScoreTileColumns];
@@ -336,11 +335,9 @@ __global__ void __launch_bounds__(kWideThreads, kWideCtasPerSm)
     pdl::enter_streaming();
     const int tid = static_cast<int>(threadIdx.x);
     if (clear != nullptr) {
-        const std::int64_t ctas = static_cast<std::int64_t>(gridDim.x) * gridDim.y;
-        const std::int64_t cta  = static_cast<std::int64_t>(blockIdx.y) * gridDim.x + blockIdx.x;
-        const int begin         = static_cast<int>(clear_words * cta / ctas);
-        const int end           = static_cast<int>(clear_words * (cta + 1) / ctas);
-        for (int i = begin + tid; i < end; i += kWideThreads) { clear[i] = 0; }
+        const int total_threads = static_cast<int>(gridDim.x * gridDim.y) * kWideThreads;
+        const int global_tid    = static_cast<int>(blockIdx.y * gridDim.x + blockIdx.x) * kWideThreads + tid;
+        for (int i = global_tid; i < clear_words; i += total_threads) { clear[i] = 0; }
     }
     extern __shared__ float4 wide_shared[];
     float4* qs = wide_shared;                                   // [head][column][kWideRow]: lane l = q[l + 32 j], j = 0..3
@@ -799,18 +796,22 @@ __global__ void __launch_bounds__(kSelectThreads)
     __syncthreads();
     score_histogram(column, slice_begin(n, slice, slices), slice_begin(n, slice + 1, slices), hist);
     __syncthreads();
-    unsigned* column_hist = histograms + static_cast<std::size_t>(c) * kScoreBins;
-    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) {
-        if (hist[i] != 0) { atomicAdd(column_hist + i, hist[i]); }
-    }
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) { sh.last = atomicAdd(arrivals + c, 1U) + 1 == static_cast<unsigned>(slices); }
-    __syncthreads();
-    if (sh.last == 0) { return; }
-    __threadfence();
+    if (slices > 1) {
+        unsigned* column_hist = histograms + static_cast<std::size_t>(c) * kScoreBins;
+        for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) {
+            if (hist[i] != 0) { atomicAdd(column_hist + i, hist[i]); }
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) { sh.last = atomicAdd(arrivals + c, 1U) + 1 == static_cast<unsigned>(slices); }
+        __syncthreads();
+        if (sh.last == 0) { return; }
+        __threadfence();
 
-    for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) { hist[i] = __ldcg(column_hist + i); }
+        for (int i = static_cast<int>(threadIdx.x); i < kScoreBins; i += kSelectThreads) {
+            hist[i] = __ldcg(column_hist + i);
+        }
+    }
     select_from_histogram(column, n, top_blocks, dynamic_smem, selected + static_cast<std::size_t>(t) * top_blocks, sh);
     if (threadIdx.x == 0) { counts[t] = top_blocks; }
 }
@@ -937,9 +938,12 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                       (kIndexDim / geometry.ratio) % 8 == 0;
     if (wide) { reserve_shared(qsa_score_wide_kernel, kWideSharedBytes, g_wide_reserved); }
     for (std::int32_t begin = 0; begin < columns; begin += l.group) {
-        const std::int32_t n   = std::min(l.group, columns - begin);
-        const int pass_clear_words = n * (1 + kScoreBins);
-        const ScoreTiles tiles = score_tiles(begin, n, batch.width);
+        const std::int32_t n       = std::min(l.group, columns - begin);
+        const int slices           = std::clamp(std::min(ceil_div(max_blocks, kSliceBlocks), ceil_div(std::int64_t{16} * sms, n)),
+                                                1, kMaxSlices);
+        const int pass_clear_words = (slices > 1 && max_blocks > top_blocks) ? n * (1 + kScoreBins) : 0;
+        std::uint32_t* pass_state  = pass_clear_words > 0 ? state : nullptr;
+        const ScoreTiles tiles     = score_tiles(begin, n, batch.width);
         if (wide) {
             const int ctas = std::clamp(ceil_div(std::int64_t{kWideCtasPerSm} * sms, tiles.count), 1,
                                         std::max(1, ceil_div(max_blocks + 1, kWideBlocks)));
@@ -947,7 +951,8 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                 {dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)), dim3(kWideThreads),
                  kWideSharedBytes, stream},
                 qsa_score_wide_kernel, index, geometry.index_heads, pooled, tables, table_stride, rows, positions,
-                batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, state, pass_clear_words, spaces));
+                batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, pass_state, pass_clear_words,
+                spaces));
         } else {
             const int ctas = std::clamp(ceil_div(std::int64_t{kScoreCtasPerSm} * sms, tiles.count), 1,
                                         std::max(1, ceil_div(max_steps, kScoreWarps)));
@@ -955,10 +960,8 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                                              dim3(kScoreThreads), 0, stream},
                                             qsa_score_kernel, index, geometry.index_heads, pooled, tables,
                                             table_stride, rows, positions, batch.width, geometry.ratio, top_blocks,
-                                            begin, tiles, scores, l.stride, state, pass_clear_words, spaces));
+                                            begin, tiles, scores, l.stride, pass_state, pass_clear_words, spaces));
         }
-        const int slices = std::clamp(std::min(ceil_div(max_blocks, kSliceBlocks), ceil_div(std::int64_t{16} * sms, n)),
-                                      1, kMaxSlices);
         CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(slices), static_cast<unsigned>(n)),
                                          dim3(kSelectThreads), smem, stream},
                                         qsa_select_global_kernel, positions, geometry.ratio, top_blocks, begin,

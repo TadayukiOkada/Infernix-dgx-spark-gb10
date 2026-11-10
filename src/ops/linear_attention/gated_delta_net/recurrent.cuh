@@ -831,7 +831,7 @@ __device__ __forceinline__ void zero_output_suffix(const Access& access,
 }
 
 template <bool NormalizeInputs, class State>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 8)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
@@ -1145,7 +1145,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
 }
 
 template <class Geometry, class State>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 8)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);

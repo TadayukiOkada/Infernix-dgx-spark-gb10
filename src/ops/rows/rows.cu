@@ -79,6 +79,16 @@ __global__ void gather_kernel(const __nv_bfloat16* __restrict__ in, int rows,
     }
 }
 
+__global__ void gather_vector_kernel(const uint4* __restrict__ in, int rows8,
+                                     const std::int32_t* __restrict__ columns, uint4* __restrict__ out) {
+    pdl::enter();
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = blockIdx.y;
+    if (r < rows8) {
+        out[static_cast<std::size_t>(i) * rows8 + r] = in[static_cast<std::size_t>(columns[i]) * rows8 + r];
+    }
+}
+
 } // namespace
 
 void split_rows(const Tensor& in, std::span<Tensor* const> outs, cudaStream_t stream) {
@@ -114,9 +124,18 @@ void gather_columns(const Tensor& in, const Tensor& columns, Tensor& out, cudaSt
     require(contiguous_bf16(in) && contiguous_bf16(out) && columns.dtype == DType::I32 && columns.is_contiguous() &&
                 out.ne[0] == in.ne[0] && columns.numel() == out.ne[1],
             "gather needs BF16 [R, T] in, BF16 [R, N] out and I32 [N] columns");
-    gather_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, out.ne[1]), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(in.data), in.ne[0], static_cast<const std::int32_t*>(columns.data),
-        static_cast<__nv_bfloat16*>(out.data));
+    const auto aligned = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; };
+    if (in.ne[0] % 8 == 0 && aligned(in.data) && aligned(out.data)) {
+        const int rows8 = in.ne[0] / 8;
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3((rows8 + kThreads - 1) / kThreads, out.ne[1]), dim3(kThreads), 0, stream},
+            gather_vector_kernel, static_cast<const uint4*>(in.data), rows8,
+            static_cast<const std::int32_t*>(columns.data), static_cast<uint4*>(out.data)));
+    } else {
+        gather_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, out.ne[1]), kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(in.data), in.ne[0], static_cast<const std::int32_t*>(columns.data),
+            static_cast<__nv_bfloat16*>(out.data));
+    }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) { throw std::runtime_error(std::string("gather_columns: ") + cudaGetErrorString(error)); }
 }

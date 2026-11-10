@@ -505,35 +505,35 @@ void sliced_k_allow_shared() {
     CUDA_CHECK(attribute);
 }
 
-// The device's SMs (cached per thread).
+// The device's SMs (cached once).
 inline int sliced_k_multiprocessors() {
-    thread_local int sms = 0;
-    if (sms == 0) {
+    static const int sms = [] {
         int current = 0;
+        int count   = 0;
         CUDA_CHECK(cudaGetDevice(&current));
-        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, current));
-    }
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, current));
+        return count;
+    }();
     return sms;
 }
 
-// `kernel`'s resident CTAs per SM at `threads` threads and `shared` dynamic bytes (cached: the
-// answer never changes for a kernel).
-template <class Kernel>
-int sliced_k_resident(Kernel kernel, int threads, std::size_t shared) {
-    struct Entry {
-        const void* kernel;
-        std::size_t shared;
-        int resident;
-    };
-    thread_local std::vector<Entry> cache;
-    const void* key = reinterpret_cast<const void*>(kernel);
-    for (const Entry& entry : cache) {
-        if (entry.kernel == key && entry.shared == shared) { return entry.resident; }
-    }
-    int resident = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, threads, shared));
-    cache.push_back({key, shared, resident});
-    return resident;
+// `Kernel`'s resident CTAs per SM at `Schedule::kThreads` threads for each stage count (cached once
+// per template specialization: the answer never changes for a kernel).
+template <auto Kernel, class Schedule>
+int sliced_k_resident(int stages) {
+    static const auto table = [] {
+        std::array<int, Schedule::kMaxStages + 1> out{};
+        for (int s = 1; s <= Schedule::kMaxStages; ++s) {
+            const std::size_t bytes = Schedule::shared_bytes(s);
+            if (bytes <= Schedule::kOptInBytes) {
+                int resident = 0;
+                CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, Kernel, Schedule::kThreads, bytes));
+                out[s] = resident;
+            }
+        }
+        return out;
+    }();
+    return table[stages];
 }
 
 // One launch at a chosen shape (block rows from the schedule, `stages` ring slots).
@@ -594,7 +594,7 @@ void launch_sliced_k_pipelined(const SlicedKOperands& operands, Output output, E
             if (bytes > Schedule::kOptInBytes) { continue; }
             candidates[count++] = {{Rows, stages},
                                    ctas,
-                                   sliced_k_resident(kernel, Schedule::kThreads, bytes),
+                                   sliced_k_resident<kernel, Schedule>(stages),
                                    Schedule::kWeightSlotBytes};
         }
     };

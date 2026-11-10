@@ -49,26 +49,16 @@ struct Fp8TmaSplitKPlan {
     }
 };
 
-// One resident wave of `kernel`'s CTAs on the running device: its occupancy at `threads` and
-// `shared` bytes times the device's SM count. Cached per (kernel, threads, shared).
-template <class Kernel>
-inline int fp8_a8_tma_wave(Kernel kernel, int threads, int shared, int ceiling) {
-    struct Entry {
-        const void* kernel;
-        int threads;
-        int shared;
-        int wave;
-    };
-    thread_local std::vector<Entry> cache;
-    const void* key = reinterpret_cast<const void*>(kernel);
-    for (const Entry& e : cache) {
-        if (e.kernel == key && e.threads == threads && e.shared == shared) { return e.wave; }
-    }
-    int per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, shared));
-    // The partials buffer is sized for `ceiling` CTAs; never plan a split beyond it.
-    const int wave = std::min(ceiling, per_sm * device_sm_count());
-    cache.push_back({key, threads, shared, wave});
+// One resident wave of `Kernel`'s CTAs on the running device: its occupancy at `Threads` and
+// `shared` bytes times the device's SM count. Cached once per template specialization.
+template <auto Kernel, int Threads, int Ceiling>
+inline int fp8_a8_tma_wave(int shared) {
+    static const int wave = [shared] {
+        int per_sm = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, Kernel, Threads, shared));
+        // The partials buffer is sized for `Ceiling` CTAs; never plan a split beyond it.
+        return std::min(Ceiling, per_sm * device_sm_count());
+    }();
     return wave;
 }
 
@@ -366,16 +356,14 @@ void launch_fp8_a8_tma_mma(const Fp8A8OperandsT<Scale>& p, Output output, Epilog
                     constexpr auto probe =
                         fp8_a8_tma_mma_kernel<Schedule, true, Output, Epilogue, false, RowPolicy,
                                               Scale, InPlace>;
-                    wave = fp8_a8_tma_wave(probe, Schedule::kThreads,
-                                           fp8_prepare_shared<bytes, probe, true>(),
-                                           Schedule::kSplitWaveCtas);
+                    wave = fp8_a8_tma_wave<probe, Schedule::kThreads, Schedule::kSplitWaveCtas>(
+                        fp8_prepare_shared<bytes, probe, true>());
                 } else {
                     constexpr auto probe =
                         fp8_a8_tma_mma_kernel<Schedule, false, Output, Epilogue, false, RowPolicy,
                                               Scale, InPlace>;
-                    wave = fp8_a8_tma_wave(probe, Schedule::kThreads,
-                                           fp8_prepare_shared<bytes, probe, true>(),
-                                           Schedule::kSplitWaveCtas);
+                    wave = fp8_a8_tma_wave<probe, Schedule::kThreads, Schedule::kSplitWaveCtas>(
+                        fp8_prepare_shared<bytes, probe, true>());
                 }
             }
             const auto plan =

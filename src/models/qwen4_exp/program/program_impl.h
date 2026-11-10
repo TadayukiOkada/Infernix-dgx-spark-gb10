@@ -689,7 +689,7 @@ public:
         // The MTP drafter (design 11.2): residual columns, the saved and chain columns, its QSA
         // records, the HC ones and its io.
         if (d.mtp) {
-            d.mtp_columns      = std::max(lanes * W, std::min(d.chunk, 512));
+            d.mtp_columns      = std::max(lanes * W, std::min(d.chunk, execution::kMtpChunkColumns));
             d.mtp_column_bytes = 2ULL * width;
             d.mtp_ones         = sizeof(float) * c.hc.streams * static_cast<std::size_t>(d.mtp_columns);
             const auto k       = static_cast<std::size_t>(d.mtp_k);
@@ -918,7 +918,7 @@ public:
             bytes += accept;
         }
         if (d.mtp) {
-            bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
+            bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, execution::kMtpChunkColumns)), lanes,
                                                              d.head_rows, dim(o.max_context), o.kv_cache);
         }
         // The lossless route's calls: a scored window, or (generation) the cache form over the lanes.
