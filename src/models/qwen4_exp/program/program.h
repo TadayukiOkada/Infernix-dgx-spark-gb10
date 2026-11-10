@@ -447,6 +447,10 @@ struct ProgramOptions {
     // draft head's top tokens under its sampler and verified by sparse rejection sampling, and its
     // one-row rounds verify every draft (no cumulative cut). Greedy rows are unchanged.
     bool sampled_mtp_drafts = false;
+    // sampled-dflash-drafts: when true, DFlash2 drafts stochastically and verifies via sparse rejection
+    // sampling. When false (default, matching MTP), DFlash2 drafts argmax and verifies via distribution-
+    // correct greedy speculative acceptance.
+    bool sampled_dflash_drafts = false;
     // The reproducible route (EngineOptions::fast_paths off): sampled requests draw by Gumbel-max
     // (ops::SamplingConfig::gumbel_max), so speculation returns plain sampling's text.
     bool gumbel_sampling = false;

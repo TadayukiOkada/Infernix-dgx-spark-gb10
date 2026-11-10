@@ -73,6 +73,9 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
         dflash_host(dflash_io_.valid)[b]     = W;
         dflash_host(dflash_io_.slots)[b]     = static_cast<std::int32_t>(lanes[b]);
         configs[b]                           = lane.sampling;
+        if (!sampled_dflash_drafts_) {
+            configs[b].temperature = 0.0F;
+        }
         configs[b].mask                      = {};
         configs[b].nonfinite                 = nullptr; // a draft's selection never fails the request
     }

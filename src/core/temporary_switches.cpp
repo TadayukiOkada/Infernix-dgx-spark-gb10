@@ -92,6 +92,9 @@ constexpr Registration kSwitches[] = {
     // Flash-Next dflash2-pairs: DFlash2 rounds of up to <value> rows (2..8; 2: today's pairs only)
     // (models/qwen4_exp/program/program_impl.h dflash2_rows_). Bits as dflash2-pairs'.
     {"INFERNIX_TMP_DFLASH2_ROWS", Scope::Qwen4Exp, Kind::Value},
+    // Flash-Next dflash2: when set, draft stochastically and verify via sparse rejection sampling;
+    // default (unset): draft argmax and verify via greedy speculative acceptance.
+    {"INFERNIX_TMP_DFLASH_SAMPLED", Scope::Qwen4Exp, Kind::Flag},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 

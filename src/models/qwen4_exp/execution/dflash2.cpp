@@ -104,11 +104,10 @@ void DFlash2::materialize(const DFlash2ContextCall& call) {
     }
     const nvtx::ScopedRange range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash, static_cast<std::uint64_t>(W * B));
     auto scope = work_.scope();
-    Tensor projected = work_.alloc(DType::BF16, {H, W * B});
-    project(call.features.view({call.features.ne[0], W * B}), p_.feature_projection, projected, work_, s);
     Tensor context = work_.alloc(DType::BF16, {H, W, B});
     Tensor flat    = context.view({H, W * B});
-    ops::rmsnorm(projected, p_.context_norm, config_.rms_norm_eps, false, flat, s);
+    project(call.features.view({call.features.ne[0], W * B}), p_.feature_projection, flat, work_, s);
+    ops::rmsnorm(flat, p_.context_norm, config_.rms_norm_eps, false, flat, s);
     std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeMaxLayers> layers;
     for (std::size_t l = 0; l < config_.layers; ++l) {
         const auto& layer = p_.layers[l];
@@ -274,7 +273,7 @@ std::size_t DFlash2::workspace_bytes(const TextConfig& text, const DFlash2Config
     for (const std::int32_t columns : {std::min(context_columns, kBatchedContextColumns), context_columns}) {
         const std::int32_t rows = columns <= kBatchedContextColumns ? max_batch : 1;
         const std::size_t cells = static_cast<std::size_t>(columns) * static_cast<std::size_t>(rows);
-        context = std::max(context, 2 * (H * cells * 2 + kSlack) +
+        context = std::max(context, (H * cells * 2 + kSlack) +
                                         ops::linear_workspace_capacity_bytes(kQ8, dim(H), dim(F), kA16, 1, dim(cells)) +
                                         ops::context_kv_materialize_workspace_capacity_bytes(
                                             static_cast<std::int32_t>(config.layers), rows, 1, columns));

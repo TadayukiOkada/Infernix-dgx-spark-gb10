@@ -995,6 +995,10 @@ public:
             diagnostic("sampled MTP drafts need the sparse acceptance's token domain; drafts stay one-hot",
                        DiagnosticLevel::Warning);
         }
+        sampled_dflash_drafts_ = (options_.sampled_dflash_drafts ||
+                                  temporary_switches::flag("INFERNIX_TMP_DFLASH_SAMPLED")) &&
+                                 plan_.dflash2 && max_width_ > 1 &&
+                                 sparse_acceptance(plan_.token_domain, max_width_, plan_.lanes);
         walk_step_tokens_ = walk_step_tokens_from_environment();
         dflash_process_calibration_.reset();
         screened_head_ = options_.screened_lm_head;
@@ -2763,9 +2767,11 @@ public:
                 }
                 for (std::int32_t b = 0; b < batch; ++b) {
                     if (from_ngram_[b]) { continue; }
+                    const std::int32_t ngram_limit =
+                        batch == 1 ? static_cast<std::int32_t>(options_.ngram_draft_tokens)
+                                   : (batch == 2 ? kPairNgramMaxDrafts : std::min(kMultiRowNgramMaxDrafts, 64 / batch - 1));
                     const std::int32_t max_copies =
-                        batch == 1 ? static_cast<std::int32_t>(ngram_proposal_[b].size())
-                                   : std::min<std::int32_t>(static_cast<std::int32_t>(ngram_proposal_[b].size()), shared_k);
+                        std::min<std::int32_t>(static_cast<std::int32_t>(ngram_proposal_[b].size()), ngram_limit);
                     if (max_copies > extents[b]) {
                         const Lane& lane      = lanes_[lanes[b]];
                         const double copy_acc = lane.ngram_accept[static_cast<std::size_t>(ngram_proposal_bucket_[b])];
@@ -5298,7 +5304,7 @@ private:
         bool dflash_sampled = false;
         if (std::exchange(dflash_round_, false)) {
             for (std::int32_t b = 0; b < batch; ++b) {
-                dflash_sampled = dflash_sampled || lanes_[lanes[b]].sampling.temperature > 0.0F;
+                dflash_sampled = dflash_sampled || (sampled_dflash_drafts_ && lanes_[lanes[b]].sampling.temperature > 0.0F);
             }
         }
         const bool sampled = std::exchange(mtp_sampled_round_, false);
@@ -7014,7 +7020,7 @@ private:
         std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_PAIR_MAX_DRAFTS", 3.0)), 0,
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kMultiRowMaxDrafts =
-        static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 3.0));
+        static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 4.0));
     static constexpr std::int32_t kPairNgramMaxDrafts     = 31;
     static constexpr std::int32_t kMultiRowNgramMaxDrafts = 21;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the
@@ -7031,10 +7037,11 @@ private:
     // pair width, INFERNIX_PAIR_DRAFT_COST below for one verified column of the round), each fitted
     // on this device; the draft cost replaced the 0.47 the 5090's cost model paid.
     static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.16);
-    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.16);
+    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.12);
     static inline const double kDFlashPairDraftCost =
-        policy_double("INFERNIX_PAIR_DRAFT_COST", 0.15);
-    static constexpr double kDFlashPairProposalCost  = 0.1;
+        policy_double("INFERNIX_PAIR_DRAFT_COST", 0.12);
+    static inline const double kDFlashPairProposalCost =
+        policy_double("INFERNIX_DFLASH_PAIR_PROPOSAL_COST", 0.08);
     // The cumulative cut's per-row thresholds and draft log-probabilities (the device gate's for row 0
     // of a one-row round, the host cut's for every row; MtpCumulative is always on).
     // TEMPORARY (INFERNIX_TMP_DFLASH2_ROWS=<n>, 4 by default), until its A/B: dflash2-pairs' rounds for up to n
@@ -7052,6 +7059,7 @@ private:
     // sampled-mtp-drafts (ProgramOptions::sampled_mtp_drafts) on a token domain the sparse
     // acceptance serves: sampled rows draw their drafts and skip the confidence cut.
     bool sampled_drafts_ = false;
+    bool sampled_dflash_drafts_ = false;
     // Multi-row rounds (three or more rows): with 2-CTA/SM A16 gate/up, 3-CTA/SM A16 down, zero-wide-tile
     // fast exit, and periodic probing in choose_multirow_draft_length, shared drafts at batch >= 3
     // amortize dense and MoE weight reads across the batch.
