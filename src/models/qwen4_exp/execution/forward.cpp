@@ -122,8 +122,7 @@ void text_head_bf16(const Parameters& parameters, const Tensor& x, Tensor& logit
 }
 
 // Whether Linear runs a draft head's rows to BF16 output. The q4_g64_fp16 proposal head registers the
-// K it was tuned at (2048, 3072, 5120) and no other, so the Flash-Next drafter's 2560-wide head has
-// no Linear schedule and keeps the FP32 projection below.
+// tuned K families (2048, 2560, 3072, 5120) with column-invariant sliced/MMA schedules.
 bool linear_projects_head_rows(const LinearParameters& rows) {
     return !rows.is_ggml() &&
            (rows.weight.qtype != QType::Q4_G64_FP16 ||
