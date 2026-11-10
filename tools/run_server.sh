@@ -49,7 +49,7 @@ DRAFT_PATH="/opt/etc/models/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-D
 HOST="0.0.0.0"
 PORT="8000"
 MAX_CONTEXT="262144"
-MAX_CONCURRENCY="8"
+MAX_CONCURRENCY="4"
 EXPLICIT_MODEL_ID=""
 TARGET_INPUT=""
 
@@ -166,8 +166,6 @@ echo
 
 export INFERNIX_EXPERTS_ON_GPU=1
 export INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.08}"
-export INFERNIX_TMP_DECODE_SHARE=0.5
-export INFERNIX_TMP_DECODE_SHARE_WALK_TOKENS=512
 
 EXPERT_A4_ARGS=()
 if [[ "${EXPERT_A4_ACTIVATIONS:-1}" == "1" ]]; then
@@ -178,20 +176,21 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     "${EXPERT_A4_ARGS[@]}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
-    --ngram-cache-mib 512 \
+    --ngram-cache-mib 4096 \
     --kv-dtype "${KV_DTYPE}" \
     --spec mtp \
-    --draft-tokens 2 \
+    --draft-tokens auto \
     --ngram-draft-tokens 31 \
     --ngram-min-match 4 \
     --temperature 1.0 \
     --top-p 0.9 \
+    --min-p 0.1 \
+    --top-k 20 \
     --lm-head-draft \
     --kv-capacity 524288 \
     --default-max-tokens 32768 \
     --preserve-thinking \
     --host-context-mib 1024 \
-    --prefill-chunk 8192 \
     --tolerant-tool-calls \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \

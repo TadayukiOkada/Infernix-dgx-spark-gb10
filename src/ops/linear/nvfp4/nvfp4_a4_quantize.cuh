@@ -57,7 +57,10 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
                   (Geometry::kInputRows / 16) % kNvfp4ScaleTileGroups == 0);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
     const int tid               = static_cast<int>(threadIdx.x);
-    const int task              = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+    const int total_blocks      = static_cast<int>(gridDim.x);
+    const int bid               = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
+                                                     : static_cast<int>(blockIdx.x);
+    const int task              = bid * static_cast<int>(blockDim.x) + tid;
     const int tasks             = tokens * kGroupsPerRow;
     if (task >= tasks) {
         // The tiled plane is addressed in whole tiles, so the launch covers the padding of the last
@@ -103,7 +106,10 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quan
     static_assert((Geometry::kInputRows / 16) % 4 == 0);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
     const int tid               = static_cast<int>(threadIdx.x);
-    const int task              = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
+    const int total_blocks      = static_cast<int>(gridDim.x);
+    const int bid               = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
+                                                     : static_cast<int>(blockIdx.x);
+    const int task              = bid * static_cast<int>(blockDim.x) + tid;
     if (task >= tokens * kGroupsPerRow) {
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
             const int pad_token = task / kGroupsPerRow;
