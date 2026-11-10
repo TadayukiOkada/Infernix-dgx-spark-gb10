@@ -671,7 +671,7 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
         for name in banks
     ):
         raise ValueError("the FP4-Local recipe imports ModelOpt NVFP4 experts (nvidia/Qwen3.8-Flash-Next-FP4-Local)")
-    if model.config["ngram_table"]["format"] != "nvfp4":
+    if not model.config["ngram_table"]["format"].startswith("nvfp4"):
         raise ValueError("the FP4-Local recipe binds the checkpoint's own NVFP4 n-gram table")
     base = sources["base"]
     mxfp8 = (
@@ -807,6 +807,11 @@ def qwen3_8_flash_next_nvfp4_w4dense(model, recipe, sources):
     for name in model.parameters:
         if name.startswith("text/layers/") and name.endswith(tier1):
             recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+    if "text/layers/0/moe/expert_input_scales" in model.parameters:
+        model.config["expert_a4_activations"] = "optional"
+    base = sources.get("base")
+    if base is not None:
+        _fp4_local_vision(model, recipe, base)
 
 
 RECIPES = {
