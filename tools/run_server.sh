@@ -29,10 +29,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Default paths (override per model with MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY in the environment)
-MODEL_PATH="${MODEL_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix}"
-NGRAM_PATH="${NGRAM_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense/Qwen3.8-Flash-Next-Local-NVFP4.ngram}"
+MODEL_PATH="${MODEL_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix}"
+NGRAM_PATH="${NGRAM_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix.ngram}"
 NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
-KV_DTYPE="${KV_DTYPE:-int8}"
+KV_DTYPE="${KV_DTYPE:-k8v4}"
 DIST_DIR="${REPO_ROOT}/dist/milestones"
 DRAFT_PATH="/opt/etc/models/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
 # DFlash2 vs MTP on GB10 (pp2048+tg128, fp8 KV, medians, decode out t/s):
@@ -49,7 +49,7 @@ DRAFT_PATH="/opt/etc/models/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-D
 HOST="0.0.0.0"
 PORT="8000"
 MAX_CONTEXT="262144"
-MAX_CONCURRENCY="4"
+MAX_CONCURRENCY="8"
 EXPLICIT_MODEL_ID=""
 TARGET_INPUT=""
 
@@ -160,28 +160,38 @@ echo " Model Weights   : ${MODEL_PATH}"
 echo " Listen Endpoint : http://${HOST}:${PORT}/v1"
 echo " Max Context     : ${MAX_CONTEXT} tokens"
 echo " Max Concurrency : ${MAX_CONCURRENCY}"
-echo " Speculative     : MTP (auto) + N-gram (15 drafts, min-match 4)"
+echo " Speculative     : MTP (auto) + N-gram (31 drafts, min-match 4)"
 echo "========================================================================================"
 echo
 
 export INFERNIX_EXPERTS_ON_GPU=1
 export INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.08}"
-    #--draft-model "$DRAFT_PATH" \
-    #--draft-tokens auto \
+
+EXPERT_A4_ARGS=()
+if [[ "${EXPERT_A4_ACTIVATIONS:-1}" == "1" ]]; then
+    EXPERT_A4_ARGS=(--expert-a4-activations)
+fi
+
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
+    "${EXPERT_A4_ARGS[@]}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
-    --ngram-cache-mib 4096 \
+    --ngram-cache-mib 512 \
     --kv-dtype "${KV_DTYPE}" \
     --spec mtp \
-    --draft-tokens auto \
-    --temperature 1.0 \
+    --draft-tokens 2 \
     --ngram-draft-tokens 31 \
     --ngram-min-match 4 \
+    --temperature 1.0 \
     --top-p 0.9 \
-    --min-p 0.1 \
-    --top-k 20 \
     --lm-head-draft \
+    --kv-capacity 524288 \
+    --expert-a4-activations \
+    --default-max-tokens 32768 \
+    --preserve-thinking \
+    --host-context-mib 1024 \
+    --prefill-chunk 8192 \
+    --tolerant-tool-calls \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --host "${HOST}" \
