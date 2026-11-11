@@ -668,21 +668,31 @@ struct FoldAccess {
     }
 
     __device__ __forceinline__ const State*
-    state_read_base(const RecurrentCoordinates& coord) const {
+    state_read_base(const RecurrentCoordinates& coord, const GdnReplayFoldKernelRow& row) const {
         const std::int64_t slot_stride =
             static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               static_cast<std::int64_t>(row_of(coord.batch).source_state_slot) * slot_stride +
+               static_cast<std::int64_t>(row.source_state_slot) * slot_stride +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+    }
+
+    __device__ __forceinline__ const State*
+    state_read_base(const RecurrentCoordinates& coord) const {
+        return state_read_base(coord, row_of(coord.batch));
+    }
+
+    __device__ __forceinline__ State* state_write_base(const RecurrentCoordinates& coord,
+                                                      const GdnReplayFoldKernelRow& row) const {
+        const std::int64_t slot_stride =
+            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
+        return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
+               static_cast<std::int64_t>(row.destination_state_slot) *
+                   slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
     __device__ __forceinline__ State* state_write_base(const RecurrentCoordinates& coord) const {
-        const std::int64_t slot_stride =
-            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
-        return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
-               static_cast<std::int64_t>(row_of(coord.batch).destination_state_slot) *
-                   slot_stride +
-               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+        return state_write_base(coord, row_of(coord.batch));
     }
 
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
@@ -704,9 +714,9 @@ struct FoldAccess {
     }
 
     __device__ __forceinline__ void
-    store_final_state(const RecurrentCoordinates& coord,
+    store_final_state(const RecurrentCoordinates& coord, const GdnReplayFoldKernelRow& row,
                       const float (&state)[kDvPerWarp][kQkPerLane]) const {
-        State* destination = state_write_base(coord);
+        State* destination = state_write_base(coord, row);
 #pragma unroll
         for (int r = 0; r < kDvPerWarp; ++r) {
             store_qk_lane(state[r],
@@ -715,7 +725,14 @@ struct FoldAccess {
         }
     }
 
+    __device__ __forceinline__ void
+    store_final_state(const RecurrentCoordinates& coord,
+                      const float (&state)[kDvPerWarp][kQkPerLane]) const {
+        store_final_state(coord, row_of(coord.batch), state);
+    }
+
     __device__ __forceinline__ void publish_final_conv_history(const RecurrentCoordinates& coord,
+                                                               const GdnReplayFoldKernelRow& row,
                                                                std::int32_t commit) const {
         const std::int32_t tile_block =
             static_cast<std::int32_t>(coord.value_head) * 8 + coord.state_tile;
@@ -723,7 +740,6 @@ struct FoldAccess {
 
         const std::int32_t tid     = coord.warp * kWarpSize + coord.lane;
         const std::int32_t channel = tile_block * 128 + tid;
-        const GdnReplayFoldKernelRow row = row_of(coord.batch);
         const __nv_bfloat16* source_history =
             conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
             static_cast<std::int64_t>(row.source_state_slot) * (3LL * Geometry::kConvChannels) + channel;
@@ -1148,13 +1164,15 @@ template <class Geometry, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 8)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
-    const std::int32_t valid         = access.active_columns(coord);
+    const GdnReplayFoldKernelRow row = access.row_of(coord.batch);
+    const std::int32_t valid         = row.commit_columns;
     if (valid == 0) { return; }
     __align__(16) float state[kDvPerWarp][kQkPerLane];
-    load_state_tile(state, access.state_read_base(coord), coord);
+    load_state_tile(state, access.state_read_base(coord, row), coord);
+    pdl::enter_streaming();
     run_recurrent_sequence<true, FoldEffects>(state, access, coord, valid);
-    access.store_final_state(coord, state);
-    access.publish_final_conv_history(coord, valid);
+    access.store_final_state(coord, row, state);
+    access.publish_final_conv_history(coord, row, valid);
 }
 
 } // namespace infernix::ops::detail::gated_delta_net
