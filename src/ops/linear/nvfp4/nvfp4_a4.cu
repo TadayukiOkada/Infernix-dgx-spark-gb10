@@ -78,7 +78,7 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
         constexpr int kRowScaleThreads =
             ActivationGeometry::kGroupsPerRow <= 160
                 ? 160
-                : (ActivationGeometry::kGroupsPerRow == 384 ? 192 : 256);
+                : (ActivationGeometry::kGroupsPerRow == 384 ? 384 : 256);
         CUDA_CHECK(pdl::launch_with(
             dep, {dim3(written_tokens), dim3(kRowScaleThreads), 0, stream},
             nvfp4_a4_row_scaled_residual_quantize_kernel<ActivationGeometry, kRowScaleThreads, Terms,

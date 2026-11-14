@@ -23,6 +23,11 @@ constexpr std::array kShapes{
     ShapeEntry{131072, 3072, select_q4_n131072_k3072},
     ShapeEntry{3456, 1152, select_q4_n3456_k1152},
     ShapeEntry{4304, 1152, select_q4_n4304_k1152},
+    ShapeEntry{1280, 2560, select_q4_n1280_k2560},
+    ShapeEntry{2560, 640, select_q4_n2560_k640},
+    ShapeEntry{324, 10240, select_q4_n324_k10240},
+    ShapeEntry{320, 10240, select_q4_n320_k10240},
+    ShapeEntry{10240, 320, select_q4_n10240_k320},
 };
 
 // The proposal heads' column-invariant route: the four-K-warp sliced family at every width (the
@@ -32,6 +37,19 @@ Q4Launch select_q4_invariant(std::int32_t t) {
     if (t <= 8) return launch_q4_a16_sliced_r32_t8_w4_s2;
     if (t <= 16) return launch_q4_a16_sliced_r32_t16_w4_s1;
     return launch_q4_a16_sliced_r32_t32_w4_s1;
+}
+Q4Launch select_q4_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
+    (void)n;
+    if (k % 128 != 0) {
+        if (t <= 32) return launch_q4_a16_mma_r32_t32_k64_wr16_wt16_s3_a3_b2;
+        return launch_q4_a16_mma_r32_t64_k64_wr16_wt32_s2_a2_b2;
+    }
+    if (t == 1) return launch_q4_a16_simt_r4_t1_w2_g8_s2;
+    if (t <= 4) return launch_q4_a16_simt_r4_t4_w2_g8_s2;
+    if (t <= 8) return launch_q4_a16_sliced_r32_t8_w4_s2;
+    if (t <= 16) return launch_q4_a16_sliced_r32_t16_w4_s1;
+    if (t <= 32) return launch_q4_a16_sliced_r32_t32_w4_s1;
+    return launch_q4_a16_mma_r32_t64_k64_wr16_wt32_s2_a2_b2;
 }
 } // namespace
 
@@ -44,7 +62,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("q4 linear: unsupported shape");
+    return select_q4_generic(n, k, t);
 }
 
 Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

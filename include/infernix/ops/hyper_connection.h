@@ -67,6 +67,24 @@ void hyper_connection_inject_mix(const Tensor& y, const Tensor& pending_inject, 
     const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
     std::int32_t rank, std::int32_t max_tokens);
 
+/// Per-stream RMSNorm of residual (contiguous BF16 [S*H, T]) with unit-offset weight (BF16 or FP32
+/// [S*H]) into out (contiguous BF16 [S*H, T]). eps > 0.
+void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::int32_t streams,
+                           float eps, Tensor& out, cudaStream_t stream);
+
+/// Whether hyper_connection_mix / hyper_connection_inject_mix use the fused decode route
+/// (direct from residual without an external normalized [S*H, T] intermediate) at `columns`.
+[[nodiscard]] bool hyper_connection_mix_is_fused(const Weight& down, const Weight& up,
+                                                 std::int32_t hidden, std::int32_t streams,
+                                                 std::int32_t rank, std::int32_t columns);
+
+/// Second half of hyper_connection_mix starting from an already-computed per-stream RMSNorm
+/// `normalized` (contiguous BF16 [S*H, T]). Workspace: hyper_connection_mix_workspace_capacity_bytes.
+void hyper_connection_mix_normalized(const Tensor& normalized, const Weight& down, const Weight& up,
+                                     LinearPolicy policy, std::int32_t streams, std::int32_t rank,
+                                     Tensor& x, Tensor* inject, WorkspaceArena& workspace,
+                                     cudaStream_t stream);
+
 /// residual[s*H+d,t] = bf16(residual[s*H+d,t] + inject[s,t] * y[d,t]). y: BF16 [H, T];
 /// inject: FP32 [S, T]; residual: BF16 [S*H, T], updated in place.
 void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& residual,

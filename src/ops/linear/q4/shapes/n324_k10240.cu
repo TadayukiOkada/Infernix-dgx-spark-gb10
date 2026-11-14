@@ -1,0 +1,20 @@
+#include "ops/linear/q4/q4_shapes.h"
+
+namespace infernix::ops::detail {
+Q4Launch select_q4_n324_k10240(std::int32_t tokens) {
+    // Selected with complete-Op cold-L2 route sweeps on GB10.
+    if (tokens <= 1) return launch_q4_a16_simt_r4_t1_w2_g8_s2;
+    if (tokens <= 8) return launch_q4_a16_simt_r4_t4_w2_g8_s2;
+    if (tokens <= 16) return launch_q4_a16_sliced_r16_t8_w4_s2;
+    if (tokens <= 32) return launch_q4_a16_sliced_r16_t16_w4_s2;
+    if (tokens <= 64) return launch_q4_a16_sliced_r16_t32_w4_s2;
+    if (tokens <= 128) return launch_q4_a16_sliced_r32_t32_w4_s2;
+    if (tokens <= 256) return launch_q4_a16_sliced_r32_t32_w2_s2;
+    if (tokens <= 416) return launch_q4_a16_mma_r32_t32_k128_s2_a2;
+    if (tokens <= 512) return launch_q4_a16_sliced_r32_t32_w2_s2;
+    if (tokens <= 832) return launch_q4_a16_mma_r32_t64_k128_s2_a1;
+    if (tokens <= 1024) return launch_q4_a16_mma_r64_t64_k64_wr32_wt16_s2_a2_b2;
+    if (tokens <= 1280) return launch_q4_a16_mma_r64_t80;
+    return launch_q4_a16_mma_r64_t96;
+}
+} // namespace infernix::ops::detail

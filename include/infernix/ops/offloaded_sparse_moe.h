@@ -412,9 +412,15 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
 /// residual columns [first, first + stream_mean->ne[1]) into it (BF16 [H, n], any row pitch),
 /// the same bits as hyper_connection_stream_mean on the updated residual. Masked columns take
 /// the mean of their untouched residual, as that call would.
+/// With next_norm_weight and next_norm_out set, the same call also writes the per-stream RMSNorm
+/// of the updated residual (with unit-offset next_norm_weight and next_norm_eps > 0) into
+/// next_norm_out (BF16 [S*H, T]), matching hyper_connection_norm bits.
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
                         const Tensor& inject, Tensor& residual, cudaStream_t stream,
                         const Tensor* stream_mean = nullptr,
-                        std::int32_t stream_mean_first_column = 0);
+                        std::int32_t stream_mean_first_column = 0,
+                        const Tensor* next_norm_weight = nullptr,
+                        Tensor* next_norm_out = nullptr,
+                        float next_norm_eps = 0.0F);
 
 } // namespace infernix::ops

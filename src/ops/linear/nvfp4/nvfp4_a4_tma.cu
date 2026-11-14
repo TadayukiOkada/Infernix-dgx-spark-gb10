@@ -70,6 +70,10 @@ void launch_nvfp4_a4_tma_linear_narrow(const Nvfp4A4Operands& p, __nv_bfloat16* 
 }
 
 namespace {
+inline constexpr Nvfp4A4TmaPromotions kTmaAllL2_256B{
+    CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_256B};
+
 template <int K, Nvfp4A4TmaPromotions Promotions = kNvfp4A4TmaWeightCodeL2_128B>
 void launch_residual(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream) {
     const LinearBf16Output y{output, p.rows};
@@ -91,7 +95,7 @@ void launch_residual(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream
     const int ctas_128 = (p.rows / 128) * ((p.tokens + 127) / 128);
     if (ctas_128 <= 24 || (p.rows == 2560 && p.tokens > 256 && p.tokens <= 384)) {
         launch_nvfp4_a4_tma_mma<Nvfp4ScheduleInstance<
-            Nvfp4A4TmaMmaSchedule<128, 3, 1, Promotions, kNvfp4A4ResidualTerms, 64>, K>>(
+            Nvfp4A4TmaMmaSchedule<128, 4, 1, Promotions, kNvfp4A4ResidualTerms, 64>, K>>(
             p, y, LinearIdentityEpilogue{}, stream, Nvfp4IdentityRows{},
             pdl::Dependency::Programmatic);
         return;
@@ -125,7 +129,7 @@ void launch_nvfp4_a4_residual_tma_linear(const Nvfp4A4Operands& p, __nv_bfloat16
         launch_residual<5120>(p, output, stream);
         return;
     case 6144:
-        launch_residual<6144>(p, output, stream);
+        launch_residual<6144, kTmaAllL2_256B>(p, output, stream);
         return;
     case 17408:
         launch_residual<17408>(p, output, stream);
@@ -144,7 +148,7 @@ void launch_nvfp4_a4_residual_tma_linear_r64(const Nvfp4A4Operands& p, __nv_bflo
         launch_residual_r64<5120>(p, output, stream);
         return;
     case 6144:
-        launch_residual_r64<6144>(p, output, stream);
+        launch_residual_r64<6144, kTmaAllL2_256B>(p, output, stream);
         return;
     case 17408:
         launch_residual_r64<17408>(p, output, stream);

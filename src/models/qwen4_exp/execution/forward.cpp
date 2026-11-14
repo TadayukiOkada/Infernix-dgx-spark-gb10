@@ -301,10 +301,35 @@ void Forward::wait_layer(const ForwardBatch& batch, std::size_t entry) {
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
     begin_call(batch, &logits);
-    Tensor residual = work_.alloc(DType::BF16, {dim(config_.residual_width()), batch.ids.ne[0]});
+    const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), S = dim(config_.hc.streams),
+                       rank = dim(config_.hc.rank), W = dim(config_.residual_width());
+    Tensor residual         = work_.alloc(DType::BF16, {W, T});
     embed(batch, residual);
+    Tensor pre_norm_buf;
+    const Tensor* pre_norm = nullptr;
+    auto can_pre_norm_layer = [&](std::uint32_t next_layer) {
+        const auto& next_block = parameters_.layers[next_layer];
+        return !next_block.ple &&
+               !ops::hyper_connection_mix_is_fused(next_block.attn_hc.down.weight, next_block.attn_hc.up.weight, H,
+                                                   S, rank, T);
+    };
+    if (!config_.lossless && config_.num_hidden_layers > 1 && tap == nullptr && batch.draft_features.data == nullptr) {
+        for (std::uint32_t l = 1; l < config_.num_hidden_layers; ++l) {
+            if (can_pre_norm_layer(l)) {
+                pre_norm_buf = work_.alloc(DType::BF16, {W, T});
+                break;
+            }
+        }
+    }
     for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) {
-        layer(l, batch, residual, tap);
+        const Tensor* next_norm_weight = nullptr;
+        Tensor* next_norm_out          = nullptr;
+        if (pre_norm_buf.data != nullptr && l + 1 < config_.num_hidden_layers && can_pre_norm_layer(l + 1)) {
+            next_norm_weight = &parameters_.layers[l + 1].attn_hc.norm;
+            next_norm_out    = &pre_norm_buf;
+        }
+        layer(l, batch, residual, tap, pre_norm, next_norm_weight, next_norm_out);
+        pre_norm = next_norm_out;
     }
     finish(batch, residual, &logits);
 }
@@ -321,7 +346,8 @@ void Forward::embed(const ForwardBatch& batch, Tensor& residual) {
     ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual, s);
 }
 
-void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap) {
+void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap,
+                    const Tensor* pre_norm, const Tensor* next_norm_weight, Tensor* next_norm_out) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0];
     const auto& block    = parameters_.layers[layer];
@@ -349,7 +375,7 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         // the mix writes the second).
         Tensor inject_a = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
         Tensor inject   = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
-        Tensor xa       = mix(block.attn_hc, residual, &inject_a);
+        Tensor xa       = mix(block.attn_hc, residual, &inject_a, nullptr, block.ple ? nullptr : pre_norm);
         Tensor y        = mixer(layer, batch, xa);
         Tensor xm       = inject_mix(block.mlp_hc, y, inject_a, residual, &inject);
         // The combine injects its output directly unless a tap records it.
@@ -370,7 +396,8 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         Tensor ym = moe(block.moe, xm, layer,
                         tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch, -1,
                         fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr, draft_mean_ptr,
-                        draft_mean_first);
+                        draft_mean_first, fused_inject ? next_norm_weight : nullptr,
+                        fused_inject ? next_norm_out : nullptr);
         if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
         if (tap != nullptr) {
             const std::pair<std::vector<Tensor>*, const Tensor*> copies[] = {
@@ -583,13 +610,20 @@ void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
     text_head_logits(parameters_, final_x, logits, work_, device_.stream);
 }
 
-Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into) {
+Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into,
+                    const Tensor* pre_norm) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
     Tensor x = into != nullptr ? *into : work_.alloc(DType::BF16, {H, T});
+    Tensor* inject_out = p.combine ? inject : nullptr;
+    if (pre_norm != nullptr && !ops::hyper_connection_mix_is_fused(p.down.weight, p.up.weight, H, S, rank, T)) {
+        ops::hyper_connection_mix_normalized(*pre_norm, p.down.weight, p.up.weight, p.down.policy, S, rank, x,
+                                             inject_out, work_, s);
+        return x;
+    }
     ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
-                              x, p.combine ? inject : nullptr, work_, s);
+                              x, inject_out, work_, s);
     return x;
 }
 
@@ -1046,7 +1080,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                     const ForwardBatch* batch, std::int32_t route_columns, const Tensor* inject, Tensor* residual,
-                    const Tensor* stream_mean, std::int32_t stream_mean_first_column) {
+                    const Tensor* stream_mean, std::int32_t stream_mean_first_column,
+                    const Tensor* next_norm_weight, Tensor* next_norm_out) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -1350,7 +1385,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     if (inject != nullptr) {
         ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s, stream_mean,
-                                stream_mean_first_column);
+                                stream_mean_first_column, next_norm_weight, next_norm_out, config_.rms_norm_eps);
         return Tensor{};
     }
     Tensor y = work_.alloc(DType::BF16, {H, T});

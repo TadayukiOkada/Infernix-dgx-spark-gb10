@@ -38,7 +38,8 @@ std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::P
     const std::size_t pass_bytes = patches.empty() ? 0 : vx::plan_vision_pass(config, *parameters_.vision, patches).bytes;
     const auto& overlay          = parameters_.model.overlay_vision();
     const std::size_t staging    = overlay ? vx::vision_staging_align(overlay->layout.staging_bytes) : 0;
-    out->window = plan_vision_window(items, reused, pass_bytes, staging, work_capacity_, residency_->lend_pitch(),
+    const std::size_t lend_pitch = residency_ ? residency_->lend_pitch() : std::size_t{4096};
+    out->window = plan_vision_window(items, reused, pass_bytes, staging, work_capacity_, lend_pitch,
                                      static_cast<std::uint32_t>(parameters_.vision->merger_fc2.weight.n),
                                      config.hidden_size, config.depth);
     return out;
@@ -77,13 +78,27 @@ void ProgramImpl::vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmissi
 
 std::uint64_t ProgramImpl::vision_lendable() const noexcept {
     const std::uint64_t limit = testing::vision_lend_limit();
-    const std::uint64_t bytes = residency_->frames() > 0 ? residency_->lendable_bytes() : 0U;
+    std::uint64_t bytes = 0U;
+    if (residency_) {
+        bytes = residency_->frames() > 0 ? residency_->lendable_bytes() : 0U;
+    } else {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+            constexpr std::size_t kHeadroom = 1ULL << 30;
+            bytes = free_bytes > kHeadroom ? static_cast<std::uint64_t>(free_bytes - kHeadroom) : 0U;
+        }
+    }
     return limit != 0 ? std::min(bytes, limit) : bytes;
 }
 
 std::uint64_t ProgramImpl::vision_lend_capacity() const noexcept {
     const std::uint64_t limit = testing::vision_lend_limit();
-    const std::uint64_t bytes = residency_->frames() > 0 ? residency_->lend_capacity_bytes() : 0U;
+    std::uint64_t bytes = 0U;
+    if (residency_) {
+        bytes = residency_->frames() > 0 ? residency_->lend_capacity_bytes() : 0U;
+    } else {
+        bytes = vision_lendable();
+    }
     return limit != 0 ? std::min(bytes, limit) : bytes;
 }
 
@@ -109,7 +124,7 @@ std::optional<BindingReservation> ProgramImpl::vision_lend(Lane& lane, std::uint
     // its calls (its next streamed call lends again, design §19.3.8 F3), but not inside a layer walk's
     // span or a wide call. For a window that does not fit they go back only when they hold every lent
     // frame, so the window then fits: a window that waits leaves them alone.
-    if (need > vision_lendable() && !walk_.active && !wide_active_ && need <= vision_lend_capacity()) {
+    if (residency_ && need > vision_lendable() && !walk_.active && !wide_active_ && need <= vision_lend_capacity()) {
         const std::uint64_t returnable = static_cast<std::uint64_t>(stream_lease_.count) + stream_wide_lease_.count +
                                          stream_walk_lease_.count + work_lease_.count;
         if (residency_->stats().lent_frames == returnable) {
@@ -118,11 +133,15 @@ std::optional<BindingReservation> ProgramImpl::vision_lend(Lane& lane, std::uint
         }
     }
     if (need <= vision_lendable()) {
-        return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
-        // Promotions still landing in the run are waited for by compute and the weight stream's
-        // transfer stream.
-        const cudaStream_t writers[] = {device_.transfer_stream};
-        v.lease = residency_->lend(need, device_.stream, writers);
+        if (residency_) {
+            return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
+            // Promotions still landing in the run are waited for by compute and the weight stream's
+            // transfer stream.
+            const cudaStream_t writers[] = {device_.transfer_stream};
+            v.lease = residency_->lend(need, device_.stream, writers);
+        } else {
+            v.owned_lease = DeviceBuffer(need);
+        }
         return std::nullopt;
     }
     BindingReservation out; // no pages short: the Engine waits while other lanes run
@@ -148,12 +167,16 @@ void ProgramImpl::vision_step(Lane& lane) {
     const auto out                       = parameters_.vision->merger_fc2.weight.n;
     if (!v.pass) {
         // The binding lent the handoff (W) or handoff and window (L) (vision_lend).
-        if (!v.lease.valid()) { throw std::logic_error("Qwen4Exp: a Vision window runs without its lease"); }
-        v.handoff = Tensor(v.lease.memory.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
+        const DeviceSpan lease_mem =
+            v.lease.valid() ? v.lease.memory : DeviceSpan{v.owned_lease.p, v.owned_lease.bytes};
+        if (lease_mem.data == nullptr || lease_mem.bytes == 0) {
+            throw std::logic_error("Qwen4Exp: a Vision window runs without its lease");
+        }
+        v.handoff = Tensor(lease_mem.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
         DeviceSpan memory;
         if (window.lease) {
             const std::size_t at = align(window.handoff_bytes);
-            memory = {static_cast<std::byte*>(v.lease.memory.data) + at, v.lease.memory.bytes - at};
+            memory = {static_cast<std::byte*>(lease_mem.data) + at, lease_mem.bytes - at};
         } else {
             // Placement W: the whole pass runs in this call from the prefill workspace, idle between
             // units and stream-ordered on compute.
@@ -200,7 +223,7 @@ void ProgramImpl::vision_step(Lane& lane) {
     if (!v.pass->done()) { return; }
     if (v.stream) { v.stream->finish(s); }
     v.timer->record_stop();
-    if (window.lease) {
+    if (window.lease && residency_ && v.lease.valid()) {
         // Only the handoff stays lent; the window's frames go back once compute reaches here.
         auto tail = residency_->split(v.lease, align(window.handoff_bytes));
         residency_->give_back(tail, s);
@@ -232,7 +255,11 @@ void ProgramImpl::vision_release(Lane& lane) noexcept {
         v.layout.reset();
         v.weights.reset();
         v.stream.reset();
-        if (v.lease.valid()) { residency_->give_back(v.lease, s); }
+        if (residency_ && v.lease.valid()) { residency_->give_back(v.lease, s); }
+        if (v.owned_lease.p != nullptr) {
+            cudaStreamSynchronize(s);
+            v.owned_lease = DeviceBuffer{};
+        }
     } catch (...) {}
     lane.vision.reset();
 }

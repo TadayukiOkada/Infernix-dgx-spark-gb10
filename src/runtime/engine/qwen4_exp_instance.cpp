@@ -172,16 +172,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             throw std::runtime_error("INFERNIX_EXPERTS_ON_GPU=1 needs an integrated (unified-memory) GPU");
         }
     }
-    if (device_experts && options.enable_vision) { // vision offload is unsupported on-device for now
-        device_experts = false;
-        report(options, DiagnosticLevel::Warning,
-               "vision offload is incompatible with experts-on-GPU; falling back to the pinned-host "
-                   "expert path for this model");
+    if (device_experts && options.enable_vision && options.vision_offload == VisionOffload::On) {
+        report(options, DiagnosticLevel::Info,
+               "experts-on-GPU keeps vision weights on device instead of offloading them");
     }
     const auto qwen4_load = [&](bool stream_experts) {
         auto load           = models::load_options(options, models::Architecture::Qwen4Exp);
         load.stream_experts = stream_experts;
         load.device_experts = device_experts;
+        if (device_experts) { load.vision_offload = false; }
         if (integrated) { load.mtp_expert_pool = false; }
         if (load.dflash2() && load.draft_model.empty()) {
             load.draft_model = default_dflash2_model(options.artifact_path);

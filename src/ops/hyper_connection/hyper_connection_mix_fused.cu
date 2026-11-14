@@ -25,6 +25,7 @@
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
 #include "ops/hyper_connection/hyper_connection_inject.cuh"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
@@ -148,6 +149,26 @@ struct Q8Codec {
             w[i] = static_cast<float>(static_cast<std::int8_t>((i < 4 ? c.code.x : c.code.y) >> ((i & 3) * 8))) *
                    c.scale;
         }
+    }
+};
+
+// q4_g64_fp16 in row_split_k128_v1: 4-bit signed-offset codes [rows, padded_k / 2], FP16 scales per 64 codes.
+struct Q4Codec {
+    struct Params {
+        const std::uint8_t* codes;
+        const std::uint8_t* scales;
+        int padded_k;
+    };
+    struct Chunk {
+        std::uint32_t code;
+        std::uint16_t scale_bits;
+    };
+    __device__ static Chunk load(const Params& p, std::int64_t row, int k) {
+        return {ld_nc_na<std::uint32_t>(p.codes + row * (p.padded_k / 2) + (k / 2)),
+                ld_nc_na<std::uint16_t>(p.scales + row * (p.padded_k / 64) * 2 + (k / 64) * 2)};
+    }
+    __device__ static void decode(const Chunk& c, float (&w)[8]) {
+        Q4SimtDecodeAtom::decode_eight(c.code, c.scale_bits, w);
     }
 };
 
@@ -430,30 +451,38 @@ __global__ __launch_bounds__(kUpThreads, MinBlocks) void hc_up_collapse_kernel(
     const int chunks    = rank / 8;
 
     if constexpr (Columns == 1) {
-        const int dl = live ? d : 0;
-        typename Codec::Chunk chunk0[kStreams];
+        constexpr int kRowsPerWarp = 2;
+        __shared__ float rs_smem[kUpFeatures][kRowsPerWarp][kStreams];
+        const int d0    = (static_cast<int>(blockIdx.x) * kUpFeatures + warp) * kRowsPerWarp;
+        const int slane = lane < kStreams ? lane : 0;
+        constexpr int kPreloadStreams = kStreams / 2;
+        typename Codec::Chunk chunk0[kPreloadStreams];
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) {
-            const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + dl;
+        for (int s = 0; s < kPreloadStreams; ++s) {
+            const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + (d0 < kHidden ? d0 : 0);
             chunk0[s]              = lane < chunks ? Codec::load(up, row, lane * 8) : typename Codec::Chunk{};
         }
-        const int slane = lane < kStreams ? lane : 0;
-        const float wb  = 1.0F + norm_value(norm_weight[static_cast<std::int64_t>(slane) * kHidden + dl]);
         pdl::trigger_dependents();
         pdl::wait_for_dependencies();
-        float r_s = 0.0F;
         if (lane < kStreams) {
-            bf16* at = residual + static_cast<std::int64_t>(slane) * kHidden + dl;
-            if constexpr (Pending) {
-                const bf16 value = hc_injected(__bfloat162float(*at), pending_inject[slane],
-                                               __bfloat162float(pending_y[dl]));
-                if (live) { *at = value; }
-                r_s = __bfloat162float(value);
-            } else {
-                r_s = __bfloat162float(*at);
+#pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                const int dr  = d0 + r;
+                const bool ok = dr < kHidden;
+                bf16* at      = residual + static_cast<std::int64_t>(slane) * kHidden + (ok ? dr : 0);
+                float rv_s    = 0.0F;
+                if constexpr (Pending) {
+                    const bf16 value = hc_injected(__bfloat162float(*at), pending_inject[slane],
+                                                   __bfloat162float(pending_y[ok ? dr : 0]));
+                    if (ok) { *at = value; }
+                    rv_s = __bfloat162float(value);
+                } else {
+                    rv_s = ok ? __bfloat162float(*at) : 0.0F;
+                }
+                rs_smem[warp][r][lane] = rv_s;
             }
         }
-        const int first_half  = (lane >> 2) & 1;
+        const int first_half    = (lane >> 2) & 1;
         const float inv_streams = 1.0F / static_cast<float>(kStreams);
         for (int k = static_cast<int>(threadIdx.x); k < down_rows; k += kUpThreads) {
             float z = 0.0F;
@@ -468,66 +497,69 @@ __global__ __launch_bounds__(kUpThreads, MinBlocks) void hc_up_collapse_kernel(
         }
         if (threadIdx.x < kStreams) { inv[threadIdx.x] = inv_in[threadIdx.x]; }
         __syncthreads();
-        if (!live) { return; }
+        if (d0 >= kHidden) { return; }
 
-        float acc[kStreams];
+#pragma unroll 1
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            const int dr = d0 + r;
+            if (dr >= kHidden) { continue; }
+            float acc[kStreams];
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) { acc[s] = 0.0F; }
-        if (lane < chunks) {
-            const float4* half = reinterpret_cast<const float4*>(m + lane * 8);
-            const float4 p = half[first_half], q = half[first_half ^ 1];
-            const float4 a = first_half ? q : p, b = first_half ? p : q;
+            for (int s = 0; s < kStreams; ++s) { acc[s] = 0.0F; }
+            if (lane < chunks) {
+                const float4* half = reinterpret_cast<const float4*>(m + lane * 8);
+                const float4 p = half[first_half], q = half[first_half ^ 1];
+                const float4 a = first_half ? q : p, b = first_half ? p : q;
 #pragma unroll
-            for (int s = 0; s < kStreams; ++s) {
-                float wv[8];
-                Codec::decode(chunk0[s], wv);
-                acc[s] = fmaf(wv[0], a.x, acc[s]);
-                acc[s] = fmaf(wv[1], a.y, acc[s]);
-                acc[s] = fmaf(wv[2], a.z, acc[s]);
-                acc[s] = fmaf(wv[3], a.w, acc[s]);
-                acc[s] = fmaf(wv[4], b.x, acc[s]);
-                acc[s] = fmaf(wv[5], b.y, acc[s]);
-                acc[s] = fmaf(wv[6], b.z, acc[s]);
-                acc[s] = fmaf(wv[7], b.w, acc[s]);
+                for (int s = 0; s < kStreams; ++s) {
+                    const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + dr;
+                    const auto ch = (r == 0 && s < kPreloadStreams) ? chunk0[s] : Codec::load(up, row, lane * 8);
+                    float wv[8];
+                    Codec::decode(ch, wv);
+                    acc[s] = fmaf(wv[0], a.x, acc[s]);
+                    acc[s] = fmaf(wv[1], a.y, acc[s]);
+                    acc[s] = fmaf(wv[2], a.z, acc[s]);
+                    acc[s] = fmaf(wv[3], a.w, acc[s]);
+                    acc[s] = fmaf(wv[4], b.x, acc[s]);
+                    acc[s] = fmaf(wv[5], b.y, acc[s]);
+                    acc[s] = fmaf(wv[6], b.z, acc[s]);
+                    acc[s] = fmaf(wv[7], b.w, acc[s]);
+                }
             }
-        }
-        const int c1 = lane + 32;
-        if (c1 < chunks) {
-            const float4* half = reinterpret_cast<const float4*>(m + c1 * 8);
-            const float4 p = half[first_half], q = half[first_half ^ 1];
-            const float4 a = first_half ? q : p, b = first_half ? p : q;
+            const int c1 = lane + 32;
+            if (c1 < chunks) {
+                const float4* half = reinterpret_cast<const float4*>(m + c1 * 8);
+                const float4 p = half[first_half], q = half[first_half ^ 1];
+                const float4 a = first_half ? q : p, b = first_half ? p : q;
 #pragma unroll
-            for (int s = 0; s < kStreams; ++s) {
-                const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + d;
-                const auto chunk1      = Codec::load(up, row, c1 * 8);
-                float wv[8];
-                Codec::decode(chunk1, wv);
-                acc[s] = fmaf(wv[0], a.x, acc[s]);
-                acc[s] = fmaf(wv[1], a.y, acc[s]);
-                acc[s] = fmaf(wv[2], a.z, acc[s]);
-                acc[s] = fmaf(wv[3], a.w, acc[s]);
-                acc[s] = fmaf(wv[4], b.x, acc[s]);
-                acc[s] = fmaf(wv[5], b.y, acc[s]);
-                acc[s] = fmaf(wv[6], b.z, acc[s]);
-                acc[s] = fmaf(wv[7], b.w, acc[s]);
+                for (int s = 0; s < kStreams; ++s) {
+                    const std::int64_t row = static_cast<std::int64_t>(s) * kHidden + dr;
+                    const auto chunk1      = Codec::load(up, row, c1 * 8);
+                    float wv[8];
+                    Codec::decode(chunk1, wv);
+                    acc[s] = fmaf(wv[0], a.x, acc[s]);
+                    acc[s] = fmaf(wv[1], a.y, acc[s]);
+                    acc[s] = fmaf(wv[2], a.z, acc[s]);
+                    acc[s] = fmaf(wv[3], a.w, acc[s]);
+                    acc[s] = fmaf(wv[4], b.x, acc[s]);
+                    acc[s] = fmaf(wv[5], b.y, acc[s]);
+                    acc[s] = fmaf(wv[6], b.z, acc[s]);
+                    acc[s] = fmaf(wv[7], b.w, acc[s]);
+                }
             }
-        }
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) { acc[s] = warp_sum(acc[s]); }
-        float r[kStreams], w_bias[kStreams];
+            for (int s = 0; s < kStreams; ++s) { acc[s] = warp_sum(acc[s]); }
+            if (lane == 0) {
+                float sum = 0.0F;
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) {
-            r[s]      = __shfl_sync(0xFFFFFFFFU, r_s, s);
-            w_bias[s] = __shfl_sync(0xFFFFFFFFU, wb, s);
-        }
-        if (lane == 0) {
-            float sum = 0.0F;
-#pragma unroll
-            for (int s = 0; s < kStreams; ++s) {
-                const float rn = r[s] * inv[s] * w_bias[s];
-                sum += sigmoidf(acc[s]) * rn;
+                for (int s = 0; s < kStreams; ++s) {
+                    const float wb_s =
+                        1.0F + norm_value(norm_weight[static_cast<std::int64_t>(s) * kHidden + dr]);
+                    const float rn = rs_smem[warp][r][s] * inv[s] * wb_s;
+                    sum += sigmoidf(acc[s]) * rn;
+                }
+                x[dr] = __float2bfloat16_rn(sum * inv_streams);
             }
-            x[d] = __float2bfloat16_rn(sum * inv_streams);
         }
     } else {
         // 1. Weights first: the S rows (s*H + d) of W_up, chunks lane and lane + 32.
@@ -720,7 +752,7 @@ __global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns ==
     const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
     const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
-    constexpr int RowsPerWarp = 1;
+    constexpr int RowsPerWarp = 2;
     constexpr int kColumns    = ExactColumns > 0 ? ExactColumns : kPassColumns; // columns per pass
     extern __shared__ __align__(16) float rn[]; // [kColumns][2][kHidden / 2]
     __shared__ float scratch[kDownThreads / 32][kColumns];
@@ -735,12 +767,14 @@ __global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns ==
 
     // 1. Weights first: the warp's rows of the stream's K slice, and the norm weights of the 8-element
     // groups this thread stages (i = 8 tid + 8 kDownThreads h, the same elements K1a's thread sums).
-    typename Codec::Chunk chunk[RowsPerWarp][kChunks];
+    constexpr int kPreloadChunks = ExactColumns == 3 ? 2 : (kChunks / 2);
+    typename Codec::Chunk chunk0[kPreloadChunks];
+    {
+        const std::int64_t source = row0 < rows ? row0 : 0;
 #pragma unroll
-    for (int r = 0; r < RowsPerWarp; ++r) {
-        const std::int64_t source = row0 + r < rows ? row0 + r : 0;
-#pragma unroll
-        for (int m = 0; m < kChunks; ++m) { chunk[r][m] = Codec::load(down, source, s * kHidden + m * 256 + lane * 8); }
+        for (int m = 0; m < kPreloadChunks; ++m) {
+            chunk0[m] = Codec::load(down, source, s * kHidden + m * 256 + lane * 8);
+        }
     }
     const Norm* w = norm_weight + static_cast<std::int64_t>(s) * kHidden;
     NormGroup<Norm> w_bits[kSlices];
@@ -857,8 +891,19 @@ __global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns ==
         for (int m = 0; m < kChunks; ++m) {
             const int g = m * 32 + lane;
             float wv[RowsPerWarp][8];
+            if (m < kPreloadChunks) {
+                Codec::decode(chunk0[m], wv[0]);
+            } else {
+                const std::int64_t source = row0 < rows ? row0 : 0;
+                Codec::decode(Codec::load(down, source, s * kHidden + m * 256 + lane * 8), wv[0]);
+            }
+            if constexpr (RowsPerWarp > 1) {
 #pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) { Codec::decode(chunk[r][m], wv[r]); }
+                for (int r = 1; r < RowsPerWarp; ++r) {
+                    const std::int64_t source = row0 + r < rows ? row0 + r : 0;
+                    Codec::decode(Codec::load(down, source, s * kHidden + m * 256 + lane * 8), wv[r]);
+                }
+            }
 #pragma unroll
             for (int c = 0; c < kColumns; ++c) {
                 if (ExactColumns > 0 || c < pass) {
@@ -914,7 +959,7 @@ constexpr int kUpV4MaxSmem = static_cast<int>(
 template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
 __global__ __launch_bounds__(
     kUpV4Threads,
-    (std::is_same_v<Codec, Q8Codec> && (ExactColumns == 2 || ExactColumns == 3)) ? 2 : 1) void hc_up_collapse_v4_kernel(
+    (std::is_same_v<Codec, Q8Codec> || std::is_same_v<Codec, Q4Codec>) && (ExactColumns >= 2 && ExactColumns <= 4) ? 2 : 1) void hc_up_collapse_v4_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
     float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
@@ -1099,6 +1144,11 @@ bool q8_rowsplit(const Weight& w) noexcept {
            w.scales != nullptr && w.padded_shape[1] % 128 == 0 && w.padded_shape[1] >= w.k;
 }
 
+bool q4_rowsplit(const Weight& w) noexcept {
+    return w.qtype == QType::Q4_G64_FP16 && w.layout == QuantLayout::RowSplit && w.qdata != nullptr &&
+           w.scales != nullptr && w.padded_shape[1] % 128 == 0 && w.padded_shape[1] >= w.k;
+}
+
 int bf16_stride(const Weight& w) noexcept { return w.padded_shape[1] >= w.k ? w.padded_shape[1] : w.k; }
 
 bool bf16_contiguous(const Weight& w) noexcept {
@@ -1107,6 +1157,10 @@ bool bf16_contiguous(const Weight& w) noexcept {
 }
 
 Q8Codec::Params q8_params(const Weight& w) {
+    return {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales), w.padded_shape[1]};
+}
+
+Q4Codec::Params q4_params(const Weight& w) {
     return {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales), w.padded_shape[1]};
 }
 
@@ -1145,7 +1199,8 @@ void launch_down_v4(const Tensor& residual, const Tensor& norm_weight, typename 
     (void)configured;
     const int columns = residual.ne[1];
     const auto launch_exact = [&]<int ExactCols>() {
-        check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
+        constexpr int kDownV4Rows = kDownRows * 2;
+        check_launch(pdl::launch_consumer({dim3((down_rows + kDownV4Rows - 1) / kDownV4Rows, streams), dim3(kDownThreads),
                                            rn_bytes, stream},
                                           hc_down_partials_v4_kernel<Codec, Norm, Fold, ExactCols>,
                                           static_cast<const bf16*>(residual.data), static_cast<const Norm*>(norm_weight.data),
@@ -1281,7 +1336,7 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
          static_cast<std::size_t>(streams) * static_cast<std::size_t>(columns)) *
         sizeof(float);
     if (columns == 1) {
-        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures - 1) / kUpFeatures), dim3(kUpThreads), up_smem, stream},
+        check_launch(pdl::launch_consumer({dim3((kHidden + kUpFeatures * 2 - 1) / (kUpFeatures * 2)), dim3(kUpThreads), up_smem, stream},
                                           hc_up_collapse_kernel<Codec, Norm, Fold, 1, 2>, static_cast<const float*>(partial),
                                           static_cast<const float*>(inv), residual_data,
                                           static_cast<const Norm*>(norm_weight.data), up, rank, down_rows, columns,
@@ -1331,6 +1386,9 @@ void mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& 
     if (down.qtype == QType::Q8_G32_FP16) {
         launch_norm<Q8Codec>(residual, norm_weight, q8_params(down), q8_params(up), down.n, rank, streams, eps, x,
                              inject, partials, pending, stream);
+    } else if (down.qtype == QType::Q4_G64_FP16) {
+        launch_norm<Q4Codec>(residual, norm_weight, q4_params(down), q4_params(up), down.n, rank, streams, eps, x,
+                             inject, partials, pending, stream);
     } else {
         launch_norm<Bf16Codec>(residual, norm_weight, bf16_params(down), bf16_params(up), down.n, rank, streams, eps,
                                x, inject, partials, pending, stream);
@@ -1342,9 +1400,10 @@ void mix_fused(const Tensor& residual, const Tensor& norm_weight, const Weight& 
 bool hc_mix_fused_supported(const Weight& down, const Weight& up, std::int32_t hidden, std::int32_t streams,
                             std::int32_t rank, std::int32_t columns) noexcept {
     const bool q8   = q8_rowsplit(down) && q8_rowsplit(up);
+    const bool q4   = q4_rowsplit(down) && q4_rowsplit(up);
     const bool bf16 = bf16_contiguous(down) && bf16_contiguous(up);
-    const std::int32_t max_columns = q8 ? kHcMixFusedMaxColumnsQ8 : kHcMixFusedMaxColumnsBf16;
-    return (q8 || bf16) && columns >= 1 && columns <= max_columns && hidden == kHidden && streams == kStreams &&
+    const std::int32_t max_columns = (q8 || q4) ? kHcMixFusedMaxColumnsQ8 : kHcMixFusedMaxColumnsBf16;
+    return (q8 || q4 || bf16) && columns >= 1 && columns <= max_columns && hidden == kHidden && streams == kStreams &&
            rank > 0 && rank % 8 == 0 && rank <= kMaxRank && down.k == kStreams * kHidden &&
            (down.n == rank || down.n == rank + kStreams) && up.n == kStreams * kHidden && up.k == rank;
 }

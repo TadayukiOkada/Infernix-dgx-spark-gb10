@@ -43,7 +43,6 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     __syncthreads();
     float total = 0.0F;
     for (int w = 0; w < blockDim.x / 32; ++w) { total += scratch[w]; }
-    __syncthreads();
     return total;
 }
 
@@ -148,6 +147,7 @@ template <class Norm>
 __global__ void __launch_bounds__(kVec8Threads) norm_vec8_kernel(const bf16* __restrict__ residual,
                                                                  const Norm* __restrict__ weight, int hidden,
                                                                  int width, float eps, bf16* __restrict__ out) {
+    pdl::enter();
     __shared__ float scratch[kVec8Threads / 32];
     const int s   = blockIdx.x;
     const int t   = gridDim.y > 1024 ? (static_cast<int>(gridDim.y) - 1 - static_cast<int>(blockIdx.y))
@@ -464,52 +464,7 @@ __launch_bounds__(320) __global__ void stream_mean_vec8_kernel(const bf16* __res
     *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(t) * pitch + d) = out_packed;
 }
 
-// The composed route's steps (private since hyper_connection_mix).
-void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::int32_t streams,
-                           float eps, Tensor& out, cudaStream_t stream) {
-    require(streams > 0 && contiguous_2d(residual, DType::BF16) && contiguous_2d(out, DType::BF16) &&
-                (contiguous_2d(weight, DType::BF16) || contiguous_2d(weight, DType::FP32)),
-            "norm requires contiguous BF16 tensors and a BF16 or FP32 weight");
-    const int width = residual.ne[0], columns = residual.ne[1];
-    require(width % streams == 0 && (width / streams) % 8 == 0 && weight.ne[0] == width &&
-                weight.ne[1] == 1 && out.ne[0] == width && out.ne[1] == columns && columns > 0,
-            "norm shapes disagree");
-    require(eps > 0, "norm epsilon must be positive");
-    require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
-    const int hidden = width / streams;
-    const bool vec8  = hidden == kVec8Threads * 8 && aligned_16(residual.data) && aligned_16(weight.data) &&
-                      aligned_16(out.data);
-    if (weight.dtype == DType::FP32) {
-        if (vec8) {
-            norm_vec8_kernel<float><<<dim3(streams, columns), kVec8Threads, 0, stream>>>(
-                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
-                hidden, width, eps, static_cast<bf16*>(out.data));
-        } else if (hidden == kThreads * 10) {
-            norm_kernel<float, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
-                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
-                hidden, width, eps, static_cast<bf16*>(out.data));
-        } else {
-            norm_kernel<float><<<dim3(streams, columns), kThreads, 0, stream>>>(
-                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
-                hidden, width, eps, static_cast<bf16*>(out.data));
-        }
-    } else {
-        if (vec8) {
-            norm_vec8_kernel<bf16><<<dim3(streams, columns), kVec8Threads, 0, stream>>>(
-                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
-                hidden, width, eps, static_cast<bf16*>(out.data));
-        } else if (hidden == kThreads * 10) {
-            norm_kernel<bf16, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
-                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
-                hidden, width, eps, static_cast<bf16*>(out.data));
-        } else {
-            norm_kernel<bf16><<<dim3(streams, columns), kThreads, 0, stream>>>(
-                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
-                hidden, width, eps, static_cast<bf16*>(out.data));
-        }
-    }
-    check_launch("norm");
-}
+// The composed route's helper (external entry point defined below in namespace infernix::ops).
 
 void hyper_connection_inject_norm(const Tensor& y, const Tensor& inject, Tensor& residual,
                                   const Tensor& weight, std::int32_t streams, float eps, Tensor& out,
@@ -671,7 +626,100 @@ void hc_collapse(const Tensor& u, const Tensor& normalized, std::int32_t streams
     }
 }
 
+void hc_mix_from_normalized(const Tensor& normalized, const Weight& down, const Weight& up, LinearPolicy policy,
+                            std::int32_t streams, std::int32_t rank, std::int32_t T, std::int32_t hidden,
+                            Tensor& x, Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
+    Tensor z = workspace.alloc(DType::BF16, {down.n, T});
+    linear(normalized, down, z, policy, workspace, stream);
+    Tensor m = workspace.alloc(DType::BF16, {rank, T});
+    hyper_connection_gates(z, rank, streams, m, inject, stream);
+    if (hc_up_collapse_supported(up, hidden, streams, T)) {
+        // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
+        hc_up_collapse(m, up, normalized, streams, x, stream);
+        return;
+    }
+    Tensor u = workspace.alloc(DType::BF16, {up.n, T});
+    linear(m, up, u, policy, workspace, stream);
+    hc_collapse(u, normalized, streams, x, stream);
+}
+
 } // namespace detail
+
+void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::int32_t streams,
+                           float eps, Tensor& out, cudaStream_t stream) {
+    require(streams > 0 && contiguous_2d(residual, DType::BF16) && contiguous_2d(out, DType::BF16) &&
+                (contiguous_2d(weight, DType::BF16) || contiguous_2d(weight, DType::FP32)),
+            "norm requires contiguous BF16 tensors and a BF16 or FP32 weight");
+    const int width = residual.ne[0], columns = residual.ne[1];
+    require(width % streams == 0 && (width / streams) % 8 == 0 && weight.ne[0] == width &&
+                weight.ne[1] == 1 && out.ne[0] == width && out.ne[1] == columns && columns > 0,
+            "norm shapes disagree");
+    require(eps > 0, "norm epsilon must be positive");
+    require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
+    const int hidden = width / streams;
+    const bool vec8  = hidden == kVec8Threads * 8 && aligned_16(residual.data) && aligned_16(weight.data) &&
+                      aligned_16(out.data);
+    if (vec8) {
+        const pdl::Dependency dep = columns <= 16 ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
+        const pdl::LaunchConfig cfg{dim3(streams, columns), dim3(kVec8Threads), 0, stream};
+        const cudaError_t status =
+            weight.dtype == DType::FP32
+                ? pdl::launch_with(dep, cfg, norm_vec8_kernel<float>,
+                                   static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
+                                   hidden, width, eps, static_cast<bf16*>(out.data))
+                : pdl::launch_with(dep, cfg, norm_vec8_kernel<bf16>,
+                                   static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                                   hidden, width, eps, static_cast<bf16*>(out.data));
+        if (status != cudaSuccess) { check_launch("norm"); }
+        return;
+    }
+    if (weight.dtype == DType::FP32) {
+        if (hidden == kThreads * 10) {
+            norm_kernel<float, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        } else {
+            norm_kernel<float><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const float*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        }
+    } else {
+        if (hidden == kThreads * 10) {
+            norm_kernel<bf16, 10, true><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        } else {
+            norm_kernel<bf16><<<dim3(streams, columns), kThreads, 0, stream>>>(
+                static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
+                hidden, width, eps, static_cast<bf16*>(out.data));
+        }
+    }
+    check_launch("norm");
+}
+
+bool hyper_connection_mix_is_fused(const Weight& down, const Weight& up, std::int32_t hidden,
+                                   std::int32_t streams, std::int32_t rank, std::int32_t columns) {
+    return columns > 0 && detail::hc_mix_fused_supported(down, up, hidden, streams, rank, columns);
+}
+
+void hyper_connection_mix_normalized(const Tensor& normalized, const Weight& down, const Weight& up,
+                                     LinearPolicy policy, std::int32_t streams, std::int32_t rank, Tensor& x,
+                                     Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
+    require(contiguous_2d(normalized, DType::BF16) && contiguous_2d(x, DType::BF16) && streams > 0 && rank > 0,
+            "mix_normalized requires contiguous BF16 tensors");
+    const std::int32_t T = normalized.ne[1], hidden = x.ne[0];
+    require(T > 0 && x.ne[1] == T && normalized.ne[0] == streams * hidden &&
+                down.k == normalized.ne[0] && up.n == normalized.ne[0] && up.k == rank &&
+                down.n == rank + (inject != nullptr ? streams : 0),
+            "mix_normalized shapes disagree");
+    if (inject != nullptr) {
+        require(contiguous_2d(*inject, DType::FP32) && inject->ne[0] == streams && inject->ne[1] == T,
+                "mix_normalized inject output must be FP32 [S, T]");
+    }
+    auto scope = workspace.scope();
+    detail::hc_mix_from_normalized(normalized, down, up, policy, streams, rank, T, hidden, x, inject, workspace,
+                                   stream);
+}
 
 void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
                           const Weight& up, LinearPolicy policy, std::int32_t streams,
@@ -699,18 +747,8 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     }
     Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
     hyper_connection_norm(residual, norm_weight, streams, eps, normalized, stream);
-    Tensor z = workspace.alloc(DType::BF16, {down.n, T});
-    linear(normalized, down, z, policy, workspace, stream);
-    Tensor m = workspace.alloc(DType::BF16, {rank, T});
-    hyper_connection_gates(z, rank, streams, m, inject, stream);
-    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
-        // Q8 W_up beyond the fused decode route: u stays in the MMA tile (bit-identical, §19.3.23).
-        detail::hc_up_collapse(m, up, normalized, streams, x, stream);
-        return;
-    }
-    Tensor u = workspace.alloc(DType::BF16, {up.n, T});
-    linear(m, up, u, policy, workspace, stream);
-    detail::hc_collapse(u, normalized, streams, x, stream);
+    detail::hc_mix_from_normalized(normalized, down, up, policy, streams, rank, T, hidden, x, inject, workspace,
+                                   stream);
 }
 
 void hyper_connection_inject_mix(const Tensor& y, const Tensor& pending_inject, Tensor& residual,
@@ -742,17 +780,8 @@ void hyper_connection_inject_mix(const Tensor& y, const Tensor& pending_inject, 
     }
     Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
     hyper_connection_inject_norm(y, pending_inject, residual, norm_weight, streams, eps, normalized, stream);
-    Tensor z = workspace.alloc(DType::BF16, {down.n, T});
-    linear(normalized, down, z, policy, workspace, stream);
-    Tensor m = workspace.alloc(DType::BF16, {rank, T});
-    hyper_connection_gates(z, rank, streams, m, inject, stream);
-    if (detail::hc_up_collapse_supported(up, hidden, streams, T)) {
-        detail::hc_up_collapse(m, up, normalized, streams, x, stream);
-        return;
-    }
-    Tensor u = workspace.alloc(DType::BF16, {up.n, T});
-    linear(m, up, u, policy, workspace, stream);
-    detail::hc_collapse(u, normalized, streams, x, stream);
+    detail::hc_mix_from_normalized(normalized, down, up, policy, streams, rank, T, hidden, x, inject, workspace,
+                                   stream);
 }
 
 std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, const Weight& up, LinearPolicy policy,

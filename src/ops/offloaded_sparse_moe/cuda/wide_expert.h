@@ -260,6 +260,8 @@ struct ExpertsWorkspace {
     void* cpu_call;               // kCpuCallBytes
     std::int32_t* tiles;          // [max_tiles][2]: (job, first column)
     std::int32_t* pass_tiles;     // [max_jobs + 2]
+    std::int32_t* narrow_jobs;    // [max_jobs]: compacted narrow GPU jobs in pass order
+    std::int32_t* pass_narrow;    // [max_jobs + 2]: pass boundaries in narrow_jobs
     // W4A4
     canon::A4Block* h_blocks;     // [entries][kHBlocks]; wide entries hold their A4(h) row here
     std::uint8_t* x_plane;        // [entries][kXRowBytes]

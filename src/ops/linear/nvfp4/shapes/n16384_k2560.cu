@@ -133,14 +133,12 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 33; }
 } // namespace
 
-// GB10 2026-11-01 (T2): the 64-row pair tile. The 128-row grid is 128 CTAs (2.67 waves of 48);
-// the 64-row panel is ahead from T = 64 at 123.7/123.7/125.8 us at T = 64/96/128 against
-// 124.4/126.3/126.8 us for the 128-row panel and 125.3/149.9/180.7 us for the A16 table. Below the
-// gate the 128-row panel wins (125.3 us against 143.9 us at T = 48) and A16 wins over both, so the
-// gate stays at 65.
+// GB10 2026-11-14: pair gate 33 -> 52. At T = 33/40/48/49 the 2-term pair is slower than A16
+// (159.6/151.4/149.5/147.3 vs 135.0/145.5/135.0/128.9 us), and from T = 52 up the 64-row panel
+// wins cleanly (122.7/122.8/124.7/122.7 vs 134.8/137.1/126.8/149.3 us at T = 52/55/56/65).
 const Nvfp4LinearShape kNvfp4N16384K2560{
     16384, 2560, launch_a16, launch_nvfp4_a4<select_a4>, uses_a4,
-    launch_nvfp4_a4_pair_r64, 33};
+    launch_nvfp4_a4_pair_r64, 52};
 
 void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                      cudaStream_t stream, LinearPolicy policy, LinearRoutes routes,
@@ -148,7 +146,7 @@ void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tens
     const LinearBf16SegmentedOutput<10240, 6144> output{
         {static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)}};
     if ((allows_a4_residual(policy) || has_route(routes, LinearRoutes::Nvfp4A4Pair)) &&
-        x.ne[1] >= 33 && workspace != nullptr) {
+        x.ne[1] >= 52 && workspace != nullptr) {
         auto scope = workspace->scope();
         const auto scratch =
             allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k, kNvfp4A4ResidualTerms, true);

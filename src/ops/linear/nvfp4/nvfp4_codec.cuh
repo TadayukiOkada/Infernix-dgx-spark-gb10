@@ -244,10 +244,8 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
 // historical behavior. The two formulations are algebraically identical and differ only in
 // floating-point rounding (~1 ulp); the resulting output error stays within the A4 allowance.
 template <bool Reciprocal = false>
-__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
-                                                                float input_scale_divisor) {
-    const uint4 packed0                = load_vec<uint4>(source);
-    const uint4 packed1                = load_vec<uint4>(source + 8);
+__device__ __forceinline__ Nvfp4QuantizedK16
+quantize_nvfp4_k16_packed(const uint4 packed0, const uint4 packed1, float input_scale_divisor) {
     const std::uint32_t represented[8] = {
         packed0.x, packed0.y, packed0.z, packed0.w, packed1.x, packed1.y, packed1.z, packed1.w,
     };
@@ -283,6 +281,14 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     }
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;
+}
+
+template <bool Reciprocal = false>
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
+                                                                float input_scale_divisor) {
+    const uint4 packed0 = load_vec<uint4>(source);
+    const uint4 packed1 = load_vec<uint4>(source + 8);
+    return quantize_nvfp4_k16_packed<Reciprocal>(packed0, packed1, input_scale_divisor);
 }
 
 // The A4 residual profile: one K16 group as a sum of NVFP4 terms. The remainder starts at the
@@ -340,15 +346,16 @@ quantize_nvfp4_terms_k16_packed(const uint4 packed0, const uint4 packed1, float 
         }
         pack_nvfp4_e2m1x16(quotients, terms[term].codes_lo, terms[term].codes_hi);
         if (term + 1 == Terms) { break; }
-        // Code * scale is exact in FP32 (two and four significant bits), so each remainder rounds
-        // once, in the subtraction.
+        // Code * scale is exact in FP32 (at most 3 and 4 significant bits, well inside normal FP32
+        // range), so fmaf(-code, scale, remainder) has one rounding and matches __fsub_rn(rem,
+        // __fmul_rn(code, scale)) bit-for-bit on all finite inputs.
 #pragma unroll
         for (int pair = 0; pair < 8; ++pair) {
             const std::uint32_t word = pair < 4 ? terms[term].codes_lo : terms[term].codes_hi;
             const float2 code =
                 decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(word >> (8 * (pair & 3))));
-            remainder[pair].x = __fsub_rn(remainder[pair].x, __fmul_rn(code.x, scale));
-            remainder[pair].y = __fsub_rn(remainder[pair].y, __fmul_rn(code.y, scale));
+            remainder[pair].x = fmaf(-code.x, scale, remainder[pair].x);
+            remainder[pair].y = fmaf(-code.y, scale, remainder[pair].y);
         }
     }
 }

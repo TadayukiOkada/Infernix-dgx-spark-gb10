@@ -32,14 +32,25 @@ __device__ __forceinline__ unsigned char* q4_mma_shared_storage() {
     }
 }
 
+template <class Schedule, class Epilogue>
+inline constexpr int q4_mma_shared_bytes = [] {
+    constexpr int extra = [] {
+        if constexpr (requires { Epilogue::template kSharedBytes<Schedule>; })
+            return static_cast<int>(Epilogue::template kSharedBytes<Schedule>);
+        else
+            return 0;
+    }();
+    return Schedule::kSharedBytes > extra ? Schedule::kSharedBytes : extra;
+}();
+
 // clang-format off
-template <class Schedule, bool Full, class Output, class Epilogue>
+template <class Schedule, bool Full, class Output, class Epilogue, class RowPolicy>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
 void q4_a16_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
     const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales,
-    Output output, Epilogue epilogue,
+    Output output, Epilogue epilogue, RowPolicy row_policy,
     std::int32_t rows,
     std::int32_t k,
     std::int32_t cols,
@@ -69,7 +80,7 @@ void q4_a16_mma_kernel(
         alignas(16) std::uint8_t Sr[S][BM * SRB];
     };
     static_assert(sizeof(SharedStorage) == Schedule::kSharedBytes);
-    auto* smem_raw = q4_mma_shared_storage<Schedule::kSharedBytes>();
+    auto* smem_raw = q4_mma_shared_storage<q4_mma_shared_bytes<Schedule, Epilogue>>();
     auto& smem     = *reinterpret_cast<SharedStorage*>(smem_raw);
     auto& As       = smem.As;
     auto& Bs       = smem.Bs;
@@ -100,7 +111,7 @@ void q4_a16_mma_kernel(
         tile_m                   = first_m + within % active_m;
         tile_n                   = within / active_m;
     }
-    const int row0 = tile_m * BM;
+    const int row0 = tile_m * RowPolicy::kOutputRowsPerCta;
     const int col0 = tile_n * BN;
 
     float accum[MT][NT][4];
@@ -155,7 +166,7 @@ void q4_a16_mma_kernel(
             const int half      = item & 1;
             const int local_row = row_group / GPB;
             const int group     = row_group - local_row * GPB;
-            const int row       = row0 + local_row;
+            const int row       = row_policy.weight_row(row0, local_row, rows);
             auto* dst = &Cr[stage][row_group * Q4RowSplitStorage::kCodeBytesPerGroup + half * 16];
             if constexpr (kFull) {
                 const std::int64_t group_index =
@@ -181,7 +192,7 @@ void q4_a16_mma_kernel(
             for (int item = tid; item < BM * kPairsPerRow; item += Schedule::kThreads) {
                 const int local_row   = item / kPairsPerRow;
                 const int pair_idx    = item - local_row * kPairsPerRow;
-                const int row         = row0 + local_row;
+                const int row         = row_policy.weight_row(row0, local_row, rows);
                 const int scale_group = group0 + pair_idx * 2;
                 auto* dst             = &Sr[stage][item * 4];
                 if (kFull || row < rows) {
@@ -197,7 +208,7 @@ void q4_a16_mma_kernel(
             for (int row_group = tid; row_group < BM * GPB; row_group += Schedule::kThreads) {
                 const int local_row   = row_group / GPB;
                 const int group       = row_group - local_row * GPB;
-                const int row         = row0 + local_row;
+                const int row         = row_policy.weight_row(row0, local_row, rows);
                 const int scale_group = group0 + group;
                 auto* dst             = &Sr[stage][row_group * SB];
                 if constexpr (kFull) {
@@ -403,22 +414,31 @@ void q4_a16_mma_kernel(
         }
     }
 
+    if constexpr (requires {
+                      epilogue.template finish_tile<Schedule, kFull>(
+                          output, smem_raw, accum, row0, token_begin + col0, rows,
+                          token_begin + cols);
+                  }) {
+        epilogue.template finish_tile<Schedule, kFull>(
+            output, smem_raw, accum, row0, token_begin + col0, rows, token_begin + cols);
+    } else {
 #pragma unroll
-    for (int mi = 0; mi < MT; ++mi) {
-        const int out_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
+        for (int mi = 0; mi < MT; ++mi) {
+            const int out_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
 #pragma unroll
-        for (int ni = 0; ni < NT; ++ni) {
-            const int token0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
-            const auto store = [&](int row, int token, float value) {
-                if (kFull || (row < rows && token < cols)) {
-                    const int global_token = token_begin + token;
-                    output.store(row, global_token, epilogue.apply(row, global_token, value));
-                }
-            };
-            store(out_row0, token0, accum[mi][ni][0]);
-            store(out_row0, token0 + 1, accum[mi][ni][1]);
-            store(out_row0 + 8, token0, accum[mi][ni][2]);
-            store(out_row0 + 8, token0 + 1, accum[mi][ni][3]);
+            for (int ni = 0; ni < NT; ++ni) {
+                const int token0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
+                const auto store = [&](int row, int token, float value) {
+                    if (kFull || (row < rows && token < cols)) {
+                        const int global_token = token_begin + token;
+                        output.store(row, global_token, epilogue.apply(row, global_token, value));
+                    }
+                };
+                store(out_row0, token0, accum[mi][ni][0]);
+                store(out_row0, token0 + 1, accum[mi][ni][1]);
+                store(out_row0 + 8, token0, accum[mi][ni][2]);
+                store(out_row0 + 8, token0 + 1, accum[mi][ni][3]);
+            }
         }
     }
 }

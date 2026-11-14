@@ -199,6 +199,7 @@ struct LaneVision {
     std::vector<std::shared_ptr<const qwen3_5::PreparedMediaPayload>> payloads; // per encoded item
     std::vector<std::uint32_t> visual;         // the encoded visual tokens' positions, ascending
     ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
+    DeviceBuffer owned_lease;                  // device-experts fallback when residency_ is null
     Tensor handoff;                            // BF16 [out, V_encoded]
     std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
     std::optional<qwen3_5::execution::VisionParameters> weights; // the stream's rebased view

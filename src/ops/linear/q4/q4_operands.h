@@ -35,10 +35,10 @@ inline void validate_q4_operands(const Q4LinearOperands& operands) {
     const auto aligned = [](const void* pointer, std::uintptr_t alignment) {
         return pointer && (reinterpret_cast<std::uintptr_t>(pointer) % alignment) == 0;
     };
-    if (operands.rows <= 0 || operands.tokens <= 0 || operands.k <= 0 || operands.k % 128 != 0 ||
+    if (operands.rows <= 0 || operands.tokens <= 0 || operands.k <= 0 || operands.k % 64 != 0 ||
         operands.padded_k < operands.k || operands.padded_k % 128 != 0) {
         throw std::invalid_argument(
-            "Q4 templates require positive N/T and K/padded K aligned to 128");
+            "Q4 templates require positive N/T, K aligned to 64, and padded K aligned to 128");
     }
     if (!aligned(operands.x, 16) || !aligned(operands.codes, 16) || !aligned(operands.scales, 4)) {
         throw std::invalid_argument("Q4 templates require aligned activation and weight planes");

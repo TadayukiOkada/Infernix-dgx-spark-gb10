@@ -902,6 +902,122 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
     cudaFreeHost(host);
 }
 
+// Masked verification call (MoeColumnMask) on W4A4 with dirty workspace memory: masked columns are
+// omitted from dispatch.entries so quantize_token_kernel must skip unmapped (-1) slots, keep
+// sentinel 0xFFFF in masked outputs, and match live narrow/wide oracles.
+void test_masked_w4a4_verify() {
+    constexpr int kExperts = 12, kColumns = 16, kWidth = 8, kTopK = 10;
+    constexpr int kEntries = kColumns * kTopK, kMaxJobs = kExperts;
+    std::printf("== masked W4A4 verify: E=%d T=%d W=%d k=%d\n", kExperts, kColumns, kWidth, kTopK);
+    std::mt19937 rng(101);
+    const std::size_t stride = moe::kRecordBytes;
+    std::vector<fixtures::Expert> bank;
+    std::vector<moe::ExpertScales> scales;
+    std::vector<std::uint8_t> frame_bytes;
+    std::vector<std::int32_t> frames(kExperts);
+    for (int e = 0; e < kExperts; ++e) {
+        bank.push_back(fixtures::random_expert(rng, e == kExperts - 1));
+        scales.push_back(bank.back().scales);
+        frames[static_cast<std::size_t>(e)] = e;
+        frame_bytes.insert(frame_bytes.end(), bank.back().record.begin(), bank.back().record.end());
+    }
+    auto* d_frame_base = device_copy(frame_bytes);
+    auto* d_frames     = device_copy(frames);
+    auto* d_scales     = device_copy(scales);
+
+    // Popular experts e=0,1 exceed kNarrowMax (wide) while higher experts stay narrow.
+    std::vector<double> popularity(kExperts, 0.4);
+    popularity[0] = popularity[1] = 8.0;
+    const auto logits = routing_logits(rng, kExperts, kColumns, kTopK, popularity);
+    auto* d_logits    = device_copy(logits);
+    const std::vector<std::int32_t> valid = {3, 6};
+    auto* d_valid                         = device_copy(valid);
+
+    std::int32_t *d_ids = nullptr, *d_route_log = nullptr;
+    float *d_weights = nullptr, *d_shared_gate = nullptr;
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * kEntries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_route_log, sizeof(std::int32_t) * kEntries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_weights, sizeof(float) * kEntries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_shared_gate, sizeof(float) * kColumns), "cudaMalloc");
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {kTopK, kColumns}),
+                                      Tensor(d_weights, DType::FP32, {kTopK, kColumns}),
+                                      Tensor(d_shared_gate, DType::FP32, {kColumns}),
+                                      {d_valid, kWidth}};
+    void* d_dispatch = nullptr;
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(kExperts, kEntries)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, kExperts, kEntries);
+    infernix::ops::moe_route_dispatch(Tensor(d_logits, DType::FP32, {kExperts + 1, kColumns}), kTopK, routing, dispatch,
+                                      d_route_log, nullptr);
+
+    const auto x            = fixtures::random_activations(rng, kColumns);
+    auto* d_x               = device_copy(x);
+    const std::size_t ws_b  = infernix::ops::moe_experts_workspace_bytes(moe::kFlashNextShape, kMaxJobs, kEntries,
+                                                                         kColumns, moe::ExpertActivation::kA4);
+    void* d_workspace       = nullptr;
+    cuda_check(cudaMalloc(&d_workspace, ws_b), "cudaMalloc");
+    // Pre-fill workspace with non-zero invalid bytes (such as 0xA5A5A5A5) to catch uninitialized entry_map reads.
+    cuda_check(cudaMemset(d_workspace, 0xA5, ws_b), "cudaMemset workspace");
+    const std::size_t out_elems = static_cast<std::size_t>(moe::kHidden) * kEntries;
+    std::uint16_t* d_out        = nullptr;
+    cuda_check(cudaMalloc(&d_out, out_elems * sizeof(std::uint16_t)), "cudaMalloc");
+    cuda_check(cudaMemset(d_out, 0xFF, out_elems * sizeof(std::uint16_t)), "cudaMemset out");
+
+    infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                          .frames        = d_frames,
+                                          .host_records  = d_frame_base,
+                                          .record_stride = stride,
+                                          .scales        = d_scales};
+    Tensor tx(d_x, DType::BF16, {moe::kHidden, kColumns});
+    Tensor out(d_out, DType::BF16, {moe::kHidden, kEntries});
+    infernix::ops::moe_experts(tx, dispatch, source, kTopK, kMaxJobs, d_workspace, out, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "moe_experts masked W4A4");
+
+    const auto got     = host_copy(d_out, out_elems);
+    const auto ids     = host_copy(d_ids, static_cast<std::size_t>(kEntries));
+    const auto offsets = host_copy(dispatch.offsets, static_cast<std::size_t>(kExperts) + 1);
+    std::vector<int> counts(kExperts);
+    for (int e = 0; e < kExperts; ++e) { counts[static_cast<std::size_t>(e)] = offsets[e + 1] - offsets[e]; }
+
+    long narrow_mismatch = 0, masked_written = 0, wide_over = 0;
+    for (int col = 0; col < kColumns; ++col) {
+        const bool live = (col % kWidth) < valid[static_cast<std::size_t>(col / kWidth)];
+        for (int s = 0; s < kTopK; ++s) {
+            const int entry    = col * kTopK + s;
+            const std::uint16_t* y = &got[static_cast<std::size_t>(entry) * moe::kHidden];
+            if (!live) {
+                for (int r = 0; r < moe::kHidden; ++r) { masked_written += (y[r] != 0xFFFFU); }
+                continue;
+            }
+            const int e = ids[static_cast<std::size_t>(entry)];
+            if (moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)])) {
+                const auto ref = fp64_expert(bank[static_cast<std::size_t>(e)], &x[static_cast<std::size_t>(col) * moe::kHidden]);
+                wide_over += error_against(y, ref).relative_l2 > 0x1p-4;
+            } else {
+                const auto ref = cpu_column(bank[static_cast<std::size_t>(e)], &x[static_cast<std::size_t>(col) * moe::kHidden]);
+                for (int r = 0; r < moe::kHidden; ++r) { narrow_mismatch += (y[r] != ref[static_cast<std::size_t>(r)]); }
+            }
+        }
+    }
+    std::printf("   masked=%ld written, narrow=%ld mismatch, wide>2^-4=%ld\n", masked_written, narrow_mismatch, wide_over);
+    check(masked_written == 0, "masked W4A4 verify leaves masked output columns untouched");
+    check(narrow_mismatch == 0, "masked W4A4 verify narrow entries equal CPU oracle bit for bit");
+    check(wide_over == 0, "masked W4A4 verify wide entries within 2^-4 relative L2 of FP64 oracle");
+
+    cudaFree(d_out);
+    cudaFree(d_workspace);
+    cudaFree(d_x);
+    cudaFree(d_dispatch);
+    cudaFree(d_shared_gate);
+    cudaFree(d_weights);
+    cudaFree(d_route_log);
+    cudaFree(d_ids);
+    cudaFree(d_valid);
+    cudaFree(d_logits);
+    cudaFree(d_scales);
+    cudaFree(d_frames);
+    cudaFree(d_frame_base);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(offloaded_moe_wide) {
@@ -925,6 +1041,7 @@ INFERNIX_OP_TEST(offloaded_moe_wide) {
         test_layer("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), {}, 31);
         // A verification-width call: 10 columns at top-10 over 12 experts.
         test_layer("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), {}, 37);
+        test_masked_w4a4_verify();
         // The cases above run the 32-token warp tiles; two experts of 600 columns each (nine full tiles and
         // a partial one) run the 64-token ones (kWarpTile64MinColumns on average).
         static_assert(2 * 600 / 2 >= wide::kWarpTile64MinColumns && 4 * 300 / 20 < wide::kWarpTile64MinColumns);

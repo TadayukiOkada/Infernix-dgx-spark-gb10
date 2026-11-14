@@ -36,24 +36,34 @@ void check_launch(const char* what) {
 __global__ void __launch_bounds__(kPlanThreads)
     plan_kernel(MoeDispatch dispatch, MoeExpertSource source, int max_jobs, int pass_jobs, int passes,
                 const std::int32_t* __restrict__ cpu_flags, const std::uint8_t** __restrict__ job_records,
-                std::int32_t* __restrict__ tiles, std::int32_t* __restrict__ pass_tiles) {
+                std::int32_t* __restrict__ tiles, std::int32_t* __restrict__ pass_tiles,
+                std::int32_t* __restrict__ narrow_jobs, std::int32_t* __restrict__ pass_narrow,
+                std::int32_t* __restrict__ entry_map, int entry_map_ints) {
     __shared__ int scan[kPlanThreads];
     __shared__ int base;
+    __shared__ int narrow_base;
     const int tid          = static_cast<int>(threadIdx.x);
     const int jobs         = min(*dispatch.job_count, max_jobs);
     const bool resolve_rec = source.staging_slots == 0 && source.fetch.request == nullptr && job_records != nullptr;
-    if (tid == 0) { base = 0; }
+    if (tid == 0) {
+        base        = 0;
+        narrow_base = 0;
+    }
     __syncthreads();
     for (int chunk = 0; chunk < passes * pass_jobs; chunk += kPlanThreads) {
         const int job = chunk + tid;
         int n         = 0;
+        int nn        = 0;
         if (job < jobs) {
+            const bool on_gpu = (cpu_flags == nullptr || cpu_flags[job] == 0);
             const int expert  = dispatch.jobs[job];
             const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            if (wide_route(columns, source.scales[expert])) { n = (columns + kTileColumns - 1) / kTileColumns; }
-            if (resolve_rec && (cpu_flags == nullptr || cpu_flags[job] == 0)) {
-                job_records[job] = resolve_unstaged_record(source, expert);
+            if (wide_route(columns, source.scales[expert])) {
+                n = (columns + kTileColumns - 1) / kTileColumns;
+            } else if (on_gpu) {
+                nn = 1;
             }
+            if (resolve_rec && on_gpu) { job_records[job] = resolve_unstaged_record(source, expert); }
         }
         scan[tid] = n;
         __syncthreads();
@@ -71,9 +81,35 @@ __global__ void __launch_bounds__(kPlanThreads)
         if (job % pass_jobs == 0 && job / pass_jobs < passes) { pass_tiles[job / pass_jobs] = first; }
         __syncthreads();
         if (tid == kPlanThreads - 1) { base = first + n; }
+        scan[tid] = nn;
+        __syncthreads();
+        for (int step = 1; step < kPlanThreads; step <<= 1) {
+            const int add = tid >= step ? scan[tid - step] : 0;
+            __syncthreads();
+            scan[tid] += add;
+            __syncthreads();
+        }
+        const int first_n = narrow_base + scan[tid] - nn;
+        if (nn != 0) { narrow_jobs[first_n] = job; }
+        if (job % pass_jobs == 0 && job / pass_jobs < passes) { pass_narrow[job / pass_jobs] = first_n; }
+        __syncthreads();
+        if (tid == kPlanThreads - 1) { narrow_base = first_n + nn; }
         __syncthreads();
     }
-    if (tid == 0) { pass_tiles[passes] = base; }
+    if (tid == 0) {
+        pass_tiles[passes]  = base;
+        pass_narrow[passes] = narrow_base;
+    }
+    if (entry_map_ints > 0) {
+        if ((reinterpret_cast<std::uintptr_t>(entry_map) & 15U) == 0U) {
+            const int vec_elems = entry_map_ints / 4;
+            auto* map4          = reinterpret_cast<int4*>(entry_map);
+            for (int i = tid; i < vec_elems; i += kPlanThreads) { map4[i] = make_int4(-1, -1, -1, -1); }
+            for (int i = vec_elems * 4 + tid; i < entry_map_ints; i += kPlanThreads) { entry_map[i] = -1; }
+        } else {
+            for (int i = tid; i < entry_map_ints; i += kPlanThreads) { entry_map[i] = -1; }
+        }
+    }
 }
 
 // A4(x) of every wide entry with its expert's gate/up input scale, in the plane layout of
@@ -131,9 +167,9 @@ __global__ void __launch_bounds__(kQuantizeThreads)
 // One CTA per job: for each routed entry of the job's expert, its plane row (its dispatch index) and
 // the expert, indexed by the entry's token * top_k + slot.
 __global__ void __launch_bounds__(kQuantizeThreads)
-    map_entries_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ pass_tiles, int passes,
-                       std::int32_t* __restrict__ map) {
-    if (pass_tiles[passes] == 0) { return; }
+    map_entries_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ pass_tiles,
+                       const std::int32_t* __restrict__ pass_narrow, int passes, std::int32_t* __restrict__ map) {
+    if (pass_tiles[passes] == 0 && pass_narrow[passes] == 0) { return; }
     const int total_jobs = *dispatch.job_count;
     for (int job = static_cast<int>(blockIdx.x); job < total_jobs; job += static_cast<int>(gridDim.x)) {
         const int expert = dispatch.jobs[job];
@@ -147,14 +183,15 @@ __global__ void __launch_bounds__(kQuantizeThreads)
 }
 
 // quantize_kernel with the loops exchanged: a warp reads one token's x row once and writes its A4(x)
-// for each of the token's top_k entries that takes the wide route (each with its expert's gate/up input
-// scale), instead of every entry's warp reading the row again. Every code and scale is the entry-major
-// kernel's. Requires a dispatch without a shared job (entries == tokens * top_k).
+// for each of the token's top_k entries whose gate/up input scales match (wide and narrow alike),
+// instead of reading x again per entry or per narrow gate/up slice. Every code and scale is the
+// entry-major kernel's. Requires a dispatch without a shared job (entries == tokens * top_k).
 __global__ void __launch_bounds__(kQuantizeThreads, 3)
-    quantize_token_kernel(const std::uint16_t* __restrict__ x, int top_k, int tokens, MoeDispatch dispatch,
+    quantize_token_kernel(const std::uint16_t* __restrict__ x, int top_k, int tokens,
                           const ExpertScales* __restrict__ scales, const std::int32_t* __restrict__ pass_tiles,
-                          int passes, const std::int32_t* __restrict__ map, std::uint8_t* __restrict__ plane) {
-    if (pass_tiles[passes] == 0) { return; }
+                          const std::int32_t* __restrict__ pass_narrow, int passes,
+                          const std::int32_t* __restrict__ map, std::uint8_t* __restrict__ plane) {
+    if (pass_tiles[passes] == 0 && pass_narrow[passes] == 0) { return; }
     static_assert(kGateUpBlocks % 32 == 0);
     constexpr int kWarps     = kQuantizeThreads / 32;
     constexpr int kPerLane   = kGateUpBlocks / 32;
@@ -163,17 +200,20 @@ __global__ void __launch_bounds__(kQuantizeThreads, 3)
     for (int t = static_cast<int>(blockIdx.x) * kWarps + warp; t < tokens; t += static_cast<int>(gridDim.x) * kWarps) {
         int slot_p         = 0;
         float slot_scale   = 0.0F;
-        bool slot_is_wide  = false;
+        bool slot_active   = false;
         if (lane < top_k) {
-            const int entry           = t * top_k + lane;
-            slot_p                    = map[2 * entry];
-            const int expert          = map[2 * entry + 1];
-            const ExpertScales sc     = scales[expert];
-            slot_scale                = sc.input_gate;
-            slot_is_wide              = wide_route(dispatch.offsets[expert + 1] - dispatch.offsets[expert], sc);
+            const int entry  = t * top_k + lane;
+            const int expert = map[2 * entry + 1];
+            // Masked verification columns leave unmapped entry_map slots at -1.
+            if (expert >= 0) {
+                slot_p                = map[2 * entry];
+                const ExpertScales sc = scales[expert];
+                slot_scale            = sc.input_gate;
+                slot_active           = (sc.input_gate == sc.input_up);
+            }
         }
-        const unsigned wide_mask = __ballot_sync(0xFFFFFFFFU, slot_is_wide);
-        if (wide_mask == 0U) { continue; }
+        const unsigned active_mask = __ballot_sync(0xFFFFFFFFU, slot_active);
+        if (active_mask == 0U) { continue; }
         const auto* token_x = x + static_cast<std::size_t>(t) * kHidden;
         // One 16-element block per lane at a time keeps the registers low enough for three CTAs per SM.
 #pragma unroll 1
@@ -196,7 +236,7 @@ __global__ void __launch_bounds__(kQuantizeThreads, 3)
                 amax           = a1 > amax ? a1 : amax;
             }
             const int position = plane_block(b);
-            unsigned rem       = wide_mask;
+            unsigned rem       = active_mask;
 #pragma unroll 1
             while (rem != 0U) {
                 const int slot          = __ffs(rem) - 1;
@@ -293,7 +333,7 @@ namespace {
 
 // Byte offsets of the workspace's regions; `end` is its size.
 struct Offsets {
-    std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
+    std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles, narrow_jobs, pass_narrow;
     std::size_t h_blocks, x_plane, narrow_acts, entry_map; // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax, job_ctas; // W4A16
     std::size_t x_terms_plane, x_row_scale, h_terms_plane, h_row_scale; // W4A16 two-term A4
@@ -329,6 +369,8 @@ Offsets offsets(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t en
     o.cpu_call    = take(kCpuCallBytes);
     o.tiles       = take(static_cast<std::size_t>(max_tiles(max_jobs, entries)) * 2 * sizeof(std::int32_t));
     o.pass_tiles  = take((j + 2) * sizeof(std::int32_t));
+    o.narrow_jobs = take(j * sizeof(std::int32_t));
+    o.pass_narrow = take((j + 2) * sizeof(std::int32_t));
     const ResidualTerms terms = activation == ExpertActivation::kA16 ? residual_terms(wide_a16) : ResidualTerms{};
     if (wide_a16 == WideA16::kLossless) {
         o.lossless = take(lossless_experts_bytes(shape, max_jobs, entries));
@@ -738,6 +780,8 @@ ExpertsWorkspace carve_experts_workspace(void* base, const ExpertShape& shape, s
     w.cpu_call    = p + o.cpu_call;
     w.tiles       = reinterpret_cast<std::int32_t*>(p + o.tiles);
     w.pass_tiles  = reinterpret_cast<std::int32_t*>(p + o.pass_tiles);
+    w.narrow_jobs = reinterpret_cast<std::int32_t*>(p + o.narrow_jobs);
+    w.pass_narrow = reinterpret_cast<std::int32_t*>(p + o.pass_narrow);
     if (wide_a16 == WideA16::kLossless) {
         w.lossless = reinterpret_cast<std::uint8_t*>(p + o.lossless);
     } else if (activation == ExpertActivation::kA16 && residual_terms(wide_a16).x != 0) {
@@ -800,9 +844,13 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
     call.mean_job_columns = entries / max_jobs;
     const bool cpu        = source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
+    const bool map_tokens = source.activation == ExpertActivation::kA4 && source.wide_a16 != WideA16::kLossless &&
+                            entries == static_cast<int>(x.ne[1]) * top_k && workspace.entry_map != nullptr;
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, max_jobs, pass_jobs, call.passes,
                                                 cpu ? workspace.cpu_flags : nullptr, workspace.job_records,
-                                                workspace.tiles, workspace.pass_tiles);
+                                                workspace.tiles, workspace.pass_tiles, workspace.narrow_jobs,
+                                                workspace.pass_narrow, map_tokens ? workspace.entry_map : nullptr,
+                                                map_tokens ? entries * 2 : 0);
     check_launch("plan");
     if (source.activation == ExpertActivation::kA16 && source.wide_a16 == WideA16::kA8) {
         // W4A16 on 8-bit activations: every token's codes are already in the x region (moe_experts encodes them
@@ -868,16 +916,16 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         check_launch("encode x");
         return call;
     }
-    if (x.ne[1] > 64 && entries == static_cast<int>(x.ne[1]) * top_k && workspace.entry_map != nullptr) {
+    if (map_tokens) {
         constexpr int kWarps   = kQuantizeThreads / 32;
         const int map_blocks   = std::max(1, std::min<int>(max_jobs, persistent_ctas()));
         const int token_blocks = std::max(1, std::min<int>(persistent_ctas() * 2,
                                                            (static_cast<int>(x.ne[1]) + kWarps - 1) / kWarps));
         map_entries_kernel<<<map_blocks, kQuantizeThreads, 0, stream>>>(
-            dispatch, workspace.pass_tiles, call.passes, workspace.entry_map);
+            dispatch, workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map);
         quantize_token_kernel<<<token_blocks, kQuantizeThreads, 0, stream>>>(
-            static_cast<const std::uint16_t*>(x.data), top_k, static_cast<int>(x.ne[1]), dispatch, source.scales,
-            workspace.pass_tiles, call.passes, workspace.entry_map, workspace.x_plane);
+            static_cast<const std::uint16_t*>(x.data), top_k, static_cast<int>(x.ne[1]), source.scales,
+            workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map, workspace.x_plane);
     } else {
         const int quant_blocks = std::max(1, std::min<int>(persistent_ctas() * 2, max_tiles(max_jobs, entries)));
         quantize_kernel<<<quant_blocks, kQuantizeThreads, 0, stream>>>(

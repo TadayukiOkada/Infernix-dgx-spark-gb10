@@ -124,25 +124,35 @@ struct PromptShape<KvCacheStorage::Fp8KeyNvfp4Value> {
     static constexpr Code Key = Code::Fp8, Value = Code::Nvfp4;
 };
 
+template <KvCacheStorage Storage, bool SplitD>
+__host__ __device__ constexpr int prompt_warps() {
+    return SplitD ? 4 : PromptShape<Storage>::Warps;
+}
+
 // One warp stage: [K rows | V rows | K scales | V scales | parity word], 16 tokens each; rows keep
 // their 16-byte chunks swizzled. The parity word's bit j is token j's parity (FP8 row scales).
-template <KvCacheStorage Storage>
+template <KvCacheStorage Storage, bool SplitD>
 struct Stage {
-    using Shape                     = PromptShape<Storage>;
-    using K                         = Row<Shape::Key>;
-    using V                         = Row<Shape::Value>;
-    static constexpr bool Parity    = Shape::Key == Code::Fp8 || Shape::Value == Code::Fp8 || Shape::Vq > 0;
-    static constexpr int Values     = kTile * K::Bytes;
-    static constexpr int KeyScales  = Values + kTile * V::Bytes;
-    static constexpr int ValueScales = KeyScales + kTile * K::ScaleSlot;
+    using Shape                      = PromptShape<Storage>;
+    using K                          = Row<Shape::Key>;
+    using V                          = Row<Shape::Value>;
+    static_assert(!SplitD || Shape::Vq == 0, "vector-quantized stages stay full-D");
+    static constexpr int KHalfBytes  = SplitD ? K::Bytes / 2 : K::Bytes;
+    static constexpr int VHalfBytes  = SplitD ? V::Bytes / 2 : V::Bytes;
+    static constexpr int KScaleSlot  = SplitD && K::ScaleSlot > 4 ? K::ScaleSlot / 2 : K::ScaleSlot;
+    static constexpr int VScaleSlot  = SplitD && V::ScaleSlot > 4 ? V::ScaleSlot / 2 : V::ScaleSlot;
+    static constexpr bool Parity     = Shape::Key == Code::Fp8 || Shape::Value == Code::Fp8 || Shape::Vq > 0;
+    static constexpr int Values      = kTile * KHalfBytes;
+    static constexpr int KeyScales   = Values + kTile * VHalfBytes;
+    static constexpr int ValueScales = KeyScales + kTile * KScaleSlot;
     // The value scales get two slots where the route gathers them with the keys: the QK phase settles
     // the 8-bit values' exact decode rescale from them, so they must land before the value rows, while
     // the next tile's are already being gathered as this tile's PV MMA reads them. A stage the combined
     // route fills (a vector-quantized stage, or a storage whose gather the split does not pay for) needs
     // one, and keeps its original footprint.
-    static constexpr bool SplitGather = Shape::Vq == 0 && K::Bytes >= kD;
+    static constexpr bool SplitGather = Shape::Vq == 0 && (SplitD || KHalfBytes >= kD);
     static constexpr int ScaleSlots   = SplitGather ? 2 : 1;
-    static constexpr int ParityWord   = ValueScales + ScaleSlots * kTile * V::ScaleSlot;
+    static constexpr int ParityWord   = ValueScales + ScaleSlots * kTile * VScaleSlot;
     // Vector-quantized: the paged code rows, each row's FP16 code scale (K, V) as its aligned word,
     // the window tags (K, V) and each row's token and read mode.
     static constexpr int VqKeyCodes   = ParityWord + (Parity ? 16 : 0);
@@ -158,22 +168,44 @@ struct Stage {
     static_assert(Values % 16 == 0 && KeyScales % 16 == 0 && ValueScales % 16 == 0 && ParityWord % 16 == 0);
 };
 
-// Shared memory: the query rows, then each warp's `Stages` stages (and NVFP4 value tile), later the merge:
-// one FP32 row buffer the warps accumulate into and every warp's (max, sum) per row; then the codebook.
-template <KvCacheStorage Storage, int Stages>
+// Shared memory: phase 1 holds the active query rows, optional split-D pair score buffers, and each
+// warp's `Stages` stages; phase 2 overlays one FP32 merge row buffer and per-KV-warp (max, sum) at
+// offset 0 (q_s is dead after the KV loop); the VQ2 codebook sits behind whichever phase is larger.
+template <KvCacheStorage Storage, int Stages, bool SplitD>
 __host__ __device__ constexpr int prompt_smem_bytes() {
-    using S              = Stage<Storage>;
-    constexpr int Warps  = PromptShape<Storage>::Warps;
-    constexpr int stages = Warps * (Stages * S::Bytes + S::Scratch);
-    constexpr int merge  = (kRows * kD + Warps * kRows * 2) * 4;
-    constexpr int book   = PromptShape<Storage>::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0;
-    return kQRow * kRows + (stages > merge ? stages : merge) + book;
+    using S                   = Stage<Storage, SplitD>;
+    constexpr int WarpsKV     = SplitD ? 2 : PromptShape<Storage>::Warps;
+    constexpr int Warps       = prompt_warps<Storage, SplitD>();
+    constexpr int pair_scores = SplitD ? WarpsKV * 1024 : 0;
+    constexpr int stages      = Warps * (Stages * S::Bytes + S::Scratch);
+    constexpr int merge       = (kRows * kD + WarpsKV * kRows * 2) * 4;
+    constexpr int book        = PromptShape<Storage>::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0;
+    constexpr int phase1      = kQRow * kRows + pair_scores + stages;
+    return (phase1 > merge ? phase1 : merge) + book;
 }
 
-// 16-byte chunk c of row r lives at chunk c ^ (r & 7): the eight rows an ldmatrix reads hit
-// distinct banks.
+template <KvCacheStorage Storage, int Stages, bool SplitD>
+__host__ __device__ constexpr int prompt_smem_blocks() {
+    constexpr int per_cta = prompt_smem_bytes<Storage, Stages, SplitD>() + 1024;
+    if constexpr (4 * per_cta <= 100 * 1024) { return 4; }
+    if constexpr (3 * per_cta <= 100 * 1024) { return 3; }
+    if constexpr (2 * per_cta <= 100 * 1024) { return 2; }
+    return 1;
+}
+
+template <KvCacheStorage Storage, int Stages, bool SplitD>
+__host__ __device__ constexpr int prompt_launch_min_blocks() {
+    constexpr int smem_blocks = prompt_smem_blocks<Storage, Stages, SplitD>();
+    if constexpr (SplitD) { return smem_blocks; }
+    return smem_blocks > 2 ? 2 : smem_blocks;
+}
+
+// 16-byte chunk c of row r lives at chunk c ^ (r & 7) when row_bytes >= 128; when row_bytes == 64
+// (4 chunks per row, SplitD NVFP4), c ^ (r & 3) ^ ((r >> 2) & 1) stays within the row while
+// keeping each 8-row ldmatrix tile across all 8 16-byte bank groups with zero bank conflicts.
 __device__ __forceinline__ int swizzled(int row, int row_bytes, int chunk) {
-    return row * row_bytes + ((chunk ^ (row & 7)) << 4);
+    const int c = row_bytes == 64 ? (chunk ^ (row & 3) ^ ((row >> 2) & 1)) : (chunk ^ (row & 7));
+    return row * row_bytes + (c << 4);
 }
 
 // The attended token at index i of a column's list (the decode kernel's order: selected blocks in
@@ -277,22 +309,30 @@ __device__ __forceinline__ void decode_v_pair(unsigned codes, __half2 scales, un
 // One ldmatrix.trans b16 lane of an NVFP4 [key][d] tile holds two packed bytes (four E2M1 codes,
 // dimensions 32c + 4n .. + 3) of key k (low 16 bits) and key k + 1 (high 16 bits), all four in the
 // same 16-element scale group: decode to the four FP16 B halves {V[k][d+u], V[k+1][d+u]} for u = 0..3.
-__device__ __forceinline__ void decode_v_quad_nvfp4(unsigned codes, __half s0, __half s1, unsigned (&out)[4]) {
-    const __half2 s0_pair = __halves2half2(s0, s0);
-    const __half2 s1_pair = __halves2half2(s1, s1);
-    const unsigned w0_01  = e2m1x2_times(codes & 0xffu, s0_pair);
-    const unsigned w1_01  = e2m1x2_times((codes >> 16) & 0xffu, s1_pair);
-    out[0]                = __byte_perm(w0_01, w1_01, 0x5410);
-    out[1]                = __byte_perm(w0_01, w1_01, 0x7632);
-    const unsigned w0_23  = e2m1x2_times((codes >> 8) & 0xffu, s0_pair);
-    const unsigned w1_23  = e2m1x2_times(codes >> 24, s1_pair);
-    out[2]                = __byte_perm(w0_23, w1_23, 0x5410);
-    out[3]                = __byte_perm(w0_23, w1_23, 0x7632);
+__device__ __forceinline__ void decode_v_quad_nvfp4(unsigned codes, __half2 s0_pair, __half2 s1_pair,
+                                                    unsigned (&out)[4]) {
+    const unsigned w0_01 = e2m1x2_times(codes & 0xffu, s0_pair);
+    const unsigned w1_01 = e2m1x2_times((codes >> 16) & 0xffu, s1_pair);
+    out[0]               = __byte_perm(w0_01, w1_01, 0x5410);
+    out[1]               = __byte_perm(w0_01, w1_01, 0x7632);
+    const unsigned w0_23 = e2m1x2_times((codes >> 8) & 0xffu, s0_pair);
+    const unsigned w1_23 = e2m1x2_times(codes >> 24, s1_pair);
+    out[2]               = __byte_perm(w0_23, w1_23, 0x5410);
+    out[3]               = __byte_perm(w0_23, w1_23, 0x7632);
 }
 
-template <KvCacheStorage Storage, int Stages>
-__global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
-                                  2 * (prompt_smem_bytes<Storage, Stages>() + 1024) <= 100 * 1024 ? 2 : 1)
+template <bool Bf16>
+__device__ __forceinline__ void qsa_mma(float* c, const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    if constexpr (Bf16) {
+        mma_bf16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
+    } else {
+        mma_f16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1);
+    }
+}
+
+template <KvCacheStorage Storage, int Stages, bool SplitD>
+__global__ void __launch_bounds__(prompt_warps<Storage, SplitD>() * 32,
+                                  prompt_launch_min_blocks<Storage, Stages, SplitD>())
     qsa_prompt_kernel(const bf16* __restrict__ q, int heads, int kv_heads, const void* __restrict__ k_pages,
                       const void* __restrict__ v_pages, const void* __restrict__ k_scales,
                       const void* __restrict__ v_scales, const std::int32_t* __restrict__ tables,
@@ -301,10 +341,13 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
                       const std::int32_t* __restrict__ selected, const std::int32_t* __restrict__ counts,
                       int top_blocks, float scale, bf16* __restrict__ out, QsaPageSpaces spaces, QsaVqWindow vq) {
     using Shape                 = PromptShape<Storage>;
-    using S                     = Stage<Storage>;
+    using S                     = Stage<Storage, SplitD>;
     using K                     = Row<Shape::Key>;
     using V                     = Row<Shape::Value>;
-    constexpr int Warps         = Shape::Warps;
+    constexpr int Rows          = kRows;
+    constexpr int HalfBlocks    = SplitD ? 8 : 16;
+    constexpr int WarpsKV       = SplitD ? 2 : Shape::Warps;
+    constexpr int Warps         = prompt_warps<Storage, SplitD>();
     constexpr int Threads       = Warps * 32;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
@@ -312,6 +355,8 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
 
     const int t = static_cast<int>(blockIdx.x), kv_head = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    const int kv_w = SplitD ? (warp >> 1) : warp;
+    const int d_w  = SplitD ? (warp & 1) : 0;
     const int gid = lane >> 2, lid = lane & 3;
     const int group = heads / kv_heads;
     const int p     = positions[t];
@@ -323,31 +368,34 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
     // Query rows (rotated into the keys' Hadamard domain where keys are rotated, then FP16 in the
     // key code's k-step order; BF16 keys: the stored values). Rows past the group are zero.
     unsigned char* q_s = smem;
-    for (int r = warp; r < kRows; r += Warps) {
-        float v[8];
+    for (int r = warp; r < Rows; r += Warps) {
+        if (r < group) {
+            float v[8];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            v[k] = r < group ? __bfloat162float(
-                                   q[(static_cast<std::size_t>(t) * heads + kv_head * group + r) * kD + lane + 32 * k])
-                             : 0.0f;
-        }
-        if constexpr (S::RotatedKeys) { normalized_hadamard_d256_inplace(v, lane); }
-#pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const int d = lane + 32 * k;
-            const int e = query_position<Shape::Key>(d);
-            unsigned char* at = q_s + swizzled(r, kQRow, e >> 3) + 2 * (e & 7);
-            if constexpr (Shape::Key == Code::Bf16) {
-                *reinterpret_cast<bf16*>(at) = __float2bfloat16_rn(v[k]);
-            } else {
-                *reinterpret_cast<__half*>(at) = __float2half_rn(v[k]);
+            for (int k = 0; k < 8; ++k) {
+                v[k] = __bfloat162float(
+                    q[(static_cast<std::size_t>(t) * heads + kv_head * group + r) * kD + lane + 32 * k]);
             }
+            if constexpr (S::RotatedKeys) { normalized_hadamard_d256_inplace(v, lane); }
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int d = lane + 32 * k;
+                const int e = query_position<Shape::Key>(d);
+                unsigned char* at = q_s + swizzled(r, kQRow, e >> 3) + 2 * (e & 7);
+                if constexpr (Shape::Key == Code::Bf16) {
+                    *reinterpret_cast<bf16*>(at) = __float2bfloat16_rn(v[k]);
+                } else {
+                    *reinterpret_cast<__half*>(at) = __float2half_rn(v[k]);
+                }
+            }
+        } else {
+            *reinterpret_cast<uint4*>(q_s + swizzled(r, kQRow, lane)) = uint4{0u, 0u, 0u, 0u};
         }
     }
     __syncthreads();
 
-    // VQ2 codebook (vector-quantized storages): behind the stages and the merge rows.
-    constexpr int kCodebookAt = prompt_smem_bytes<Storage, Stages>() -
+    // VQ2 codebook (vector-quantized storages): behind whichever shared-memory phase is larger.
+    constexpr int kCodebookAt = prompt_smem_bytes<Storage, Stages, SplitD>() -
                                 (Shape::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0);
     const auto* codebook = reinterpret_cast<const std::int8_t*>(smem + kCodebookAt);
     if constexpr (Shape::Vq > 0) {
@@ -357,16 +405,18 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
         }
         __syncthreads();
     }
-    const int call_first = positions[(t / width) * width];
-    const int window_row = vq.slots != nullptr ? vq.slots[t / width] : 0;
-    unsigned char* stages = smem + kQRow * kRows + warp * (Stages * S::Bytes + S::Scratch);
+    const int call_first  = positions[(t / width) * width];
+    const int window_row  = vq.slots != nullptr ? vq.slots[t / width] : 0;
+    float* pair_scores    = reinterpret_cast<float*>(smem + kQRow * Rows);
+    unsigned char* stages = smem + kQRow * Rows + (SplitD ? WarpsKV * 1024 : 0) +
+                            warp * (Stages * S::Bytes + S::Scratch);
     const int tiles       = (total + kTile - 1) / kTile;
 
     // The byte offset of tile i's value-scale slot. Consecutive tiles of one warp use different slots:
     // the single-stage route gathers a tile's value scales with its keys, so the next tile's are already
     // in flight while this tile's PV MMA still reads them.
     const auto value_scale_at = [&](int i) {
-        return ((i / Warps) & (S::ScaleSlots - 1)) * (kTile * V::ScaleSlot);
+        return ((i / WarpsKV) & (S::ScaleSlots - 1)) * (kTile * S::VScaleSlot);
     };
 
     // Gathers tile i's `Part` (both halves, or one of them) into stage s and commits it as one group;
@@ -451,39 +501,47 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
             return;
         }
         if constexpr ((Part & kGatherKey) != 0) {
-            rows(k_s, k_plane + row_at * K::Bytes, std::integral_constant<int, K::Bytes>{});
+            rows(k_s, k_plane + row_at * K::Bytes + d_w * S::KHalfBytes,
+                 std::integral_constant<int, S::KHalfBytes>{});
         }
         if constexpr ((Part & kGatherValue) != 0) {
-            rows(v_s, v_plane + row_at * V::Bytes, std::integral_constant<int, V::Bytes>{});
+            rows(v_s, v_plane + row_at * V::Bytes + d_w * S::VHalfBytes,
+                 std::integral_constant<int, S::VHalfBytes>{});
         }
         if constexpr ((Part & kGatherKey) != 0 && (K::ScaleSlot > 0 || V::ScaleSlot > 0)) {
             // Lanes 0-15 gather their row's key scales, lanes 16-31 its value scales; both travel with
             // the keys, and the parity word is the keys' token parity.
             const bool key    = lane < 16;
-            const auto scales = [&](const void* pool, const void* host, const void* lent, int slot_bytes,
-                                    unsigned char* dst) {
+            const auto scales = [&](const void* pool, const void* host, const void* lent, auto orig_slot_t,
+                                    auto slot_bytes_t, unsigned char* dst) {
+                constexpr int OrigSlot  = decltype(orig_slot_t)::value;
+                constexpr int SlotBytes = decltype(slot_bytes_t)::value;
                 int scale_page;
                 const auto* base = static_cast<const unsigned char*>(qsa_space_plane(spaces, pool, host, lent, id, scale_page));
-                if (slot_bytes == 4) { // one FP16: its aligned word
+                if constexpr (OrigSlot == 4) { // one FP16: its aligned word (needed by both D halves)
                     cp_async_zfill<4>(dst, base + (2 * row_at & ~std::size_t{3}), valid ? 4 : 0);
-                } else if (slot_bytes == 8) {
-                    cp_async_zfill<8>(dst, base + 8 * row_at, valid ? 8 : 0);
+                } else if constexpr (SlotBytes == 4) {
+                    cp_async_zfill<4>(dst, base + 8 * row_at + 4 * d_w, valid ? 4 : 0);
+                } else if constexpr (SlotBytes == 8) {
+                    cp_async_zfill<8>(dst, base + OrigSlot * row_at + 8 * d_w, valid ? 8 : 0);
                 } else {
                     cp_async_zfill<16>(dst, base + 16 * row_at, valid ? 16 : 0);
                 }
             };
             if (key) {
                 if constexpr (K::ScaleSlot > 0) {
-                    scales(k_scales, spaces.host_k_scale, spaces.lent_k_scale, K::ScaleSlot,
-                           k_s + S::KeyScales + row * K::ScaleSlot);
+                    scales(k_scales, spaces.host_k_scale, spaces.lent_k_scale,
+                           std::integral_constant<int, K::ScaleSlot>{}, std::integral_constant<int, S::KScaleSlot>{},
+                           k_s + S::KeyScales + row * S::KScaleSlot);
                 }
             } else {
                 // The value scales travel with the key group: the exact power of two the 8-bit values
                 // decode by comes from them, and the QK phase settles it before the value rows
                 // themselves are waited for. Tile i's own slot keeps them clear of the next tile's.
                 if constexpr (V::ScaleSlot > 0) {
-                    scales(v_scales, spaces.host_v_scale, spaces.lent_v_scale, V::ScaleSlot,
-                           k_s + S::ValueScales + value_scale_at(i) + row * V::ScaleSlot);
+                    scales(v_scales, spaces.host_v_scale, spaces.lent_v_scale,
+                           std::integral_constant<int, V::ScaleSlot>{}, std::integral_constant<int, S::VScaleSlot>{},
+                           k_s + S::ValueScales + value_scale_at(i) + row * S::VScaleSlot);
                 }
             }
             if constexpr (S::Parity) {
@@ -494,19 +552,24 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
         cp_commit();
     };
 
-    // The A fragments of k step kb of the query rows.
+    // The A fragments of k step kb of the query rows. Base addresses for the 4 low chunk-pairs stay in
+    // 4 registers across the tile loop; high steps add compile-time constant +128/+256/+384 offsets.
     const int a_mat = lane >> 3, a_rin = lane & 7;
     const int a_row = a_rin + ((a_mat & 1) << 3);
-    const auto query_fragment = [&](int kb, unsigned (&a)[4]) {
-        ldmatrix_x4(a[0], a[1], a[2], a[3], smem_addr(q_s + swizzled(a_row, kQRow, 2 * kb + (a_mat >> 1))));
+    const unsigned q_base = smem_addr(q_s) + static_cast<unsigned>(a_row * kQRow + (SplitD ? 256 * d_w : 0));
+    unsigned q_addr[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        q_addr[k] = q_base + static_cast<unsigned>(((2 * k + (a_mat >> 1)) ^ a_rin) << 4);
+    }
+    const auto query_fragment = [&](int kb_local, unsigned (&a)[4]) {
+        ldmatrix_x4(a[0], a[1], a[2], a[3], q_addr[kb_local & 3] + static_cast<unsigned>(128 * (kb_local >> 2)));
     };
 
-    // Output rows g (registers 0/1) and g + 8 (2/3) of 32 n8 tiles: 8-bit value tiles [db][0] and
-    // [db][1] hold the even and odd dimensions of block db; FP16 tiles [db][h] dimensions
-    // 16 db + 8 h .. + 7.
-    float o[16][2][4];
+    // Output rows g (registers 0/1) and g + 8 (2/3) of 16 or 32 n8 tiles (`HalfBlocks` blocks).
+    float o[HalfBlocks][2][4];
 #pragma unroll
-    for (int b = 0; b < 16; ++b) {
+    for (int b = 0; b < HalfBlocks; ++b) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
 #pragma unroll
@@ -551,7 +614,8 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
             for (int j = 0; j < 4; ++j) { score[nt][j] = 0.0f; }
         }
         if constexpr (Shape::Key == Code::Int8 || Shape::Key == Code::Fp8) {
-            constexpr int Groups = K::Groups, Steps = 16 / Groups;
+            constexpr int Groups = SplitD && K::Groups > 1 ? K::Groups / 2 : K::Groups;
+            constexpr int Steps  = (SplitD ? 8 : 16) / Groups;
 #pragma unroll
             for (int g = 0; g < Groups; ++g) {
                 float acc[2][4];
@@ -566,20 +630,20 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
                     unsigned a[4];
                     query_fragment(kb, a);
                     unsigned r0, r1;
-                    ldmatrix_x2(r0, r1, smem_addr(k_s + swizzled(lane & 15, K::Bytes, kb)));
+                    ldmatrix_x2(r0, r1, smem_addr(k_s + swizzled(lane & 15, S::KHalfBytes, kb)));
                     unsigned lo, hi;
                     if constexpr (Shape::Key == Code::Int8) {
                         widen_codes(r0, lo, hi);
                     } else {
                         widen_e4m3(r0, lo, hi);
                     }
-                    mma_f16(acc[0][0], acc[0][1], acc[0][2], acc[0][3], a[0], a[1], a[2], a[3], lo, hi);
+                    qsa_mma<false>(acc[0], a, lo, hi);
                     if constexpr (Shape::Key == Code::Int8) {
                         widen_codes(r1, lo, hi);
                     } else {
                         widen_e4m3(r1, lo, hi);
                     }
-                    mma_f16(acc[1][0], acc[1][1], acc[1][2], acc[1][3], a[0], a[1], a[2], a[3], lo, hi);
+                    qsa_mma<false>(acc[1], a, lo, hi);
                 }
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
@@ -602,16 +666,34 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
         } else if constexpr (Shape::Key == Code::Nvfp4) {
             // Lane (gid, lid) decodes dimensions 32c + 8 lid .. + 7 of keys gid and gid + 8 with their
             // group scale 2c + lid / 2: exact FP16 values, no per-group partials.
+            constexpr int Nvfp4Chunks = SplitD ? 4 : 8;
+            unsigned ksc[2][2]{};
+            if constexpr (SplitD) {
+                const unsigned perm = (lid & 2) != 0 ? 0x7531u : 0x6420u;
 #pragma unroll
-            for (int c = 0; c < 8; ++c) {
+                for (int nt = 0; nt < 2; ++nt) {
+                    const uint2 raw   = *reinterpret_cast<const uint2*>(k_s + S::KeyScales + (nt * 8 + gid) * 8);
+                    const unsigned s4 = __byte_perm(raw.x, raw.y, perm);
+                    ksc[nt][0]        = e4m3x2_to_f16x2(s4 & 0xffffu);
+                    ksc[nt][1]        = e4m3x2_to_f16x2(s4 >> 16);
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < Nvfp4Chunks; ++c) {
                 unsigned r[2];
-                ldmatrix_x2(r[0], r[1], smem_addr(k_s + swizzled(lane & 15, K::Bytes, c)));
+                ldmatrix_x2(r[0], r[1], smem_addr(k_s + swizzled(lane & 15, S::KHalfBytes, c)));
                 unsigned b[2][4];
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
-                    const int key   = nt * 8 + gid;
-                    const __half sc = e4m3_to_half(k_s[S::KeyScales + key * K::ScaleSlot + 2 * c + (lid >> 1)]);
-                    const __half2 s2 = __halves2half2(sc, sc);
+                    __half2 s2;
+                    if constexpr (SplitD) {
+                        const unsigned s2_u = __byte_perm(ksc[nt][c >> 1], 0u, (c & 1) != 0 ? 0x3232u : 0x1010u);
+                        s2                  = load_vec<__half2>(&s2_u);
+                    } else {
+                        const int key   = nt * 8 + gid;
+                        const __half sc = e4m3_to_half(k_s[S::KeyScales + key * S::KScaleSlot + 2 * c + (lid >> 1)]);
+                        s2              = __halves2half2(sc, sc);
+                    }
 #pragma unroll
                     for (int byte = 0; byte < 4; ++byte) { b[nt][byte] = e2m1x2_times((r[nt] >> (8 * byte)) & 0xffu, s2); }
                 }
@@ -619,24 +701,61 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
                 for (int half = 0; half < 2; ++half) {
                     unsigned a[4];
                     query_fragment(2 * c + half, a);
-                    mma_f16(score[0][0], score[0][1], score[0][2], score[0][3], a[0], a[1], a[2], a[3], b[0][2 * half],
-                            b[0][2 * half + 1]);
-                    mma_f16(score[1][0], score[1][1], score[1][2], score[1][3], a[0], a[1], a[2], a[3], b[1][2 * half],
-                            b[1][2 * half + 1]);
+                    qsa_mma<false>(score[0], a, b[0][2 * half], b[0][2 * half + 1]);
+                    qsa_mma<false>(score[1], a, b[1][2 * half], b[1][2 * half + 1]);
                 }
             }
         } else {
             const int b_mat = lane >> 3, b_rin = lane & 7;
             const int b_row = b_rin + ((b_mat >> 1) << 3);
+            constexpr int Bf16Steps = SplitD ? 8 : 16;
 #pragma unroll
-            for (int kb = 0; kb < 16; ++kb) {
+            for (int kb = 0; kb < Bf16Steps; ++kb) {
                 unsigned a[4];
                 query_fragment(kb, a);
                 unsigned b[4];
                 ldmatrix_x4(b[0], b[1], b[2], b[3],
-                            smem_addr(k_s + swizzled(b_row, K::Bytes, 2 * kb + (b_mat & 1))));
-                mma_bf16(score[0][0], score[0][1], score[0][2], score[0][3], a[0], a[1], a[2], a[3], b[0], b[1]);
-                mma_bf16(score[1][0], score[1][1], score[1][2], score[1][3], a[0], a[1], a[2], a[3], b[2], b[3]);
+                            smem_addr(k_s + swizzled(b_row, S::KHalfBytes, 2 * kb + (b_mat & 1))));
+                qsa_mma<true>(score[0], a, b[0], b[1]);
+                qsa_mma<true>(score[1], a, b[2], b[3]);
+            }
+        }
+
+        if constexpr (SplitD) {
+            float* ps            = pair_scores + kv_w * 256;
+            const auto pair_sync = [&]() {
+                if (kv_w == 0) {
+                    asm volatile("bar.sync 1, 64;" ::: "memory");
+                } else {
+                    asm volatile("bar.sync 2, 64;" ::: "memory");
+                }
+            };
+            if (d_w == 1) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) { ps[(nt * 4 + j) * 32 + lane] = score[nt][j]; }
+                }
+            }
+            pair_sync();
+            if (d_w == 0) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float sum              = score[nt][j] + ps[(nt * 4 + j) * 32 + lane];
+                        score[nt][j]                 = sum;
+                        ps[(nt * 4 + j) * 32 + lane] = sum;
+                    }
+                }
+            }
+            pair_sync();
+            if (d_w == 1) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) { score[nt][j] = ps[(nt * 4 + j) * 32 + lane]; }
+                }
             }
         }
 
@@ -645,36 +764,45 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             const int index = i * kTile + nt * 8 + 2 * lid;
-            if (index >= total) { score[nt][0] = score[nt][2] = -CUDART_INF_F; }
-            if (index + 1 >= total) { score[nt][1] = score[nt][3] = -CUDART_INF_F; }
+            if (index >= total) {
+                score[nt][0] = -CUDART_INF_F;
+                score[nt][2] = -CUDART_INF_F;
+            }
+            if (index + 1 >= total) {
+                score[nt][1] = -CUDART_INF_F;
+                score[nt][3] = -CUDART_INF_F;
+            }
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
             bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }
         bm0 = warp_max<4>(bm0, FullMask);
         bm1 = warp_max<4>(bm1, FullMask);
-        const float nm0 = fmaxf(m0, bm0), nm1 = fmaxf(m1, bm1);
+        const float nm0    = fmaxf(m0, bm0);
         const float alpha0 = m0 == -CUDART_INF_F ? 0.0f : exp2_approx((m0 - nm0) * scale_l2);
+        m0                 = nm0;
+        const float base0  = nm0 * scale_l2;
+        float bl0          = 0.0f;
+        const float nm1    = fmaxf(m1, bm1);
         const float alpha1 = m1 == -CUDART_INF_F ? 0.0f : exp2_approx((m1 - nm1) * scale_l2);
-        m0 = nm0;
-        m1 = nm1;
-        const float base0 = nm0 * scale_l2, base1 = nm1 * scale_l2;
-        float bl0 = 0.0f, bl1 = 0.0f;
+        m1                 = nm1;
+        const float base1  = nm1 * scale_l2;
+        float bl1          = 0.0f;
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             pr[nt][0] = exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -base0));
             pr[nt][1] = exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -base0));
+            bl0 += pr[nt][0] + pr[nt][1];
             pr[nt][2] = exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -base1));
             pr[nt][3] = exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -base1));
-            bl0 += pr[nt][0] + pr[nt][1];
             bl1 += pr[nt][2] + pr[nt][3];
         }
         l0 = __fmaf_rn(l0, alpha0, bl0);
         l1 = __fmaf_rn(l1, alpha1, bl1);
-        // The 128 output rescales are pure scaling: when no row's max moved this tile every alpha is
+        // The output rescales are pure scaling: when no row's max moved this tile every alpha is
         // exp2_approx(0) = 1 exactly and the whole loop can be skipped (warp-uniform, bits unchanged).
         if (!__all_sync(FullMask, alpha0 == 1.0f && alpha1 == 1.0f)) {
 #pragma unroll
-            for (int b = 0; b < 16; ++b) {
+            for (int b = 0; b < HalfBlocks; ++b) {
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     o[b][h][0] *= alpha0;
@@ -693,8 +821,17 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
             float own;
             if constexpr (Shape::Value == Code::Int8) {
                 const __half* vs = reinterpret_cast<const __half*>(k_s + S::ValueScales + qk.scale_at);
-                const __half2 pair = load_vec<__half2>(&vs[2 * lane]);
-                own                = fmaxf(fabsf(__low2float(pair)), fabsf(__high2float(pair)));
+                if constexpr (SplitD) {
+                    if (lane < 16) {
+                        const __half2 pair = load_vec<__half2>(&vs[2 * lane]);
+                        own                = fmaxf(fabsf(__low2float(pair)), fabsf(__high2float(pair)));
+                    } else {
+                        own = 0.0f;
+                    }
+                } else {
+                    const __half2 pair = load_vec<__half2>(&vs[2 * lane]);
+                    own                = fmaxf(fabsf(__low2float(pair)), fabsf(__high2float(pair)));
+                }
             } else {
                 own = lane < 16
                           ? fabsf(__half2float(row_scale(k_s, parity, S::ValueScales + qk.scale_at, lane)))
@@ -728,7 +865,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
         const unsigned (&pa)[4]  = qk.pa;
 
         if constexpr (S::EvenOddValues) {
-            constexpr int Groups = V::Groups;
+            constexpr int Groups = SplitD && V::Groups > 1 ? V::Groups / 2 : V::Groups;
             const __half2 down = qk.down;
             const int v_mat = lane >> 3, v_rin = lane & 7;
             const int v_row = v_rin + ((v_mat & 1) << 3);
@@ -740,13 +877,13 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
                 }
             };
 #pragma unroll
-            for (int db = 0; db < 16; db += 2) {
+            for (int db = 0; db < HalfBlocks; db += 2) {
                 unsigned r[4];
                 ldmatrix_x4_t(r[0], r[1], r[2], r[3],
-                              smem_addr(v_s + swizzled(v_row, V::Bytes, db + (v_mat >> 1))));
+                              smem_addr(v_s + swizzled(v_row, S::VHalfBytes, db + (v_mat >> 1))));
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int g       = (db + h) * Groups / 16;
+                    const int g       = (db + h) * Groups / HalfBlocks;
                     const int key     = 2 * lid;
                     const __half2 s01 = __hmul2(__halves2half2(value_scale(key, g), value_scale(key + 1, g)), down);
                     const __half2 s89 = __hmul2(__halves2half2(value_scale(key + 8, g), value_scale(key + 9, g)), down);
@@ -755,8 +892,8 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
                     decode_v_pair<Shape::Value>(r[2 * h + 1], s89, e1, o1);
                     float* even = o[db + h][0];
                     float* odd  = o[db + h][1];
-                    mma_f16(even[0], even[1], even[2], even[3], pa[0], pa[1], pa[2], pa[3], e0, e1);
-                    mma_f16(odd[0], odd[1], odd[2], odd[3], pa[0], pa[1], pa[2], pa[3], o0, o1);
+                    qsa_mma<false>(even, pa, e0, e1);
+                    qsa_mma<false>(odd, pa, o0, o1);
                 }
             }
         } else {
@@ -771,37 +908,48 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
                                   smem_addr(fp16_rows + swizzled(v_row, row_bytes, c - C0 + (v_mat >> 1))));
                     float* first  = o[c >> 1][0];
                     float* second = o[c >> 1][1];
-                    mma_f16(first[0], first[1], first[2], first[3], pa[0], pa[1], pa[2], pa[3], r[0], r[1]);
-                    mma_f16(second[0], second[1], second[2], second[3], pa[0], pa[1], pa[2], pa[3], r[2], r[3]);
+                    qsa_mma<false>(first, pa, r[0], r[1]);
+                    qsa_mma<false>(second, pa, r[2], r[3]);
                 }
             };
             if constexpr (Shape::Value == Code::Nvfp4) {
                 const int key  = 2 * lid;
                 const int g_in = gid >> 2;
+                constexpr int Nvfp4Chunks = SplitD ? 4 : 8;
+                const unsigned vs_perm    = g_in != 0 ? 0x0031u : 0x0020u;
 #pragma unroll
-                for (int c = 0; c < 8; c += 2) {
+                for (int c = 0; c < Nvfp4Chunks; c += 2) {
                     unsigned r[4];
                     ldmatrix_x4_t(r[0], r[1], r[2], r[3],
-                                  smem_addr(v_s + swizzled(v_row, V::Bytes, c + (v_mat >> 1))));
+                                  smem_addr(v_s + swizzled(v_row, S::VHalfBytes, c + (v_mat >> 1))));
+                    const unsigned char* vs_c = k_s + S::ValueScales + qk.scale_at + 2 * c;
+                    const auto load_v_pair    = [&](int row) {
+                        const unsigned raw = *reinterpret_cast<const unsigned*>(vs_c + row * S::VScaleSlot);
+                        return e4m3x2_to_f16x2(__byte_perm(raw, 0u, vs_perm));
+                    };
+                    const unsigned p0 = load_v_pair(key), p1 = load_v_pair(key + 1);
+                    const unsigned p8 = load_v_pair(key + 8), p9 = load_v_pair(key + 9);
 #pragma unroll
                     for (int hc = 0; hc < 2; ++hc) {
-                        const int chunk = c + hc;
-                        const int g     = 2 * chunk + g_in;
-                        const unsigned char* vs = k_s + S::ValueScales + qk.scale_at + g;
+                        const int chunk     = c + hc;
+                        const unsigned sel  = hc != 0 ? 0x3232u : 0x1010u;
+                        const unsigned s0_u = __byte_perm(p0, 0u, sel);
+                        const unsigned s1_u = __byte_perm(p1, 0u, sel);
+                        const unsigned s8_u = __byte_perm(p8, 0u, sel);
+                        const unsigned s9_u = __byte_perm(p9, 0u, sel);
                         unsigned b0[4], b1[4];
-                        decode_v_quad_nvfp4(r[2 * hc], e4m3_to_half(vs[key * V::ScaleSlot]),
-                                            e4m3_to_half(vs[(key + 1) * V::ScaleSlot]), b0);
-                        decode_v_quad_nvfp4(r[2 * hc + 1], e4m3_to_half(vs[(key + 8) * V::ScaleSlot]),
-                                            e4m3_to_half(vs[(key + 9) * V::ScaleSlot]), b1);
+                        decode_v_quad_nvfp4(r[2 * hc], load_vec<__half2>(&s0_u), load_vec<__half2>(&s1_u), b0);
+                        decode_v_quad_nvfp4(r[2 * hc + 1], load_vec<__half2>(&s8_u), load_vec<__half2>(&s9_u), b1);
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             float* dst = o[2 * chunk + (u >> 1)][u & 1];
-                            mma_f16(dst[0], dst[1], dst[2], dst[3], pa[0], pa[1], pa[2], pa[3], b0[u], b1[u]);
+                            qsa_mma<false>(dst, pa, b0[u], b1[u]);
                         }
                     }
                 }
             } else {
-                pv.template operator()<0, 32>(v_s, 2 * kD);
+                constexpr int Fp16Chunks = SplitD ? 16 : 32;
+                pv.template operator()<0, Fp16Chunks>(v_s, S::VHalfBytes);
             }
         }
     };
@@ -851,20 +999,20 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
     // With 128-byte rows (NVFP4 keys) the second addressing, commit-group and wait per tile measured
     // 3.5-5 % slower than the combined gather, so `Stage::SplitGather` keeps one group for it.
     if constexpr (Stages == 1 && S::SplitGather) {
-        // Two CTAs per SM, one stage: the key half and the value half are separate commit groups, so a
+        // One stage per warp: the key half and the value half are separate commit groups, so a
         // tile's values stream in behind its QK MMA and online softmax and the next tile's keys behind
         // the PV MMA. Each half of the stage is refilled only after the phase that reads it is done (the
         // `__syncwarp` barriers), and `cp_wait<1>` leaves exactly the one group the other phase still
-        // needs in flight. The other warps (this CTA's and the other CTA's) hide what is left.
-        if (warp < tiles) { issue(warp, 0, std::integral_constant<int, kGatherKey>{}); }
-        for (int i = warp; i < tiles; i += Warps) {
+        // needs in flight. The other warps (this CTA's and the other CTAs') hide what is left.
+        if (kv_w < tiles) { issue(kv_w, 0, std::integral_constant<int, kGatherKey>{}); }
+        for (int i = kv_w; i < tiles; i += WarpsKV) {
             issue(i, 0, std::integral_constant<int, kGatherValue>{});
             cp_wait<1>();  // this tile's keys are staged; its values may still be streaming
             __syncwarp();
             const QkState qk = score_tile(i, 0);
             __syncwarp();  // every lane is done with the key rows before the next tile's overwrite
-            if (i + Warps < tiles) {
-                issue(i + Warps, 0, std::integral_constant<int, kGatherKey>{});
+            if (i + WarpsKV < tiles) {
+                issue(i + WarpsKV, 0, std::integral_constant<int, kGatherKey>{});
                 cp_wait<1>();  // this tile's values are staged; the next tile's keys may still stream
             } else {
                 cp_wait<0>();
@@ -874,9 +1022,9 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
             __syncwarp();  // the value rows are read out before the next tile's overwrite
         }
     } else if constexpr (Stages == 1) {
-        // Two CTAs per SM: the other warps hide each tile's gather, whose keys and values stay one
-        // commit group (see `Stage::SplitGather`).
-        for (int i = warp; i < tiles; i += Warps) {
+        // The other warps hide each tile's gather, whose keys and values stay one commit group (see
+        // `Stage::SplitGather`).
+        for (int i = kv_w; i < tiles; i += WarpsKV) {
             issue(i, 0, std::integral_constant<int, kGatherBoth>{});
             cp_wait<0>();
             __syncwarp();
@@ -887,10 +1035,10 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
         }
     } else {
         int s = 0;
-        if (warp < tiles) { issue(warp, 0, std::integral_constant<int, kGatherBoth>{}); }
-        for (int i = warp; i < tiles; i += Warps) {
-            if (i + Warps < tiles) {
-                issue(i + Warps, s ^ 1, std::integral_constant<int, kGatherBoth>{});
+        if (kv_w < tiles) { issue(kv_w, 0, std::integral_constant<int, kGatherBoth>{}); }
+        for (int i = kv_w; i < tiles; i += WarpsKV) {
+            if (i + WarpsKV < tiles) {
+                issue(i + WarpsKV, s ^ 1, std::integral_constant<int, kGatherBoth>{});
                 cp_wait<1>();
             } else {
                 cp_wait<0>();
@@ -905,48 +1053,50 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
     }
     cp_wait<0>();
 
-    // Merge the warps' rows in warp order: every warp publishes its (max, sum) per row, then the warps
-    // add their scaled unnormalized rows into one FP32 buffer in turn (fma per element in warp order,
-    // skipping a warp without keys for the row), and l the same way.
+    // Merge the KV warps' rows in warp order: every KV pair publishes its (max, sum) per row, then the
+    // KV pairs add their scaled unnormalized rows into one FP32 buffer in turn (both D halves writing
+    // disjoint slices in parallel when SplitD). Rows overlays dead q_s at offset 0.
     l0 += __shfl_xor_sync(FullMask, l0, 1);
     l0 += __shfl_xor_sync(FullMask, l0, 2);
     l1 += __shfl_xor_sync(FullMask, l1, 1);
     l1 += __shfl_xor_sync(FullMask, l1, 2);
     __syncthreads();
-    float* rows  = reinterpret_cast<float*>(smem + kQRow * kRows); // [kRows][kD]
-    float* stats = rows + kRows * kD;                               // [Warps][kRows][2]
-    if (lid == 0) {
-        stats[(warp * kRows + gid) * 2]         = m0;
-        stats[(warp * kRows + gid) * 2 + 1]     = l0;
-        stats[(warp * kRows + gid + 8) * 2]     = m1;
-        stats[(warp * kRows + gid + 8) * 2 + 1] = l1;
+    float* rows  = reinterpret_cast<float*>(smem); // [Rows][kD]
+    float* stats = rows + Rows * kD;               // [WarpsKV][Rows][2]
+    if (d_w == 0 && lid == 0) {
+        stats[(kv_w * Rows + gid) * 2]         = m0;
+        stats[(kv_w * Rows + gid) * 2 + 1]     = l0;
+        stats[(kv_w * Rows + gid + 8) * 2]     = m1;
+        stats[(kv_w * Rows + gid + 8) * 2 + 1] = l1;
     }
     __syncthreads();
     const auto row_max = [&](int row) {
         float m = -CUDART_INF_F;
 #pragma unroll
-        for (int w = 0; w < Warps; ++w) { m = fmaxf(m, stats[(w * kRows + row) * 2]); }
+        for (int w = 0; w < WarpsKV; ++w) { m = fmaxf(m, stats[(w * Rows + row) * 2]); }
         return m;
     };
     const float f0 = m0 == -CUDART_INF_F ? 0.0f : exp2_approx((m0 - row_max(gid)) * scale_l2);
     const float f1 = m1 == -CUDART_INF_F ? 0.0f : exp2_approx((m1 - row_max(gid + 8)) * scale_l2);
-    for (int w = 0; w < Warps; ++w) {
-        if (warp == w) {
+#pragma unroll 1
+    for (int kw = 0; kw < WarpsKV; ++kw) {
+        if (kv_w == kw) {
 #pragma unroll
-            for (int b = 0; b < 16; ++b) {
+            for (int b = 0; b < HalfBlocks; ++b) {
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         const int upper = j >> 1;
                         const int row   = gid + 8 * upper;
-                        const int d     = Shape::Value == Code::Nvfp4
-                                              ? 32 * (b >> 1) + 8 * lid + 4 * (j & 1) + 2 * (b & 1) + h
-                                              : (S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h
-                                                                  : 16 * b + 8 * h + 2 * lid + (j & 1));
+                        const int d     = (SplitD ? 128 * d_w : 0) +
+                                          (Shape::Value == Code::Nvfp4
+                                               ? 32 * (b >> 1) + 8 * lid + 4 * (j & 1) + 2 * (b & 1) + h
+                                               : (S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h
+                                                                   : 16 * b + 8 * h + 2 * lid + (j & 1)));
                         const bool live = (upper ? m1 : m0) != -CUDART_INF_F;
                         float& a        = rows[row * kD + d];
-                        if (w == 0) {
+                        if (kw == 0) {
                             a = live ? __fmaf_rn(upper ? f1 : f0, o[b][h][j], 0.0f) : 0.0f;
                         } else if (live) {
                             a = __fmaf_rn(upper ? f1 : f0, o[b][h][j], a);
@@ -962,10 +1112,10 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32,
         const float m = row_max(row);
         float l       = 0.0f;
 #pragma unroll
-        for (int w = 0; w < Warps; ++w) {
-            const float mw = stats[(w * kRows + row) * 2];
+        for (int w = 0; w < WarpsKV; ++w) {
+            const float mw = stats[(w * Rows + row) * 2];
             if (mw == -CUDART_INF_F) { continue; }
-            l = __fmaf_rn(exp2_approx((mw - m) * scale_l2), stats[(w * kRows + row) * 2 + 1], l);
+            l = __fmaf_rn(exp2_approx((mw - m) * scale_l2), stats[(w * Rows + row) * 2 + 1], l);
         }
         const float value = l > 0.0f ? rows[row * kD + d] / l : 0.0f;
         if constexpr (S::RotatedValues) {
@@ -995,19 +1145,24 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("qsa prompt: ") + message); }
 }
 
-template <KvCacheStorage Storage>
-void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
-            const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
-            const QsaVqWindow& vq) {
+template <KvCacheStorage Storage, bool SplitD>
+void launch_split(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
+                  const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
+                  const QsaVqWindow& vq, int stages_choice) {
     const auto run = [&]<int Stages>() {
-        constexpr int bytes = prompt_smem_bytes<Storage, Stages>();
+        constexpr int bytes = prompt_smem_bytes<Storage, Stages, SplitD>();
         static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
-        static const cudaError_t configured = cudaFuncSetAttribute(
-            qsa_prompt_kernel<Storage, Stages>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        static const cudaError_t configured = [&] {
+            const cudaError_t e1 = cudaFuncSetAttribute(
+                qsa_prompt_kernel<Storage, Stages, SplitD>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+            if (e1 != cudaSuccess) { return e1; }
+            return cudaFuncSetAttribute(qsa_prompt_kernel<Storage, Stages, SplitD>,
+                                        cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        }();
         require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
         const int columns = q.ne[2];
         const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
-        qsa_prompt_kernel<Storage, Stages><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(
+        qsa_prompt_kernel<Storage, Stages, SplitD><<<grid, prompt_warps<Storage, SplitD>() * 32, bytes, stream>>>(
             static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
             layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
             static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
@@ -1015,10 +1170,19 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
             static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
             g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
     };
-    // One stage where two CTAs fit an SM only at Stages = 1 and the call fills a wave: the second CTA's
-    // warps hide each tile's gather better than a second stage does (26-41 % faster at 86-512 columns,
-    // design §19.3.15). Storages where two CTAs already fit at Stages = 2 (e.g. Nvfp4Group16: 45 KiB/CTA)
-    // keep both 2 CTAs/SM and double-buffered Stages = 2.
+    if (stages_choice == 1) {
+        run.template operator()<1>();
+    } else {
+        run.template operator()<2>();
+    }
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa prompt attention: ") + cudaGetErrorString(error)); }
+}
+
+template <KvCacheStorage Storage>
+void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
+            const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
+            const QsaVqWindow& vq) {
     static const int sms = [] {
         int device = 0, count = 0;
         if (cudaGetDevice(&device) != cudaSuccess ||
@@ -1027,17 +1191,34 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
         }
         return count;
     }();
-    // GB10: the split stage (upstream qsa_prompt_split) was removed with the one-stage gather
-    // rewrite; the combined gather below is the only route.
-    constexpr bool two_ctas_1 = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
-    constexpr bool two_ctas_2 = 2 * (prompt_smem_bytes<Storage, 2>() + 1024) <= 100 * 1024;
-    if (!two_ctas_2 && two_ctas_1 && q.ne[2] * g.kv_heads >= sms) {
-        run.template operator()<1>();
-    } else {
-        run.template operator()<2>();
+    const int forced = qsa_prompt_forced();
+    const bool use_split_d = [&] {
+        if constexpr (PromptShape<Storage>::Vq > 0) {
+            return false;
+        } else if (forced >= 0) {
+            return forced != 0;
+        } else {
+            return qsa_prompt_split(Storage) && (Storage == KvCacheStorage::BFloat16 || q.ne[2] * g.kv_heads >= sms);
+        }
+    }();
+    const auto pick_stages = [&]<bool SplitD>() {
+        constexpr int blocks_1 = prompt_launch_min_blocks<Storage, 1, SplitD>();
+        constexpr int blocks_2 = prompt_launch_min_blocks<Storage, 2, SplitD>();
+        if constexpr (PromptShape<Storage>::Vq > 0) {
+            if (forced == 0) { return 2; }
+            if (forced == 1) { return 1; }
+        }
+        return (blocks_1 > blocks_2 && q.ne[2] * g.kv_heads > blocks_2 * sms) ? 1 : 2;
+    };
+    if constexpr (PromptShape<Storage>::Vq == 0) {
+        if (use_split_d) {
+            launch_split<Storage, true>(q, layer, batch, g, scale, selected, counts, out, stream, vq,
+                                        pick_stages.template operator()<true>());
+            return;
+        }
     }
-    const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa prompt attention: ") + cudaGetErrorString(error)); }
+    launch_split<Storage, false>(q, layer, batch, g, scale, selected, counts, out, stream, vq,
+                                 pick_stages.template operator()<false>());
 }
 
 } // namespace
@@ -1099,7 +1280,7 @@ std::atomic<int>& forced_variant() {
 bool qsa_prompt_split(KvCacheStorage storage) {
     const int forced = forced_variant().load(std::memory_order_relaxed);
     if (forced >= 0) { return forced != 0; }
-    return storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Fp8E4M3Row256;
+    return storage != KvCacheStorage::Vq2 && storage != KvCacheStorage::Q4KeyVq2Value;
 }
 
 void qsa_prompt_force(int variant) {

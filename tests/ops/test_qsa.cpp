@@ -1209,20 +1209,28 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
     synchronize("attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " " + c.name;
-    // The prompt kernel's split stage and its combined gather give the same bits (calls off the one-stage
-    // prompt route run the same kernel either way).
-    {
-        const OtherPromptVariant other(storage);
+    const bool is_vq      = storage == KvCacheStorage::Vq2 || storage == KvCacheStorage::Q4KeyVq2Value;
+    // The prompt kernel's alternate variant: VQ storages keep identical reduction bits between
+    // Stages=1 and Stages=2; SplitD changes FP32 reduction order and is qualified directly against the
+    // FP64 oracle below alongside the default variant.
+    const auto other_got = [&] {
+        const int was = ops::detail::qsa_prompt_forced();
+        // Exercise both SplitD (1) and !SplitD (0) even on narrow shapes where default falls back to !SplitD.
+        ops::detail::qsa_prompt_force((!is_vq && columns * kKvHeads < 48) ? 1 : (ops::detail::qsa_prompt_split(storage) ? 0 : 1));
         DeviceBuffer dother(static_cast<std::size_t>(kD) * kHeads * columns * 2);
         Tensor other_out(dother.p, DType::BF16, {kD, kHeads, columns});
         ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
                            Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), layer, batch, kGeometry,
                            1.0F / 16.0F, max_context, workspace.p, workspace_bytes, other_out, nullptr);
         synchronize("attention, other prompt variant");
+        ops::detail::qsa_prompt_force(was);
         const std::size_t n = static_cast<std::size_t>(kD) * kHeads * columns;
-        expect(download<std::uint16_t>(dother, n) == download<std::uint16_t>(dout, n),
-               tag + ": the prompt kernel's split stage and combined gather give the same bits");
-    }
+        if (is_vq) {
+            expect(download<std::uint16_t>(dother, n) == download<std::uint16_t>(dout, n),
+                   tag + ": the prompt kernel's split stage and combined gather give the same bits");
+        }
+        return t::from_device_bf16(dother, n);
+    }();
     // Width invariance inside the unsplit class: the row's last 100 columns as a call of their own
     // (also unsplit) give the same bits; the prefix cache resumes rely on it.
     if (rows == 1 && width >= 186) {
@@ -1351,18 +1359,24 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         moved_batch.block_tables  = Tensor(dmoved.p, DType::I32, {pages_per_row, rows});
         DeviceBuffer dspaced(static_cast<std::size_t>(kD) * kHeads * columns * 2);
         Tensor spaced_out(dspaced.p, DType::BF16, {kD, kHeads, columns});
-        // Both prompt variants: the split stage's gathers translate the page spaces too.
+        // Both prompt variants: host and lent page spaces match the pool's bits on each variant.
         for (const bool other_variant : {false, true}) {
-            std::optional<OtherPromptVariant> other;
-            if (other_variant) { other.emplace(storage); }
+            const int was = ops::detail::qsa_prompt_forced();
+            if (other_variant) {
+                ops::detail::qsa_prompt_force((!is_vq && columns * kKvHeads < 48)
+                                                  ? 1
+                                                  : (ops::detail::qsa_prompt_split(storage) ? 0 : 1));
+            }
             ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
                                Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), spaced, moved_batch,
                                kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, spaced_out,
                                nullptr);
             synchronize("attention over page spaces");
+            if (other_variant) { ops::detail::qsa_prompt_force(was); }
             const auto spaced_got = t::from_device_bf16(dspaced, static_cast<std::size_t>(kD) * kHeads * columns);
-            expect(spaced_got == got, tag + ": pages in host and lent spaces give the pool's bits" +
-                                          (other_variant ? " (other prompt variant)" : ""));
+            expect(spaced_got == (other_variant ? other_got : got),
+                   tag + ": pages in host and lent spaces give the pool's bits" +
+                       (other_variant ? " (other prompt variant)" : ""));
         }
         cudaFreeHost(host_mem);
     }
@@ -1412,6 +1426,9 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
             });
     }
     g_failures += t::verify_reduction(tag, got, ref, kAttentionCriterion);
+    if (!is_vq) {
+        g_failures += t::verify_reduction(tag + " (other prompt variant)", other_got, ref, kAttentionCriterion);
+    }
 }
 
 // The prompt kernel's split stage against its combined gather,
@@ -1481,21 +1498,34 @@ void test_prompt_variants(KvCacheStorage storage, int start, std::uint32_t seed)
         return download<std::uint16_t>(dout, elements);
     };
     const auto combined = run(false), split = run(true);
-    std::size_t first_difference = elements;
-    for (std::size_t i = 0; i < elements && first_difference == elements; ++i) {
-        if (combined[i] != split[i]) { first_difference = i; }
-    }
-    const bool finite = std::all_of(combined.begin(), combined.end(),
-                                    [](std::uint16_t h) { return (h & 0x7f80U) != 0x7f80U; });
+    const bool finite_c = std::all_of(combined.begin(), combined.end(),
+                                      [](std::uint16_t h) { return (h & 0x7f80U) != 0x7f80U; });
+    const bool finite_s = std::all_of(split.begin(), split.end(),
+                                      [](std::uint16_t h) { return (h & 0x7f80U) != 0x7f80U; });
     const std::string tag = std::string("qsa_attention ") + storage_name(storage) + " prompt W=4096 from " +
                             std::to_string(start);
-    expect(finite, tag + ": finite output");
-    expect(first_difference == elements,
-           tag + ": the split stage gives the combined gather's bits" +
-               (first_difference == elements
-                    ? std::string()
-                    : " (first difference at column " + std::to_string(first_difference / (kD * kHeads)) +
-                          ", head " + std::to_string(first_difference / kD % kHeads) + ")"));
+    expect(finite_c && finite_s, tag + ": finite output");
+    if (storage == KvCacheStorage::Vq2 || storage == KvCacheStorage::Q4KeyVq2Value) {
+        std::size_t first_difference = elements;
+        for (std::size_t i = 0; i < elements && first_difference == elements; ++i) {
+            if (combined[i] != split[i]) { first_difference = i; }
+        }
+        expect(first_difference == elements,
+               tag + ": the split stage gives the combined gather's bits" +
+                   (first_difference == elements
+                        ? std::string()
+                        : " (first difference at column " + std::to_string(first_difference / (kD * kHeads)) +
+                              ", head " + std::to_string(first_difference / kD % kHeads) + ")"));
+    } else {
+        std::vector<double> combined_f64(elements);
+        std::vector<double> split_f64(elements);
+        for (std::size_t i = 0; i < elements; ++i) {
+            combined_f64[i] = from_bf16(combined[i]);
+            split_f64[i]    = from_bf16(split[i]);
+        }
+        g_failures += t::verify_reduction(tag + ": split-D within attention tolerance", combined_f64, split_f64,
+                                          kAttentionCriterion);
+    }
 }
 
 // ----------------------------------------------------------------------------------- prepare

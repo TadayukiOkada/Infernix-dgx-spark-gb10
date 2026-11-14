@@ -27,24 +27,64 @@ __device__ __forceinline__ std::int64_t nvfp4_tiled_scale_offset(int token, int 
            (group - group_tile * kGroupsPerTile);
 }
 
-// Four consecutive lanes (lane & 3 = 0..3) quantize four consecutive 16-element K-groups of the
-// same token and same 16-group scale tile while keeping 16-byte BF16 input loads and 8-byte FP4
-// code stores contiguous across the warp. In both RowMajor and Tiled128/Tiled256 layouts those
-// four scale bytes occupy a 4-byte-aligned word, so packing them across the four lanes via warp
-// shuffle emits a single coalesced uint32_t store per quad.
+// Four consecutive logical K-groups share a 4-byte-aligned quad of scale bytes in both RowMajor
+// and Tiled128/Tiled256 layouts. Under natural thread order (`EvenOddWarp == false`), lanes
+// (lane & 3 = 0..3) hold groups 0..3; under warp-coalesced 512B BF16 loading (`EvenOddWarp ==
+// true`), even lanes (0,2,4,6) hold groups 0..3 and odd lanes (1,3,5,7) hold groups 16..19.
+template <bool EvenOddWarp = false>
 __device__ __forceinline__ void store_nvfp4_scale_quad(std::uint8_t* scales,
                                                        std::int64_t scale_offset,
                                                        std::uint8_t scale, int tid) {
-    std::uint32_t word = static_cast<std::uint32_t>(scale);
-    word |= __shfl_down_sync(0xFFFFFFFFU, word, 1, 4) << 8;
-    word |= __shfl_down_sync(0xFFFFFFFFU, word, 2, 4) << 16;
-    if ((tid & 3) == 0) {
+    constexpr int kWidth = EvenOddWarp ? 8 : 4;
+    constexpr int kStep1 = EvenOddWarp ? 2 : 1;
+    constexpr int kStep2 = EvenOddWarp ? 4 : 2;
+    constexpr int kMask  = EvenOddWarp ? 6 : 3;
+    std::uint32_t word   = static_cast<std::uint32_t>(scale);
+    word |= __shfl_down_sync(0xFFFFFFFFU, word, kStep1, kWidth) << 8;
+    word |= __shfl_down_sync(0xFFFFFFFFU, word, kStep2, kWidth) << 16;
+    if ((tid & kMask) == 0) {
         store_vec(scales + scale_offset, word);
     }
 }
 
+__device__ __forceinline__ void load_nvfp4_warp_coalesced_k16(const __nv_bfloat16* warp_in,
+                                                              int lane, uint4& p0, uint4& p1) {
+    // Issue two coalesced 512B warp loads across 32 consecutive K16 groups, then exchange one
+    // uint4 with lane ^ 1 so even lanes (2*j) hold group j and odd lanes (2*j + 1) hold 16 + j.
+    const uint4 lo   = load_vec<uint4>(warp_in + lane * 8);
+    const uint4 hi   = load_vec<uint4>(warp_in + 256 + lane * 8);
+    const uint4 send = (lane & 1) ? lo : hi;
+    const uint4 recv = make_uint4(__shfl_xor_sync(0xFFFFFFFFU, send.x, 1),
+                                  __shfl_xor_sync(0xFFFFFFFFU, send.y, 1),
+                                  __shfl_xor_sync(0xFFFFFFFFU, send.z, 1),
+                                  __shfl_xor_sync(0xFFFFFFFFU, send.w, 1));
+    p0               = (lane & 1) ? recv : lo;
+    p1               = (lane & 1) ? hi : recv;
+}
+
+__device__ __forceinline__ __nv_bfloat162 nvfp4_bf16x2_abs(std::uint32_t bits) {
+    union {
+        std::uint32_t raw;
+        __nv_bfloat162 pair;
+    } u{bits & 0x7FFF7FFFU};
+    return u.pair;
+}
+
+__device__ __forceinline__ void nvfp4_update_amax_bf16x2(const uint4 p0, const uint4 p1,
+                                                          __nv_bfloat162& amax2) {
+    const __nv_bfloat162 m0 =
+        __hmax2_nan(nvfp4_bf16x2_abs(p0.x), nvfp4_bf16x2_abs(p0.y));
+    const __nv_bfloat162 m1 =
+        __hmax2_nan(nvfp4_bf16x2_abs(p0.z), nvfp4_bf16x2_abs(p0.w));
+    const __nv_bfloat162 m2 =
+        __hmax2_nan(nvfp4_bf16x2_abs(p1.x), nvfp4_bf16x2_abs(p1.y));
+    const __nv_bfloat162 m3 =
+        __hmax2_nan(nvfp4_bf16x2_abs(p1.z), nvfp4_bf16x2_abs(p1.w));
+    amax2 = __hmax2_nan(amax2, __hmax2_nan(__hmax2_nan(m0, m1), __hmax2_nan(m2, m3)));
+}
+
 template <class Geometry, int Threads, Nvfp4ScaleLayout Layout, bool Reciprocal = false>
-__global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kernel(
+__global__ __launch_bounds__(Threads, 1024 / Threads) void nvfp4_a4_quantize_kernel(
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, std::int32_t written_tokens,
     float input_scale_divisor) {
@@ -56,12 +96,13 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     static_assert(Layout == Nvfp4ScaleLayout::RowMajor ||
                   (Geometry::kInputRows / 16) % kNvfp4ScaleTileGroups == 0);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
-    const int tid               = static_cast<int>(threadIdx.x);
-    const int total_blocks      = static_cast<int>(gridDim.x);
-    const int bid               = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
-                                                     : static_cast<int>(blockIdx.x);
-    const int task              = bid * static_cast<int>(blockDim.x) + tid;
-    const int tasks             = tokens * kGroupsPerRow;
+    constexpr bool kWarpRowAligned = (kGroupsPerRow % 32) == 0;
+    const int tid                  = static_cast<int>(threadIdx.x);
+    const int total_blocks         = static_cast<int>(gridDim.x);
+    const int bid                  = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
+                                                        : static_cast<int>(blockIdx.x);
+    const int task                 = bid * static_cast<int>(blockDim.x) + tid;
+    const int tasks                = tokens * kGroupsPerRow;
     if (task >= tasks) {
         // The tiled plane is addressed in whole tiles, so the launch covers the padding of the last
         // one. A padded token owns no input and no code byte, only the scale the consumer's tile
@@ -79,11 +120,28 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
         return;
     }
 
-    const int token                   = task / kGroupsPerRow;
-    const int group                   = task - token * kGroupsPerRow;
-    const Nvfp4QuantizedK16 quantized = quantize_nvfp4_k16<Reciprocal>(
-        input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
-        input_scale_divisor);
+    int token = 0;
+    int group = 0;
+    Nvfp4QuantizedK16 quantized;
+    if constexpr (kWarpRowAligned) {
+        const int lane       = tid & 31;
+        const int warp_task  = bid * static_cast<int>(blockDim.x) + (tid & ~31);
+        token                = warp_task / kGroupsPerRow;
+        const int base_group = warp_task - token * kGroupsPerRow;
+        uint4 p0{};
+        uint4 p1{};
+        load_nvfp4_warp_coalesced_k16(
+            input + static_cast<std::int64_t>(token) * Geometry::kInputRows + base_group * 16, lane,
+            p0, p1);
+        group     = base_group + (lane >> 1) + ((lane & 1) ? 16 : 0);
+        quantized = quantize_nvfp4_k16_packed<Reciprocal>(p0, p1, input_scale_divisor);
+    } else {
+        token     = task / kGroupsPerRow;
+        group     = task - token * kGroupsPerRow;
+        quantized = quantize_nvfp4_k16<Reciprocal>(
+            input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
+            input_scale_divisor);
+    }
     auto* code_destination =
         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
     store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
@@ -91,25 +149,27 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
         scale_offset = nvfp4_tiled_scale_offset<Geometry, Layout>(token, group);
     }
-    store_nvfp4_scale_quad(scales, scale_offset, quantized.scale, tid);
+    store_nvfp4_scale_quad<kWarpRowAligned>(scales, scale_offset, quantized.scale, tid);
 }
 
 // The A4 residual profile's planes (quantize_nvfp4_terms_k16), each laid out like the A4 plane: codes
 // row-major, scales row-major or tiled (the TMA route, padding zeroed as for one plane).
 template <class Geometry, int Threads, int Terms,
           Nvfp4ScaleLayout Layout = Nvfp4ScaleLayout::RowMajor>
-__global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quantize_kernel(
+__global__ __launch_bounds__(Threads, 1024 / Threads) void nvfp4_a4_residual_quantize_kernel(
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, std::int32_t written_tokens,
     float input_scale_divisor, std::int64_t code_plane, std::int64_t scale_plane) {
     pdl::enter();
+    static_assert(Threads % 32 == 0);
     static_assert((Geometry::kInputRows / 16) % 4 == 0);
-    constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
-    const int tid               = static_cast<int>(threadIdx.x);
-    const int total_blocks      = static_cast<int>(gridDim.x);
-    const int bid               = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
-                                                     : static_cast<int>(blockIdx.x);
-    const int task              = bid * static_cast<int>(blockDim.x) + tid;
+    constexpr int kGroupsPerRow    = Geometry::kInputRows / 16;
+    constexpr bool kWarpRowAligned = (kGroupsPerRow % 32) == 0;
+    const int tid                  = static_cast<int>(threadIdx.x);
+    const int total_blocks         = static_cast<int>(gridDim.x);
+    const int bid                  = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
+                                                        : static_cast<int>(blockIdx.x);
+    const int task                 = bid * static_cast<int>(blockDim.x) + tid;
     if (task >= tokens * kGroupsPerRow) {
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
             const int pad_token = task / kGroupsPerRow;
@@ -125,12 +185,28 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quan
         }
         return;
     }
-    const int token = task / kGroupsPerRow;
-    const int group = task - token * kGroupsPerRow;
+    int token = 0;
+    int group = 0;
     Nvfp4QuantizedK16 terms[Terms];
-    quantize_nvfp4_terms_k16<Terms>(
-        input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
-        input_scale_divisor, terms);
+    if constexpr (kWarpRowAligned) {
+        const int lane       = tid & 31;
+        const int warp_task  = bid * static_cast<int>(blockDim.x) + (tid & ~31);
+        token                = warp_task / kGroupsPerRow;
+        const int base_group = warp_task - token * kGroupsPerRow;
+        uint4 p0{};
+        uint4 p1{};
+        load_nvfp4_warp_coalesced_k16(
+            input + static_cast<std::int64_t>(token) * Geometry::kInputRows + base_group * 16, lane,
+            p0, p1);
+        group = base_group + (lane >> 1) + ((lane & 1) ? 16 : 0);
+        quantize_nvfp4_terms_k16_packed<Terms>(p0, p1, input_scale_divisor, terms);
+    } else {
+        token = task / kGroupsPerRow;
+        group = task - token * kGroupsPerRow;
+        quantize_nvfp4_terms_k16<Terms>(
+            input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
+            input_scale_divisor, terms);
+    }
     const std::int64_t code_offset =
         static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
     std::int64_t scale_offset = static_cast<std::int64_t>(token) * kGroupsPerRow + group;
@@ -141,7 +217,8 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quan
     for (int term = 0; term < Terms; ++term) {
         store_vec(codes + term * code_plane + code_offset,
                   make_uint2(terms[term].codes_lo, terms[term].codes_hi));
-        store_nvfp4_scale_quad(scales + term * scale_plane, scale_offset, terms[term].scale, tid);
+        store_nvfp4_scale_quad<kWarpRowAligned>(scales + term * scale_plane, scale_offset,
+                                                terms[term].scale, tid);
     }
 }
 
@@ -166,11 +243,12 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
                                              std::int64_t scale_plane) {
     static_assert(Threads % 32 == 0 && Threads <= 512);
     static_assert((Geometry::kInputRows / 16) % 4 == 0);
-    constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
-    constexpr int kWarps        = Threads / 32;
-    constexpr bool kExactGroups = (kGroupsPerRow % Threads) == 0;
-    constexpr int kMaxGroups    = (kGroupsPerRow + Threads - 1) / Threads;
-    constexpr bool kCacheGroups = kMaxGroups <= kNvfp4A4RowScaledCachedGroups;
+    constexpr int kGroupsPerRow    = Geometry::kInputRows / 16;
+    constexpr bool kWarpRowAligned = (kGroupsPerRow % 32) == 0;
+    constexpr int kWarps           = Threads / 32;
+    constexpr bool kExactGroups    = (kGroupsPerRow % Threads) == 0;
+    constexpr int kMaxGroups       = (kGroupsPerRow + Threads - 1) / Threads;
+    constexpr bool kCacheGroups    = kMaxGroups <= kNvfp4A4RowScaledCachedGroups;
     __shared__ float warp_maxima[kWarps];
 
     pdl::enter();
@@ -180,6 +258,7 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
     const int token = total_blocks > 256 ? (total_blocks - 1 - static_cast<int>(blockIdx.x))
                                          : static_cast<int>(blockIdx.x);
     const int tid   = static_cast<int>(threadIdx.x);
+    const int lane  = tid & 31;
     if (token >= tokens) {
         if constexpr (Layout != Nvfp4ScaleLayout::RowMajor) {
             for (int group = tid * 4; group < kGroupsPerRow; group += Threads * 4) {
@@ -197,34 +276,49 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
     const __nv_bfloat16* row_in = input + static_cast<std::int64_t>(token) * Geometry::kInputRows;
     uint4 cached_p0[kCacheGroups ? kMaxGroups : 1];
     uint4 cached_p1[kCacheGroups ? kMaxGroups : 1];
-    float amax = 0.0F;
+    __nv_bfloat162 amax2 = nvfp4_bf16x2_abs(0U);
 #pragma unroll
     for (int iter = 0; iter < kMaxGroups; ++iter) {
-        const int group = tid + iter * Threads;
-        if (kExactGroups || group < kGroupsPerRow) {
-            const uint4 p0 = load_vec<uint4>(row_in + group * 16);
-            const uint4 p1 = load_vec<uint4>(row_in + group * 16 + 8);
-            if constexpr (kCacheGroups) {
-                cached_p0[iter] = p0;
-                cached_p1[iter] = p1;
+        if constexpr (kWarpRowAligned) {
+            const int base_group = iter * Threads + (tid & ~31);
+            if (kExactGroups || base_group < kGroupsPerRow) {
+                uint4 p0{};
+                uint4 p1{};
+                load_nvfp4_warp_coalesced_k16(row_in + base_group * 16, lane, p0, p1);
+                if constexpr (kCacheGroups) {
+                    cached_p0[iter] = p0;
+                    cached_p1[iter] = p1;
+                }
+                nvfp4_update_amax_bf16x2(p0, p1, amax2);
             }
-            const std::uint32_t words[8]{p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
-#pragma unroll
-            for (int pair = 0; pair < 8; ++pair) {
-                const float2 v = bf16x2_bits_to_float2(words[pair]);
-                const float a  = fabsf(v.x);
-                const float b  = fabsf(v.y);
-                amax           = (a > amax || a != a) ? a : amax;
-                amax           = (b > amax || b != b) ? b : amax;
+        } else {
+            const int group = tid + iter * Threads;
+            if (kExactGroups || group < kGroupsPerRow) {
+                const uint4 p0 = load_vec<uint4>(row_in + group * 16);
+                const uint4 p1 = load_vec<uint4>(row_in + group * 16 + 8);
+                if constexpr (kCacheGroups) {
+                    cached_p0[iter] = p0;
+                    cached_p1[iter] = p1;
+                }
+                nvfp4_update_amax_bf16x2(p0, p1, amax2);
             }
         }
     }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
-        amax              = (other > amax || other != other) ? other : amax;
+        union {
+            std::uint32_t raw;
+            __nv_bfloat162 pair;
+        } u;
+        u.pair = amax2;
+        u.raw  = __shfl_xor_sync(0xFFFFFFFFU, u.raw, offset);
+        amax2  = __hmax2_nan(amax2, u.pair);
     }
-    if ((tid & 31) == 0) { warp_maxima[tid >> 5] = amax; }
+    if (lane == 0) {
+        const float2 amax_f2  = __bfloat1622float2(amax2);
+        warp_maxima[tid >> 5] = (amax_f2.x > amax_f2.y || amax_f2.x != amax_f2.x) ? amax_f2.x
+                                                                                  : amax_f2.y;
+    }
     __syncthreads();
     float all = 0.0F;
 #pragma unroll
@@ -238,12 +332,21 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
     const float divisor = (rs > 0.0F && isfinite(rs)) ? (1.0F / rs) : 0.0F;
 #pragma unroll
     for (int iter = 0; iter < kMaxGroups; ++iter) {
-        const int group = tid + iter * Threads;
-        if (kExactGroups || group < kGroupsPerRow) {
+        const int base_group = iter * Threads + (tid & ~31);
+        const bool active    = kWarpRowAligned ? (kExactGroups || base_group < kGroupsPerRow)
+                                               : (kExactGroups || (tid + iter * Threads) < kGroupsPerRow);
+        if (active) {
+            const int group = kWarpRowAligned ? (base_group + (lane >> 1) + ((lane & 1) ? 16 : 0))
+                                              : (tid + iter * Threads);
             Nvfp4QuantizedK16 terms[Terms];
             if constexpr (kCacheGroups) {
                 quantize_nvfp4_terms_k16_packed<Terms, true>(cached_p0[iter], cached_p1[iter],
                                                              divisor, terms);
+            } else if constexpr (kWarpRowAligned) {
+                uint4 p0{};
+                uint4 p1{};
+                load_nvfp4_warp_coalesced_k16(row_in + base_group * 16, lane, p0, p1);
+                quantize_nvfp4_terms_k16_packed<Terms, true>(p0, p1, divisor, terms);
             } else {
                 quantize_nvfp4_terms_k16<Terms, true>(row_in + group * 16, divisor, terms);
             }
@@ -257,8 +360,8 @@ nvfp4_a4_row_scaled_residual_quantize_kernel(const __nv_bfloat16* __restrict__ i
             for (int term = 0; term < Terms; ++term) {
                 store_vec(codes + term * code_plane + code_offset,
                           make_uint2(terms[term].codes_lo, terms[term].codes_hi));
-                store_nvfp4_scale_quad(scales + term * scale_plane, scale_offset,
-                                       terms[term].scale, tid);
+                store_nvfp4_scale_quad<kWarpRowAligned>(scales + term * scale_plane, scale_offset,
+                                                        terms[term].scale, tid);
             }
         }
     }

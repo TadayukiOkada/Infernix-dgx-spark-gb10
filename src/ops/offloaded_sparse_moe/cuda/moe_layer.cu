@@ -14,6 +14,7 @@
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "core/temporary_switches.h"
+#include "infernix/ops/hyper_connection.h"
 
 #include "ops/common/canonical_math.h"
 #include "ops/common/mbarrier.cuh"
@@ -973,6 +974,7 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, const ActCodes
     std::int64_t lo[Groups], hi[Groups];
 #pragma unroll
     for (int g = 0; g < Groups; ++g) { lo[g] = hi[g] = 0; }
+#pragma unroll 1
     for (int b = warp; b < blocks; b += kWarps) {
         const ActCodes& a = acts[b];
         std::uint32_t act_word;
@@ -1024,6 +1026,7 @@ __device__ void unit_sums_pair(const std::uint8_t* matrix, int blocks, const Act
     std::int64_t lo0[Groups], hi0[Groups], lo1[Groups], hi1[Groups];
 #pragma unroll
     for (int g = 0; g < Groups; ++g) { lo0[g] = hi0[g] = lo1[g] = hi1[g] = 0; }
+#pragma unroll 1
     for (int b = warp; b < blocks; b += kWarps) {
         const ActCodes& a            = acts[b];
         const std::uint32_t packed   = a.dup[q];
@@ -1090,7 +1093,7 @@ __device__ __forceinline__ void unit_sums_split_pair_half(const std::uint8_t* ma
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int q = lane >> 3, i = lane & 7;
     const ActCodes* const parity_acts = acts + (i & 1);
-#pragma unroll
+#pragma unroll 1
     for (int m = 0; m < BLen / kWarps; ++m) {
         const int db               = warp + kWarps * m;
         const int b                = B0 + db;
@@ -1497,20 +1500,371 @@ __device__ __forceinline__ void unit_sums_quad_half(const std::uint8_t* matrix, 
     }
 }
 
+// Hardware m16n8k16 int8->int32 MMA and fast nibble-to-s8 unpacking for exact W4A4 prefill.
+__device__ __forceinline__ void mma_s8s8_k16(int& d0, int& d1, int& d2, int& d3, std::uint32_t a0, std::uint32_t a1,
+                                             std::uint32_t b0) {
+    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+        : "r"(a0), "r"(a1), "r"(b0));
+}
+
+__device__ __forceinline__ std::uint32_t e2m1x4_to_s8x4(std::uint32_t low_nibbles) {
+    const std::uint32_t m     = low_nibbles & 0x07070707U;
+    const std::uint32_t x     = (m | (m >> 4)) & 0x00770077U;
+    const std::uint32_t sel16 = (x | (x >> 8)) & 0xFFFFU;
+    const std::uint32_t pos   = __byte_perm(0x03020100U, 0x0C080604U, sel16);
+    const std::uint32_t neg   = __byte_perm(0xFDFEFF00U, 0xF4F8FAFCU, sel16);
+    const std::uint32_t b3    = (low_nibbles >> 3) & 0x01010101U;
+    const std::uint32_t mask  = b3 * 0xFFU;
+    return (pos & ~mask) | (neg & mask);
+}
+
+constexpr int kGateUpStageBlocks     = 16; // 10 chunks of 16 blocks = 4 blocks per warp per stage; closed under plane_block
+constexpr int kGateUpChunks          = moe::kGateUpBlocks / kGateUpStageBlocks; // 10
+constexpr int kGateUpChunkGroupBytes = kGateUpStageBlocks * static_cast<int>(moe::kUnitBytes); // 2,304
+constexpr int kGateUpChunkBytes      = kGateUpGroups * kGateUpChunkGroupBytes;               // 4,608
+
+constexpr int kDownStageBlocks     = 8; // 5 chunks of 8 blocks = 2 blocks per warp per stage
+constexpr int kDownChunks          = moe::kDownBlocks / kDownStageBlocks;                  // 5
+constexpr int kDownChunkGroupBytes = kDownStageBlocks * static_cast<int>(moe::kUnitBytes); // 1,152
+constexpr int kDownChunkBytes      = kDownGroups * kDownChunkGroupBytes;                   // 4,608
+
+constexpr int kPackedHCodeBytes  = moe::kHBlocks * 8;                    // 320
+constexpr int kPackedHScaleBytes = ((moe::kHBlocks + 15) / 16) * 16;     // 48
+constexpr int kPackedHRowBytes   = kPackedHCodeBytes + kPackedHScaleBytes; // 368
+static_assert(kPackedHRowBytes <= moe::kHBlocks * static_cast<int>(sizeof(canon::A4Block)));
+static_assert(kGateUpChunkGroupBytes % 16 == 0 && kDownChunkGroupBytes % 16 == 0);
+static_assert(kGateUpStageBlocks % 4 == 0 && kGateUpStageBlocks % kWarps == 0);
+static_assert(kDownStageBlocks % kWarps == 0 && kDownChunks * kDownStageBlocks == moe::kDownBlocks);
+
+struct PackedHRow {
+    alignas(16) std::uint32_t codes[moe::kHBlocks][2];
+    alignas(16) std::uint8_t scales[kPackedHScaleBytes];
+};
+static_assert(sizeof(PackedHRow) == kPackedHRowBytes);
+
+__device__ __forceinline__ void quantize_packed_h_block_warp(std::uint16_t h_bf16, float input_scale,
+                                                              PackedHRow* dst, int slice) {
+    const int lane   = threadIdx.x & 31;
+    const float v    = lane < 16 ? canon::bf16_to_f32(h_bf16) : 0.0F;
+    float amax       = (v == v) ? canon::f32_from_bits(canon::f32_bits(v) & 0x7FFFFFFFU) : 0.0F;
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
+        amax              = other > amax ? other : amax;
+    }
+    std::uint8_t s;
+    std::int32_t scale_scaled;
+    float d, inv_d;
+    bool fast_inv;
+    canon::prepare_a4_scale_word(amax, input_scale, s, scale_scaled, d, inv_d, fast_inv);
+    std::uint32_t code = 0U;
+    if (lane < 16 && scale_scaled != 0) {
+        const float q = scaled_q_value(v, d, inv_d, fast_inv);
+        asm("{\n\t"
+            ".reg .b8 b;\n\t"
+            "cvt.rn.satfinite.e2m1x2.f32 b, %1, %1;\n\t"
+            "cvt.u32.u8 %0, b;\n\t"
+            "}"
+            : "=r"(code)
+            : "f"(q));
+        code &= 0xFU;
+        if ((code & 7U) == 0U) { code = 0U; }
+    }
+    std::uint32_t packed = code << (8 * (lane & 3));
+    packed |= __shfl_xor_sync(0xFFFFFFFFU, packed, 1);
+    packed |= __shfl_xor_sync(0xFFFFFFFFU, packed, 2);
+    const std::uint32_t w0 = __shfl_sync(0xFFFFFFFFU, packed, 0);
+    const std::uint32_t w1 = __shfl_sync(0xFFFFFFFFU, packed, 4);
+    const std::uint32_t w2 = __shfl_sync(0xFFFFFFFFU, packed, 8);
+    const std::uint32_t w3 = __shfl_sync(0xFFFFFFFFU, packed, 12);
+    if (lane == 0) {
+        *reinterpret_cast<uint2*>(&dst->codes[slice][0]) = make_uint2(w0 | (w1 << 4), w2 | (w3 << 4));
+        dst->scales[slice]                               = s;
+    }
+}
+
+__device__ __forceinline__ void stage_gate_up_chunk(const std::uint8_t* record_slice, std::uint8_t* dst, int chunk) {
+    const std::uint8_t* const src0 = record_slice + chunk * kGateUpChunkGroupBytes;
+    for (int i = static_cast<int>(threadIdx.x) * 16; i < kGateUpChunkBytes; i += static_cast<int>(blockDim.x) * 16) {
+        const std::uint8_t* const src =
+            i < kGateUpChunkGroupBytes ? (src0 + i) : (src0 + kGateUpGroupBytes + (i - kGateUpChunkGroupBytes));
+        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src) : "memory");
+    }
+}
+
+struct XPlaneChunk {
+    struct Row {
+        alignas(16) std::uint32_t codes[kGateUpStageBlocks][2];
+        alignas(16) std::uint8_t scales[kGateUpStageBlocks];
+    };
+    Row rows[moe::kMaxColumns];
+};
+static_assert(sizeof(XPlaneChunk::Row) == kGateUpStageBlocks * 8 + kGateUpStageBlocks);
+
+__device__ __forceinline__ void stage_xplane_chunk(const std::uint8_t* x_plane, int first, int count, int chunk,
+                                                   XPlaneChunk& dst) {
+    const int total_vec16 = count * (kGateUpStageBlocks / 2); // 8 * count <= 64
+    for (int idx = static_cast<int>(threadIdx.x); idx < total_vec16; idx += static_cast<int>(blockDim.x)) {
+        const int col           = idx / (kGateUpStageBlocks / 2);
+        const int v             = idx % (kGateUpStageBlocks / 2);
+        const std::uint8_t* src = x_plane + static_cast<std::size_t>(first + col) * moe::wide::kXRowBytes +
+                                  kGateUpStageBlocks * 8 * chunk + 16 * v;
+        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(&dst.rows[col].codes[2 * v][0]));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src) : "memory");
+    }
+    if (static_cast<int>(threadIdx.x) < count) {
+        const int col           = static_cast<int>(threadIdx.x);
+        const std::uint8_t* src = x_plane + static_cast<std::size_t>(first + col) * moe::wide::kXRowBytes +
+                                  moe::wide::kXCodeBytes + kGateUpStageBlocks * chunk;
+        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(&dst.rows[col].scales[0]));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src) : "memory");
+    }
+}
+
+__device__ __forceinline__ void quantize_split_chunk_xplane(const bf16* __restrict__ x, int hidden,
+                                                          const MoeDispatch& dispatch, int first, int count, int top_k,
+                                                          const moe::ExpertScales& scales, int chunk,
+                                                          XPlaneChunk& gate_dst, XPlaneChunk& up_dst) {
+    const int total_blocks = count * kGateUpStageBlocks; // <= 128 == kThreads
+    for (int idx = static_cast<int>(threadIdx.x); idx < total_blocks; idx += static_cast<int>(blockDim.x)) {
+        const int col     = idx / kGateUpStageBlocks;
+        const int b_local = idx % kGateUpStageBlocks;
+        const int pos     = moe::wide::plane_block(b_local);
+        const int b       = chunk * kGateUpStageBlocks + b_local;
+        const int t       = moe::wide::entry_column(dispatch.entries[first + col], top_k, dispatch.shared_first);
+        const auto* src   = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
+        std::uint32_t packed[4];
+        std::uint8_t sg, su;
+        std::int32_t sg_s, su_s;
+        quantize_split_words_from_bf16(src, scales.input_gate, scales.input_up, packed, sg, sg_s, su, su_s);
+        gate_dst.rows[col].codes[pos][0] = (packed[0] & 0x0F0F0F0FU) | ((packed[1] & 0x0F0F0F0FU) << 4);
+        gate_dst.rows[col].codes[pos][1] = (packed[2] & 0x0F0F0F0FU) | ((packed[3] & 0x0F0F0F0FU) << 4);
+        gate_dst.rows[col].scales[pos]   = sg;
+        up_dst.rows[col].codes[pos][0]   = ((packed[0] >> 4) & 0x0F0F0F0FU) | (packed[1] & 0xF0F0F0F0U);
+        up_dst.rows[col].codes[pos][1]   = ((packed[2] >> 4) & 0x0F0F0F0FU) | (packed[3] & 0xF0F0F0F0U);
+        up_dst.rows[col].scales[pos]     = su;
+    }
+}
+
+__device__ __forceinline__ void commit_stage() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int Keep> __device__ __forceinline__ void wait_stage() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(Keep) : "memory");
+}
+
+__device__ __forceinline__ void imma_gate_up_chunk(const std::uint8_t* __restrict__ matrix, const XPlaneChunk& gate_xq,
+                                                   const XPlaneChunk& up_xq, bool split_input, int count,
+                                                   std::int64_t (&acc_lo0)[kGateUpGroups],
+                                                   std::int64_t (&acc_lo1)[kGateUpGroups],
+                                                   std::int64_t (&acc_hi0)[kGateUpGroups],
+                                                   std::int64_t (&acc_hi1)[kGateUpGroups]) {
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int group = lane >> 2; // 0..7: weight rows (group, group+8); act col
+    const int t     = lane & 3;  // 0..3: k = 4*t..4*t+3; output cols (2*t, 2*t+1)
+    const int c0    = 2 * t;
+    const int c1    = c0 + 1;
+    const int widx  = t >> 1;
+    const int nsh   = (t & 1) * 4;
+#pragma unroll
+    for (int m = 0; m < kGateUpStageBlocks / kWarps; ++m) {
+        const int db  = warp + kWarps * m;
+        const int pos = moe::wide::plane_block(db);
+        std::uint32_t b0_g = 0U, b0_u = 0U;
+        std::int32_t sa0_g = 0, sa1_g = 0, sa0_u = 0, sa1_u = 0;
+        if (group < count) {
+            const std::uint32_t word32 = gate_xq.rows[group].codes[pos][widx];
+            b0_g                       = e2m1x4_to_s8x4(word32 >> nsh);
+        }
+        if (c0 < count) { sa0_g = canon::e4m3_scaled(gate_xq.rows[c0].scales[pos]); }
+        if (c1 < count) { sa1_g = canon::e4m3_scaled(gate_xq.rows[c1].scales[pos]); }
+        if (split_input) {
+            if (group < count) {
+                const std::uint32_t word32_u = up_xq.rows[group].codes[pos][widx];
+                b0_u                         = e2m1x4_to_s8x4(word32_u >> nsh);
+            }
+            if (c0 < count) { sa0_u = canon::e4m3_scaled(up_xq.rows[c0].scales[pos]); }
+            if (c1 < count) { sa1_u = canon::e4m3_scaled(up_xq.rows[c1].scales[pos]); }
+        }
+#pragma unroll
+        for (int g = 0; g < kGateUpGroups; ++g) {
+            const std::uint8_t* unit =
+                matrix + (static_cast<std::size_t>(g) * kGateUpStageBlocks + db) * moe::kUnitBytes;
+            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * t + 4 * group);
+            const std::uint32_t a0        = e2m1x4_to_s8x4(code_word);
+            const std::uint32_t a1        = e2m1x4_to_s8x4(code_word >> 4);
+            const std::int32_t sw_lo      = canon::e4m3_scaled(unit[128 + group]);
+            const std::int32_t sw_hi      = canon::e4m3_scaled(unit[136 + group]);
+            if (!split_input) {
+                int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                mma_s8s8_k16(d0, d1, d2, d3, a0, a1, b0_g);
+                acc_lo0[g] += static_cast<std::int64_t>(d0 * sw_lo) * sa0_g;
+                acc_lo1[g] += static_cast<std::int64_t>(d1 * sw_lo) * sa1_g;
+                acc_hi0[g] += static_cast<std::int64_t>(d2 * sw_hi) * sa0_g;
+                acc_hi1[g] += static_cast<std::int64_t>(d3 * sw_hi) * sa1_g;
+            } else {
+                const bool is_gate = (group & 1) == 0;
+                int dg0 = 0, dg1 = 0, dg2 = 0, dg3 = 0;
+                int du0 = 0, du1 = 0, du2 = 0, du3 = 0;
+                mma_s8s8_k16(dg0, dg1, dg2, dg3, is_gate ? a0 : 0U, is_gate ? a1 : 0U, b0_g);
+                mma_s8s8_k16(du0, du1, du2, du3, !is_gate ? a0 : 0U, !is_gate ? a1 : 0U, b0_u);
+                const int d0           = is_gate ? dg0 : du0;
+                const int d1           = is_gate ? dg1 : du1;
+                const int d2           = is_gate ? dg2 : du2;
+                const int d3           = is_gate ? dg3 : du3;
+                const std::int32_t sa0 = is_gate ? sa0_g : sa0_u;
+                const std::int32_t sa1 = is_gate ? sa1_g : sa1_u;
+                acc_lo0[g] += static_cast<std::int64_t>(d0 * sw_lo) * sa0;
+                acc_lo1[g] += static_cast<std::int64_t>(d1 * sw_lo) * sa1;
+                acc_hi0[g] += static_cast<std::int64_t>(d2 * sw_hi) * sa0;
+                acc_hi1[g] += static_cast<std::int64_t>(d3 * sw_hi) * sa1;
+            }
+        }
+    }
+}
+
 struct GateUpShared {
     alignas(16) std::uint8_t stage[kGateUpStageBytes];
     // The activations are read only by unit_sums and the partial sums are written only after the
-    // barrier that follows it, so they share storage. Warp 0 holds its own partial sums in
-    // registers, so only warps 1..kWarps-1 write to partial.
+    // barrier that follows it, so they share storage. Each warp k keeps its own partial sum for
+    // output column k in registers, so kWarps - 1 slots suffice per column.
     union {
-        ActCodes acts[moe::kGateUpBlocks];
+        ActCodes acts[moe::kGateUpBlocks / 2];
         DownActCodes acts_quad[moe::kGateUpBlocks / 2];
-        std::int64_t partial[kWarps - 1][2][16 * kGateUpGroups];
+        std::int64_t partial[kWarps - 1][4][16 * kGateUpGroups];
     };
-    std::uint16_t y[2][16 * kGateUpGroups];
+    std::uint16_t y[4][16 * kGateUpGroups];
 };
 
 static_assert(3 * (sizeof(GateUpShared) + 1024) <= 101376, "three gate/up CTAs must fit an SM");
+
+struct GateUpOneShared {
+    alignas(16) std::uint8_t stage[kGateUpStageBytes];
+    union {
+        ActCodes acts[moe::kGateUpBlocks / 2];
+        std::int64_t partial[kWarps - 1][16 * kGateUpGroups];
+    };
+    std::uint16_t y[16 * kGateUpGroups];
+};
+
+static_assert(3 * (sizeof(GateUpOneShared) + 1024) <= 101376, "three 1-col gate/up CTAs must fit an SM");
+
+struct GateUpXPlaneShared {
+    alignas(16) std::uint8_t stage[2][kGateUpChunkBytes];
+    union {
+        XPlaneChunk xq[2];
+        struct {
+            std::int64_t partial[kWarps][4][16 * kGateUpGroups];
+            std::uint16_t y[4][16 * kGateUpGroups];
+        } epi;
+    };
+};
+
+static_assert(4 * (sizeof(GateUpXPlaneShared) + 1024) <= 101376, "four xplane gate/up CTAs must fit an SM");
+
+template <class Partial, class YBuf>
+__device__ __forceinline__ void emit_gate_up_cols(int warp, int lane, int first, int c_base, int cols,
+                                                    const moe::ExpertScales& scales, std::int64_t s0,
+                                                    std::int64_t s1, std::int64_t s2, std::int64_t s3,
+                                                    Partial& partial, YBuf& y_buf,
+                                                    canon::A4Block* __restrict__ h_blocks, int slice) {
+    __syncthreads();
+    if (warp != 0) { partial[warp - 1][0][lane] = s0; }
+    if (cols > 1 && warp != 1) { partial[warp < 1 ? warp : warp - 1][1][lane] = s1; }
+    if (cols > 2 && warp != 2) { partial[warp < 2 ? warp : warp - 1][2][lane] = s2; }
+    if (cols > 3 && warp != 3) { partial[warp < 3 ? warp : warp - 1][3][lane] = s3; }
+    __syncthreads();
+    if (warp < cols) {
+        const int row      = lane;
+        const bool gate    = (row & 1) == 0;
+        std::int64_t total = warp == 0 ? s0 : (warp == 1 ? s1 : (warp == 2 ? s2 : s3));
+#pragma unroll
+        for (int w = 0; w < kWarps - 1; ++w) { total += partial[w][warp][row]; }
+        y_buf[warp][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+        __syncwarp();
+        const std::uint16_t h_val =
+            lane < 16 ? canon::swiglu_bf16(y_buf[warp][2 * lane], y_buf[warp][2 * lane + 1]) : 0;
+        quantize_a4_block_warp(h_val, scales.input_down,
+                               &h_blocks[static_cast<std::size_t>(first + c_base + warp) * kHBlocks + slice]);
+    }
+}
+
+__global__ void __launch_bounds__(kThreads, 3)
+    gate_up_kernel_one(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
+                       MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
+                       const std::int32_t* __restrict__ cpu_flags, int job_base,
+                       canon::A4Block* __restrict__ h_blocks, PassPhase phase) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm        = *reinterpret_cast<GateUpOneShared*>(smem_raw);
+    const int job   = job_base + static_cast<int>(blockIdx.y);
+    const int slice = blockIdx.x;
+    if (source.staging_slots == 0 && source.fetch.request == nullptr && phase == PassPhase::All) {
+        pdl::enter();
+    }
+    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
+    const int expert           = dispatch.jobs[job];
+    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    if (record == nullptr) { return; }
+    const moe::ExpertScales scales = source.scales[expert];
+    const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+    if (count <= 0 || moe::wide_route(count, scales)) { return; }
+    const std::uint8_t* const record_slice =
+        record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes;
+    stage_gate_up_half(record_slice, sm.stage, 0);
+    const int lane         = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const bool split_input = scales.input_up != scales.input_gate;
+    constexpr int kHalf    = moe::kGateUpBlocks / 2;
+    if (split_input) {
+        quantize_split_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, scales.input_up, sm.acts,
+                             kHalf, 0);
+    } else {
+        quantize_column_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, sm.acts, kHalf, 0);
+    }
+    stage_wait();
+    __syncthreads();
+    std::int64_t s[kGateUpGroups];
+    if (split_input) {
+        unit_sums<kGateUpGroups, true, false>(sm.stage, kHalf, sm.acts, s);
+    } else {
+        unit_sums<kGateUpGroups, false, false>(sm.stage, kHalf, sm.acts, s);
+    }
+    __syncthreads();
+    stage_gate_up_half(record_slice, sm.stage, 1);
+    if (split_input) {
+        quantize_split_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, scales.input_up, sm.acts,
+                             kHalf, kHalf);
+    } else {
+        quantize_column_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, sm.acts, kHalf, kHalf);
+    }
+    stage_wait();
+    __syncthreads();
+    if (split_input) {
+        unit_sums<kGateUpGroups, true, true>(sm.stage, kHalf, sm.acts, s);
+    } else {
+        unit_sums<kGateUpGroups, false, true>(sm.stage, kHalf, sm.acts, s);
+    }
+    __syncthreads();
+    if (warp > 0 && lane < 16) {
+#pragma unroll
+        for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp - 1][g * 16 + lane] = s[g]; }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int row      = lane;
+        const bool gate    = (row & 1) == 0;
+        std::int64_t total = row < 16 ? s[0] : s[1];
+#pragma unroll
+        for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][row]; }
+        sm.y[row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+        __syncwarp();
+        const std::uint16_t h_val =
+            lane < 16 ? canon::swiglu_bf16(sm.y[2 * lane], sm.y[2 * lane + 1]) : 0;
+        quantize_a4_block_warp(h_val, scales.input_down, &h_blocks[static_cast<std::size_t>(first) * kHBlocks + slice]);
+    }
+    __syncthreads();
+    pdl::trigger_dependents();
+}
 
 __global__ void __launch_bounds__(kThreads, 3)
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
@@ -1549,42 +1903,20 @@ __global__ void __launch_bounds__(kThreads, 3)
             const int t1 = dispatch.entries[first + c + 1] / top_k;
             const int t2 = dispatch.entries[first + c + 2] / top_k;
             const int t3 = cols == 4 ? dispatch.entries[first + c + 3] / top_k : t2;
-            std::int64_t s[4] = {};
             quantize_quad_half_codes<0, kHalf>(x, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
             stage_wait();
             __syncthreads();
-            unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s);
+            std::int64_t s0[4] = {};
+            unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s0);
             __syncthreads();
             stage_gate_up_half(record_slice, sm.stage, 1);
             quantize_quad_half_codes<kHalf, kHalf>(x, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
             stage_wait();
             __syncthreads();
-            unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s);
-#pragma unroll 1
-            for (int pair = 0; pair < 2; ++pair) {
-                const int c_base           = 2 * pair;
-                const std::int64_t s0_pair = pair == 0 ? s[0] : s[2];
-                const std::int64_t s1_pair = pair == 0 ? s[1] : s[3];
-                __syncthreads(); // every warp has read sm.acts_quad/partial before writing sm.partial
-                if (warp > 0) { sm.partial[warp - 1][0][lane] = s0_pair; }
-                if (warp != 1) { sm.partial[warp == 0 ? 0 : warp - 1][1][lane] = s1_pair; }
-                __syncthreads();
-                if (warp < 2 && c_base + warp < cols) {
-                    const int col      = warp;
-                    const int row      = lane;
-                    const bool gate    = (row & 1) == 0;
-                    std::int64_t total = col == 0 ? s0_pair : s1_pair;
-#pragma unroll
-                    for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][col][row]; }
-                    sm.y[col][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
-                    __syncwarp();
-                    const std::uint16_t h_val =
-                        lane < 16 ? canon::swiglu_bf16(sm.y[col][2 * lane], sm.y[col][2 * lane + 1]) : 0;
-                    quantize_a4_block_warp(
-                        h_val, scales.input_down,
-                        &h_blocks[static_cast<std::size_t>(first + c + c_base + col) * kHBlocks + slice]);
-                }
-            }
+            std::int64_t s1[4] = {};
+            unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s1);
+            emit_gate_up_cols(warp, lane, first, c, cols, scales, s0[0] + s1[0], s0[1] + s1[1], s0[2] + s1[2],
+                              s0[3] + s1[3], sm.partial, sm.y, h_blocks, slice);
         }
         for (; c + 1 < count; c += 2) {
             __syncthreads();
@@ -1602,29 +1934,8 @@ __global__ void __launch_bounds__(kThreads, 3)
             stage_wait();
             __syncthreads();
             unit_sums_pair<kGateUpGroups, true>(sm.stage, kHalf, sm.acts, s0, s1);
-            __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
-            if (lane < 16) {
-#pragma unroll
-                for (int g = 0; g < kGateUpGroups; ++g) {
-                    if (warp > 0) { sm.partial[warp - 1][0][g * 16 + lane] = s0[g]; }
-                    if (warp != 1) { sm.partial[warp == 0 ? 0 : warp - 1][1][g * 16 + lane] = s1[g]; }
-                }
-            }
-            __syncthreads();
-            if (warp < 2) {
-                const int col      = warp;
-                const int row      = lane;
-                const bool gate    = (row & 1) == 0;
-                std::int64_t total = col == 0 ? (row < 16 ? s0[0] : s0[1]) : (row < 16 ? s1[0] : s1[1]);
-#pragma unroll
-                for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][col][row]; }
-                sm.y[col][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
-                __syncwarp();
-                const std::uint16_t h_val =
-                    lane < 16 ? canon::swiglu_bf16(sm.y[col][2 * lane], sm.y[col][2 * lane + 1]) : 0;
-                quantize_a4_block_warp(h_val, scales.input_down,
-                                       &h_blocks[static_cast<std::size_t>(first + c + col) * kHBlocks + slice]);
-            }
+            emit_gate_up_cols(warp, lane, first, c, 2, scales, lane < 16 ? s0[0] : s0[1],
+                              lane < 16 ? s1[0] : s1[1], 0, 0, sm.partial, sm.y, h_blocks, slice);
         }
     } else { // split input scales: pairs share one weight scan over two K-halves
         for (; c + 1 < count; c += 2) {
@@ -1645,34 +1956,11 @@ __global__ void __launch_bounds__(kThreads, 3)
             unit_sums_split_pair_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts, lo, hi);
             std::int64_t s[kGateUpGroups][2];
             reduce_row_sums<kGateUpGroups, 2>(lo, hi, s);
-            __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
-            if (lane < 16) {
-#pragma unroll
-                for (int g = 0; g < kGateUpGroups; ++g) {
-                    if (warp > 0) { sm.partial[warp - 1][0][g * 16 + lane] = s[g][0]; }
-                    if (warp != 1) { sm.partial[warp == 0 ? 0 : warp - 1][1][g * 16 + lane] = s[g][1]; }
-                }
-            }
-            __syncthreads();
-            if (warp < 2) {
-                const int col      = warp;
-                const int row      = lane;
-                const bool gate    = (row & 1) == 0;
-                std::int64_t total = col == 0 ? (row < 16 ? s[0][0] : s[1][0]) : (row < 16 ? s[0][1] : s[1][1]);
-#pragma unroll
-                for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][col][row]; }
-                sm.y[col][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
-                __syncwarp();
-                const std::uint16_t h_val =
-                    lane < 16 ? canon::swiglu_bf16(sm.y[col][2 * lane], sm.y[col][2 * lane + 1]) : 0;
-                quantize_a4_block_warp(h_val, scales.input_down,
-                                       &h_blocks[static_cast<std::size_t>(first + c + col) * kHBlocks + slice]);
-            }
+            emit_gate_up_cols(warp, lane, first, c, 2, scales, lane < 16 ? s[0][0] : s[1][0],
+                              lane < 16 ? s[0][1] : s[1][1], 0, 0, sm.partial, sm.y, h_blocks, slice);
         }
     }
     for (; c < count; ++c) { // one pass per remaining column of the job
-        // Gate rows are even, up rows odd; with distinct input scales one scan computes both, each
-        // lane reading the nibble pair and scale of its rows' parity (unit_sums SplitInput).
         __syncthreads();
         if (c > 0) { stage_gate_up_half(record_slice, sm.stage, 0); }
         if (split_input) {
@@ -1705,27 +1993,143 @@ __global__ void __launch_bounds__(kThreads, 3)
         } else {
             unit_sums<kGateUpGroups, false, true>(sm.stage, kHalf, sm.acts, s);
         }
-        __syncthreads(); // every warp has read sm.acts before any warp writes sm.partial
-        if (warp > 0 && lane < 16) {
-#pragma unroll
-            for (int g = 0; g < kGateUpGroups; ++g) { sm.partial[warp - 1][0][g * 16 + lane] = s[g]; }
+        emit_gate_up_cols(warp, lane, first, c, 1, scales, lane < 16 ? s[0] : s[1], 0, 0, 0, sm.partial, sm.y,
+                          h_blocks, slice);
+    }
+    __syncthreads();
+    pdl::trigger_dependents();
+}
+
+__device__ __forceinline__ void emit_gate_up_cols_xplane(
+    int first_col, int c_base, int cols, const moe::ExpertScales& scales,
+    const std::int64_t (&acc_lo0)[kGateUpGroups], const std::int64_t (&acc_lo1)[kGateUpGroups],
+    const std::int64_t (&acc_hi0)[kGateUpGroups], const std::int64_t (&acc_hi1)[kGateUpGroups],
+    std::int64_t (&partial)[kWarps][4][16 * kGateUpGroups], std::uint16_t (&y_buf)[4][16 * kGateUpGroups],
+    canon::A4Block* __restrict__ h_blocks, int slice) {
+    __syncthreads();
+    const int lane    = static_cast<int>(threadIdx.x) & 31;
+    const int warp    = static_cast<int>(threadIdx.x) >> 5;
+    const int group   = lane >> 2;
+    const int t       = lane & 3;
+    const bool active = c_base == 0 ? (t < 2) : (t >= 2);
+    if (active) {
+        const int lc0 = c_base == 0 ? (2 * t) : (2 * t - 4);
+        if (lc0 < cols) {
+            partial[warp][lc0][group]      = acc_lo0[0];
+            partial[warp][lc0][8 + group]  = acc_hi0[0];
+            partial[warp][lc0][16 + group] = acc_lo0[1];
+            partial[warp][lc0][24 + group] = acc_hi0[1];
         }
-        __syncthreads();
-        if (warp == 0) {
-            const int row   = lane;
-            const bool gate = (row & 1) == 0;
-            std::int64_t total = row < 16 ? s[0] : s[1];
-#pragma unroll
-            for (int w = 0; w < kWarps - 1; ++w) { total += sm.partial[w][0][row]; }
-            sm.y[0][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
-            __syncwarp();
-            const std::uint16_t h_val =
-                lane < 16 ? canon::swiglu_bf16(sm.y[0][2 * lane], sm.y[0][2 * lane + 1]) : 0;
-            quantize_a4_block_warp(h_val, scales.input_down,
-                                   &h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + slice]);
+        if (lc0 + 1 < cols) {
+            partial[warp][lc0 + 1][group]      = acc_lo1[0];
+            partial[warp][lc0 + 1][8 + group]  = acc_hi1[0];
+            partial[warp][lc0 + 1][16 + group] = acc_lo1[1];
+            partial[warp][lc0 + 1][24 + group] = acc_hi1[1];
         }
     }
     __syncthreads();
+    if (warp < cols) {
+        const int row      = lane;
+        const bool gate    = (row & 1) == 0;
+        std::int64_t total = 0;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) { total += partial[w][warp][row]; }
+        y_buf[warp][row] = canon::a4_row_output(total, gate ? scales.alpha_gate : scales.alpha_up);
+        __syncwarp();
+        const std::uint16_t h_val =
+            lane < 16 ? canon::swiglu_bf16(y_buf[warp][2 * lane], y_buf[warp][2 * lane + 1]) : 0;
+        auto* row_dst = reinterpret_cast<PackedHRow*>(
+            h_blocks + static_cast<std::size_t>(first_col + c_base + warp) * moe::kHBlocks);
+        quantize_packed_h_block_warp(h_val, scales.input_down, row_dst, slice);
+    }
+}
+
+__global__ void __launch_bounds__(kThreads, 4)
+    gate_up_xplane_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
+                          int top_k, const std::uint8_t* const* __restrict__ job_records,
+                          const std::int32_t* __restrict__ narrow_jobs, const std::int32_t* __restrict__ pass_narrow,
+                          int pass, const std::uint8_t* __restrict__ x_plane, canon::A4Block* __restrict__ h_blocks) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm = *reinterpret_cast<GateUpXPlaneShared*>(smem_raw);
+    if (source.staging_slots == 0 && source.fetch.request == nullptr) { pdl::enter(); }
+    const int n_begin     = pass_narrow[pass];
+    const int n_end       = pass_narrow[pass + 1];
+    const int total_items = (n_end - n_begin) * kGateUpCtas;
+    for (int idx = static_cast<int>(blockIdx.x); idx < total_items; idx += static_cast<int>(gridDim.x)) {
+        const int job              = narrow_jobs[n_begin + idx / kGateUpCtas];
+        const std::uint8_t* record = pass_record(PassPhase::All, source, dispatch.jobs[job], job_records, job);
+        if (record == nullptr) {
+            __syncthreads();
+            continue;
+        }
+        const int expert = dispatch.jobs[job];
+        const int first  = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+        if (count <= 0) {
+            __syncthreads();
+            continue;
+        }
+        const int slice                        = idx % kGateUpCtas;
+        const std::uint8_t* const record_slice =
+            record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes;
+        const bool split_input = source.scales[expert].input_up != source.scales[expert].input_gate;
+#pragma unroll 1
+        for (int c_outer = 0; c_outer < count; c_outer += moe::kMaxColumns) {
+            const int rem                       = min(moe::kMaxColumns, count - c_outer);
+            std::int64_t acc_lo0[kGateUpGroups] = {}, acc_lo1[kGateUpGroups] = {};
+            std::int64_t acc_hi0[kGateUpGroups] = {}, acc_hi1[kGateUpGroups] = {};
+            if (!split_input) {
+                stage_gate_up_chunk(record_slice, sm.stage[0], 0);
+                stage_xplane_chunk(x_plane, first + c_outer, rem, 0, sm.xq[0]);
+                commit_stage();
+#pragma unroll 1
+                for (int chunk = 0; chunk < kGateUpChunks; ++chunk) {
+                    const int cur = chunk & 1, nxt = cur ^ 1;
+                    if (chunk + 1 < kGateUpChunks) {
+                        stage_gate_up_chunk(record_slice, sm.stage[nxt], chunk + 1);
+                        stage_xplane_chunk(x_plane, first + c_outer, rem, chunk + 1, sm.xq[nxt]);
+                        commit_stage();
+                        wait_stage<1>();
+                    } else {
+                        wait_stage<0>();
+                    }
+                    __syncthreads();
+                    imma_gate_up_chunk(sm.stage[cur], sm.xq[cur], sm.xq[cur], false, rem, acc_lo0, acc_lo1, acc_hi0,
+                                       acc_hi1);
+                    if (chunk + 1 < kGateUpChunks) { __syncthreads(); }
+                }
+            } else {
+                const moe::ExpertScales split_scales = source.scales[expert];
+                stage_gate_up_chunk(record_slice, sm.stage[0], 0);
+                commit_stage();
+#pragma unroll 1
+                for (int chunk = 0; chunk < kGateUpChunks; ++chunk) {
+                    const int cur = chunk & 1, nxt = cur ^ 1;
+                    if (chunk + 1 < kGateUpChunks) {
+                        stage_gate_up_chunk(record_slice, sm.stage[nxt], chunk + 1);
+                        commit_stage();
+                    }
+                    quantize_split_chunk_xplane(x, hidden, dispatch, first + c_outer, rem, top_k, split_scales, chunk,
+                                                sm.xq[0], sm.xq[1]);
+                    if (chunk + 1 < kGateUpChunks) {
+                        wait_stage<1>();
+                    } else {
+                        wait_stage<0>();
+                    }
+                    __syncthreads();
+                    imma_gate_up_chunk(sm.stage[cur], sm.xq[0], sm.xq[1], true, rem, acc_lo0, acc_lo1, acc_hi0,
+                                       acc_hi1);
+                    if (chunk + 1 < kGateUpChunks) { __syncthreads(); }
+                }
+            }
+            const moe::ExpertScales& ep_scales = source.scales[expert];
+#pragma unroll 1
+            for (int c_base = 0; c_base < rem; c_base += 4) {
+                emit_gate_up_cols_xplane(first + c_outer, c_base, min(4, rem - c_base), ep_scales, acc_lo0, acc_lo1,
+                                         acc_hi0, acc_hi1, sm.epi.partial, sm.epi.y, h_blocks, slice);
+            }
+            __syncthreads();
+        }
+    }
     pdl::trigger_dependents();
 }
 
@@ -1948,38 +2352,304 @@ __global__ void __launch_bounds__(kThreads, 3)
     }
 }
 
+__device__ __forceinline__ void stage_down_chunk(const std::uint8_t* record_slice, std::uint8_t* dst, int chunk) {
+    constexpr int kDownGroupBytes  = moe::kDownBlocks * static_cast<int>(moe::kUnitBytes); // 5,760
+    constexpr int kVecsPerGroup    = kDownChunkGroupBytes / 16;                             // 72
+    constexpr int kTotalVecs       = kDownChunkBytes / 16;                                  // 288
+    const std::uint8_t* const src0 = record_slice + chunk * kDownChunkGroupBytes;
+    for (int v = static_cast<int>(threadIdx.x); v < kTotalVecs; v += static_cast<int>(blockDim.x)) {
+        const int g                    = v / kVecsPerGroup;
+        const int off                  = (v - g * kVecsPerGroup) * 16;
+        const std::uint8_t* const src  = src0 + static_cast<std::size_t>(g) * kDownGroupBytes + off;
+        const auto s                   = static_cast<unsigned>(__cvta_generic_to_shared(dst + v * 16));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src) : "memory");
+    }
+}
+
+__device__ __forceinline__ void stage_packed_h(const canon::A4Block* __restrict__ h_blocks, int first_col, int count,
+                                               PackedHRow (&dst)[moe::kMaxColumns]) {
+    constexpr int kVecsPerRow = kPackedHRowBytes / 16; // 23
+    const int total_vecs      = count * kVecsPerRow;
+    for (int v = static_cast<int>(threadIdx.x); v < total_vecs; v += static_cast<int>(blockDim.x)) {
+        const int col              = v / kVecsPerRow;
+        const int off              = (v - col * kVecsPerRow) * 16;
+        const std::uint8_t* src    = reinterpret_cast<const std::uint8_t*>(
+            h_blocks + static_cast<std::size_t>(first_col + col) * moe::kHBlocks) + off;
+        const auto s               = static_cast<unsigned>(
+            __cvta_generic_to_shared(reinterpret_cast<std::uint8_t*>(&dst[col]) + off));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src) : "memory");
+    }
+}
+
+__device__ __forceinline__ void imma_down_chunk(const std::uint8_t* __restrict__ matrix,
+                                                const PackedHRow (&h)[moe::kMaxColumns], int chunk, int count,
+                                                std::int64_t (&acc_lo0)[kDownGroups],
+                                                std::int64_t (&acc_lo1)[kDownGroups],
+                                                std::int64_t (&acc_hi0)[kDownGroups],
+                                                std::int64_t (&acc_hi1)[kDownGroups]) {
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int group = lane >> 2;
+    const int t     = lane & 3;
+    const int c0    = 2 * t;
+    const int c1    = c0 + 1;
+    const int widx  = t >> 1;
+    const int nsh   = (t & 1) * 4;
+#pragma unroll
+    for (int m = 0; m < kDownStageBlocks / kWarps; ++m) {
+        const int db       = warp + kWarps * m;
+        const int b        = chunk * kDownStageBlocks + db;
+        std::uint32_t b0   = 0U;
+        std::int32_t sa0   = 0, sa1 = 0;
+        if (group < count) {
+            const std::uint32_t word32 = h[group].codes[b][widx];
+            b0                         = e2m1x4_to_s8x4(word32 >> nsh);
+        }
+        if (c0 < count) { sa0 = canon::e4m3_scaled(h[c0].scales[b]); }
+        if (c1 < count) { sa1 = canon::e4m3_scaled(h[c1].scales[b]); }
+#pragma unroll
+        for (int g = 0; g < kDownGroups; ++g) {
+            const std::uint8_t* unit =
+                matrix + (static_cast<std::size_t>(g) * kDownStageBlocks + db) * moe::kUnitBytes;
+            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * t + 4 * group);
+            const std::uint32_t a0        = e2m1x4_to_s8x4(code_word);
+            const std::uint32_t a1        = e2m1x4_to_s8x4(code_word >> 4);
+            const std::int32_t sw_lo      = canon::e4m3_scaled(unit[128 + group]);
+            const std::int32_t sw_hi      = canon::e4m3_scaled(unit[136 + group]);
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            mma_s8s8_k16(d0, d1, d2, d3, a0, a1, b0);
+            acc_lo0[g] += static_cast<std::int64_t>(d0 * sw_lo) * sa0;
+            acc_lo1[g] += static_cast<std::int64_t>(d1 * sw_lo) * sa1;
+            acc_hi0[g] += static_cast<std::int64_t>(d2 * sw_hi) * sa0;
+            acc_hi1[g] += static_cast<std::int64_t>(d3 * sw_hi) * sa1;
+        }
+    }
+}
+
+struct DownPrefillShared {
+    alignas(16) std::uint8_t stage[2][kDownChunkBytes];
+    union {
+        PackedHRow h[moe::kMaxColumns];
+        std::int64_t partial[kWarps][2][16 * kDownGroups];
+    } epi;
+};
+
+static_assert(4 * (sizeof(DownPrefillShared) + 1024) <= 101376, "four prefill down CTAs must fit an SM");
+
+__global__ void __launch_bounds__(kThreads, 4)
+    down_prefill_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
+                        const std::uint8_t* const* __restrict__ job_records,
+                        const std::int32_t* __restrict__ narrow_jobs, const std::int32_t* __restrict__ pass_narrow,
+                        int pass, const canon::A4Block* __restrict__ h_blocks, bf16* __restrict__ outputs) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm              = *reinterpret_cast<DownPrefillShared*>(smem_raw);
+    const int n_begin     = pass_narrow[pass];
+    const int n_end       = pass_narrow[pass + 1];
+    const int total_items = (n_end - n_begin) * kDownCtas;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const int group       = lane >> 2;
+    const int t           = lane & 3;
+
+    auto item_meta = [&](int idx, const std::uint8_t*& record_slice, int& tile, int& expert, int& first, int& count) {
+        record_slice = nullptr;
+        tile         = 0;
+        expert       = 0;
+        first        = 0;
+        count        = 0;
+        if (idx >= total_items) { return; }
+        const int job              = narrow_jobs[n_begin + idx / kDownCtas];
+        tile                       = idx % kDownCtas;
+        expert                     = dispatch.jobs[job];
+        const std::uint8_t* record = pass_record(PassPhase::All, source, expert, job_records, job);
+        if (record == nullptr) { return; }
+        first = dispatch.offsets[expert];
+        count = dispatch.offsets[expert + 1] - first;
+        if (count <= 0) { return; }
+        record_slice = record + moe::kGateUpBytes +
+                       static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes;
+    };
+
+    const int item0               = static_cast<int>(blockIdx.x);
+    const std::uint8_t* cur_slice = nullptr;
+    int cur_tile = 0, cur_expert = 0, cur_first = 0, cur_count = 0;
+    item_meta(item0, cur_slice, cur_tile, cur_expert, cur_first, cur_count);
+    int buf = 0;
+    if (cur_slice != nullptr) {
+        stage_down_chunk(cur_slice, sm.stage[buf], 0);
+        commit_stage();
+    }
+    pdl::wait_for_dependencies();
+
+    for (int idx = item0; idx < total_items; idx += static_cast<int>(gridDim.x)) {
+        const std::uint8_t* nxt_slice = nullptr;
+        int nxt_tile = 0, nxt_expert = 0, nxt_first = 0, nxt_count = 0;
+        item_meta(idx + static_cast<int>(gridDim.x), nxt_slice, nxt_tile, nxt_expert, nxt_first, nxt_count);
+        if (cur_slice == nullptr) {
+            if (nxt_slice != nullptr) {
+                stage_down_chunk(nxt_slice, sm.stage[buf], 0);
+                commit_stage();
+            }
+            cur_slice  = nxt_slice;
+            cur_tile   = nxt_tile;
+            cur_expert = nxt_expert;
+            cur_first  = nxt_first;
+            cur_count  = nxt_count;
+            continue;
+        }
+        const float alpha_down = source.scales[cur_expert].alpha_down;
+#pragma unroll 1
+        for (int c_outer = 0; c_outer < cur_count; c_outer += moe::kMaxColumns) {
+            const int rem     = min(moe::kMaxColumns, cur_count - c_outer);
+            const bool last_c = c_outer + moe::kMaxColumns >= cur_count;
+            if (c_outer > 0) {
+                stage_down_chunk(cur_slice, sm.stage[buf], 0);
+                commit_stage();
+            }
+            stage_packed_h(h_blocks, cur_first + c_outer, rem, sm.epi.h);
+            commit_stage();
+
+            std::int64_t acc_lo0[kDownGroups] = {}, acc_lo1[kDownGroups] = {};
+            std::int64_t acc_hi0[kDownGroups] = {}, acc_hi1[kDownGroups] = {};
+#pragma unroll 1
+            for (int chunk = 0; chunk < kDownChunks; ++chunk) {
+                const int nxt = buf ^ 1;
+                if (chunk + 1 < kDownChunks) {
+                    stage_down_chunk(cur_slice, sm.stage[nxt], chunk + 1);
+                    commit_stage();
+                    wait_stage<1>();
+                } else if (last_c && nxt_slice != nullptr) {
+                    stage_down_chunk(nxt_slice, sm.stage[nxt], 0);
+                    commit_stage();
+                    wait_stage<1>();
+                } else {
+                    wait_stage<0>();
+                }
+                __syncthreads();
+                imma_down_chunk(sm.stage[buf], sm.epi.h, chunk, rem, acc_lo0, acc_lo1, acc_hi0, acc_hi1);
+                buf = nxt;
+                if (chunk + 1 < kDownChunks) { __syncthreads(); }
+            }
+
+            const int pairs = (rem + 1) >> 1;
+#pragma unroll 1
+            for (int p = 0; p < pairs; ++p) {
+                const int cols = min(2, rem - 2 * p);
+                __syncthreads();
+                if (t == p) {
+#pragma unroll
+                    for (int g = 0; g < kDownGroups; ++g) {
+                        sm.epi.partial[warp][0][16 * g + group]     = acc_lo0[g];
+                        sm.epi.partial[warp][0][16 * g + 8 + group] = acc_hi0[g];
+                        if (cols > 1) {
+                            sm.epi.partial[warp][1][16 * g + group]     = acc_lo1[g];
+                            sm.epi.partial[warp][1][16 * g + 8 + group] = acc_hi1[g];
+                        }
+                    }
+                }
+                __syncthreads();
+                const int col_local = warp >> 1;
+                const int row_half  = warp & 1;
+                if (col_local < cols) {
+                    const int row      = row_half * 32 + lane;
+                    std::int64_t total = 0;
+#pragma unroll
+                    for (int w = 0; w < kWarps; ++w) { total += sm.epi.partial[w][col_local][row]; }
+                    const std::uint16_t y = canon::a4_row_output(total, alpha_down);
+                    const int column      = dispatch.entries[cur_first + c_outer + 2 * p + col_local];
+                    reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden +
+                                                              16 * kDownGroups * cur_tile + row] = y;
+                }
+            }
+            __syncthreads();
+        }
+        cur_slice  = nxt_slice;
+        cur_tile   = nxt_tile;
+        cur_expert = nxt_expert;
+        cur_first  = nxt_first;
+        cur_count  = nxt_count;
+    }
+}
+
+int persistent_narrow_ctas() {
+    static const int ctas = [] {
+        int dev = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        return sms * 4;
+    }();
+    return ctas;
+}
+
 void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                         const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
-                        canon::A4Block* h_blocks, int /*columns*/, ActCodes* /*narrow_acts*/,
-                        bf16* outputs, cudaStream_t stream, PassPhase phase = PassPhase::All,
-                        PassPart part = PassPart::Both) {
+                        canon::A4Block* h_blocks, int columns, const moe::wide::ExpertsWorkspace& layout,
+                        int pass_index, bool use_xplane, bf16* outputs, cudaStream_t stream,
+                        PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
     static const bool configured = [] {
+        cudaFuncSetAttribute(gate_up_kernel_one, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(GateUpOneShared)));
         cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(sizeof(GateUpShared)));
+        cudaFuncSetAttribute(gate_up_xplane_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(GateUpXPlaneShared)));
         cudaFuncSetAttribute(down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(sizeof(DownShared)));
+        cudaFuncSetAttribute(down_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(DownPrefillShared)));
+        cudaFuncSetAttribute(gate_up_kernel_one, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                              cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(gate_up_xplane_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
         cudaFuncSetAttribute(down_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(down_prefill_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                              cudaSharedmemCarveoutMaxShared);
         return true;
     }();
     (void)configured;
     const bool unstaged_direct = source.staging_slots == 0 && source.fetch.request == nullptr && phase == PassPhase::All;
+    if (use_xplane) {
+        const int persistent = persistent_narrow_ctas();
+        if (part != PassPart::Down) {
+            CUDA_CHECK(pdl::launch_with(
+                unstaged_direct ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized,
+                {dim3(persistent), dim3(kThreads), sizeof(GateUpXPlaneShared), stream}, gate_up_xplane_kernel, x,
+                static_cast<int>(moe::kHidden), dispatch, source, top_k, job_records, layout.narrow_jobs,
+                layout.pass_narrow, pass_index, layout.x_plane, h_blocks));
+            check_launch("gate/up xplane");
+        }
+        if (part == PassPart::GateUp) { return; }
+        const auto dep = part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic;
+        CUDA_CHECK(pdl::launch_with(dep, {dim3(persistent), dim3(kThreads), sizeof(DownPrefillShared), stream},
+                                    down_prefill_kernel, dispatch, source, static_cast<int>(moe::kHidden), job_records,
+                                    layout.narrow_jobs, layout.pass_narrow, pass_index,
+                                    static_cast<const canon::A4Block*>(h_blocks), outputs));
+        return;
+    }
     if (part != PassPart::Down) {
-        CUDA_CHECK(pdl::launch_with(
-            unstaged_direct ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized,
-            {dim3(kGateUpCtas, jobs), dim3(kThreads), sizeof(GateUpShared), stream}, gate_up_kernel, x,
-            static_cast<int>(moe::kHidden), dispatch, source, top_k, job_records, flags, base, h_blocks, phase));
+        const auto gu_dep = unstaged_direct ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
+        if (columns == 1) {
+            CUDA_CHECK(pdl::launch_with(gu_dep,
+                                        {dim3(kGateUpCtas, jobs), dim3(kThreads), sizeof(GateUpOneShared), stream},
+                                        gate_up_kernel_one, x, static_cast<int>(moe::kHidden), dispatch, source, top_k,
+                                        job_records, flags, base, h_blocks, phase));
+        } else {
+            CUDA_CHECK(pdl::launch_with(gu_dep,
+                                        {dim3(kGateUpCtas, jobs), dim3(kThreads), sizeof(GateUpShared), stream},
+                                        gate_up_kernel, x, static_cast<int>(moe::kHidden), dispatch, source, top_k,
+                                        job_records, flags, base, h_blocks, phase));
+        }
         check_launch("gate/up");
     }
     if (part == PassPart::GateUp) { return; }
     // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
     const auto dep = part == PassPart::Down ? pdl::Dependency::Serialized : pdl::Dependency::Programmatic;
-    CUDA_CHECK(pdl::launch_with(dep, {dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownShared), stream},
-                                down_kernel, dispatch, source, static_cast<int>(moe::kHidden),
-                                job_records, flags, base, static_cast<const canon::A4Block*>(h_blocks), outputs,
-                                phase));
+    CUDA_CHECK(pdl::launch_with(dep, {dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownShared), stream}, down_kernel,
+                                dispatch, source, static_cast<int>(moe::kHidden), job_records, flags, base,
+                                static_cast<const canon::A4Block*>(h_blocks), outputs, phase));
 }
 
 // ------------------------------------------------------------------------ A16 narrow route (§16.2.1)
@@ -2962,7 +3632,8 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
 void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
-                 PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
+                 PassPhase phase = PassPhase::All, PassPart part = PassPart::Both, int pass_index = 0,
+                 bool use_xplane = false) {
     // Wide calls (more than kMaxColumns columns) were planned by moe_experts.
     const bool wide = columns > moe::kMaxColumns;
     if (source.ggml.gate_up_format == QType::FP8_E4M3FN_B128) {
@@ -3018,8 +3689,8 @@ void launch_pass(int columns, const bf16* x, const MoeDispatch& dispatch, const 
         });
         return;
     }
-    launch_expert_pass(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns,
-                       reinterpret_cast<ActCodes*>(layout.narrow_acts), outputs, stream, phase, part);
+    launch_expert_pass(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns, layout,
+                       pass_index, use_xplane, outputs, stream, phase, part);
 }
 
 // ------------------------------------------------------------------------------ CPU-served misses
@@ -3777,17 +4448,70 @@ __launch_bounds__(320) __global__ void combine_vec8_kernel(const bf16* __restric
     *reinterpret_cast<uint4*>(y + static_cast<std::size_t>(t) * hidden + d) = out_packed;
 }
 
-template <bool kMasked, bool kWriteMean = false>
-__launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_kernel(
-    const bf16* __restrict__ outputs, const float* __restrict__ weights, const float* __restrict__ shared_gate,
-    const bf16* __restrict__ shared, const float* __restrict__ inject, int hidden, int top_k, int streams,
-    int columns, bf16* __restrict__ residual, MoeColumnMask mask, bf16* __restrict__ mean_out,
-    std::int64_t mean_pitch, int mean_first) {
+enum class CombineNextNorm : std::uint8_t { kNone = 0, kBf16 = 1, kFp32 = 2 };
+
+template <CombineNextNorm kNorm>
+__device__ __forceinline__ void store_combine_next_norm(uint4 r_packed, const void* __restrict__ next_weight,
+                                                        int s, std::size_t sd, int hidden, float eps,
+                                                        float (*scratch)[10], bf16* __restrict__ next_out_col) {
+    const bf16* r_vals = reinterpret_cast<const bf16*>(&r_packed);
+    float sum_sq       = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float rv = __bfloat162float(r_vals[j]);
+        sum_sq += rv * rv;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) { sum_sq += __shfl_xor_sync(0xFFFFFFFFU, sum_sq, offset); }
+    const int warp = static_cast<int>(threadIdx.x >> 5);
+    const int lane = static_cast<int>(threadIdx.x & 31U);
+    const int slot = s & 1;
+    if (lane == 0) { scratch[slot][warp] = sum_sq; }
+    __syncthreads();
+    float total     = 0.0F;
+    const int warps = static_cast<int>(blockDim.x) >> 5;
+    for (int w = 0; w < warps; ++w) { total += scratch[slot][w]; }
+    const float inv = rsqrtf(total / static_cast<float>(hidden) + eps);
+    float wf[8];
+    if constexpr (kNorm == CombineNextNorm::kFp32) {
+        const float* w  = static_cast<const float*>(next_weight) + sd;
+        const float4 w0 = *reinterpret_cast<const float4*>(w);
+        const float4 w1 = *reinterpret_cast<const float4*>(w + 4);
+        wf[0] = w0.x; wf[1] = w0.y; wf[2] = w0.z; wf[3] = w0.w;
+        wf[4] = w1.x; wf[5] = w1.y; wf[6] = w1.z; wf[7] = w1.w;
+    } else {
+        const bf16* w        = static_cast<const bf16*>(next_weight) + sd;
+        const uint4 w_packed = *reinterpret_cast<const uint4*>(w);
+        const bf16* ws       = reinterpret_cast<const bf16*>(&w_packed);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { wf[j] = __bfloat162float(ws[j]); }
+    }
+    uint4 y_packed;
+    bf16* ys = reinterpret_cast<bf16*>(&y_packed);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        ys[j] = __float2bfloat16_rn(__bfloat162float(r_vals[j]) * inv * (1.0F + wf[j]));
+    }
+    *reinterpret_cast<uint4*>(next_out_col + sd) = y_packed;
+}
+
+template <bool kMasked, bool kWriteMean = false, CombineNextNorm kNorm = CombineNextNorm::kNone>
+__launch_bounds__(320, kWriteMean ? 2 : (kNorm != CombineNextNorm::kNone ? 3 : 4))
+    __global__ void combine_inject_vec8_kernel(
+        const bf16* __restrict__ outputs, const float* __restrict__ weights, const float* __restrict__ shared_gate,
+        const bf16* __restrict__ shared, const float* __restrict__ inject, int hidden, int top_k, int streams,
+        int columns, bf16* __restrict__ residual, MoeColumnMask mask, bf16* __restrict__ mean_out,
+        std::int64_t mean_pitch, int mean_first, const void* __restrict__ next_norm_weight,
+        bf16* __restrict__ next_norm_out, float next_norm_eps) {
+    static_assert(!(kWriteMean && kNorm != CombineNextNorm::kNone));
     pdl::enter();
+    __shared__ float norm_scratch[2][10];
     const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
     const std::size_t width = static_cast<std::size_t>(streams) * hidden;
+    bf16* next_out_col      = kNorm != CombineNextNorm::kNone ? (next_norm_out + static_cast<std::size_t>(t) * width)
+                                                              : nullptr;
     if constexpr (kMasked) {
         if (!column_live(mask, t)) {
             if constexpr (kWriteMean) {
@@ -3807,6 +4531,14 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
                     for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
                     *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) =
                         mean_packed;
+                }
+            } else if constexpr (kNorm != CombineNextNorm::kNone) {
+                for (int s = 0; s < streams; ++s) {
+                    const std::size_t sd = static_cast<std::size_t>(s) * hidden + d;
+                    const uint4 r_packed =
+                        *reinterpret_cast<const uint4*>(residual + static_cast<std::size_t>(t) * width + sd);
+                    store_combine_next_norm<kNorm>(r_packed, next_norm_weight, s, sd, hidden, next_norm_eps,
+                                                   norm_scratch, next_out_col);
                 }
             }
             return;
@@ -3831,23 +4563,29 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
     float v[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) { v[j] = __bfloat162float(__float2bfloat16_rn(sum[j])); }
-    if constexpr (kWriteMean) {
-        const bool write_mean = t >= mean_first;
-        float mean[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-        for (int s = 0; s < streams; ++s) {
-            const float inj = inject[static_cast<std::size_t>(t) * streams + s];
-            uint4* r_ptr    = reinterpret_cast<uint4*>(
-                residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
-            uint4 r_packed = *r_ptr;
-            bf16* r        = reinterpret_cast<bf16*>(&r_packed);
+    const bool write_mean = kWriteMean && t >= mean_first;
+    float mean[kWriteMean ? 8 : 1] = {};
+    for (int s = 0; s < streams; ++s) {
+        const float inj      = inject[static_cast<std::size_t>(t) * streams + s];
+        const std::size_t sd = static_cast<std::size_t>(s) * hidden + d;
+        uint4* r_ptr         = reinterpret_cast<uint4*>(residual + static_cast<std::size_t>(t) * width + sd);
+        uint4 r_packed       = *r_ptr;
+        bf16* r              = reinterpret_cast<bf16*>(&r_packed);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
-            *r_ptr = r_packed;
+        for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
+        *r_ptr = r_packed;
+        if constexpr (kWriteMean) {
             if (write_mean) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) { mean[j] += __bfloat162float(r[j]); }
             }
         }
+        if constexpr (kNorm != CombineNextNorm::kNone) {
+            store_combine_next_norm<kNorm>(r_packed, next_norm_weight, s, sd, hidden, next_norm_eps,
+                                           norm_scratch, next_out_col);
+        }
+    }
+    if constexpr (kWriteMean) {
         if (write_mean) {
             const float inv_s = 1.0F / static_cast<float>(streams);
             uint4       mean_packed;
@@ -3856,17 +4594,6 @@ __launch_bounds__(320, kWriteMean ? 2 : 4) __global__ void combine_inject_vec8_k
             for (int j = 0; j < 8; ++j) { mean_bf16[j] = __float2bfloat16_rn(mean[j] * inv_s); }
             *reinterpret_cast<uint4*>(mean_out + static_cast<std::size_t>(t - mean_first) * mean_pitch + d) =
                 mean_packed;
-        }
-    } else {
-        for (int s = 0; s < streams; ++s) {
-            const float inj = inject[static_cast<std::size_t>(t) * streams + s];
-            uint4* r_ptr    = reinterpret_cast<uint4*>(
-                residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d);
-            uint4 r_packed = *r_ptr;
-            bf16* r        = reinterpret_cast<bf16*>(&r_packed);
-#pragma unroll
-            for (int j = 0; j < 8; ++j) { r[j] = __float2bfloat16_rn(__bfloat162float(r[j]) + inj * v[j]); }
-            *r_ptr = r_packed;
         }
     }
 }
@@ -4411,8 +5138,12 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                                             stage_kernel, dispatch, unlanded, base, jobs, flags, job_records, fetch,
                                             StageBytes{}));
         }
+        const bool use_xplane = use_wide && (outputs.ne[1] == static_cast<int>(x.ne[1]) * top_k) &&
+                                layout.entry_map != nullptr && layout.narrow_jobs != nullptr &&
+                                layout.pass_narrow != nullptr && layout.x_plane != nullptr;
         launch_pass(x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base, jobs,
-                    layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
+                    layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream, PassPhase::All,
+                    PassPart::Both, base / pass_jobs, use_xplane);
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
@@ -4470,7 +5201,8 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
 
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
                         const Tensor& inject, Tensor& residual, cudaStream_t stream,
-                        const Tensor* stream_mean, std::int32_t stream_mean_first_column) {
+                        const Tensor* stream_mean, std::int32_t stream_mean_first_column,
+                        const Tensor* next_norm_weight, Tensor* next_norm_out, float next_norm_eps) {
     require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) &&
                 contiguous(residual, DType::BF16) && contiguous(inject, DType::FP32),
             "combine inject requires contiguous BF16 tensors and FP32 inject");
@@ -4497,6 +5229,18 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
         mean_pitch = stream_mean->nb[1] / 2;
         mean_out   = static_cast<bf16*>(stream_mean->data);
     }
+    const bool want_next_norm = next_norm_weight != nullptr || next_norm_out != nullptr;
+    if (want_next_norm) {
+        require(next_norm_weight != nullptr && next_norm_out != nullptr,
+                "combine inject next norm requires both weight and output");
+        require(contiguous(*next_norm_out, DType::BF16) &&
+                    (contiguous(*next_norm_weight, DType::BF16) || contiguous(*next_norm_weight, DType::FP32)),
+                "combine inject next norm requires BF16 output and BF16 or FP32 weight");
+        require(next_norm_weight->ne[0] == streams * hidden && next_norm_weight->ne[1] == 1 &&
+                    next_norm_out->ne[0] == streams * hidden && next_norm_out->ne[1] == columns,
+                "combine inject next norm shapes disagree");
+        require(next_norm_eps > 0.0F, "combine inject next norm epsilon must be positive");
+    }
     const auto* routed_out = static_cast<const bf16*>(outputs.data);
     const auto* weights    = static_cast<const float*>(routing.weights.data);
     const auto* gate       = static_cast<const float*>(routing.shared_gate.data);
@@ -4504,31 +5248,53 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
     const auto* inject_in  = static_cast<const float*>(inject.data);
     auto* residual_io      = static_cast<bf16*>(residual.data);
     const pdl::Dependency dep = columns <= 16 ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
-    if (hidden % 8 == 0 && aligned_16(routed_out) && aligned_16(shared_out) && aligned_16(residual_io) &&
-        (mean_out == nullptr || (mean_pitch % 8 == 0 && aligned_16(mean_out)))) {
+    const bool vec8_base = hidden % 8 == 0 && aligned_16(routed_out) && aligned_16(shared_out) &&
+                           aligned_16(residual_io) &&
+                           (mean_out == nullptr || (mean_pitch % 8 == 0 && aligned_16(mean_out)));
+    if (vec8_base) {
         const int vec_elems = hidden / 8;
         const int threads   = (vec_elems <= 320 && vec_elems % 32 == 0) ? vec_elems : kThreads;
         const pdl::LaunchConfig cfg{dim3((vec_elems + threads - 1) / threads, columns), dim3(threads), 0, stream};
+        const bool fused_next_norm = want_next_norm && mean_out == nullptr && vec_elems == threads &&
+                                     aligned_16(next_norm_weight->data) && aligned_16(next_norm_out->data);
+        const void* nn_w   = fused_next_norm ? next_norm_weight->data : nullptr;
+        bf16*       nn_out = fused_next_norm ? static_cast<bf16*>(next_norm_out->data) : nullptr;
+        auto launch_vec8 = [&](auto kernel) {
+            CUDA_CHECK(pdl::launch_with(dep, cfg, kernel, routed_out, weights, gate, shared_out, inject_in,
+                                        hidden, top_k, streams, columns, residual_io, routing.mask, mean_out,
+                                        mean_pitch, stream_mean_first_column, nn_w, nn_out, next_norm_eps));
+        };
+        if (fused_next_norm) {
+            if (next_norm_weight->dtype == DType::FP32) {
+                if (masked) {
+                    launch_vec8(combine_inject_vec8_kernel<true, false, CombineNextNorm::kFp32>);
+                } else {
+                    launch_vec8(combine_inject_vec8_kernel<false, false, CombineNextNorm::kFp32>);
+                }
+            } else {
+                if (masked) {
+                    launch_vec8(combine_inject_vec8_kernel<true, false, CombineNextNorm::kBf16>);
+                } else {
+                    launch_vec8(combine_inject_vec8_kernel<false, false, CombineNextNorm::kBf16>);
+                }
+            }
+            return;
+        }
         if (mean_out != nullptr) {
             if (masked) {
-                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<true, true>, routed_out, weights, gate,
-                                            shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
-                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+                launch_vec8(combine_inject_vec8_kernel<true, true, CombineNextNorm::kNone>);
             } else {
-                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<false, true>, routed_out, weights,
-                                            gate, shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
-                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+                launch_vec8(combine_inject_vec8_kernel<false, true, CombineNextNorm::kNone>);
             }
         } else {
             if (masked) {
-                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<true, false>, routed_out, weights,
-                                            gate, shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
-                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+                launch_vec8(combine_inject_vec8_kernel<true, false, CombineNextNorm::kNone>);
             } else {
-                CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_vec8_kernel<false, false>, routed_out, weights,
-                                            gate, shared_out, inject_in, hidden, top_k, streams, columns, residual_io,
-                                            routing.mask, mean_out, mean_pitch, stream_mean_first_column));
+                launch_vec8(combine_inject_vec8_kernel<false, false, CombineNextNorm::kNone>);
             }
+        }
+        if (want_next_norm) {
+            hyper_connection_norm(residual, *next_norm_weight, streams, next_norm_eps, *next_norm_out, stream);
         }
         return;
     }
@@ -4541,6 +5307,9 @@ void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const 
         CUDA_CHECK(pdl::launch_with(dep, cfg, combine_inject_kernel<false>, routed_out, weights, gate, shared_out,
                                     inject_in, hidden, top_k, streams, columns, residual_io, routing.mask,
                                     mean_out, mean_pitch, stream_mean_first_column));
+    }
+    if (want_next_norm) {
+        hyper_connection_norm(residual, *next_norm_weight, streams, next_norm_eps, *next_norm_out, stream);
     }
 }
 

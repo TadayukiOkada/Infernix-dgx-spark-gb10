@@ -2,17 +2,23 @@
 #
 # run_server.sh
 #
-# Starts an infernix-serve binary for a given milestone build or commit on DGX Spark GB10.
+# Builds infernix-serve and starts it for a selected model on DGX Spark GB10.
 # Automatically sets --model-id to the commit hash so benchmarks (such as tool-eval-bench)
 # can target the exact build version.
 #
 # Usage:
-#   ./tools/run_server.sh [options] [commit_or_binary_path]
+#   ./tools/run_server.sh [options] <model_alias>
+#
+# Model aliases:
+#   dense8      Qwen3.8-Flash-Next NVIDIA NVFP4 Dense8-Infernix
+#   nvfp4       Qwen3.8-Flash-Next Local NVFP4-W4Dense (F4-Local-NVPF4-Dense)
+#   iqs_3       Qwen3.8-Flash-Next GSQ-RCO IQ3_S-Infernix  (aliases: iq3s, iq3_s)
+#   local-f4    Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-New
 #
 # Examples:
-#   ./tools/run_server.sh 76d56902
-#   ./tools/run_server.sh dist/milestones/infernix-serve-76d56902
-#   ./tools/run_server.sh --port 8000 b9c97634
+#   ./tools/run_server.sh dense8
+#   ./tools/run_server.sh --port 8000 nvfp4
+#   ./tools/run_server.sh --max-concurrency 8 iqs_3
 #
 # Options:
 #   --port PORT         Listen port (default: 8000)
@@ -22,26 +28,29 @@
 #   --max-concurrency N Max concurrency (default: 4)
 #   -h, --help          Show this help message and exit
 #
+# Environment overrides:
+#   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / KV_DTYPE override per-alias defaults
+#   SPEC_BACKEND (default: mtp, or dflash2), EXPERT_A4_ACTIVATIONS (default: 1)
+#   SKIP_BUILD=1 to skip rebuilding infernix-serve
+#
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Default paths (override per model with MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY in the environment)
-MODEL_PATH="${MODEL_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix}"
-NGRAM_PATH="${NGRAM_PATH:-/opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix.ngram}"
-NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+MODELS_DIR="/opt/etc/models"
+DRAFT_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
+
 KV_DTYPE="${KV_DTYPE:-k8v4}"
-DIST_DIR="${REPO_ROOT}/dist/milestones"
-DRAFT_PATH="/opt/etc/models/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
 
 HOST="0.0.0.0"
 PORT="8000"
 MAX_CONTEXT="262144"
 MAX_CONCURRENCY="4"
 EXPLICIT_MODEL_ID=""
-TARGET_INPUT=""
+MODEL_ALIAS=""
+EXPERT_A4_DEFAULT=1
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -71,86 +80,99 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            TARGET_INPUT="$1"
+            MODEL_ALIAS="$1"
             shift
             ;;
     esac
 done
 
-# If no target binary/commit provided, look for the newest in dist/milestones or fall back to build-native
-BINARY_PATH=""
-COMMIT_HASH=""
-
-if [[ -z "${TARGET_INPUT}" ]]; then
-    # Prefer build-native/apps/infernix-serve when newer than dist/milestones, else newest milestone
-    LATEST_BIN="$(ls -t "${DIST_DIR}"/infernix-serve-* 2>/dev/null | grep -v '\.tsv$' | head -n 1 || true)"
-    if [[ -x "${REPO_ROOT}/build-native/apps/infernix-serve" ]] && { [[ -z "${LATEST_BIN}" ]] || [[ "${REPO_ROOT}/build-native/apps/infernix-serve" -nt "${LATEST_BIN}" ]]; }; then
-        BINARY_PATH="${REPO_ROOT}/build-native/apps/infernix-serve"
-    elif [[ -n "${LATEST_BIN}" ]]; then
-        BINARY_PATH="${LATEST_BIN}"
-    else
-        echo "Error: No compiled infernix-serve binary found." >&2
-        echo "Please specify a commit or binary path, e.g.: ./tools/run_server.sh 76d56902" >&2
-        exit 1
-    fi
-else
-    # Check if TARGET_INPUT is an existing file path
-    if [[ -x "${TARGET_INPUT}" ]]; then
-        BINARY_PATH="${TARGET_INPUT}"
-    elif [[ -x "${DIST_DIR}/${TARGET_INPUT}" ]]; then
-        BINARY_PATH="${DIST_DIR}/${TARGET_INPUT}"
-    elif [[ -x "${DIST_DIR}/infernix-serve-${TARGET_INPUT}" ]]; then
-        BINARY_PATH="${DIST_DIR}/infernix-serve-${TARGET_INPUT}"
-    elif ls "${DIST_DIR}"/infernix-serve-"${TARGET_INPUT}"* >/dev/null 2>&1; then
-        BINARY_PATH="$(ls "${DIST_DIR}"/infernix-serve-"${TARGET_INPUT}"* | head -n 1)"
-    elif [[ "${TARGET_INPUT}" == "head" || "${TARGET_INPUT}" == "HEAD" ]]; then
-        COMMIT_HASH="$(git -C "${REPO_ROOT}" rev-parse --short=8 HEAD)"
-        if [[ -x "${DIST_DIR}/infernix-serve-${COMMIT_HASH}" ]]; then
-            BINARY_PATH="${DIST_DIR}/infernix-serve-${COMMIT_HASH}"
-        else
-            BINARY_PATH="${REPO_ROOT}/build-native/apps/infernix-serve"
-        fi
-    elif git -C "${REPO_ROOT}" rev-parse --verify "${TARGET_INPUT}^{commit}" >/dev/null 2>&1; then
-        RESOLVED_HASH="$(git -C "${REPO_ROOT}" rev-parse --short=8 "${TARGET_INPUT}")"
-        echo "Milestone binary for commit ${RESOLVED_HASH} (${TARGET_INPUT}) is not yet compiled in ${DIST_DIR}."
-        echo "Automatically compiling milestone binary via tools/build_milestone_binaries.sh..."
-        "${REPO_ROOT}/tools/build_milestone_binaries.sh" "${RESOLVED_HASH}"
-        if ls "${DIST_DIR}"/infernix-serve-"${RESOLVED_HASH}"* >/dev/null 2>&1; then
-            BINARY_PATH="$(ls "${DIST_DIR}"/infernix-serve-"${RESOLVED_HASH}"* | head -n 1)"
-        else
-            echo "Error: Build completed but binary for ${RESOLVED_HASH} was not found in ${DIST_DIR}" >&2
-            exit 1
-        fi
-    else
-        echo "Error: Cannot resolve binary for '${TARGET_INPUT}' in ${DIST_DIR} and not a valid git commit." >&2
-        echo "Available compiled binaries in ${DIST_DIR}:" >&2
-        ls -1 "${DIST_DIR}"/infernix-serve-* 2>/dev/null | grep -v '\.tsv$' || echo "  (none)" >&2
-        exit 1
-    fi
+if [[ -z "${MODEL_ALIAS}" ]]; then
+    echo "Error: No model alias specified." >&2
+    echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4" >&2
+    echo "Usage: ./tools/run_server.sh [options] <model_alias>" >&2
+    exit 1
 fi
 
-# Extract commit hash from binary name or git
-BINARY_NAME="$(basename "${BINARY_PATH}")"
+# Resolve model alias -> weights, n-gram volume, residency
+case "${MODEL_ALIAS}" in
+    dense8)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-Nvidia-Dense8-Infernix"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix"
+        NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        EXPERT_A4_DEFAULT=0
+        ;;
+    nvfp4)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix"
+        NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-Local-NVFP4.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        EXPERT_A4_DEFAULT=0
+        ;;
+    iqs_3|iq3s|iq3_s)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix-00001-of-00002.infernix"
+        NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-ram}"
+        EXPERT_A4_DEFAULT=0
+        ;;
+    local-f4)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix"
+        NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        EXPERT_A4_DEFAULT=1
+        ;;
+    *)
+        echo "Error: Unknown model alias '${MODEL_ALIAS}'." >&2
+        echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4" >&2
+        exit 1
+        ;;
+esac
+
+if [[ ! -f "${MODEL_PATH}" ]]; then
+    echo "Error: Model weights not found: ${MODEL_PATH}" >&2
+    exit 1
+fi
+if [[ ! -e "${NGRAM_PATH}" ]]; then
+    echo "Error: N-gram volume not found: ${NGRAM_PATH}" >&2
+    exit 1
+fi
+
+# Build infernix-serve (incremental) and run only this binary
+BINARY_PATH="${REPO_ROOT}/build-native/apps/infernix-serve"
+if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+    echo "Building infernix-serve..."
+    cmake --build "${REPO_ROOT}/build-native" --target infernix-serve --parallel "$(nproc)"
+fi
+if [[ ! -x "${BINARY_PATH}" ]]; then
+    echo "Error: infernix-serve binary not found after build: ${BINARY_PATH}" >&2
+    exit 1
+fi
+
+# Model ID defaults to the current commit hash
 if [[ -n "${EXPLICIT_MODEL_ID}" ]]; then
     MODEL_ID="${EXPLICIT_MODEL_ID}"
-elif [[ "${BINARY_NAME}" =~ infernix-serve-([0-9a-fA-F]{8}) ]]; then
-    MODEL_ID="${BASH_REMATCH[1]}"
 elif git -C "${REPO_ROOT}" rev-parse --short=8 HEAD >/dev/null 2>&1; then
     MODEL_ID="$(git -C "${REPO_ROOT}" rev-parse --short=8 HEAD)"
 else
     MODEL_ID="infernix-model"
 fi
 
+SPEC_BACKEND="${SPEC_BACKEND:-$([[ -f "${DRAFT_PATH}" ]] && echo dflash2 || echo mtp)}"
+
 echo "========================================================================================"
 echo " INFERNIX SERVER LAUNCHER (GB10 sm_121a)"
 echo "========================================================================================"
 echo " Binary          : ${BINARY_PATH}"
-echo " Model ID (Alias): ${MODEL_ID}"
+echo " Model Alias     : ${MODEL_ALIAS}"
+echo " Model ID        : ${MODEL_ID}"
 echo " Model Weights   : ${MODEL_PATH}"
+echo " N-gram Volume   : ${NGRAM_PATH} (${NGRAM_RESIDENCY})"
 echo " Listen Endpoint : http://${HOST}:${PORT}/v1"
 echo " Max Context     : ${MAX_CONTEXT} tokens"
 echo " Max Concurrency : ${MAX_CONCURRENCY}"
-echo " Speculative     : MTP (auto) + N-gram (31 drafts, min-match 4)"
+echo " Speculative     : ${SPEC_BACKEND} (auto) + N-gram (31 drafts, min-match 4)"
 echo "========================================================================================"
 echo
 
@@ -158,11 +180,10 @@ export INFERNIX_EXPERTS_ON_GPU=1
 export INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.08}"
 
 EXPERT_A4_ARGS=()
-if [[ "${EXPERT_A4_ACTIVATIONS:-1}" == "1" ]]; then
+if [[ "${EXPERT_A4_ACTIVATIONS:-${EXPERT_A4_DEFAULT}}" == "1" ]]; then
     EXPERT_A4_ARGS=(--expert-a4-activations)
 fi
 
-SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
 SPEC_ARGS=(--spec "${SPEC_BACKEND}" --draft-tokens auto)
 if [[ "${SPEC_BACKEND}" == "dflash2" ]]; then
     SPEC_ARGS+=(--draft-model "${DRAFT_PATH}")
@@ -187,8 +208,9 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --preserve-thinking \
     --host-context-mib 1024 \
     --tolerant-tool-calls \
+    --vision \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --host "${HOST}" \
     --port "${PORT}" \
-    --model-id "${MODEL_ID}"
+    --model-id "qwen3.8-flash-next"

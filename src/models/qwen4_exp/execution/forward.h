@@ -299,7 +299,9 @@ public:
     // chunk are the same.
     void begin_call(const ForwardBatch& batch, const Tensor* logits);
     void embed(const ForwardBatch& batch, Tensor& residual);
-    void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
+    void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr,
+               const Tensor* pre_norm = nullptr, const Tensor* next_norm_weight = nullptr,
+               Tensor* next_norm_out = nullptr);
     // layer() in two halves, for a walk whose MoE runs once over several chunks' columns (every
     // step of both halves acts column by column, so the outputs are layer()'s bit for bit).
     // layer_mixer runs everything before the MoE and writes its input xm (BF16 [H, T]) and its
@@ -379,8 +381,11 @@ private:
     void lossless_layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual);
     // The final mixer and the LM head over residuals (BF16 [S*H, n]) into FP32 logits [V, n].
     void lossless_head(const Tensor& residuals, Tensor& logits);
-    // The block's mixed input (into `into` when given, else the workspace).
-    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr);
+    // The block's mixed input (into `into` when given, else the workspace). When `pre_norm` is
+    // set and the fused decode mix does not apply, uses `pre_norm` directly instead of recomputing
+    // the per-stream RMSNorm from `residual`.
+    Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject, Tensor* into = nullptr,
+               const Tensor* pre_norm = nullptr);
     // The attention half's inject (y with its coefficients `pending`) into the residual, then the MLP
     // half's mix: one Op that folds the inject into the fused mixer's reads under the temporary
     // INFERNIX_TMP_HC_INJECT_FOLD (candidates §7.3 D6), else the two Ops in turn. Same bits either way.
@@ -417,7 +422,8 @@ private:
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                const ForwardBatch* batch = nullptr, std::int32_t route_columns = -1, const Tensor* inject = nullptr,
                Tensor* residual = nullptr, const Tensor* stream_mean = nullptr,
-               std::int32_t stream_mean_first_column = 0);
+               std::int32_t stream_mean_first_column = 0, const Tensor* next_norm_weight = nullptr,
+               Tensor* next_norm_out = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, const Tensor& residual);
     // The dense projections' route flags for the current call: ForwardFastPaths::prefill_routes

@@ -1,5 +1,7 @@
 #include "ops/hyper_connection/hyper_connection_up_collapse.h"
 
+#include "ops/linear/q4/q4_instances.cuh"
+#include "ops/linear/q4/q4_mma_launch.cuh"
 #include "ops/linear/q8/q8_instances.cuh"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 
@@ -25,6 +27,8 @@ template <int Features>
 struct HcStreamRows {
     static constexpr int kOutputRowsPerCta = Features;
     int hidden;
+
+    int output_rows(int) const { return hidden; }
 
     __device__ __forceinline__ int weight_row(int row0, int local_row, int) const {
         return (local_row / Features) * hidden + row0 + local_row % Features;
@@ -110,6 +114,16 @@ void launch(const Tensor& m, const Weight& up, const Tensor& normalized, Tensor&
         HcStreamRows<Features>{hidden});
 }
 
+template <class Schedule>
+void launch_q4(const Tensor& m, const Weight& up, const Tensor& normalized, Tensor& x, cudaStream_t stream) {
+    constexpr int Features = Schedule::kBlockRows / kStreams;
+    const int hidden       = x.ne[0];
+    launch_q4_a16_mma<Schedule>(
+        q4_linear_operands(m, up), HcNoOutput{},
+        HcCollapseEpilogue{static_cast<const bf16*>(normalized.data), static_cast<bf16*>(x.data), hidden}, stream,
+        HcStreamRows<Features>{hidden});
+}
+
 } // namespace
 
 bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_t streams,
@@ -120,11 +134,13 @@ bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden, std::int32_
     // moved the boundary from 17 (where the 48-token tile lost 2..4 % at 5 and 9..16 in the
     // 2026-10-30 GB10 retune) down to the fused mix's edge (infernix_hyper_connection_bench, GB10).
     if (streams != kStreams || hidden <= 0 || hidden % 16 != 0 || columns <= 4 || up.qdata == nullptr ||
-        up.n != streams * hidden) {
+        up.n != streams * hidden || up.layout != QuantLayout::RowSplit || up.scales == nullptr ||
+        up.padded_shape[1] % 128 != 0 || up.padded_shape[1] < up.k) {
         return false;
     }
-    return up.qtype == QType::Q8_G32_FP16 && up.layout == QuantLayout::RowSplit && up.scales != nullptr &&
-           up.padded_shape[1] % 128 == 0 && up.padded_shape[1] >= up.k && up.k % 8 == 0;
+    if (up.qtype == QType::Q8_G32_FP16) return up.k % 8 == 0;
+    if (up.qtype == QType::Q4_G64_FP16) return up.k % 64 == 0;
+    return false;
 }
 
 void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized, std::int32_t streams, Tensor& x,
@@ -134,9 +150,12 @@ void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized,
         normalized.ne[0] != up.n || x.ne[1] != T) {
         throw std::invalid_argument("hyper_connection: fused up + collapse shapes disagree");
     }
-    // Tiles by width from the GB10 sweep (whole mixer, Q8 layers); every tile gives the same bits.
-    // The BF16 fused route was removed once the admission above became Q8-only (upstream 2026-10-28).
     const int hidden = x.ne[0];
+    if (up.qtype == QType::Q4_G64_FP16) {
+        if (T <= 32) return launch_q4<q4_instances::MmaR32T32K64Wr16Wt16S3A3B2>(m, up, normalized, x, stream);
+        if (T <= 64) return launch_q4<q4_instances::MmaR32T64K64Wr16Wt32S2A2B2>(m, up, normalized, x, stream);
+        return launch_q4<q4_instances::MmaR64T64K64Wr32Wt16S2A2B2>(m, up, normalized, x, stream);
+    }
     // The linear family's measured argmin for this shape at 9..32 columns rides the same tile: the
     // 32-row K64 one, whose unpredicated K and 4 CTAs/SM the fused route needs to keep its bandwidth.
     // The 64-row K128 tile of the 17..48 band runs ~180 GB/s here and loses even to the composed

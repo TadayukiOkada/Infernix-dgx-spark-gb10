@@ -111,7 +111,8 @@ Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
         d.a_scales = nvfp4_make_tma_planes(const_cast<std::uint8_t*>(p.x_scales), tile, scale_rows,
                                            tile, Schedule::kTerms, p.scale_plane, tile, 16,
                                            CU_TENSOR_MAP_SWIZZLE_NONE,
-                                           "encode residual activation scales TMA");
+                                           "encode residual activation scales TMA",
+                                           Schedule::kPromotions.a_codes);
     } else {
         d.a_codes = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x),
                                       CU_TENSOR_MAP_DATA_TYPE_UINT8, p.k / 2, p.tokens, p.k / 2, 64,
@@ -121,7 +122,8 @@ Nvfp4A4TmaDescriptors make_nvfp4_a4_tma_descriptors(const Nvfp4A4Operands& p) {
         d.a_scales = nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.x_scales),
                                        CU_TENSOR_MAP_DATA_TYPE_UINT8, tile, scale_rows, tile, tile,
                                        16, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                       "encode activation scales TMA");
+                                       "encode activation scales TMA",
+                                       Schedule::kPromotions.a_codes);
     }
     d.b_codes =
         nvfp4_make_tma_2d(const_cast<std::uint8_t*>(p.codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
@@ -180,12 +182,14 @@ struct Nvfp4A4TmaSharedStorage {
 __device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y,
                                                         int token_count, int k) {
     (void)token_count;
-    const int tiles_m    = static_cast<int>(gridDim.x);
-    const int tiles_n    = static_cast<int>(gridDim.y);
-    const int linear     = static_cast<int>(blockIdx.y) * tiles_m + static_cast<int>(blockIdx.x);
-    const int group_n    = k > 6144 ? 4 : 8;
-    const int group_span = tiles_m * group_n;
-    const int group      = linear / group_span;
+    const int tiles_m     = static_cast<int>(gridDim.x);
+    const int tiles_n     = static_cast<int>(gridDim.y);
+    const int linear      = static_cast<int>(blockIdx.y) * tiles_m + static_cast<int>(blockIdx.x);
+    const int max_group_n = k <= 2560 ? 12 : (k > 6144 ? 4 : 8);
+    const int num_groups  = (tiles_n + max_group_n - 1) / max_group_n;
+    const int group_n     = (tiles_n + num_groups - 1) / num_groups;
+    const int group_span  = tiles_m * group_n;
+    const int group       = linear / group_span;
     const int first_n    = group * group_n;
     const int active_n   = min(group_n, tiles_n - first_n);
     const int within     = linear - group * group_span;
@@ -567,8 +571,8 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
         // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
         static constexpr int bytes   = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
         static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows, InPlace>;
-        (void)nvfp4_prepare_shared<bytes, kernel, true>();
         for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            (void)nvfp4_prepare_shared<bytes, kernel, true>();
             const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
             CUDA_CHECK(pdl::launch_with(
                 dependency, {grid, dim3(Schedule::kThreads), bytes, stream}, kernel, parameter,

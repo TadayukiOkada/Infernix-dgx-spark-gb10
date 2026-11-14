@@ -1191,6 +1191,41 @@ void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed
                 mean_same ? "bit-equal to stream_mean" : "DIFFERENT");
     check(same, "moe_combine_inject equals moe_combine followed by hyper_connection_inject");
     check(mean_same, "moe_combine_inject's stream mean equals hyper_connection_stream_mean on the injected residual");
+    if (hidden % 8 == 0) {
+        for (const DType nw_dtype : {DType::BF16, DType::FP32}) {
+            const std::size_t nw_elems = static_cast<std::size_t>(streams) * hidden;
+            const float eps            = 1e-6F;
+            void* d_nw                 = nw_dtype == DType::FP32 ? static_cast<void*>(device_copy(floats(nw_elems)))
+                                                                 : static_cast<void*>(device_copy(bf16s(nw_elems)));
+            auto* d_fused_nn = device_copy(residual);
+            auto* d_ref_nn   = device_copy(std::vector<std::uint16_t>(nw_elems * columns, 0xCDCDU));
+            auto* d_fused_no = device_copy(std::vector<std::uint16_t>(nw_elems * columns, 0xEFEFU));
+            const Tensor t_nw(d_nw, nw_dtype, {static_cast<std::int32_t>(nw_elems), 1});
+            Tensor t_fused_nn(d_fused_nn, DType::BF16, {streams * hidden, columns});
+            Tensor t_ref_no(d_ref_nn, DType::BF16, {streams * hidden, columns});
+            Tensor t_fused_no(d_fused_no, DType::BF16, {streams * hidden, columns});
+            infernix::ops::hyper_connection_norm(t_split, t_nw, streams, eps, t_ref_no, nullptr);
+            infernix::ops::moe_combine_inject(t_outputs, routing, t_shared, t_inject, t_fused_nn, nullptr, nullptr, 0,
+                                               &t_nw, &t_fused_no, eps);
+            cuda_check(cudaDeviceSynchronize(), "combine inject next norm");
+            std::vector<std::uint16_t> nn_resid(residual.size()), ref_no(nw_elems * columns),
+                fused_no(nw_elems * columns);
+            cuda_check(cudaMemcpy(nn_resid.data(), d_fused_nn, nn_resid.size() * 2, cudaMemcpyDeviceToHost), "copy");
+            cuda_check(cudaMemcpy(ref_no.data(), d_ref_nn, ref_no.size() * 2, cudaMemcpyDeviceToHost), "copy");
+            cuda_check(cudaMemcpy(fused_no.data(), d_fused_no, fused_no.size() * 2, cudaMemcpyDeviceToHost), "copy");
+            const bool nn_resid_same = split == nn_resid;
+            const bool nn_out_same   = ref_no == fused_no;
+            std::printf("combine_inject next_norm(%s) T=%d H=%d masked=%d: resid=%s, norm=%s\n",
+                        nw_dtype == DType::FP32 ? "fp32" : "bf16", columns, hidden, masked ? 1 : 0,
+                        nn_resid_same ? "bit-equal" : "DIFFERENT", nn_out_same ? "bit-equal" : "DIFFERENT");
+            check(nn_resid_same, "moe_combine_inject with next_norm leaves residual bit-equal");
+            check(nn_out_same, "moe_combine_inject next_norm equals hyper_connection_norm on updated residual");
+            cudaFree(d_nw);
+            cudaFree(d_fused_nn);
+            cudaFree(d_ref_nn);
+            cudaFree(d_fused_no);
+        }
+    }
     for (void* p : {static_cast<void*>(d_outputs), static_cast<void*>(d_shared), static_cast<void*>(d_weights),
                     static_cast<void*>(d_gate), static_cast<void*>(d_inject), static_cast<void*>(d_split),
                     static_cast<void*>(d_fused), static_cast<void*>(d_y), static_cast<void*>(d_ref_mean),
@@ -1659,8 +1694,10 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_route_pooled(256, 3, 8, 256, 271, true);
             test_route_pooled(256, 4, 8, 64, 277, true);
             for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
-            // The fused stream mean: a masked call's window (vec8), and the scalar kernel's path.
+            // The fused stream mean & next_norm: masked vec8 (H=2560), fallback vec8 (H=40 -> hyper_connection_norm), and scalar (H=20).
             test_combine_inject(5, 10, 4, 311U, moe::kHidden, true);
+            test_combine_inject(5, 10, 4, 319U, 40, false);
+            test_combine_inject(5, 10, 4, 323U, 40, true);
             test_combine_inject(5, 10, 4, 313U, 20);
             test_combine_inject(5, 10, 4, 317U, 20, true);
             test_service_column_bound();

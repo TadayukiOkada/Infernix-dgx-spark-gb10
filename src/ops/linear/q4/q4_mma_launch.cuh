@@ -21,32 +21,47 @@ int q4_prepare_mma_shared() {
     }
 }
 
-template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue>
+template <int BlockRows>
+struct Q4MmaIdentityRows {
+    static constexpr int kOutputRowsPerCta = BlockRows;
+    static int output_rows(int rows) { return rows; }
+    __device__ __forceinline__ int weight_row(int row0, int local_row, int) const {
+        return row0 + local_row;
+    }
+};
+
+template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue,
+          class RowPolicy = Q4MmaIdentityRows<Schedule::kBlockRows>>
 void launch_q4_a16_mma(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, RowPolicy row_policy = {}) {
     validate_q4_operands(operands);
     if (operands.padded_k % Schedule::kBlockK != 0) {
         throw std::invalid_argument("Q4 MMA padded K must contain complete K tiles");
     }
     for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(static_cast<unsigned>(div_up(operands.rows, Schedule::kBlockRows)),
-                        static_cast<unsigned>(div_up(count, Schedule::kBlockTokens)));
+        const dim3 grid(
+            static_cast<unsigned>(
+                div_up(row_policy.output_rows(operands.rows), RowPolicy::kOutputRowsPerCta)),
+            static_cast<unsigned>(div_up(count, Schedule::kBlockTokens)));
         const auto* x   = operands.x + static_cast<std::int64_t>(offset) * operands.k;
         const bool full = operands.rows % Schedule::kBlockRows == 0 &&
                           count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&
                           operands.k % Schedule::kBlockK == 0;
+        constexpr int kSharedBytes = q4_mma_shared_bytes<Schedule, Epilogue>;
         if (full) {
-            constexpr auto kernel = q4_a16_mma_kernel<Schedule, true, Output, Epilogue>;
-            const int shared      = q4_prepare_mma_shared<Schedule::kSharedBytes, kernel>();
+            constexpr auto kernel =
+                q4_a16_mma_kernel<Schedule, true, Output, Epilogue, RowPolicy>;
+            const int shared = q4_prepare_mma_shared<kSharedBytes, kernel>();
             kernel<<<grid, Schedule::kThreads, shared, stream>>>(
-                x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
-                count, operands.padded_k, offset);
+                x, operands.codes, operands.scales, output, epilogue, row_policy, operands.rows,
+                operands.k, count, operands.padded_k, offset);
         } else {
-            constexpr auto kernel = q4_a16_mma_kernel<Schedule, false, Output, Epilogue>;
-            const int shared      = q4_prepare_mma_shared<Schedule::kSharedBytes, kernel>();
+            constexpr auto kernel =
+                q4_a16_mma_kernel<Schedule, false, Output, Epilogue, RowPolicy>;
+            const int shared = q4_prepare_mma_shared<kSharedBytes, kernel>();
             kernel<<<grid, Schedule::kThreads, shared, stream>>>(
-                x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
-                count, operands.padded_k, offset);
+                x, operands.codes, operands.scales, output, epilogue, row_policy, operands.rows,
+                operands.k, count, operands.padded_k, offset);
         }
         CUDA_CHECK(cudaGetLastError());
     });

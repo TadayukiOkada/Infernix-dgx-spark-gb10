@@ -57,10 +57,12 @@ using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    // GB10 2026-11-03: the prefill token tile is now picked per width by the 48-SM wave-fill rule
-    // (nvfp4_a4_tma_prefill_route). Measured here: T = 640-896 and 1152-1536 run 4.8-16.4% ahead on
-    // the 128-token tile (mean 9.7%); 257-512, 1024, 1664 and 2048 stay on the wide one.
+    // GB10 2026-11-14: T = 2048 runs 3.9-4.4% faster on the 128-token narrow TMA tile
+    // (326.6 vs 339.9 us), and T = 129-256 gains 18.7-24.1% on Tiled128 TMA vs T128R128Resident
+    // (61.8/65.4/68.8 vs 78.7/86.1/85.0 us at T = 129/192/256).
+    if (tokens >= 2048) return nvfp4_a4_tma_narrow_route();
     if (tokens >= 257) return nvfp4_a4_tma_prefill_route<Geometry>(tokens);
+    if (tokens >= 129) return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
     if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
     if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R128>();

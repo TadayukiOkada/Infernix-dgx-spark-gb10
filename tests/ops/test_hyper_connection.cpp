@@ -523,6 +523,32 @@ INFERNIX_OP_TEST(hyper_connection) {
             const Result captured3 = run(p, r3, 3, inject, ws, stream, true, fp32_norm);
             check(captured3.x == all3.x && captured3.inject == all3.inject,
                   tag + ": a graph-captured fused call equals the eager call");
+            if (!infernix::ops::hyper_connection_mix_is_fused(p.down_w, p.up_w, kH, kS, kRank, 193)) {
+                const auto r193   = residual(193, 777U);
+                const Result ref  = run(p, r193, 193, inject, ws, stream, false, fp32_norm);
+                Device rd(r193.size() * 2), nrd(r193.size() * 2), xd(static_cast<std::size_t>(kH) * 193 * 2),
+                    id(static_cast<std::size_t>(kS) * 193 * 4);
+                t::cuda_check(cudaMemcpy(rd.p, r193.data(), r193.size() * 2, cudaMemcpyHostToDevice), "residual");
+                const Tensor R(rd.p, DType::BF16, {kW, 193});
+                Tensor NR(nrd.p, DType::BF16, {kW, 193});
+                const Tensor w =
+                    fp32_norm ? Tensor(p.norm32_device->p, DType::FP32, {kW}) : Tensor(p.norm_device->p, DType::BF16, {kW});
+                Tensor x(xd.p, DType::BF16, {kH, 193});
+                Tensor inj(id.p, DType::FP32, {kS, 193});
+                infernix::ops::hyper_connection_norm(R, w, kS, kEps, NR, stream);
+                infernix::ops::hyper_connection_mix_normalized(NR, p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only,
+                                                               kS, kRank, x, inject ? &inj : nullptr, ws, stream);
+                t::cuda_check(cudaStreamSynchronize(stream), "mix_normalized");
+                std::vector<std::uint16_t> mx(ref.x.size());
+                t::cuda_check(cudaMemcpy(mx.data(), xd.p, mx.size() * 2, cudaMemcpyDeviceToHost), "mx");
+                bool norm_mix_same = mx == ref.x;
+                if (inject) {
+                    std::vector<float> minj(ref.inject.size());
+                    t::cuda_check(cudaMemcpy(minj.data(), id.p, minj.size() * 4, cudaMemcpyDeviceToHost), "minj");
+                    norm_mix_same = norm_mix_same && (minj == ref.inject);
+                }
+                check(norm_mix_same, tag + ": hyper_connection_norm + mix_normalized bit-equals mix at T=193");
+            }
         }
         up_collapse_bit_identity(Codec::Q8, stream);
         // Shapes that disagree are refused.
