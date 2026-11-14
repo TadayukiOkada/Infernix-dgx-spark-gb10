@@ -43,6 +43,8 @@ public:
     void clear() {
         nodes_.clear();
         edges_.clear();
+        edge_table_.clear();
+        edge_table_count_ = 0;
         tokens_.clear();
         nodes_.push_back(Node{});
         last_ = 0;
@@ -157,26 +159,46 @@ public:
         Match match;
         if (maximum == 0 || history.empty()) { return match; }
 
-        // Fast path: if history matches the active tail ending at last_, use O(1) suffix link traversal.
+        // Fast path: if history matches the active tail ending at last_ (with no boundary tokens),
+        // last_ is already the SAM state for history, avoiding root-to-tip linked-list traversal.
         int32_t state = 0;
         int32_t matched = 0;
-
-        for (const auto t : history) {
-            if (is_boundary(t)) {
-                state   = 0;
-                matched = 0;
-                continue;
+        bool tail_match = (last_ != 0 && history.size() <= tokens_.size());
+        if (tail_match) {
+            const auto tail_offset = tokens_.size() - history.size();
+            for (std::size_t i = 0; i < history.size(); ++i) {
+                const auto t = history[i];
+                if (t != tokens_[tail_offset + i] || is_boundary(t)) {
+                    tail_match = false;
+                    break;
+                }
             }
-            while (state != -1 && get_transition(state, t) == -1) {
-                state   = nodes_[state].link;
-                matched = state != -1 ? nodes_[state].len : 0;
+        }
+        if (tail_match) {
+            state = last_;
+            const auto hlen = static_cast<int32_t>(history.size());
+            while (state != 0 && nodes_[state].link != -1 && nodes_[nodes_[state].link].len >= hlen) {
+                state = nodes_[state].link;
             }
-            if (state == -1) {
-                state   = 0;
-                matched = 0;
-            } else {
-                state = get_transition(state, t);
-                matched++;
+            matched = std::min<int32_t>(nodes_[state].len, hlen);
+        } else {
+            for (const auto t : history) {
+                if (is_boundary(t)) {
+                    state   = 0;
+                    matched = 0;
+                    continue;
+                }
+                while (state != -1 && get_transition(state, t) == -1) {
+                    state   = nodes_[state].link;
+                    matched = state != -1 ? nodes_[state].len : 0;
+                }
+                if (state == -1) {
+                    state   = 0;
+                    matched = 0;
+                } else {
+                    state = get_transition(state, t);
+                    matched++;
+                }
             }
         }
 
@@ -257,12 +279,60 @@ private:
         int32_t next_edge = -1;
     };
 
+    struct EdgeSlot {
+        int32_t u   = -1;
+        Token key   = 0;
+        int32_t to  = -1;
+    };
+
     std::size_t token_capacity_ = 0;
     std::vector<Node> nodes_;
     std::vector<Edge> edges_;
+    std::vector<EdgeSlot> edge_table_;
+    std::size_t edge_table_count_ = 0;
     std::vector<Token> tokens_;
     std::vector<Token> boundaries_;
     int32_t last_ = 0;
+
+    [[nodiscard]] static std::size_t hash_edge(int32_t u, Token key) noexcept {
+        std::uint64_t x = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(u)) << 32) |
+                          static_cast<std::uint32_t>(key);
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return static_cast<std::size_t>(x);
+    }
+
+    void rehash_edge_table(std::size_t new_cap) {
+        std::vector<EdgeSlot> next(new_cap);
+        const std::size_t mask = new_cap - 1;
+        for (const auto& s : edge_table_) {
+            if (s.u < 0) { continue; }
+            std::size_t idx = hash_edge(s.u, s.key) & mask;
+            while (next[idx].u >= 0) { idx = (idx + 1) & mask; }
+            next[idx] = s;
+        }
+        edge_table_ = std::move(next);
+    }
+
+    void put_edge_table(int32_t u, Token token, int32_t to) {
+        if ((edge_table_count_ + 1) * 2 > edge_table_.size()) {
+            rehash_edge_table(edge_table_.empty() ? 1024 : edge_table_.size() * 2);
+        }
+        const std::size_t mask = edge_table_.size() - 1;
+        std::size_t idx = hash_edge(u, token) & mask;
+        while (edge_table_[idx].u >= 0) {
+            if (edge_table_[idx].u == u && edge_table_[idx].key == token) {
+                edge_table_[idx].to = to;
+                return;
+            }
+            idx = (idx + 1) & mask;
+        }
+        edge_table_[idx] = EdgeSlot{u, token, to};
+        ++edge_table_count_;
+    }
 
     [[nodiscard]] static bool power_of_two(std::size_t value) noexcept {
         return value != 0 && (value & (value - 1)) == 0;
@@ -274,8 +344,14 @@ private:
 
     [[nodiscard]] int32_t get_transition(int32_t u, Token token) const noexcept {
         if (nodes_[u].first_key == token) { return nodes_[u].first_to; }
-        for (int32_t e = nodes_[u].next_edge; e != -1; e = edges_[e].next) {
-            if (edges_[e].key == token) { return edges_[e].to; }
+        if (nodes_[u].next_edge == -1 || edge_table_.empty()) { return -1; }
+        const std::size_t mask = edge_table_.size() - 1;
+        std::size_t idx = hash_edge(u, token) & mask;
+        while (edge_table_[idx].u >= 0) {
+            if (edge_table_[idx].u == u && edge_table_[idx].key == token) {
+                return edge_table_[idx].to;
+            }
+            idx = (idx + 1) & mask;
         }
         return -1;
     }
@@ -285,20 +361,26 @@ private:
             nodes_[u].first_to = to;
             return;
         }
-        for (int32_t e = nodes_[u].next_edge; e != -1; e = edges_[e].next) {
-            if (edges_[e].key == token) {
-                edges_[e].to = to;
-                return;
-            }
-        }
         if (nodes_[u].first_key == -1) {
             nodes_[u].first_key = token;
             nodes_[u].first_to  = to;
-        } else {
-            const auto new_edge = static_cast<int32_t>(edges_.size());
-            edges_.push_back(Edge{token, to, nodes_[u].next_edge});
-            nodes_[u].next_edge = new_edge;
+            return;
         }
+        if (nodes_[u].next_edge != -1 && !edge_table_.empty()) {
+            const std::size_t mask = edge_table_.size() - 1;
+            std::size_t idx = hash_edge(u, token) & mask;
+            while (edge_table_[idx].u >= 0) {
+                if (edge_table_[idx].u == u && edge_table_[idx].key == token) {
+                    edge_table_[idx].to = to;
+                    return;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+        const auto new_edge = static_cast<int32_t>(edges_.size());
+        edges_.push_back(Edge{token, to, nodes_[u].next_edge});
+        nodes_[u].next_edge = new_edge;
+        put_edge_table(u, token, to);
     }
 
     void copy_transitions(int32_t dst, int32_t src) {
@@ -309,6 +391,7 @@ private:
             const auto new_edge = static_cast<int32_t>(edges_.size());
             edges_.push_back(Edge{edges_[e].key, edges_[e].to, nodes_[dst].next_edge});
             nodes_[dst].next_edge = new_edge;
+            put_edge_table(dst, edges_[e].key, edges_[e].to);
         }
     }
 };

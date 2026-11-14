@@ -56,6 +56,7 @@ std::string ProgramImpl::graph_label(const DecodeGraph& graph) const {
         {"MTP draft", mtp_draft_graphs_, mtp_k_},
         {"sampled MTP draft", mtp_sampled_graphs_, mtp_k_},
         {"gated MTP draft", mtp_gated_graphs_, mtp_k_},
+        {"gated sampled MTP draft", mtp_sampled_gated_graphs_, mtp_k_},
         {"MTP catch-up", mtp_catch_graphs_, max_width_},
         {"DFlash2 proposal", dflash_propose_graphs_, 1},
         {"DFlash2 context", dflash_context_graphs_, max_width_},
@@ -143,7 +144,6 @@ void ProgramImpl::capture_graph_set() {
                     take(verify_graph(batch, W, true), [&] { verify_graph_body(batch, W, true); });
                 }
                 take(commit_graph(batch, W), [&] { commit_body(batch, W); });
-                if (mtp_) { take(mtp_catch_graph(batch, W), [&] { mtp_catch_body(batch, W); }); }
                 if (mtp_ && dflash2_) {
                     take(dflash_context_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)],
                          [&] { drafter_->materialize(dflash2_context_call(batch, W)); });

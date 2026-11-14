@@ -4939,6 +4939,7 @@ private:
         ops::qsa_commit_tails(Tensor(qsa_records_.p, DType::BF16, {di_, W, batch, layers}), positions, commit_columns,
                               tails, slots, execution::qsa_geometry(c_), s);
         ops::ple_conv_commit(Tensor(ple_records_.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states, slots, s);
+        if (rows.empty() && mtp_) { mtp_catch_body(batch, W); }
         if (rows.empty() && dflash2_ && !mtp_) { drafter_->materialize(dflash2_context_call(batch, W)); }
     }
     DecodeGraph& mtp_catch_graph(std::int32_t batch, std::int32_t W) {
@@ -5060,7 +5061,8 @@ private:
             stride = max_width_;
         } else if (at < 0 && ((at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0 ||
                               (at = route_trace_index(mtp_sampled_graphs_, &graph)) >= 0 ||
-                              (at = route_trace_index(mtp_gated_graphs_, &graph)) >= 0)) {
+                              (at = route_trace_index(mtp_gated_graphs_, &graph)) >= 0 ||
+                              (at = route_trace_index(mtp_sampled_gated_graphs_, &graph)) >= 0)) {
             family = RouteTraceGraph::MtpDraft;
             stride = mtp_k_;
         } else if (at < 0 && (at = route_trace_index(mtp_catch_graphs_, &graph)) >= 0) {
@@ -5512,9 +5514,10 @@ private:
             }
         }
         upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * batch, s);
-        // The fold, QSA tails and PLE commit (and on DFlash2 without MTP the drafter's context too) as one graph per
-        // batch size and width, which reads every row's count and slot from the device, instead of three launches
-        // (four with the context's graph) on the host's turnaround each round (design §19.3.34). Same bits.
+        if (mtp_) { stage_mtp_catch_up(rows, W, commit, s); }
+        // The fold, QSA tails and PLE commit (and on DFlash2 without MTP the drafter's context, and with MTP
+        // its catch-up too) as one graph per batch size and width, which reads every row's count and slot
+        // from the device, instead of separate launches on the host's turnaround each round (design §19.3.34).
         const bool graphed          = !c_.lossless;
         const bool context_in_graph = graphed && dflash2_ && !mtp_;
         if (graphed) {
@@ -5522,9 +5525,7 @@ private:
         } else {
             commit_body(batch, W, std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)));
         }
-        // The drafter's catch-up on a stream of greater priority beside these commit kernels, with the next
-        // round's drafts pre-drafted there (candidates §13 SR-01), measured within chance (removed 2026-10-28).
-        if (mtp_) { mtp_catch_up(rows, W, commit); }
+        if (mtp_) { finish_mtp_catch_up(rows, W, commit, !graphed, s); }
         if (context_in_graph) {
             dflash2_settle_frontiers(rows, commit);
         } else if (dflash2_) {
@@ -5569,7 +5570,10 @@ private:
         mtp_catch_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
         mtp_draft_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_);
         mtp_gated_graphs_.resize(static_cast<std::size_t>(mtp_k_));
-        if (sampled_drafts_) { mtp_sampled_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_); }
+        if (sampled_drafts_) {
+            mtp_sampled_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_);
+            mtp_sampled_gated_graphs_.resize(static_cast<std::size_t>(mtp_k_));
+        }
     }
 
     // The drafter pool (candidates §22 VM-01 variant B): the drafter's routed experts behind a
@@ -5739,7 +5743,7 @@ private:
         // acceptance only, so A/B arms replaying one greedy request run the same rounds.
         if (replay_clock_) { return kWidthCost; }
         double a = 0.0, b = 0.0;
-        return round_cost_fit(a, b) ? std::clamp(b / a, 0.16, kWidthCost) : kWidthCost;
+        return round_cost_fit(a, b) ? std::clamp(b / a, 0.05, kWidthCost) : kWidthCost;
     }
 
     // At a decode round's start: the previous round's cycle when both are one-row MTP rounds (an
@@ -5986,11 +5990,14 @@ private:
     // stale, beyond the cut that reads them. (Design §19.3.27: at --spec-min-p, 34 % of the steps of
     // mixed-topic MTP 4 rounds, decode +2.2 %.)
     [[nodiscard]] bool mtp_draft_gated(std::int32_t batch, std::int32_t steps, bool sampled) const noexcept {
-        return !sampled && batch == 1 && steps > 1 && (options_.auto_draft_length || std::isfinite(draft_min_logprob_));
+        if (batch != 1 || steps <= 1) { return false; }
+        return sampled || options_.auto_draft_length || std::isfinite(draft_min_logprob_);
     }
 
     DecodeGraph& mtp_draft_graph(std::int32_t batch, std::int32_t steps, bool sampled) {
-        if (mtp_draft_gated(batch, steps, sampled)) { return mtp_gated_graphs_[static_cast<std::size_t>(steps - 1)]; }
+        if (mtp_draft_gated(batch, steps, sampled)) {
+            return (sampled ? mtp_sampled_gated_graphs_ : mtp_gated_graphs_)[static_cast<std::size_t>(steps - 1)];
+        }
         auto& graphs = sampled ? mtp_sampled_graphs_ : mtp_draft_graphs_;
         return graphs[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)];
     }
@@ -6045,6 +6052,15 @@ private:
         if (mtp_draft_gated(batch, steps, sampled)) {
             replay_gated(graph, steps, draft_step,
                          [&](std::int32_t j, cudaGraphConditionalHandle next) {
+                             if (sampled) {
+                                 const float min_lp = std::isfinite(draft_min_logprob_)
+                                                          ? static_cast<float>(draft_min_logprob_)
+                                                          : -2.12026F; // log(0.12)
+                                 const auto* confidence =
+                                     reinterpret_cast<const float*>(mtp_device(mtp_io_.logprobs + static_cast<std::size_t>(j)));
+                                 launch_graph_gate(confidence, static_cast<double>(min_lp), next, s);
+                                 return;
+                             }
                              if (options_.auto_draft_length) {
                                  // Steps 0..j's product against the round's threshold word (one row).
                                  launch_graph_gate_product(reinterpret_cast<const float*>(mtp_device(mtp_io_.logprobs)),
@@ -6119,10 +6135,9 @@ private:
     // After a verification round's commit: the drafter's cells of the verified window from its
     // residuals and committed tokens (index-key tails advance by the committed count), and each
     // row's last committed residual becomes its pending cell, already written.
-    void mtp_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
-        const cudaStream_t s     = device_.stream;
-        const auto batch         = static_cast<std::int32_t>(rows.size());
-        const std::size_t column = 2ULL * width_;
+    void stage_mtp_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit,
+                            cudaStream_t s) {
+        const auto batch = static_cast<std::int32_t>(rows.size());
         for (std::int32_t b = 0; b < batch; ++b) {
             const std::int32_t k = commit[b];
             for (std::int32_t j = 0; j < W; ++j) {
@@ -6131,7 +6146,13 @@ private:
             }
         }
         upload_pinned(mtp_device(mtp_io_.up_ids), mtp_host(mtp_io_.up_ids), 4ULL * batch * W, s);
-        replay(mtp_catch_graph(batch, W), [&] { mtp_catch_body(batch, W); });
+    }
+
+    void finish_mtp_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit,
+                             bool run_body, cudaStream_t s) {
+        const auto batch         = static_cast<std::int32_t>(rows.size());
+        const std::size_t column = 2ULL * width_;
+        if (run_body) { mtp_catch_body(batch, W); }
         for (std::int32_t b = 0; b < batch; ++b) {
             const std::int32_t k = commit[b];
             const auto lane      = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
@@ -6141,6 +6162,14 @@ private:
                                        column, cudaMemcpyDeviceToDevice, s));
             lanes_[lane].mtp_cells = lanes_[lane].state_tokens;
         }
+    }
+
+    void mtp_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
+        const cudaStream_t s = device_.stream;
+        const auto batch     = static_cast<std::int32_t>(rows.size());
+        stage_mtp_catch_up(rows, W, commit, s);
+        replay(mtp_catch_graph(batch, W), [&] { mtp_catch_body(batch, W); });
+        finish_mtp_catch_up(rows, W, commit, false, s);
     }
 
     // Samples the next token of each row from read_logits (row b = column b) into pending_tokens_.
@@ -6912,6 +6941,7 @@ private:
     // With sampled drafts, the same for rounds with a sampled row (greedy rounds keep the argmax).
     std::vector<DecodeGraph> mtp_sampled_graphs_;
     std::vector<DecodeGraph> mtp_gated_graphs_; // one-row argmax rounds: steps - 1
+    std::vector<DecodeGraph> mtp_sampled_gated_graphs_; // one-row sampled rounds: steps - 1
     // Whether this round's MTP drafts were sampled (their proposals wait in the drafter's io).
     bool mtp_sampled_round_ = false;
     std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
@@ -6985,7 +7015,7 @@ private:
     // 0.38 of a plain round. Single-stream MTP sweep on the Dense8 model: 0.38 -> ~31.7 tok/s, 0.25 ->
     // ~40 tok/s (optimum), <=0.20 overshoots (positions 4+ accept ~0). Default lowered to 0.25;
     // INFERNIX_WIDTH_COST still overrides for per-workload tuning.
-    static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.18);
+    static inline const double kWidthCost         = policy_double("INFERNIX_WIDTH_COST", 0.08);
     static inline const double kNgramWidthCost    = policy_double("INFERNIX_NGRAM_WIDTH_COST", 0.08);
     static constexpr std::uint64_t kProbeInterval = 8;
     // DFlash2's calibrated length (--draft-tokens auto): a verified draft's column and a proposal in

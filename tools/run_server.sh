@@ -14,6 +14,7 @@
 #   nvfp4       Qwen3.8-Flash-Next Local NVFP4-W4Dense (F4-Local-NVPF4-Dense)
 #   iqs_3       Qwen3.8-Flash-Next GSQ-RCO IQ3_S-Infernix  (aliases: iq3s, iq3_s)
 #   local-f4    Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-New
+#   hc4-w4dense Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-HC4-W4Dense (alias: hc4)
 #
 # Examples:
 #   ./tools/run_server.sh dense8
@@ -88,7 +89,7 @@ done
 
 if [[ -z "${MODEL_ALIAS}" ]]; then
     echo "Error: No model alias specified." >&2
-    echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4" >&2
+    echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4, hc4-w4dense (hc4)" >&2
     echo "Usage: ./tools/run_server.sh [options] <model_alias>" >&2
     exit 1
 fi
@@ -123,9 +124,17 @@ case "${MODEL_ALIAS}" in
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
         EXPERT_A4_DEFAULT=1
         ;;
+    hc4-w4dense|hc4)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense.infernix"
+        NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
+        EXPERT_A4_DEFAULT=1
+        ;;
     *)
         echo "Error: Unknown model alias '${MODEL_ALIAS}'." >&2
-        echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4" >&2
+        echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4, hc4-w4dense (hc4)" >&2
         exit 1
         ;;
 esac
