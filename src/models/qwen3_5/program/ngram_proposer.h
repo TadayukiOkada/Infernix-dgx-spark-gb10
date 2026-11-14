@@ -124,8 +124,9 @@ public:
         for (const auto n : widths_) {
             if (history.size() < n) { continue; }
             const auto tail = history.last(n);
-            if (std::find_if(tail.begin(), tail.end(), [](Token t) { return t < 0; }) !=
-                tail.end()) {
+            if (std::find_if(tail.begin(), tail.end(), [this](Token t) {
+                    return t < 0 || std::binary_search(boundaries_.begin(), boundaries_.end(), t);
+                }) != tail.end()) {
                 continue;
             }
             const auto& bucket = buckets_[hash(tail, n) & (buckets_.size() - 1)];

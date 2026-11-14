@@ -318,9 +318,9 @@ struct DFlash2Io {
                 words = 0;
 };
 
-// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's four most probable tokens:
-// measured against 8 and 16 at T 1.0 / top-p 0.95 / top-k 20 (design §19.3.24).
-inline constexpr std::int32_t kSampledDraftRanks = 4;
+// Sampled MTP drafts (sampled-mtp-drafts) draw from the draft head's sixteen most probable
+// tokens under the request's sampler with penalty/intra-chain overlays (design §19.3.24).
+inline constexpr std::int32_t kSampledDraftRanks = ops::kSparseSpeculativeCandidates;
 
 // Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
 // (ProgramImpl::plan_device) computes it from the options and the configuration alone: before the
@@ -1811,7 +1811,6 @@ public:
         lane.next_call = 0;
         clear_prompt_uses(lane);
         lane.mtp_policy_rounds = 0;
-        lane.mtp_cumulative.reset();
         lane.dflash_calibration = dflash_process_calibration_;
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
@@ -1834,6 +1833,8 @@ public:
             lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(max_width_ - 1), 0);
         }
         lane.sampling       = q.sampling;
+        lane.mtp_cumulative.reset((sampled_drafts_ && lane.sampling.temperature > 0.0F) ? kMtpSampledCumulativeBase
+                                                                                       : kMtpCumulativeBase);
         if (lane.sampling.temperature > 0.0F) {
             const double t = static_cast<double>(lane.sampling.temperature);
             lane.ngram_accept[0] = kNgramAcceptancePriors[0] * std::clamp(std::exp(-1.5 * t), 0.15, 1.0);
@@ -5414,12 +5415,16 @@ private:
                     double& a        = lane.mtp_accept[static_cast<std::size_t>(j)];
                     a                = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
                 }
-                // The chain's verified drafts against the cumulative cut's bin table (rows whose drafts
-                // read_mtp_drafts kept: argmax drafts under --draft-tokens auto).
-                if (mtp_ && !dflash2_ && options_.auto_draft_length && !(sparse && lane.sampling.temperature > 0.0F)) {
+                // The chain's verified drafts against the cumulative cut's bin table (both argmax and
+                // sampled 16-rank drafts under --draft-tokens auto).
+                if (mtp_ && !dflash2_ && options_.auto_draft_length) {
+                    const bool row_sampled = sparse && lane.sampling.temperature > 0.0F;
                     lane.mtp_cumulative.observe(mtp_draft_logprobs_[static_cast<std::size_t>(b)].data(),
                                                 static_cast<std::int32_t>(std::min<std::uint64_t>(n, 8)),
-                                                static_cast<std::int32_t>(std::min<std::uint64_t>(A, n)));
+                                                static_cast<std::int32_t>(std::min<std::uint64_t>(A, n)),
+                                                row_sampled ? kMtpSampledCumulativeBins : kMtpCumulativeBins,
+                                                row_sampled ? kMtpSampledCumulativeBase : kMtpCumulativeBase,
+                                                row_sampled ? kMtpSampledCumulativeFloor : kMtpCumulativeFloor);
                 }
                 if (dflash2_) {
                     const std::span<const float> confidences(dflash_confidence_[b].data(), n);
@@ -5433,11 +5438,12 @@ private:
                 ++stats.ngram_rounds;
                 stats.ngram_drafted_tokens += n;
                 stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
-                // The bucket's acceptance per position.
+                // The bucket's acceptance per position; back off faster on complete 0-token misses.
                 if (ngram_bucket_[b] >= 0) {
-                    double& a = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
-                    const double hit = n > 0 ? static_cast<double>(A) / static_cast<double>(n) : 0.0;
-                    a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * hit;
+                    double& a           = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
+                    const double hit    = n > 0 ? static_cast<double>(A) / static_cast<double>(n) : 0.0;
+                    const double weight = A == 0 ? std::min(2.5 * kAcceptanceWeight, 0.5) : kAcceptanceWeight;
+                    a                   = (1.0 - weight) * a + weight * hit;
                 }
             }
             for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
@@ -5973,9 +5979,11 @@ private:
     void stage_mtp_samplers(std::span<const std::uint32_t> lanes, cudaStream_t stream) {
         auto* configs = reinterpret_cast<ops::SamplingConfig*>(mtp_host(mtp_io_.configs));
         for (std::size_t b = 0; b < lanes.size(); ++b) {
-            configs[b]           = lanes_[lanes[b]].sampling;
+            configs[b] = lanes_[lanes[b]].sampling;
             if (configs[b].temperature > 0.0F) {
-                configs[b].temperature *= 0.85F;
+                const float pen   = std::fabs(configs[b].presence_penalty) + std::fabs(configs[b].frequency_penalty);
+                const float scale = pen > 0.0F ? std::min(1.0F, 0.88F + 0.08F * pen) : 0.88F;
+                configs[b].temperature *= scale;
             }
             configs[b].mask      = {};
             configs[b].nonfinite = nullptr; // a draft's selection never fails the request
@@ -5983,7 +5991,7 @@ private:
         upload_pinned(mtp_device(mtp_io_.configs), configs, sizeof(ops::SamplingConfig) * lanes.size(), stream);
     }
 
-    // A one-row argmax round verifies its drafts only up to its cut (with --draft-tokens auto the cumulative
+    // A one-row round verifies its drafts only up to its cut (with --draft-tokens auto the cumulative
     // cut, MtpCumulative; with a fixed length the first draft below --spec-min-p), so a draft step runs only
     // while every earlier draft cleared it: the device applies the host's cut (the same comparisons) and
     // skips the steps whose drafts it would discard. A skipped step leaves its draft and confidence words
@@ -5991,7 +5999,7 @@ private:
     // mixed-topic MTP 4 rounds, decode +2.2 %.)
     [[nodiscard]] bool mtp_draft_gated(std::int32_t batch, std::int32_t steps, bool sampled) const noexcept {
         if (batch != 1 || steps <= 1) { return false; }
-        return sampled || options_.auto_draft_length || std::isfinite(draft_min_logprob_);
+        return need_mtp_logprobs(batch, sampled);
     }
 
     DecodeGraph& mtp_draft_graph(std::int32_t batch, std::int32_t steps, bool sampled) {
@@ -6046,25 +6054,19 @@ private:
                                .sample_rows      = plane(mtp_io_.sample_rows, kSampledDraftRanks, DType::I32),
                                .sample_logprobs  = plane(mtp_io_.sample_logprobs, kSampledDraftRanks, DType::FP32),
                                .draft_candidates = plane(mtp_io_.draft_candidates, C, DType::I32),
-                               .draft_q          = plane(mtp_io_.draft_q, C, DType::FP32)});
+                               .draft_q          = plane(mtp_io_.draft_q, C, DType::FP32),
+                               .prior_drafts     = (sampled && j > 0)
+                                                       ? Tensor(mtp_device(mtp_io_.drafts), DType::I32, {batch, j})
+                                                       : Tensor{}});
         };
         DecodeGraph& graph = mtp_draft_graph(batch, steps, sampled);
         if (mtp_draft_gated(batch, steps, sampled)) {
             replay_gated(graph, steps, draft_step,
                          [&](std::int32_t j, cudaGraphConditionalHandle next) {
-                             if (sampled) {
-                                 const float min_lp = std::isfinite(draft_min_logprob_)
-                                                          ? static_cast<float>(draft_min_logprob_)
-                                                          : -2.12026F; // log(0.12)
-                                 const auto* confidence =
-                                     reinterpret_cast<const float*>(mtp_device(mtp_io_.logprobs + static_cast<std::size_t>(j)));
-                                 launch_graph_gate(confidence, static_cast<double>(min_lp), next, s);
-                                 return;
-                             }
                              if (options_.auto_draft_length) {
                                  // Steps 0..j's product against the round's threshold word (one row).
                                  launch_graph_gate_product(reinterpret_cast<const float*>(mtp_device(mtp_io_.logprobs)),
-                                                           1, j, kMtpCumulativeBins,
+                                                           1, j, sampled ? kMtpSampledCumulativeBins : kMtpCumulativeBins,
                                                            reinterpret_cast<const float*>(mtp_device(mtp_io_.cumulative)),
                                                            next, s);
                                  return;
@@ -6096,34 +6098,25 @@ private:
                 mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + nb];
             }
             // The row's confident drafts: those before the first chain product below the staged
-            // threshold with --draft-tokens auto, else before the first below draft_min_logprob_ (the
-            // device gate's comparison for a gated one-row round); every sampled draft
-            // with sampled-mtp-drafts (a sampled proposal's acceptance does not follow the head's top
-            // probability, and its rounds were measured faster without a cut).
+            // threshold with --draft-tokens auto (greedy or calibrated 16-rank sampled table), else
+            // before the first below draft_min_logprob_ (the device gate's comparison for a gated
+            // one-row round).
             mtp_confident_[b] = steps;
             mtp_executed_[b]  = steps;
             if (!need_logprobs) { continue; }
             const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
             auto& kept           = mtp_draft_logprobs_[static_cast<std::size_t>(b)];
             for (std::int32_t j = 0; j < steps; ++j) { kept[static_cast<std::size_t>(j)] = logprobs[j * batch + nb]; }
-            if (sampled && lane.sampling.temperature > 0.0F) {
-                // Sampled draft early-exit: verify only drafts exceeding the confidence floor.
-                // Drafts with p < 12% on NVFP4 have near-zero empirical acceptance and waste verify GEMM width.
-                const float min_lp = std::isfinite(draft_min_logprob_)
-                                         ? static_cast<float>(draft_min_logprob_)
-                                         : -2.12026F; // log(0.12)
-                const auto cut    = mtp_min_logprob_cut(logprobs + nb, batch, steps, min_lp, gated);
-                mtp_confident_[b] = cut.kept;
-                mtp_executed_[b]  = cut.executed;
-            } else {
-                const auto cut = options_.auto_draft_length
-                                     ? mtp_cumulative_cut(logprobs + nb, batch, steps,
-                                                          mtp_cumulative_threshold_[static_cast<std::size_t>(nb)],
-                                                          kMtpCumulativeBins, gated)
-                                     : mtp_min_logprob_cut(logprobs + nb, batch, steps, draft_min_logprob_, gated);
-                mtp_confident_[b] = cut.kept;
-                mtp_executed_[b]  = cut.executed;
-            }
+            const bool row_sampled = sampled && lane.sampling.temperature > 0.0F;
+            const auto cut         = options_.auto_draft_length
+                                         ? mtp_cumulative_cut(logprobs + nb, batch, steps,
+                                                              mtp_cumulative_threshold_[static_cast<std::size_t>(nb)],
+                                                              row_sampled ? kMtpSampledCumulativeBins : kMtpCumulativeBins,
+                                                              gated)
+                                         : mtp_min_logprob_cut(logprobs + nb, batch, steps,
+                                                               static_cast<float>(draft_min_logprob_), gated);
+            mtp_confident_[b]      = cut.kept;
+            mtp_executed_[b]       = cut.executed;
         }
     }
 

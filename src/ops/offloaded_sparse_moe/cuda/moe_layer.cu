@@ -855,7 +855,7 @@ struct ActCodes {
     std::int32_t scale1;
 };
 
-static_assert(sizeof(ActCodes) == moe::wide::kNarrowActBytes, "the narrow acts plane stores ActCodes");
+static_assert(sizeof(ActCodes) == 24, "ActCodes packs four code words and two scales");
 
 __device__ __forceinline__ std::uint32_t dup_nibbles(std::uint32_t codes) { return codes | (codes << 4); }
 

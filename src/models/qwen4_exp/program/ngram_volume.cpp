@@ -283,14 +283,22 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
     }
     const std::size_t row_bytes = table_.row_bytes;
+    constexpr std::size_t kPrefetchDist = 8;
     if (resident_) {
         const std::byte* blocks = resident_->data();
-        const auto copy_range   = [&](std::size_t lo, std::size_t hi) {
+        const auto row_offset   = [&](std::uint32_t row) noexcept -> std::uint64_t {
+            return static_cast<std::uint64_t>(row / table_.rows_per_block) * table_.block_bytes +
+                   static_cast<std::uint64_t>(row % table_.rows_per_block) * row_bytes;
+        };
+        const auto copy_range = [&](std::size_t lo, std::size_t hi) {
             for (std::size_t i = lo; i < hi; ++i) {
+                if (i + kPrefetchDist < hi && rows[i + kPrefetchDist] < table_.rows) {
+                    const std::uint64_t next_at = row_offset(rows[i + kPrefetchDist]);
+                    __builtin_prefetch(blocks + next_at, 0, 0);
+                    if (row_bytes > 64) { __builtin_prefetch(blocks + next_at + 64, 0, 0); }
+                }
                 if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
-                const std::uint64_t at =
-                    static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) * table_.block_bytes +
-                    static_cast<std::uint64_t>(rows[i] % table_.rows_per_block) * row_bytes;
+                const std::uint64_t at = row_offset(rows[i]);
                 std::memcpy(out.data() + i * row_bytes, blocks + at, row_bytes);
             }
         };
@@ -317,6 +325,9 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
             auto& my_misses      = local_misses[t];
             std::uint64_t hits   = 0;
             for (std::size_t i = lo; i < hi; ++i) {
+                if (i + kPrefetchDist < hi && rows[i + kPrefetchDist] < table_.rows) {
+                    __builtin_prefetch(tags_.data() + set_of(rows[i + kPrefetchDist]) * kCacheWays, 0, 1);
+                }
                 if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
                 const std::size_t slot = find_slot(rows[i]);
                 if (slot != std::numeric_limits<std::size_t>::max()) {
@@ -339,6 +350,9 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         }
     } else {
         for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (i + kPrefetchDist < rows.size() && rows[i + kPrefetchDist] < table_.rows) {
+                __builtin_prefetch(tags_.data() + set_of(rows[i + kPrefetchDist]) * kCacheWays, 0, 1);
+            }
             if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
             const std::size_t slot = find_slot(rows[i]);
             if (slot != std::numeric_limits<std::size_t>::max()) {

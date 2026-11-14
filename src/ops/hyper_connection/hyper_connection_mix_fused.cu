@@ -748,7 +748,7 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
 // column, GB10 candidate 2026-10-30) measured 3..8 % slower at the widths this branch now serves
 // (T = 2..3) and neutral at 4..8, so the pass loop stays.
 template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
-__global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns == 3) ? 2 : 1) void hc_down_partials_v4_kernel(
+__global__ __launch_bounds__(kDownThreads, (ExactColumns >= 2 && ExactColumns <= 4) ? 2 : 1) void hc_down_partials_v4_kernel(
     const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
     const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
@@ -767,7 +767,7 @@ __global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns ==
 
     // 1. Weights first: the warp's rows of the stream's K slice, and the norm weights of the 8-element
     // groups this thread stages (i = 8 tid + 8 kDownThreads h, the same elements K1a's thread sums).
-    constexpr int kPreloadChunks = ExactColumns == 3 ? 2 : (kChunks / 2);
+    constexpr int kPreloadChunks = ExactColumns == 4 ? 1 : (ExactColumns == 3 ? 2 : (kChunks / 2));
     typename Codec::Chunk chunk0[kPreloadChunks];
     {
         const std::int64_t source = row0 < rows ? row0 : 0;
@@ -793,31 +793,25 @@ __global__ __launch_bounds__(kDownThreads, (ExactColumns == 2 || ExactColumns ==
         // 2. K1a's loads (and pending inject) and per-thread sums of squares (its elements in index
         // order), its warp butterflies and its warps' sums in warp order.
         uint4 values[kColumns][kSlices];
-        uint4 ys[Pending ? kColumns : 1][kSlices];
 #pragma unroll
         for (int c = 0; c < kColumns; ++c) {
             const bf16* r = residual + static_cast<std::int64_t>(c0 + c) * width + static_cast<std::int64_t>(s) * kHidden;
+            float inject  = 0.0F;
+            if constexpr (Pending) {
+                if (ExactColumns > 0 || c < pass) {
+                    inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
+                }
+            }
 #pragma unroll
             for (int h = 0; h < kSlices; ++h) {
                 const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
                 if ((ExactColumns > 0 || c < pass) && i < kHidden) {
-                    values[c][h] = load_ldg<uint4>(r + i);
+                    uint4 v = load_ldg<uint4>(r + i);
                     if constexpr (Pending) {
-                        ys[c][h] = load_ldg<uint4>(pending_y + static_cast<std::int64_t>(c0 + c) * kHidden + i);
+                        const uint4 y = load_ldg<uint4>(pending_y + static_cast<std::int64_t>(c0 + c) * kHidden + i);
+                        v             = injected8(v, y, inject);
                     }
-                }
-            }
-        }
-        if constexpr (Pending) {
-#pragma unroll
-            for (int c = 0; c < kColumns; ++c) {
-                if (ExactColumns > 0 || c < pass) {
-                    const float inject = pending_inject[static_cast<std::int64_t>(c0 + c) * kStreams + s];
-#pragma unroll
-                    for (int h = 0; h < kSlices; ++h) {
-                        const int i = static_cast<int>(threadIdx.x) * 8 + kDownThreads * 8 * h;
-                        if (i < kHidden) { values[c][h] = injected8(values[c][h], ys[c][h], inject); }
-                    }
+                    values[c][h] = v;
                 }
             }
         }

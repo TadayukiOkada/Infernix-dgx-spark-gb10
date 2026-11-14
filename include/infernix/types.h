@@ -126,11 +126,12 @@ enum class FastPath : std::uint8_t {
     // and fold each group's weight scale into its accumulator (ops::LinearRoutes::Q4W4A8).
     Q4W4A8,
     // Qwen3.8-Flash-Next MTP, and Qwen3.5 MTP with resident experts and no n-gram copies: a sampled
-    // request's drafts are drawn from the draft head's four most probable tokens under the request's
-    // sampler and verified by speculative rejection sampling against that proposal
-    // (ops::speculative_sample_sparse_drafts), and its rounds verify every draft (no --spec-min-p
-    // cut). The output distribution stays the sampler's; a seeded sampled request's text changes,
-    // greedy requests are unchanged. Without it the drafts are the head's argmax (one-hot proposals).
+    // request's drafts are drawn from the draft head's sixteen most probable tokens under the request's
+    // sampler (with penalty-aware temperature scaling, penalty and intra-chain overlays) and verified by
+    // speculative rejection sampling against that proposal (ops::speculative_sample_sparse_drafts), subject
+    // to the cumulative or --spec-min-p cut. The output distribution stays the sampler's; a seeded sampled
+    // request's text changes, greedy requests are unchanged. Without it the drafts are the head's argmax
+    // (one-hot proposals).
     // Qualified on Flash-Next only; on Qwen3.5 it runs as a --fast-path candidate.
     SampledMtpDrafts,
     // Chunked Gated DeltaNet calls (prefill and other calls of 16 or more tokens) store the
@@ -264,7 +265,7 @@ enum class FastPath : std::uint8_t {
     // depends on where its calls start. Without it the router runs the FP32 SIMT dot products.
     RouterMma,
     // Qwen3.8-Flash-Next artifacts with a BF16 or 8-bit LM head converted with its 2-bit screen
-    // (--screen-heads): a decode or verification round of at most 16 columns whose every row is
+    // (--screen-heads): a decode or verification round of at most 32 columns whose every row is
     // greedy, without penalties, a grammar or a token constraint, scores the whole vocabulary from the screen and
     // computes only the rows within 5 logits of each column's best screen score (at most 64) with the
     // exact head's arithmetic (ops::screened_head_logits). Those rows' logits carry the exact head's
@@ -474,7 +475,7 @@ struct SpeculativeOptions {
     // --spec-min-p (MTP, Qwen3.8-Flash-Next DFlash2): a one-row round verifies its drafts up to the
     // first whose drafter probability is below this value; 0 verifies every draft. In [0, 1]; unset
     // is 0. Qwen3.8-Flash-Next MTP takes it with a fixed draft length only (with draft_tokens_auto its
-    // argmax chains stop at a cumulative acceptance cut, and startup refuses it); other backends
+    // chains stop at a cumulative acceptance cut, and startup refuses it); other backends
     // refuse it.
     std::optional<float> draft_min_p;
     // DFlash2, DFlash or MTP tree verification by batch size: entry c-1 is the column count (anchor

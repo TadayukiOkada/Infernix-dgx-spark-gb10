@@ -30,37 +30,53 @@ namespace infernix::models::qwen4_exp {
 // draft j while the product over i <= j of the observed acceptance rate of draft i's probability bin
 // stays at or above the request's threshold. The bins are Basalt's, as log-probability edges (the
 // drafter's stored values, compared without exp, so host and device classify alike:
-// core/decode_graph.h). The threshold starts at kMtpCumulativeBase and falls toward 0.25 as the
-// request's drafts are accepted more often than the table predicts (observed / expected accepted,
-// decayed 0.97 per round, mapped linearly over 0.9..1.1). Draft-only: verification and outputs are
-// unchanged. It is the cut of `--draft-tokens auto` (Dense8 MTP auto, ABBA x5: conv 1.0529x, 5/5, worst 1.0296;
-// struct 1.0009x); a fixed draft length keeps the --spec-min-p cut (MTP-3 under this cut: conv 1.0423x, struct
-// 0.9919x, worse in every pair; 2026-10-28).
+// core/decode_graph.h). The threshold starts at kMtpCumulativeBase and falls toward
+// kMtpCumulativeFloor as the request's drafts are accepted more often than the table predicts
+// (observed / expected accepted, decayed 0.97 per round, mapped linearly over 0.9..1.1). Draft-only:
+// verification and outputs are unchanged. It is the cut of `--draft-tokens auto` (Dense8 MTP auto,
+// ABBA x5: conv 1.0529x, 5/5, worst 1.0296; struct 1.0009x); a fixed draft length keeps the
+// --spec-min-p cut (MTP-3 under this cut: conv 1.0423x, struct 0.9919x, worse in every pair;
+// 2026-10-28).
 inline constexpr GraphGateBins kMtpCumulativeBins{
     {-1.20397280F, -0.693147181F, -0.356674944F, -0.223143551F, -0.105360516F, -0.0512932944F, -0.0100503359F},
     {0.12F, 0.26F, 0.43F, 0.51F, 0.59F, 0.66F, 0.79F, 0.96F}};
-inline constexpr float kMtpCumulativeBase = 0.35F;
+inline constexpr float kMtpCumulativeBase  = 0.35F;
+inline constexpr float kMtpCumulativeFloor = 0.25F;
+
+// The cumulative table for sampled 16-rank MTP chains (temperature > 0): because the drafter draws
+// across up to 16 ranks and verification preserves target mass over that candidate set (block
+// verification), empirical single-step acceptance exceeds the argmax top-1 bin probability in lower
+// top-1 log-probability bands.
+inline constexpr GraphGateBins kMtpSampledCumulativeBins{
+    {-2.59026717F, -2.12026354F, -1.60943791F, -1.20397280F, -0.693147181F, -0.356674944F, -0.105360516F},
+    {0.22F, 0.44F, 0.58F, 0.68F, 0.76F, 0.84F, 0.91F, 0.97F}};
+inline constexpr float kMtpSampledCumulativeBase  = 0.28F;
+inline constexpr float kMtpSampledCumulativeFloor = 0.20F;
 
 struct MtpCumulative {
     float threshold = kMtpCumulativeBase;
     double observed = 0.0, expected = 0.0;
 
-    void reset() { *this = MtpCumulative{}; }
+    void reset(float base = kMtpCumulativeBase) {
+        *this     = MtpCumulative{};
+        threshold = base;
+    }
     // One verified chain: `offered` drafts with these log-probabilities, `accepted` of them taken.
-    void observe(const float* logprobs, std::int32_t offered, std::int32_t accepted) {
+    void observe(const float* logprobs, std::int32_t offered, std::int32_t accepted,
+                 const GraphGateBins& bins = kMtpCumulativeBins,
+                 float base = kMtpCumulativeBase, float floor = kMtpCumulativeFloor) {
         if (offered <= 0) { return; }
         constexpr double kDecay = 0.97, kLowRatio = 0.9, kHighRatio = 1.1;
-        constexpr float kFloor  = 0.25F;
         double chance = 1.0, sum = 0.0;
         for (std::int32_t j = 0; j < offered; ++j) {
-            chance *= static_cast<double>(graph_gate_rate(logprobs[j], kMtpCumulativeBins));
+            chance *= static_cast<double>(graph_gate_rate(logprobs[j], bins));
             sum += chance;
         }
         observed = observed * kDecay + static_cast<double>(accepted);
         expected = expected * kDecay + sum;
         if (expected < 0.5) { return; }
         const double t = std::clamp((observed / expected - kLowRatio) / (kHighRatio - kLowRatio), 0.0, 1.0);
-        threshold      = kMtpCumulativeBase + static_cast<float>(t) * (kFloor - kMtpCumulativeBase);
+        threshold      = base + static_cast<float>(t) * (floor - base);
     }
 };
 

@@ -107,7 +107,7 @@ case "${MODEL_ALIAS}" in
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense"
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix"
         NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-Local-NVFP4.ngram"
-        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
         EXPERT_A4_DEFAULT=0
         ;;
     iqs_3|iq3s|iq3_s)
@@ -121,14 +121,14 @@ case "${MODEL_ALIAS}" in
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New"
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix"
         NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix.ngram"
-        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
         EXPERT_A4_DEFAULT=1
         ;;
     hc4-w4dense|hc4)
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense"
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense.infernix"
         NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
-        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
         SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
         EXPERT_A4_DEFAULT=1
         ;;

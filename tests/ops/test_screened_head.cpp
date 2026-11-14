@@ -616,6 +616,45 @@ void logits_case(LogitsHead& head, std::uint64_t seed) {
         cudaGraphDestroy(graph);
         cudaStreamDestroy(stream);
     }
+    // Wide calls (T in [17, 32]): exact screen/rescore across both 16-column halves, column-16
+    // width invariance, repeat determinism and CUDA Graph replay at T = 32.
+    {
+        const auto wide_cols = make_columns(head.values, head.rows, 32, seed + 17, false);
+        int wide_differs     = 0;
+        for (const std::int32_t T : {24, 32}) {
+            check_logits_call(head, wide_cols, T, policy, work, head.label + " wide T=" + std::to_string(T),
+                              {0, 16, T - 1}, wide_differs);
+        }
+        std::cout << head.label << ": wide argmax differs in " << wide_differs << " of 56 columns\n";
+        check(wide_differs <= 2, head.label + ": wide screened argmax matches the full head on structured columns");
+        DeviceArray<std::uint16_t> dx32(wide_cols);
+        const Tensor x32(dx32.p, DType::BF16, {K, 32});
+        const Tensor x1_col16(dx32.p + static_cast<std::size_t>(16) * K, DType::BF16, {K, 1});
+        const auto out32 = run_logits(head, x32, policy, work);
+        const auto out16 = run_logits(head, x1_col16, policy, work);
+        check(std::memcmp(out32.data() + static_cast<std::size_t>(16) * head.rows, out16.data(),
+                          sizeof(float) * head.rows) == 0,
+              head.label + ": wide column 16 logits do not depend on the call's width");
+        cudaStream_t stream = nullptr;
+        cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "wide stream");
+        DeviceArray<float> out(static_cast<std::size_t>(head.rows) * 32);
+        Tensor logits(out.p, DType::FP32, {head.rows, 32});
+        cudaGraph_t graph      = nullptr;
+        cudaGraphExec_t replay = nullptr;
+        cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "wide capture");
+        infernix::ops::screened_head_logits(x32, head.bf16_rows ? head.bf16_tensor : Tensor{},
+                                            head.bf16_rows ? Weight{} : head.q8_weight, head.screen_weight, head.valid,
+                                            policy, logits, work, stream);
+        cuda(cudaStreamEndCapture(stream, &graph), "wide end capture");
+        cuda(cudaGraphInstantiate(&replay, graph, 0), "wide instantiate");
+        cuda(cudaMemsetAsync(out.p, 0, out.n * sizeof(float), stream), "wide clear");
+        cuda(cudaGraphLaunch(replay, stream), "wide replay");
+        cuda(cudaStreamSynchronize(stream), "wide replay sync");
+        check(out.host() == out32, head.label + ": wide CUDA Graph replay gives the eager bits");
+        cudaGraphExecDestroy(replay);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    }
     // A margin admitting every row: the `rescored` best screen scores (the radix path), still exact.
     {
         const infernix::ops::ScreenedHeadPolicy wide_margin{.margin = 1000.0F, .rescored = 64};
@@ -695,7 +734,7 @@ void top_case(std::uint64_t seed) {
 
     // Each fixture column's FP64 screen scores, once. The screen's grid is the Op's own
     // (screened_head_screen_grid): the 1..8-column ring fits two co-resident CTAs per SM.
-    std::vector<std::unique_ptr<ColumnScreen>> oracles(32);
+    std::vector<std::unique_ptr<ColumnScreen>> oracles(64);
     const auto oracle = [&](const std::vector<std::uint16_t>& xbits, int slot, std::int32_t t) -> const ColumnScreen& {
         auto& c = oracles[static_cast<std::size_t>(slot + t)];
         if (!c) { c = std::make_unique<ColumnScreen>(column_screen(screen, R, xbits.data() + static_cast<std::size_t>(t) * K)); }
@@ -775,6 +814,27 @@ void top_case(std::uint64_t seed) {
     check(flat_stats.worst_difference <= 4.0 * std::ldexp(1.0, -23), "top form: flat columns' rank differences are exact");
     check(flat_stats.unexplained == 0, "top form: flat columns' admitted exact top rows are among the ranks");
     check(flat_stats.worst_normalizer <= 0.25, "top form: flat columns' normalizer approximates the exact log-normalizer");
+    {
+        const auto wide_top = make_columns(dequantized, R, 32, seed + 7, false);
+        TopStats wide_total;
+        for (const std::int32_t T : {24, 32}) {
+            const TopStats s = check_columns(wide_top, 32, T, policy);
+            wide_total.columns += s.columns;
+            wide_total.differs += s.differs;
+            wide_total.rank_differs += s.rank_differs;
+            wide_total.unexplained += s.unexplained;
+            wide_total.worst_difference = std::max(wide_total.worst_difference, s.worst_difference);
+            wide_total.worst_normalizer = std::max(wide_total.worst_normalizer, s.worst_normalizer);
+        }
+        std::cout << "top form, wide T=24,32: " << wide_total.differs << " of " << wide_total.columns
+                  << " drafts differ (" << wide_total.unexplained << " not explained), normalizer worst "
+                  << wide_total.worst_normalizer << " nats\n";
+        check(wide_total.differs <= 2, "top form: wide draft equals the exact head's argmax on structured columns");
+        check(wide_total.unexplained == 0, "top form: wide admitted exact top rows are among the ranks");
+        check(wide_total.worst_difference <= 4.0 * std::ldexp(1.0, -23),
+              "top form: wide rank differences are exact");
+        check(wide_total.worst_normalizer <= 0.25, "top form: wide normalizer approximates the exact log-normalizer");
+    }
     // The radix paths: margin 0 with four ranks (one row within the margin, four required), and a margin
     // admitting every row (more than `rescored`: the 64 best screen scores). Margin 0 rescores only the
     // screen's four best, so the exact top row is required only where the screen ranks it there.
@@ -821,6 +881,60 @@ void top_case(std::uint64_t seed) {
         cudaGraphExecDestroy(replay);
         cudaGraphDestroy(graph);
         cudaStreamDestroy(stream);
+        {
+            const Tensor x8(dx.p, DType::BF16, {K, 8});
+            const auto exact8 = exact_logits(x8, &head, nullptr, R);
+            // When margin admits >= 16 candidates (so P_t has fixed cap 64 for both ranks=4 and
+            // ranks=16), kTailExcludedRanks=4 keeps the top-4 rows, variance v_t, and logprobs bit-identical.
+            const infernix::ops::ScreenedHeadPolicy wide_policy{.margin = 1000.0F, .rescored = 64};
+            std::vector<std::int32_t> rows4_w, rows16_w, tok4_w, tok16_w;
+            std::vector<float> lp4_w, lp16_w;
+            run(x8, 4, true, wide_policy, rows4_w, lp4_w, tok4_w);
+            run(x8, 16, true, wide_policy, rows16_w, lp16_w, tok16_w);
+            check(tok16_w == tok4_w, "top form: wide policy ranks=16 returns the same top tokens as ranks=4");
+            for (std::int32_t t = 0; t < 8; ++t) {
+                for (int j = 0; j < 4; ++j) {
+                    check(rows16_w[t * 16 + j] == rows4_w[t * 4 + j] &&
+                              std::memcmp(&lp16_w[t * 16 + j], &lp4_w[t * 4 + j], sizeof(float)) == 0,
+                          "top form: wide policy ranks=16 top-4 rows and logprobs are bit-identical to ranks=4");
+                }
+            }
+            // Under default policy, ranks=16 selects max(within, 16) candidates: verify unique valid
+            // rows, exact BF16 logit descending order, exact rank differences, and admitted exact top-16.
+            std::vector<std::int32_t> rows16, tokens16;
+            std::vector<float> lp16;
+            run(x8, 16, true, policy, rows16, lp16, tokens16);
+            double worst_diff16 = 0.0;
+            for (std::int32_t t = 0; t < 8; ++t) {
+                const auto at = [&](int row) { return bf16_round(exact8[static_cast<std::size_t>(t) * R + row]); };
+                const double exact_normalizer = log_normalizer(exact8, R, t, R);
+                const auto top16              = top_rows(exact8, R, t, R, 16);
+                std::vector<std::int32_t> seen(rows16.begin() + t * 16, rows16.begin() + (t + 1) * 16);
+                std::sort(seen.begin(), seen.end());
+                check(seen.front() >= 0 && seen.back() < R && std::adjacent_find(seen.begin(), seen.end()) == seen.end(),
+                      "top form: ranks=16 rows are unique and in range");
+                for (int j = 0; j < 16; ++j) {
+                    const bool in_out = std::binary_search(seen.begin(), seen.end(), top16[j]);
+                    if (!in_out) {
+                        check(selection_excludes(oracle(columns, 0, t), top16[j], screen_grid_for(R, 8), policy),
+                              "top form: every exact top-16 row admitted by policy appears in ranks=16");
+                    }
+                }
+                for (int j = 1; j < 16; ++j) {
+                    const std::int32_t prev_row = rows16[t * 16 + j - 1];
+                    const std::int32_t cur_row  = rows16[t * 16 + j];
+                    const float vp              = at(prev_row);
+                    const float vc              = at(cur_row);
+                    check(vp > vc || (vp == vc && prev_row < cur_row),
+                          "top form: ranks=16 rows are ordered by exact BF16 logit descending");
+                    const double d = std::fabs(static_cast<double>(lp16[t * 16 + j] - lp16[t * 16]) -
+                                               (static_cast<double>(vc) - at(rows16[t * 16])));
+                    worst_diff16   = std::max(worst_diff16, d / std::max(1.0, std::fabs(exact_normalizer)));
+                }
+            }
+            check(worst_diff16 <= 4.0 * std::ldexp(1.0, -23),
+                  "top form: ranks=16 rank differences match exact BF16 differences");
+        }
         // Informational: one draft step's head (T = 1) against the exact proposal head's projection.
         DeviceArray<float> out(static_cast<std::size_t>(R));
         Tensor logits(out.p, DType::FP32, {R, 1});

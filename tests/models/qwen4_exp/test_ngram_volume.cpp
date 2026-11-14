@@ -87,7 +87,7 @@ bool rows_match(std::span<const std::uint32_t> rows, const std::vector<std::byte
     return true;
 }
 
-std::vector<std::byte> read(const q4::NgramVolume& volume, const std::vector<std::uint32_t>& rows) {
+std::vector<std::byte> read(q4::NgramVolume& volume, const std::vector<std::uint32_t>& rows) {
     std::vector<std::byte> out(rows.size() * kRowBytes);
     volume.read_rows(rows, out);
     return out;
@@ -224,7 +224,7 @@ int main() {
     const auto path = std::filesystem::temp_directory_path() / "infernix_ngram_volume_test.ngram";
     try {
         const q4::NgramTableConfig table = make_volume(path);
-        const q4::NgramVolume volume(path, table);
+        q4::NgramVolume volume(path, table);
         std::mt19937 rng(20261004);
 
         // Random rows (cold): one read per distinct block.
@@ -298,7 +298,7 @@ int main() {
 
         // Resident mode: multi-threaded volume load, small and prefill-sized multi-threaded RAM gather.
         {
-            const q4::NgramVolume resident_vol(path, table, /*resident=*/true);
+            q4::NgramVolume resident_vol(path, table, /*resident=*/true);
             check(resident_vol.resident(), "resident volume reports resident()");
             check(resident_vol.counters().reads == table.blocks, "resident load counts all blocks");
             check(rows_match(rows, read(resident_vol, rows)), "resident small call equals the oracle");

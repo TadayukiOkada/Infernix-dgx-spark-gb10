@@ -176,6 +176,11 @@ __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams 
     float* partial         = reinterpret_cast<float*>(xs + C * kGroups);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t = lane & 3;
+    // Eight 16-thread half-warps handle one tile's 8 columns x 16 item rows in parallel after MMA.
+    const int sub        = tid >> 4;
+    const int r          = tid & 15;
+    const int half_shift = (sub & 1) * 16;
+    const unsigned hmask = 0xffffu << half_shift;
     const int items = p.rows / kItemRows;
     const int first = static_cast<int>(blockIdx.x), stride = static_cast<int>(gridDim.x);
     const int mine  = first < items ? (items - first + stride - 1) / stride : 0;
@@ -205,15 +210,22 @@ __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams 
     pdl::enter_streaming();
     quantize_columns<Tiles>(p, xq, xs);
 
-    // Thread c < T keeps column c's best rows (descending) and its softmax partial.
-    float best[kListLength];
-    int best_row[kListLength];
+    // Half-warp sub keeps column (nt * 8 + sub)'s best rows (descending) and its softmax partial
+    // replicated identically across its 16 lanes r = 0..15.
+    float best[Tiles][kListLength];
+    int best_row[Tiles][kListLength];
+    float column_max[Tiles];
+    float column_sum[Tiles];
 #pragma unroll
-    for (int j = 0; j < kListLength; ++j) {
-        best[j]     = negative_infinity();
-        best_row[j] = INT_MAX;
+    for (int nt = 0; nt < Tiles; ++nt) {
+#pragma unroll
+        for (int j = 0; j < kListLength; ++j) {
+            best[nt][j]     = negative_infinity();
+            best_row[nt][j] = INT_MAX;
+        }
+        column_max[nt] = negative_infinity();
+        column_sum[nt] = 0.0f;
     }
-    float column_max = negative_infinity(), column_sum = 0.0f;
 
     for (int k = 0; k < mine; ++k) {
         cp_wait<kRing - 2>();
@@ -264,68 +276,98 @@ __global__ void __launch_bounds__(kScreenThreads, 1) screen_kernel(ScreenParams 
         }
         __syncthreads();
         const int row0 = (first + k * stride) * kItemRows;
-        for (int e = tid; e < kItemRows * C; e += kThreads) {
+        const int row  = row0 + r;
+#pragma unroll
+        for (int nt = 0; nt < Tiles; ++nt) {
+            const int col = nt * 8 + sub;
+            const int e   = r * C + col;
             // The K split's fixed summation order: warp 0's slot first, ascending.
             float v = partial[e];
 #pragma unroll
             for (int w = 1; w < kWarps; ++w) { v += partial[w * kItemRows * C + e]; }
-            partial[e] = v;
             if constexpr (Logits) {
-                const int column = e % C;
-                if (column < p.columns) {
-                    p.logits[static_cast<std::size_t>(column) * p.rows + row0 + e / C] = v;
+                if (col < p.columns) {
+                    p.logits[static_cast<std::size_t>(col) * p.rows + row] = v;
                 }
             }
-        }
-        __syncthreads();
-        if (tid < p.columns) {
-            float item_max = negative_infinity();
-#pragma unroll 4
-            for (int r = 0; r < kItemRows; ++r) {
-                const float v = partial[r * C + tid];
-                const int row = row0 + r;
-                if (row >= p.valid_rows) { continue; }
-                item_max = fmaxf(item_max, v);
-                if (!ranks_above(v, row, best[kListLength - 1], best_row[kListLength - 1])) { continue; }
-                // Insert in order with constant indices (registers, no local memory).
-                bool placed = false;
+            const bool active = col < p.columns && row < p.valid_rows;
+            const float score = active ? v : negative_infinity();
+            float item_max    = score;
 #pragma unroll
-                for (int i = kListLength - 1; i > 0; --i) {
-                    if (!placed) {
-                        if (ranks_above(v, row, best[i - 1], best_row[i - 1])) {
-                            best[i]     = best[i - 1];
-                            best_row[i] = best_row[i - 1];
-                        } else {
-                            best[i]     = v;
-                            best_row[i] = row;
-                            placed      = true;
+            for (int offset = 8; offset > 0; offset >>= 1) {
+                item_max = fmaxf(item_max, __shfl_xor_sync(0xffffffffu, item_max, offset));
+            }
+            const unsigned cand_ballot = __ballot_sync(
+                0xffffffffu,
+                active && ranks_above(score, row, best[nt][kListLength - 1], best_row[nt][kListLength - 1]));
+            unsigned cand_mask = (cand_ballot >> half_shift) & 0xffffu;
+            while (cand_mask != 0u) {
+                const int src      = __ffs(cand_mask) - 1;
+                cand_mask         &= cand_mask - 1u;
+                const int src_lane = half_shift + src;
+                const float cv     = __shfl_sync(hmask, score, src_lane);
+                const int crow     = row0 + src;
+                if (ranks_above(cv, crow, best[nt][kListLength - 1], best_row[nt][kListLength - 1])) {
+                    bool placed = false;
+#pragma unroll
+                    for (int i = kListLength - 1; i > 0; --i) {
+                        if (!placed) {
+                            if (ranks_above(cv, crow, best[nt][i - 1], best_row[nt][i - 1])) {
+                                best[nt][i]     = best[nt][i - 1];
+                                best_row[nt][i] = best_row[nt][i - 1];
+                            } else {
+                                best[nt][i]     = cv;
+                                best_row[nt][i] = crow;
+                                placed          = true;
+                            }
                         }
                     }
-                }
-                if (!placed) {
-                    best[0]     = v;
-                    best_row[0] = row;
+                    if (!placed) {
+                        best[nt][0]     = cv;
+                        best_row[nt][0] = crow;
+                    }
                 }
             }
             if constexpr (Softmax) {
-                if (item_max > negative_infinity()) {
-                    const float top = fmaxf(column_max, item_max);
-                    float sum       = column_sum * __expf(column_max - top);
-                    for (int r = 0; r < kItemRows && row0 + r < p.valid_rows; ++r) { sum += __expf(partial[r * C + tid] - top); }
-                    column_max = top;
-                    column_sum = sum;
+                const float top = fmaxf(column_max[nt], item_max);
+                float term      = (item_max > negative_infinity() && active) ? __expf(score - top) : 0.0f;
+#pragma unroll
+                for (int offset = 8; offset > 0; offset >>= 1) {
+                    term += __shfl_xor_sync(0xffffffffu, term, offset);
+                }
+                if (col < p.columns && item_max > negative_infinity()) {
+                    column_sum[nt] = column_sum[nt] * __expf(column_max[nt] - top) + term;
+                    column_max[nt] = top;
                 }
             }
         }
     }
     pdl::trigger_dependents();
-    if (tid < p.columns) {
-        float2* list = p.lists + (static_cast<std::size_t>(tid) * gridDim.x + blockIdx.x) * kListLength;
+    __syncthreads();
+    auto* out_lists = reinterpret_cast<float2*>(partial);
 #pragma unroll
-        for (int j = 0; j < kListLength; ++j) { list[j] = make_float2(best[j], __int_as_float(best_row[j])); }
-        if constexpr (Softmax) {
-            p.partials[static_cast<std::size_t>(tid) * gridDim.x + blockIdx.x] = make_float2(column_max, column_sum);
+    for (int nt = 0; nt < Tiles; ++nt) {
+        const int col = nt * 8 + sub;
+        if (r == 0 && col < p.columns) {
+#pragma unroll
+            for (int j = 0; j < kListLength; ++j) {
+                out_lists[sub * kListLength + j] = make_float2(best[nt][j], __int_as_float(best_row[nt][j]));
+            }
         }
+        __syncwarp();
+        if (col < p.columns) {
+            if (r < kListLength) {
+                float2* list = p.lists + (static_cast<std::size_t>(col) * gridDim.x + blockIdx.x) * kListLength;
+                list[r]      = out_lists[sub * kListLength + r];
+            }
+            if constexpr (Softmax) {
+                if (r == 0) {
+                    p.partials[static_cast<std::size_t>(col) * gridDim.x + blockIdx.x] =
+                        make_float2(column_max[nt], column_sum[nt]);
+                }
+            }
+        }
+        __syncwarp();
     }
 }
 
@@ -574,6 +616,7 @@ struct TopParams {
 // alone undercounts the tail (by 0.3-0.6 nats on flat columns of the 131K-row proposal head). v is the
 // mean square of e - s over the rescored rows outside the four best exact logits (the rows a column
 // boosts carry residuals the screen attenuates), from at least kTailResidualRows rows, else 0.
+constexpr int kTailExcludedRanks  = 4;
 constexpr int kTailResidualRows   = 8;
 constexpr float kTailResidualMax  = 4.0f;
 constexpr int kNormalizerTerms    = 5; // tail partials, rescored exact, rescored screen, residual squares, rows
@@ -609,10 +652,11 @@ __global__ void __launch_bounds__(kSelectThreads) screened_top_kernel(TopParams 
     }
     __syncthreads();
     if (warp == 0) {
-        // The ranks among the rescored rows: the larger BF16 logit, on ties the lower row. All four are
-        // taken whatever p.ranks, so the normalizer's residual rows (and with it every log-probability)
-        // do not depend on the ranks a call asks for.
-        for (int j = 0; j < kScreenedHeadMaxRanks; ++j) {
+        // The ranks among the rescored rows: the larger BF16 logit, on ties the lower row. At least
+        // kTailExcludedRanks (4) are picked whatever p.ranks, so the normalizer's residual rows (and
+        // with it every log-probability) do not depend on the ranks a call asks for.
+        const int pick_count = max(kTailExcludedRanks, p.ranks);
+        for (int j = 0; j < pick_count; ++j) {
             float v = negative_infinity();
             int row = INT_MAX, at = -1;
             for (int e = lane; e < n; e += 32) {
@@ -636,7 +680,7 @@ __global__ void __launch_bounds__(kSelectThreads) screened_top_kernel(TopParams 
             if (lane == 0) {
                 s.picked[j]       = at >= 0 ? row : 0;
                 s.picked_value[j] = v;
-                if (at >= 0) { s.taken[at] = 1; }
+                if (at >= 0) { s.taken[at] = j < kTailExcludedRanks ? 2 : 1; }
             }
             __syncwarp();
         }
@@ -663,7 +707,7 @@ __global__ void __launch_bounds__(kSelectThreads) screened_top_kernel(TopParams 
     for (int e = tid; e < n; e += kSelectThreads) {
         terms[1] += expf(s.rounded[e] - top);
         terms[2] += expf(s.select.screen[e] - top);
-        if (!s.taken[e]) {
+        if (s.taken[e] != 2) {
             const float residual = s.rounded[e] - s.select.screen[e];
             terms[3] += residual * residual;
             terms[4] += 1.0f;
@@ -834,7 +878,20 @@ int run_screen(const ScreenParams& p, cudaStream_t stream) {
         return grid;
     }
     const int grid = screen_grid<2, false>(items);
-    launch_screen<2, false, Logits, Softmax>(p, grid, stream);
+    if (p.columns <= 16) {
+        launch_screen<2, false, Logits, Softmax>(p, grid, stream);
+        return grid;
+    }
+    ScreenParams p0 = p;
+    p0.columns      = 16;
+    launch_screen<2, false, Logits, Softmax>(p0, grid, stream);
+    ScreenParams p1 = p;
+    p1.x            = p.x + static_cast<std::size_t>(16) * kHidden;
+    p1.columns      = p.columns - 16;
+    p1.logits       = p.logits != nullptr ? p.logits + static_cast<std::size_t>(16) * p.rows : nullptr;
+    p1.lists        = p.lists + static_cast<std::size_t>(16) * grid * kListLength;
+    p1.partials     = p.partials != nullptr ? p.partials + static_cast<std::size_t>(16) * grid : nullptr;
+    launch_screen<2, false, Logits, Softmax>(p1, grid, stream);
     return grid;
 }
 
@@ -903,7 +960,7 @@ void screened_head_top(const Tensor& x, const Weight& head, const Weight& screen
     require(ranks >= 1 && ranks <= kScreenedHeadMaxRanks && rows.data != nullptr && rows.dtype == DType::I32 &&
                 rows.is_contiguous() && rows.ne[1] == T && logprobs.data != nullptr && logprobs.dtype == DType::FP32 &&
                 logprobs.is_contiguous() && logprobs.ne[0] == ranks && logprobs.ne[1] == T,
-            "rows and logprobs must be contiguous I32 / FP32 [ranks, T] with ranks in [1, 4]");
+            "rows and logprobs must be contiguous I32 / FP32 [ranks, T] with ranks in [1, 16]");
     require(ranks <= policy.rescored, "the policy must rescore at least the ranks");
     const bool mapped = row_ids.data != nullptr;
     require(mapped == (tokens.data != nullptr), "row_ids and tokens are both given or both empty");

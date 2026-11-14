@@ -1935,7 +1935,7 @@ int block_distribution_case(int k, bool boundary_tie = false) {
 // round's drafts and prefix tests, so a key a later round met again (a draft or prefix-test uniform the
 // previous outcome depended on) would bias these laws; with every draft keyed (position, 0) the most
 // probable token's frequency falls from 0.600 to about 0.573, about 12 sigma of the pooled bound here.
-int block_chain_distribution_case(int k) {
+int block_chain_distribution_case(int k, bool variable_extents = false) {
     constexpr int batch = 8, sequences = 8192, positions_checked = 12;
     constexpr int S     = ops::kSparseSpeculativeCandidates;
     const int width     = k + 1;
@@ -2022,8 +2022,15 @@ int block_chain_distribution_case(int k) {
         d_lengths.copy_from_host(host_lengths.data(), host_lengths.size() * sizeof(int));
         d_anchors.copy_from_host(initial_anchors.data(), initial_anchors.size() * sizeof(int));
         std::vector<std::vector<int>> text(batch);
+        std::vector<int> round_extents(batch, k);
         while (std::any_of(text.begin(), text.end(),
                            [&](const std::vector<int>& t) { return static_cast<int>(t.size()) < positions_checked; })) {
+            if (variable_extents) {
+                for (int row = 0; row < batch; ++row) {
+                    round_extents[row] = (group + host_lengths[row] + row) % (k + 1);
+                }
+                d_extents.copy_from_host(round_extents.data(), round_extents.size() * sizeof(int));
+            }
             for (int step = 0; step < k; ++step) {
                 std::vector<int> at(batch);
                 for (int row = 0; row < batch; ++row) at[row] = host_lengths[row] + 1 + step;
@@ -2047,7 +2054,7 @@ int block_chain_distribution_case(int k) {
             const auto after  = from_device<int>(d_lengths, batch);
             for (int row = 0; row < batch; ++row) {
                 const int size = sizes[row];
-                if (size < 1 || size > width || after[row] != host_lengths[row] + size) {
+                if (size < 1 || size > round_extents[row] + 1 || after[row] != host_lengths[row] + size) {
                     ++failures;
                     continue;
                 }
@@ -2548,6 +2555,212 @@ int sample_sparse_drafts_case() {
             }
         }
     }
+    // Penalized proposal (presence_penalty / frequency_penalty via token_counts): candidate
+    // reordering, greedy flip, min_p/top_p truncation after penalty adjustment, confidence bound,
+    // and empirical draw frequencies.
+    {
+        constexpr int T = 4, n = 8, domain = 64, launches = 2000;
+        const std::vector<Column> pen_cols{{0.0F, 0, 1.0F, 0.0F},
+                                           {1.0F, 0, 1.0F, 0.25F},
+                                           {0.8F, 0, 0.65F, 0.0F},
+                                           {1.0F, 0, 1.0F, 0.0F}};
+        std::vector<int> host_counts(T * domain, 0);
+        // Column 0..2: row 0 (id 10) count 2, row 1 (id 5) count 1, others 0 -> id 10 drops below id 7.
+        // Column 3: row 0 (id 20) count 1 with presence 1.0 gives exact tie -1.5 with row 1 (id 12);
+        // lower token id (12 < 20) must break the tie and take rank 0.
+        for (int t = 0; t < 3; ++t) {
+            host_counts[t * domain + 10] = 2;
+            host_counts[t * domain + 5]  = 1;
+        }
+        host_counts[3 * domain + 20] = 1;
+        DeviceBuffer d_counts        = to_device(host_counts);
+        std::vector<std::int32_t> rows(n * T), positions(T);
+        std::vector<float> lp(n * T);
+        std::vector<ops::SamplingConfig> configs(T);
+        const std::array<std::int32_t, n> base_ids{10, 5, 7, 14, 18, 22, 26, 30};
+        for (int t = 0; t < T; ++t) {
+            for (int j = 0; j < n; ++j) {
+                if (t < 3) {
+                    rows[t * n + j] = base_ids[j];
+                    lp[t * n + j]   = -0.5F - 0.35F * static_cast<float>(j);
+                } else {
+                    rows[t * n + j] = j == 0 ? 20 : (j == 1 ? 12 : 30 + j);
+                    lp[t * n + j]   = j == 0 ? -0.5F : (j == 1 ? -1.5F : -3.0F - 0.5F * j);
+                }
+            }
+            positions[t]                 = 7000 + t;
+            configs[t].temperature       = pen_cols[t].temperature;
+            configs[t].top_k             = pen_cols[t].top_k;
+            configs[t].top_p             = pen_cols[t].top_p;
+            configs[t].min_p             = pen_cols[t].min_p;
+            configs[t].presence_penalty  = t == 3 ? 1.0F : 1.1F;
+            configs[t].frequency_penalty = t == 3 ? 0.0F : 0.6F;
+            configs[t].seed              = 12345ULL + t;
+            configs[t].token_counts      = static_cast<std::int32_t*>(d_counts.p) + t * domain;
+        }
+        DeviceBuffer d_rows = to_device(rows), d_lp = to_device(lp), d_positions = to_device(positions),
+                     d_configs = to_device(configs);
+        GuardedDeviceBuffer d_drafts(4ULL * T), d_candidates(4ULL * S * T), d_q(4ULL * S * T), d_confidence(4ULL * T);
+        Tensor r(d_rows.p, DType::I32, {n, T}), l(d_lp.p, DType::FP32, {n, T}), p(d_positions.p, DType::I32, {T});
+        Tensor drafts(d_drafts.data(), DType::I32, {T}), candidates(d_candidates.data(), DType::I32, {S, T});
+        Tensor q(d_q.data(), DType::FP32, {S, T}), confidence(d_confidence.data(), DType::FP32, {T});
+        ops::speculative_sample_sparse_drafts(r, l, nullptr, static_cast<const ops::SamplingConfig*>(d_configs.p), p,
+                                              kDraw, drafts, candidates, q, confidence, context.stream);
+        context.synchronize();
+        const auto got_drafts     = read<std::int32_t>(d_drafts, T);
+        const auto got_candidates = read<std::int32_t>(d_candidates, S * T);
+        const auto got_q          = read<float>(d_q, S * T);
+        const auto got_confidence = read<float>(d_confidence, T);
+        std::vector<double> col1_want_q(S, 0.0);
+        std::vector<std::int32_t> col1_want_ids(S, 0);
+        for (int t = 0; t < T; ++t) {
+            struct CandScore {
+                float adj;
+                std::int32_t id;
+            };
+            std::vector<CandScore> sorted(n);
+            double orig_sum = 0.0, pen_sum = 0.0;
+            const double lp0 = lp[t * n];
+            for (int j = 0; j < n; ++j) {
+                const int id    = rows[t * n + j];
+                const int c     = host_counts[t * domain + id];
+                const float adj = lp[t * n + j] - (c > 0 ? configs[t].presence_penalty : 0.0F) -
+                                  static_cast<float>(c) * configs[t].frequency_penalty;
+                sorted[j] = {adj, id};
+                orig_sum += std::exp(static_cast<double>(lp[t * n + j]) - lp0);
+                pen_sum += std::exp(static_cast<double>(adj) - lp0);
+            }
+            std::stable_sort(sorted.begin(), sorted.end(), [](const CandScore& a, const CandScore& b) {
+                return a.adj > b.adj || (a.adj == b.adj && a.id < b.id);
+            });
+            const double tail_scaled = std::max(0.0, std::exp(-lp0) - orig_sum);
+            const double want_conf =
+                std::min(0.0, static_cast<double>(sorted[0].adj) - (std::log(pen_sum + tail_scaled) + lp0));
+            std::vector<float> sorted_lp(n);
+            std::vector<std::int32_t> ids(S);
+            for (int j = 0; j < n; ++j) {
+                ids[j]       = sorted[j].id;
+                sorted_lp[j] = sorted[j].adj;
+            }
+            for (int j = n, next = 0; j < S; ++j) {
+                while (std::find(ids.begin(), ids.begin() + j, next) != ids.begin() + j) { ++next; }
+                ids[j] = next++;
+            }
+            std::vector<double> want_q;
+            (void)oracle_q(pen_cols[t], sorted_lp.data(), n, want_q);
+            if (t == 1) {
+                col1_want_q   = want_q;
+                col1_want_ids = ids;
+            }
+            bool ok = got_confidence[t] <= 0.0F && std::abs(got_confidence[t] - want_conf) <= 1e-4;
+            for (int s = 0; s < S; ++s) {
+                ok = ok && got_candidates[t * S + s] == ids[s] && std::abs(got_q[t * S + s] - want_q[s]) <= 2e-6;
+            }
+            if (t == 0) { ok = ok && got_drafts[t] == 7; } // id 10 (-2.8) and id 5 (-2.55) lose to id 7 (-1.2)
+            if (t == 3) { ok = ok && ids[0] == 12 && ids[1] == 20; } // tie-break on lower token id
+            if (!ok) {
+                ++failures;
+                std::cerr << "sample_sparse_drafts penalized column " << t << " mismatch (draft " << got_drafts[t]
+                          << ", conf " << got_confidence[t] << " want " << want_conf << ")\n";
+            }
+        }
+        // Empirical frequency check on penalized column 1 across launches.
+        std::vector<std::uint64_t> col1_hist(domain, 0);
+        for (int launch = 0; launch < launches; ++launch) {
+            for (int t = 0; t < T; ++t) { positions[t] = 20000 + launch * T + t; }
+            CUDA_CHECK(cudaMemcpyAsync(d_positions.p, positions.data(), 4ULL * T, cudaMemcpyHostToDevice,
+                                       context.stream));
+            ops::speculative_sample_sparse_drafts(r, l, nullptr, static_cast<const ops::SamplingConfig*>(d_configs.p), p,
+                                                  kDraw, drafts, candidates, q, confidence, context.stream);
+            context.synchronize();
+            const auto drawn = read<std::int32_t>(d_drafts, T);
+            const int id1    = drawn[1];
+            if (id1 >= 0 && id1 < domain) { ++col1_hist[static_cast<std::size_t>(id1)]; }
+        }
+        for (int j = 0; j < n; ++j) {
+            const double expected = launches * col1_want_q[j];
+            const double bound    = 6 * std::sqrt(launches * col1_want_q[j] * (1 - col1_want_q[j])) + 2;
+            const auto got_cnt    = col1_hist[static_cast<std::size_t>(col1_want_ids[j])];
+            if (std::abs(static_cast<double>(got_cnt) - expected) > bound) {
+                ++failures;
+                std::cerr << "sample_sparse_drafts penalized col1 id " << col1_want_ids[j] << ": " << got_cnt
+                          << " for " << expected << " expected\n";
+            }
+        }
+        failures += d_drafts.verify_guards("sample_sparse_drafts penalized drafts");
+        failures += d_candidates.verify_guards("sample_sparse_drafts penalized candidates");
+        failures += d_q.verify_guards("sample_sparse_drafts penalized q");
+        failures += d_confidence.verify_guards("sample_sparse_drafts penalized confidence");
+
+        // Intra-chain prior_drafts overlay: token_counts is null, prior_drafts supplies two prior
+        // steps for each column. Column 0 has id 10 once in prior (count 1) -> drops below id 7;
+        // column 1 combines two prior steps hitting id 5 twice -> tests frequency accumulation.
+        std::vector<std::int32_t> prior_host{
+            10, 3, 12, 99, // step 0 across T=4 columns
+            31, 5, 10, 20  // step 1 across T=4 columns (col 1 sees id 5 once; make step 0 = 5 too below)
+        };
+        prior_host[1] = 5; // col 1 step 0 = 5, step 1 = 5 -> count(5) = 2
+        std::vector<ops::SamplingConfig> prior_configs = configs;
+        for (auto& cfg : prior_configs) { cfg.token_counts = nullptr; }
+        DeviceBuffer d_prior        = to_device(prior_host);
+        DeviceBuffer d_prior_cfg    = to_device(prior_configs);
+        Tensor prior_t(d_prior.p, DType::I32, {T, 2});
+        ops::speculative_sample_sparse_drafts(r, l, nullptr, static_cast<const ops::SamplingConfig*>(d_prior_cfg.p), p,
+                                              kDraw, drafts, candidates, q, confidence, context.stream, prior_t);
+        context.synchronize();
+        const auto prior_got_drafts     = read<std::int32_t>(d_drafts, T);
+        const auto prior_got_candidates = read<std::int32_t>(d_candidates, S * T);
+        const auto prior_got_q          = read<float>(d_q, S * T);
+        const auto prior_got_conf       = read<float>(d_confidence, T);
+        for (int t = 0; t < T; ++t) {
+            struct CandScore {
+                float adj;
+                std::int32_t id;
+            };
+            std::vector<CandScore> sorted(n);
+            double orig_sum = 0.0, pen_sum = 0.0;
+            const double lp0 = lp[t * n];
+            for (int j = 0; j < n; ++j) {
+                const int id = rows[t * n + j];
+                const int c  = (prior_host[t] == id ? 1 : 0) + (prior_host[T + t] == id ? 1 : 0);
+                const float adj = lp[t * n + j] - (c > 0 ? prior_configs[t].presence_penalty : 0.0F) -
+                                  static_cast<float>(c) * prior_configs[t].frequency_penalty;
+                sorted[j] = {adj, id};
+                orig_sum += std::exp(static_cast<double>(lp[t * n + j]) - lp0);
+                pen_sum += std::exp(static_cast<double>(adj) - lp0);
+            }
+            std::stable_sort(sorted.begin(), sorted.end(), [](const CandScore& a, const CandScore& b) {
+                return a.adj > b.adj || (a.adj == b.adj && a.id < b.id);
+            });
+            const double tail_scaled = std::max(0.0, std::exp(-lp0) - orig_sum);
+            const double want_conf =
+                std::min(0.0, static_cast<double>(sorted[0].adj) - (std::log(pen_sum + tail_scaled) + lp0));
+            std::vector<float> sorted_lp(n);
+            std::vector<std::int32_t> ids(S);
+            for (int j = 0; j < n; ++j) {
+                ids[j]       = sorted[j].id;
+                sorted_lp[j] = sorted[j].adj;
+            }
+            for (int j = n, next = 0; j < S; ++j) {
+                while (std::find(ids.begin(), ids.begin() + j, next) != ids.begin() + j) { ++next; }
+                ids[j] = next++;
+            }
+            std::vector<double> want_q;
+            (void)oracle_q(pen_cols[t], sorted_lp.data(), n, want_q);
+            bool ok = prior_got_conf[t] <= 0.0F && std::abs(prior_got_conf[t] - want_conf) <= 1e-4;
+            for (int s = 0; s < S; ++s) {
+                ok = ok && prior_got_candidates[t * S + s] == ids[s] &&
+                     std::abs(prior_got_q[t * S + s] - want_q[s]) <= 2e-6;
+            }
+            if (t == 0) { ok = ok && prior_got_drafts[t] == 5; } // id 10 drops to -2.2 while id 5 is -0.85
+            if (t == 3) { ok = ok && ids[0] == 12 && ids[1] == 20; } // id 20 appeared in prior step 1 -> tie at -1.5
+            if (!ok) {
+                ++failures;
+                std::cerr << "sample_sparse_drafts prior_drafts column " << t << " mismatch (draft "
+                          << prior_got_drafts[t] << ", conf " << prior_got_conf[t] << " want " << want_conf << ")\n";
+            }
+        }
+    }
     std::cout << "sample_sparse_drafts failures=" << failures << '\n';
     return failures;
 }
@@ -2774,6 +2987,7 @@ INFERNIX_OP_TEST(speculative_round) {
     for (const int k : {1, 3, 7}) failures += block_distribution_case(k);
     failures += block_distribution_case(3, true);
     for (const int k : {4, 7}) failures += block_chain_distribution_case(k);
+    failures += block_chain_distribution_case(4, true);
     for (const int k : {1, 3, 7, 15, 31}) {
         for (const int batch : {1, 8}) {
             SparseAcceptSuite suite(k, batch);

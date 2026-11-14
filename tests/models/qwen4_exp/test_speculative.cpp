@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -27,6 +28,11 @@ using infernix::models::qwen4_exp::expected_chain_tokens;
 using infernix::models::qwen4_exp::expected_copy_tokens;
 using infernix::models::qwen4_exp::kMtpCumulativeBins;
 using infernix::models::qwen4_exp::kMtpCumulativeBase;
+using infernix::models::qwen4_exp::kMtpCumulativeFloor;
+using infernix::models::qwen4_exp::kMtpSampledCumulativeBins;
+using infernix::models::qwen4_exp::kMtpSampledCumulativeBase;
+using infernix::models::qwen4_exp::kMtpSampledCumulativeFloor;
+using infernix::models::qwen4_exp::MtpCumulative;
 using infernix::models::qwen4_exp::MtpDraftCut;
 using infernix::models::qwen4_exp::mtp_cumulative_cut;
 using infernix::models::qwen4_exp::mtp_min_logprob_cut;
@@ -241,6 +247,50 @@ void check_expected_tokens() {
     }
 }
 
+void check_sampled_cumulative_table() {
+    for (std::size_t i = 0; i < std::size(kMtpSampledCumulativeBins.edges); ++i) {
+        if (i > 0) {
+            require(kMtpSampledCumulativeBins.edges[i - 1] < kMtpSampledCumulativeBins.edges[i],
+                    "sampled cumulative bin edges must strictly increase");
+        }
+        require(kMtpSampledCumulativeBins.rates[i] < kMtpSampledCumulativeBins.rates[i + 1],
+                "sampled cumulative bin rates must strictly increase");
+    }
+    for (const float r : kMtpSampledCumulativeBins.rates) {
+        require(r > 0.0F && r <= 1.0F, "sampled cumulative bin rates must lie in (0, 1]");
+    }
+    require(kMtpSampledCumulativeFloor < kMtpSampledCumulativeBase,
+            "sampled cumulative floor must sit below base");
+    MtpCumulative cum;
+    cum.reset(kMtpSampledCumulativeBase);
+    require(cum.threshold == kMtpSampledCumulativeBase, "reset sets sampled base threshold");
+    // Feed perfect acceptance across moderate-confidence chains -> threshold lowers smoothly toward floor.
+    const std::array<float, 4> mod_lp{-0.8F, -0.8F, -0.8F, -0.8F};
+    for (int round = 0; round < 64; ++round) {
+        cum.observe(mod_lp.data(), 4, 4, kMtpSampledCumulativeBins, kMtpSampledCumulativeBase,
+                    kMtpSampledCumulativeFloor);
+    }
+    require(cum.threshold >= kMtpSampledCumulativeFloor && cum.threshold < kMtpSampledCumulativeBase,
+            "high observed/expected acceptance lowers sampled threshold toward floor");
+    // Check host/device cut simulation agreement over kMtpSampledCumulativeBins.
+    Rng rng;
+    for (int trial = 0; trial < 5000; ++trial) {
+        const std::int32_t steps = 1 + trial % 8;
+        std::vector<float> lps(static_cast<std::size_t>(steps));
+        for (float& v : lps) { v = rng.next_logprob(); }
+        const float threshold = kMtpSampledCumulativeFloor +
+                                0.5F * static_cast<float>(rng.next_unit());
+        const bool gated = (trial % 2) == 0;
+        const auto cut   = mtp_cumulative_cut(lps.data(), 1, steps, threshold, kMtpSampledCumulativeBins, gated);
+        require(cut.kept == brute_cut(lps.data(), 1, steps, threshold, kMtpSampledCumulativeBins),
+                "sampled cumulative kept matches brute cut");
+        if (gated) {
+            require(cut.executed == simulated_device_steps(lps.data(), 1, steps, threshold, kMtpSampledCumulativeBins),
+                    "sampled cumulative executed matches device gate simulation");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -252,6 +302,7 @@ int main() {
         check_against_device_chain();
         check_copy_fallback();
         check_expected_tokens();
+        check_sampled_cumulative_table();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

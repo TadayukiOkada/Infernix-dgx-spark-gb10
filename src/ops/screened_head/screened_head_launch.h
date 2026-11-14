@@ -14,7 +14,7 @@ inline constexpr std::int32_t kHidden     = 2560; // the head width the screen k
 inline constexpr std::int32_t kListLength = 8;    // screen candidates kept per CTA and column
 inline constexpr std::int32_t kMaxGrid    = 256;  // screen CTAs at most (one per SM)
 
-// The exact rescore of a BF16 head's listed rows at 1..16 columns: projection_fp32's tensor-core
+// The exact rescore of a BF16 head's listed rows at 1..32 columns: projection_fp32's tensor-core
 // mapping (the BF16 sliced-K MMA tile) over the listed rows. entries [columns][cap] hold each column's
 // rows, counts [columns] how many are live; logits [vocab_rows, columns] receives row entries[c][i] of
 // column c for i < counts[c]. Launched as a programmatic dependent of the selection.

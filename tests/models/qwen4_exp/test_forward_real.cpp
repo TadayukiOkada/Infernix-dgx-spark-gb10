@@ -360,7 +360,7 @@ struct Call {
     std::vector<std::int32_t> host_slots, host_rows;
 };
 
-Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std::vector<std::vector<std::int32_t>>& histories,
+Call make_call(const q4::TextConfig& c, q4::NgramVolume& volume, const std::vector<std::vector<std::int32_t>>& histories,
                std::int32_t first, std::int32_t width, std::vector<std::int32_t> slots, std::vector<std::int32_t> rows,
                bool every_column = false) {
     const auto batch = static_cast<std::int32_t>(histories.size());
@@ -458,7 +458,7 @@ std::vector<int> top(const std::vector<float>& v, std::size_t offset, std::size_
 // no resident experts here), one of them with a CPU expert service configured as the Program's
 // (decode cap 32, assist cap 256 from 9 columns) as well.
 bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContext& device,
-                       const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
+                       q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
                        std::int32_t context, KvCacheStorage kv) {
     namespace moe               = infernix::ops::offloaded_moe;
     const auto& c               = parameters.model.config().text;
@@ -552,7 +552,7 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
 // MoE inputs and outputs, and logits (the Forward's share of the exact route's request invariance);
 // prints the first block and tap that differs per width.
 bool check_decode_widths(const q4::execution::Parameters& parameters, DeviceContext& device,
-                         const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
+                         q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
                          std::int32_t context, KvCacheStorage kv) {
     const auto& c        = parameters.model.config().text;
     const auto n         = static_cast<std::int32_t>(tokens.size());
@@ -660,7 +660,7 @@ bool check_decode_widths(const q4::execution::Parameters& parameters, DeviceCont
 // head's; the normalizer's error is reported. The policy is the Forward's (margin 5, 64 rows). Fails
 // when either agreement is below 99.5 % (Basalt reports 99.93 % for its draft screen).
 bool check_screened_heads(const q4::execution::Parameters& parameters, DeviceContext& device,
-                          const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, std::int32_t context,
+                          q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens, std::int32_t context,
                           KvCacheStorage kv) {
     if (!parameters.output_head_screen || !parameters.draft_head.rows || !parameters.draft_head.screen ||
         (parameters.output_head_q8 && parameters.output_head_q8->is_ggml())) {
@@ -916,7 +916,7 @@ int main(int argc, char** argv) {
         const char* ngram_env = std::getenv("INFERNIX_QWEN4_NGRAM");
         const std::filesystem::path volume_path =
             ngram_env != nullptr ? std::filesystem::path(ngram_env) : q4::default_ngram_volume(artifact_env);
-        const q4::NgramVolume volume(volume_path, q4::resolve_ngram_volume(volume_path, c.ple));
+        q4::NgramVolume volume(volume_path, q4::resolve_ngram_volume(volume_path, c.ple));
         const std::size_t vocab = c.vocab_size;
         if (scoring) {
             // Teacher-forced scoring: chunked prefill of each whole text in slot 0 of its own harness.

@@ -1559,7 +1559,7 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
         // argmax unless the screen misses it, and a sampled draft's ranks carry exact logits with an
         // approximate normalizer. Draft-only: verification is unchanged.
         const bool screened = head.rows && head.screen &&
-                              (call.sample_configs == nullptr || call.sample_rows.ne[0] <= 4);
+                              (call.sample_configs == nullptr || call.sample_rows.ne[0] <= ops::kScreenedHeadMaxRanks);
         Tensor drafts = call.drafts;
         Tensor narrow;
         if (!screened) {
@@ -1608,7 +1608,8 @@ void Forward::mtp_block(const MtpCall& call, const Tensor& rows) {
                                     : Tensor{};
             ops::speculative_sample_sparse_drafts(
                 sample_rows, sample_logprobs, head.rows ? static_cast<const std::int32_t*>(head.token_ids.data) : nullptr,
-                call.sample_configs, call.positions, call.draft_step, drafts, candidates, q, confidence, s);
+                call.sample_configs, call.positions, call.draft_step, drafts, candidates, q, confidence, s,
+                call.prior_drafts);
         } else if (screened) {
             // The top row, its token (the draft) and its log-probability (the confidence) in one call.
             Tensor top_row = work_.alloc(DType::I32, {1, T});

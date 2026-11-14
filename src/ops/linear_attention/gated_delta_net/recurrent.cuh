@@ -895,7 +895,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 // columns, value channel i mod 16 of its state tile at every eighth column from i / 16, and the last warp one
 // column's gates per lane; the recurrence then runs from shared memory as recurrent_record_kernel's.
 template <bool ADirect, class State, int MaxWidth = kRecordConvMaxWidth>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, MaxWidth <= 16 ? 5 : 4)
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, MaxWidth <= 16 ? 6 : 4)
     recurrent_record_conv_kernel(const __grid_constant__ RecordConvAccess<State> access) {
     __shared__ __align__(16) RecordConvShared<MaxWidth> shared;
     const RecordAccess<false, State>& record = access.record;

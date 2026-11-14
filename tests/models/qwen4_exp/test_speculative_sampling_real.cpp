@@ -180,9 +180,15 @@ int report(const std::string& name, const std::vector<double>& p, double alpha, 
 }
 
 struct Setup {
-    const char* artifact = nullptr;
-    const char* ngram    = nullptr;
-    const char* drafter  = nullptr;
+    const char* artifact       = nullptr;
+    const char* ngram          = nullptr;
+    const char* drafter        = nullptr;
+    bool expert_a4_activations = false;
+    bool lm_head_draft         = false;
+    bool auto_draft            = false;
+    bool block_verification    = false;
+    bool fast_paths            = false;
+    float presence_penalty     = 0.0F;
 };
 
 enum class Drafts { None, MtpOneHot, MtpSampled, DFlash2TextHead, DFlash2ProposalHead };
@@ -191,18 +197,25 @@ infernix::EngineOptions engine_options(const Setup& setup, Drafts drafts, std::u
     infernix::EngineOptions options;
     options.artifact_path = setup.artifact;
     if (setup.ngram != nullptr) { options.ngram_volume_path = setup.ngram; }
-    options.max_context          = 4096;
-    const char* kv               = std::getenv("INFERNIX_QWEN4_KV");
-    options.kv_cache             = kv != nullptr ? infernix::test::parse_kv_cache_storage(kv) : infernix::KvCacheStorage::Int8Group64;
-    options.max_concurrency      = concurrency;
-    options.max_pending_requests = 2 * concurrency;
-    options.fast_paths           = false;
+    options.max_context           = 4096;
+    const char* kv                = std::getenv("INFERNIX_QWEN4_KV");
+    options.kv_cache              = kv != nullptr ? infernix::test::parse_kv_cache_storage(kv) : infernix::KvCacheStorage::Int8Group64;
+    options.max_concurrency       = concurrency;
+    options.max_pending_requests  = 2 * concurrency;
+    options.expert_a4_activations = setup.expert_a4_activations;
+    options.fast_paths            = setup.fast_paths;
     switch (drafts) {
     case Drafts::None: break;
     case Drafts::MtpSampled: options.fast_path_candidates = {infernix::FastPath::SampledMtpDrafts}; [[fallthrough]];
     case Drafts::MtpOneHot:
-        options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
-        options.speculative.draft_tokens = 4;
+        options.speculative.backend = infernix::SpeculativeBackend::Mtp;
+        if (setup.auto_draft) {
+            options.speculative.draft_tokens      = 0;
+            options.speculative.draft_tokens_auto = true;
+        } else {
+            options.speculative.draft_tokens = 4;
+        }
+        if (setup.lm_head_draft) { options.speculative.proposal_head = infernix::ProposalHead::Optimized; }
         break;
     case Drafts::DFlash2ProposalHead: options.speculative.proposal_head = infernix::ProposalHead::Optimized; [[fallthrough]];
     case Drafts::DFlash2TextHead:
@@ -211,18 +224,23 @@ infernix::EngineOptions engine_options(const Setup& setup, Drafts drafts, std::u
         options.speculative.draft_model  = setup.drafter;
         break;
     }
+    if (setup.block_verification && drafts != Drafts::None) {
+        options.fast_path_candidates.push_back(infernix::FastPath::BlockVerification);
+    }
     return options;
 }
 
-infernix::RequestOptions request(float temperature, std::uint64_t seed, std::uint32_t tokens, bool reuse) {
+infernix::RequestOptions request(float temperature, std::uint64_t seed, std::uint32_t tokens, bool reuse,
+                                 float presence_penalty = 0.0F) {
     infernix::RequestOptions options;
-    options.execution.requested_output_tokens = tokens;
-    options.execution.sampling.temperature    = temperature;
-    options.execution.sampling.top_k          = 20;
-    options.execution.sampling.top_p          = 0.95F;
-    options.execution.sampling.seed           = seed;
-    options.execution.allow_prefix_reuse      = reuse;
-    options.stop.include_model_defaults       = false;
+    options.execution.requested_output_tokens  = tokens;
+    options.execution.sampling.temperature     = temperature;
+    options.execution.sampling.top_k           = 20;
+    options.execution.sampling.top_p           = 0.95F;
+    options.execution.sampling.presence_penalty = presence_penalty;
+    options.execution.sampling.seed            = seed;
+    options.execution.allow_prefix_reuse       = reuse;
+    options.stop.include_model_defaults        = false;
     return options;
 }
 
@@ -237,11 +255,11 @@ void add(infernix::SpeculativeStats& sum, const infernix::SpeculativeStats& one)
     sum.accepted_tokens += one.accepted_tokens;
 }
 
-Outputs greedy(infernix::Engine& engine) {
+Outputs greedy(infernix::Engine& engine, float presence_penalty = 0.0F) {
     Outputs out;
     for (const char* text : kGreedyPrompts) {
-        const auto result =
-            engine.generate(engine.prepare_tokens(engine.tokenize_text(text)), request(0.0F, 0, 256, false));
+        const auto result = engine.generate(engine.prepare_tokens(engine.tokenize_text(text)),
+                                            request(0.0F, 0, 256, false, presence_penalty));
         out.tokens.push_back(result.generated_token_ids);
         add(out.speculative, result.speculative);
     }
@@ -259,7 +277,8 @@ void print_acceptance(const infernix::SpeculativeStats& s) {
 // `count` seeded requests from `first_seed` on an engine of `lanes` lanes. One lane takes them back to
 // back, the next queued while one decodes; several take them in waves of `lanes` started together.
 Outputs sample(infernix::Engine& engine, const Tokens& prompt, float temperature, std::uint64_t first_seed,
-               std::uint32_t count, std::uint32_t tokens, std::uint32_t lanes, bool reuse) {
+               std::uint32_t count, std::uint32_t tokens, std::uint32_t lanes, bool reuse,
+               float presence_penalty = 0.0F) {
     Outputs out;
     std::deque<infernix::GenerationHandle> handles;
     const std::uint32_t queued = lanes == 1 ? 2 : lanes;
@@ -267,8 +286,8 @@ Outputs sample(infernix::Engine& engine, const Tokens& prompt, float temperature
     while (out.tokens.size() < count) {
         const bool open = lanes == 1 || handles.empty();
         for (; open && submitted < count && handles.size() < queued; ++submitted) {
-            handles.push_back(
-                engine.submit(engine.prepare_tokens(prompt), request(temperature, first_seed + submitted, tokens, reuse)));
+            handles.push_back(engine.submit(engine.prepare_tokens(prompt),
+                                            request(temperature, first_seed + submitted, tokens, reuse, presence_penalty)));
         }
         const infernix::GenerationResult result = handles.front().wait();
         handles.pop_front();
@@ -349,24 +368,26 @@ int mtp(const Setup& setup, const Reference& ref, bool greedy_only, std::uint32_
     int failures = 0;
     Outputs greedy_one_hot, greedy_sampled;
     {
-        std::printf("== MTP 4, one-hot drafts (one lane)\n");
+        std::printf("== MTP %s, one-hot drafts (one lane)\n", setup.auto_draft ? "auto" : "4");
         const SectionTimer timer;
         infernix::Engine engine(engine_options(setup, Drafts::MtpOneHot, 1));
-        greedy_one_hot = greedy(engine);
+        greedy_one_hot = greedy(engine, setup.presence_penalty);
         if (!greedy_only) {
-            const Outputs one_hot = sample(engine, ref.prompt, 1.0F, trials + 1ULL, trials, tokens, 1, true);
+            const Outputs one_hot =
+                sample(engine, ref.prompt, 1.0F, trials + 1ULL, trials, tokens, 1, true, setup.presence_penalty);
             print_acceptance(one_hot.speculative);
             failures += drafts_per_request("one-hot MTP requests", one_hot.speculative, trials);
             failures += report("one-hot drafts", compare(ref.plain.tokens, one_hot.tokens, trials, tokens), alpha, true);
         }
     }
     {
-        std::printf("== MTP 4, sampled drafts (one lane)\n");
+        std::printf("== MTP %s, sampled drafts (one lane)\n", setup.auto_draft ? "auto" : "4");
         const SectionTimer timer;
         infernix::Engine engine(engine_options(setup, Drafts::MtpSampled, 1));
-        greedy_sampled = greedy(engine);
+        greedy_sampled = greedy(engine, setup.presence_penalty);
         if (!greedy_only) {
-            const Outputs drafts = sample(engine, ref.prompt, 1.0F, 2ULL * trials + 1, trials, tokens, 1, true);
+            const Outputs drafts =
+                sample(engine, ref.prompt, 1.0F, 2ULL * trials + 1, trials, tokens, 1, true, setup.presence_penalty);
             print_acceptance(drafts.speculative);
             failures += drafts_per_request("sampled MTP requests", drafts.speculative, trials);
             failures += check(drafts.speculative.accepted_tokens > 0 &&
@@ -507,6 +528,12 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--greedy-only") { greedy_only = true; }
+        if (arg == "--expert-a4-activations") { setup.expert_a4_activations = true; }
+        if (arg == "--lm-head-draft") { setup.lm_head_draft = true; }
+        if (arg == "--auto-draft") { setup.auto_draft = true; }
+        if (arg == "--block-verification") { setup.block_verification = true; }
+        if (arg == "--fast-paths") { setup.fast_paths = true; }
+        if (arg == "--presence-penalty" && i + 1 < argc) { setup.presence_penalty = std::stof(argv[++i]); }
         if (arg == "--concurrency" && i + 1 < argc) {
             concurrency = static_cast<std::uint32_t>(std::clamp(std::stoul(argv[++i]), 1UL, 8UL));
         }
@@ -523,11 +550,13 @@ int main(int argc, char** argv) {
                         tokens);
             const SectionTimer timer;
             infernix::Engine engine(engine_options(setup, Drafts::None, greedy_only ? 1 : concurrency));
-            ref.greedy = greedy(engine);
+            ref.greedy = greedy(engine, setup.presence_penalty);
             ref.prompt = engine.tokenize_text(kPrompt);
             if (!greedy_only) {
-                ref.plain = sample(engine, ref.prompt, 1.0F, 1, trials, tokens, concurrency, true);
-                ref.cold  = sample(engine, ref.prompt, 0.8F, 3ULL * trials + 1, trials, tokens, concurrency, true);
+                ref.plain =
+                    sample(engine, ref.prompt, 1.0F, 1, trials, tokens, concurrency, true, setup.presence_penalty);
+                ref.cold = sample(engine, ref.prompt, 0.8F, 3ULL * trials + 1, trials, tokens, concurrency, true,
+                                  setup.presence_penalty);
                 failures += report("plain T 0.8", compare(ref.plain.tokens, ref.cold.tokens, trials, tokens), alpha, false);
                 failures += report("plain T 0.8 (first " + std::to_string(half) + ")",
                                    compare(ref.plain.tokens, ref.cold.tokens, half, tokens), alpha, false);

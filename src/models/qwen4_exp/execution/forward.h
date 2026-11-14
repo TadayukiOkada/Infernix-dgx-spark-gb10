@@ -259,6 +259,8 @@ struct MtpCall {
     const ops::SamplingConfig* sample_configs = nullptr;
     std::uint32_t draft_step                  = 0;
     Tensor sample_rows, sample_logprobs, draft_candidates, draft_q;
+    // Optional I32 [T, step]: earlier drafts of this chain overlaid onto penalty token counts.
+    Tensor prior_drafts;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };

@@ -192,7 +192,7 @@ void speculative_sample_sparse_drafts(const Tensor& rows, const Tensor& logprobs
                                       const SamplingConfig* configs, const Tensor& positions, std::uint32_t draw,
                                       Tensor& drafts,
                                       Tensor& candidate_ids, Tensor& proposal_q, Tensor& confidence,
-                                      cudaStream_t stream) {
+                                      cudaStream_t stream, const Tensor& prior_drafts) {
     constexpr const char* op = "speculative_sample_sparse_drafts";
     const std::int32_t count   = rows.ne[0];
     const std::int32_t columns = rows.ne[1];
@@ -210,8 +210,14 @@ void speculative_sample_sparse_drafts(const Tensor& rows, const Tensor& logprobs
     require_matrix(candidate_ids, DType::I32, kSparseCandidates, columns, op, "candidate_ids");
     require_matrix(proposal_q, DType::FP32, kSparseCandidates, columns, op, "proposal_q");
     if (confidence.data != nullptr) { require_vector(confidence, DType::FP32, columns, op, "confidence"); }
+    if (prior_drafts.data != nullptr) {
+        require_matrix(prior_drafts, DType::I32, columns, prior_drafts.ne[1], op, "prior_drafts");
+        if (prior_drafts.data == drafts.data) {
+            throw std::invalid_argument("speculative_sample_sparse_drafts: prior_drafts must not alias drafts");
+        }
+    }
     detail::speculative_sample_sparse_drafts_launch(rows, logprobs, token_ids, configs, positions, draw, drafts,
-                                                    candidate_ids, proposal_q, confidence, stream);
+                                                    candidate_ids, proposal_q, confidence, prior_drafts, stream);
 }
 
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,

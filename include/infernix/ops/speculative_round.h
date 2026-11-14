@@ -218,27 +218,34 @@ void speculative_accept_sparse_drafts(
  *
  * Algorithm:
  *   Draws column t's draft from a draft head's n most probable rows under configs[t] and writes
- *   the 16-candidate proposal speculative_accept_sparse_drafts verifies it with. A column with
- *   temperature<=0 drafts rank 0 with a one-hot q. Otherwise, over the ranks j < m, m = min(n,
- *   top_k) when top_k>0 and n otherwise:
- *     w[j] = exp((logprobs[j,t] - logprobs[0,t]) / temperature);
+ *   the 16-candidate proposal speculative_accept_sparse_drafts verifies it with. When
+ *   presence_penalty or frequency_penalty is nonzero and configs[t].token_counts is non-null or
+ *   prior_drafts is non-empty, each mapped rank's count c_v adds occurrences in
+ *   prior_drafts[t, 0..prior_steps-1] to token_counts[v], its log-probability is adjusted by
+ *   presence_penalty * (c_v > 0) + frequency_penalty * c_v,
+ *   and the n ranks are ordered by adjusted score descending (lower token id breaking ties) before
+ *   selection; greedy rows select adjusted rank 0 with a one-hot q. Otherwise, over the first m =
+ *   min(n, top_k) (or n when top_k <= 0) ordered ranks:
+ *     w[j] = exp((score[j] - score[0]) / temperature);
  *   the support is the ranks before the first with w[j] < min_p * w[0] (min_p>0), cut after the
  *   shortest prefix whose weight reaches top_p * sum_{j<m} w[j] (top_p<1), and at least rank 0;
  *   q[j] = w[j] / sum_{support} w. The draft is the first rank whose cumulative q exceeds
  *   u = sampling_uniform(seed, positions[t], kSamplePurposeDFlash2Proposal, draw), the last support
  *   rank if none does: a caller drawing several drafts at one position (chained steps at a clamped
- *   position) gives each its own `draw`. Penalties, masks and token_counts are not read: q is only
- *   the distribution the draft was drawn from, and the acceptance Op applies the sampler to the
- *   target.
+ *   position) gives each its own `draw`. Masks are not read (the acceptance Op applies masks to
+ *   the target).
  *
  * Logical shapes:
  *   rows I32 [n,T] and logprobs FP32 [n,T] hold column t's n most probable rows and their
  *   log-probabilities in descending order (top_logprobs), n in [1,16], T in [1,8]. token_ids, when
  *   non-null, is a device I32 table mapping a row to its token id (null: rows are token ids); the
  *   ids are distinct and in the acceptance Op's token domain. configs is a device-resident
- *   SamplingConfig[T]; positions is I32 [T]. Outputs: drafts I32 [T]; candidate_ids I32 [16,T] (the
- *   n ranks' token ids, then the smallest ids not among them, which get q = 0); proposal_q FP32
- *   [16,T]; confidence FP32 [T] when non-empty: logprobs[0,t]. Inputs and outputs do not overlap.
+ *   SamplingConfig[T]; positions is I32 [T]; prior_drafts, when non-empty, is contiguous I32
+ *   [T, prior_steps] (prior_steps >= 1) holding earlier drafted tokens of the same chain and must
+ *   not alias drafts. Outputs: drafts I32 [T]; candidate_ids I32 [16,T] (the n ordered candidate
+ *   token ids, then the smallest ids not among them, which get q = 0); proposal_q FP32 [16,T];
+ *   confidence FP32 [T] when non-empty: adjusted top-1 log-probability (equals logprobs[0,t] when no
+ *   penalties apply). Inputs and outputs do not overlap.
  *
  * Workspace:
  *   None.
@@ -247,7 +254,7 @@ void speculative_sample_sparse_drafts(const Tensor& rows, const Tensor& logprobs
                                       const std::int32_t* token_ids, const SamplingConfig* configs,
                                       const Tensor& positions, std::uint32_t draw, Tensor& drafts,
                                       Tensor& candidate_ids, Tensor& proposal_q, Tensor& confidence,
-                                      cudaStream_t stream);
+                                      cudaStream_t stream, const Tensor& prior_drafts = {});
 
 /**
  * Op: speculative_select_accepted_hidden
