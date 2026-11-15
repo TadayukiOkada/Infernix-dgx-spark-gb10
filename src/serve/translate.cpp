@@ -290,7 +290,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     }
     if (!thinking && !effort &&
         request.continuation == infernix::PromptContinuationMode::NewAssistantTurn &&
-        request.uses_tools() && (server.enable_thinking == false || server.restore_tool_reasoning)) {
+        request.uses_tools() && server.enable_thinking == false) {
         if (has_trailing_tool_error(request) || is_simple_math_query(request)) {
             result.enable_thinking = true;
         } else {
@@ -443,7 +443,7 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
         if (!options.execution.thinking.budget && request.token_constraint.empty() &&
-            (server.enable_thinking == false || server.restore_tool_reasoning) &&
+            server.enable_thinking == false &&
             !request.enable_thinking && !request.reasoning_effort &&
             has_trailing_tool_error(request)) {
             options.execution.thinking.budget = 20U;

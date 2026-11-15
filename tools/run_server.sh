@@ -51,6 +51,7 @@ NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-31}"
 THINKING_FLAG="${THINKING_FLAG:-}"
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 RESTORE_TOOL_REASONING="${RESTORE_TOOL_REASONING:-1}"
+CHAT_TEMPLATE_PATH="${CHAT_TEMPLATE_PATH:-${REPO_ROOT}/tools/chat_templates/qwen3_8.jinja}"
 
 HOST="0.0.0.0"
 PORT="8000"
@@ -250,10 +251,10 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --kv-capacity 524288 \
     --default-max-tokens 32768 \
     --preserve-thinking \
+    --chat-template "${CHAT_TEMPLATE_PATH}" \
     "${RESTORE_ARGS[@]}" \
     "${THINKING_ARGS[@]}" \
     "${REASONING_ARGS[@]}" \
-    --thinking-budget-message $'\n\n Considering the tool error, I have to call an alternative tool such as web_search based on the thinking directly now.' \
     --host-context-mib 1024 \
     --tolerant-tool-calls \
     --max-context "${MAX_CONTEXT}" \

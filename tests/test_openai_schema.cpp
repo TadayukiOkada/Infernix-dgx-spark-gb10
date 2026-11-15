@@ -985,8 +985,10 @@ int test_reasoning_and_extensions() {
                                                             {"content", "weather in Berlin?"}}})}};
         const ResolvedPromptSemantics tool_sem =
             resolve_prompt_semantics(parse(tool_req).generation, restore_server);
-        failures += check(tool_sem.enable_thinking == false && !tool_sem.reasoning_effort.has_value(),
-                          "restore_tool_reasoning disables thinking by default on tool requests");
+        failures += check(tool_sem.enable_thinking == true &&
+                              tool_sem.reasoning_effort == infernix::ReasoningEffort::Medium,
+                          "restore_tool_reasoning keeps thinking and server reasoning effort on "
+                          "tool requests when server thinking is enabled");
 
         Json math_req = Json{{"model", "qwen"},
                              {"tools", Json::array({calc_tool})},
