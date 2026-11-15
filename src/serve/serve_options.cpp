@@ -111,6 +111,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--no-prefix-reuse", false},
     ServeOptionArity{"--lm-head-draft", false},
     ServeOptionArity{"--no-thinking", false},
+    ServeOptionArity{"--reasoning-effort"},
     ServeOptionArity{"--preserve-thinking", false},
     ServeOptionArity{"--tolerant-tool-calls", false},
     ServeOptionArity{"--restore-tool-reasoning", false},
@@ -253,6 +254,17 @@ std::optional<std::size_t> parse_vram_headroom(const char* text) {
         throw std::invalid_argument("--vram-headroom-mib is out of range");
     }
     return static_cast<std::size_t>(mib) << 20;
+}
+
+infernix::ReasoningEffort parse_reasoning_effort(std::string_view text) {
+    if (text == "none") { return infernix::ReasoningEffort::None; }
+    if (text == "minimal") { return infernix::ReasoningEffort::Minimal; }
+    if (text == "low") { return infernix::ReasoningEffort::Low; }
+    if (text == "medium") { return infernix::ReasoningEffort::Medium; }
+    if (text == "high") { return infernix::ReasoningEffort::High; }
+    if (text == "xhigh") { return infernix::ReasoningEffort::XHigh; }
+    if (text == "max") { return infernix::ReasoningEffort::Max; }
+    throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
 }
 
 } // namespace
@@ -573,6 +585,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --seed N                   fixed random seed\n"
            "  --greedy                   force temperature 0 (exact argmax)\n"
            "  --no-thinking              disable the thinking mode (enabled by default)\n"
+           "  --reasoning-effort E       default reasoning effort for the chat template:\n"
+           "                             none | minimal | low | medium | high | xhigh | max\n"
+           "                             (none disables thinking by default)\n"
            "  --preserve-thinking        retain closed-turn assistant reasoning\n"
            "                             in later prompts\n"
            "  --tolerant-tool-calls      recover complete Qwen calls with malformed wrapper or\n"
@@ -1062,6 +1077,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--reasoning-effort") {
+            options.reasoning_effort = parse_reasoning_effort(require_value("--reasoning-effort"));
+            if (options.reasoning_effort == infernix::ReasoningEffort::None &&
+                !options.enable_thinking.has_value()) {
+                options.enable_thinking = false;
+            }
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {

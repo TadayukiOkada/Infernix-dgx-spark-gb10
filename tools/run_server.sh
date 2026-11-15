@@ -27,12 +27,14 @@
 #   --model-id ID       Explicit model ID override (default: extracted commit hash)
 #   --max-context N     Max context length (default: 262144)
 #   --max-concurrency N Max concurrency (default: 4)
+#   --reasoning-effort E  Default template reasoning effort (default: medium)
 #   -h, --help          Show this help message and exit
 #
 # Environment overrides:
-#   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / KV_DTYPE (default: nvfp4)
-#   SPEC_BACKEND (default: dflash2 if present else mtp), NGRAM_DRAFT_TOKENS (default: 3)
-#   THINKING_FLAG (default: --no-thinking), EXPERT_A4_ACTIVATIONS (default: 1 for FP4-Local)
+#   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / KV_DTYPE (default: k8v4)
+#   SPEC_BACKEND (default: dflash2 if present else mtp), NGRAM_DRAFT_TOKENS (default: 31)
+#   THINKING_FLAG (default: empty), REASONING_EFFORT (default: medium)
+#   EXPERT_A4_ACTIVATIONS (default: 1 for FP4-Local)
 #   SKIP_BUILD=1 to skip rebuilding infernix-serve
 #
 
@@ -44,9 +46,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODELS_DIR="/opt/etc/models"
 DRAFT_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
 
-KV_DTYPE="${KV_DTYPE:-nvfp4}"
-NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-3}"
-THINKING_FLAG="${THINKING_FLAG:---no-thinking}"
+KV_DTYPE="${KV_DTYPE:-k8v4}"
+NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-31}"
+THINKING_FLAG="${THINKING_FLAG:-}"
+REASONING_EFFORT="${REASONING_EFFORT:-medium}"
+RESTORE_TOOL_REASONING="${RESTORE_TOOL_REASONING:-1}"
 
 HOST="0.0.0.0"
 PORT="8000"
@@ -80,6 +84,10 @@ while [[ $# -gt 0 ]]; do
             MAX_CONCURRENCY="$2"
             shift 2
             ;;
+        --reasoning-effort)
+            REASONING_EFFORT="$2"
+            shift 2
+            ;;
         -h|--help)
             sed -ne '/^#/!q;s/^# //;2,$p' "$0"
             exit 0
@@ -92,7 +100,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${MODEL_ALIAS}" ]]; then
-    MODEL_ALIAS="nvfp4"
+    MODEL_ALIAS="hc4"
 fi
 
 # Resolve model alias -> weights, n-gram volume, residency
@@ -110,7 +118,7 @@ case "${MODEL_ALIAS}" in
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-Local-NVFP4-W4Dense.infernix"
         NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-Local-NVFP4.ngram"
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
-        EXPERT_A4_DEFAULT=0
+        EXPERT_A4_DEFAULT=1
         VISION_DEFAULT=0
         ;;
     iqs_3|iq3s|iq3_s)
@@ -209,6 +217,16 @@ if [[ -n "${THINKING_FLAG}" ]]; then
     THINKING_ARGS=("${THINKING_FLAG}")
 fi
 
+REASONING_ARGS=()
+if [[ -n "${REASONING_EFFORT}" ]]; then
+    REASONING_ARGS=(--reasoning-effort "${REASONING_EFFORT}")
+fi
+
+RESTORE_ARGS=()
+if [[ "${RESTORE_TOOL_REASONING}" == "1" ]]; then
+    RESTORE_ARGS=(--restore-tool-reasoning)
+fi
+
 SPEC_ARGS=(--spec "${SPEC_BACKEND}" --draft-tokens auto)
 if [[ "${SPEC_BACKEND}" == "dflash2" ]]; then
     SPEC_ARGS+=(--draft-model "${DRAFT_PATH}")
@@ -232,8 +250,9 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --kv-capacity 524288 \
     --default-max-tokens 32768 \
     --preserve-thinking \
-    --restore-tool-reasoning \
+    "${RESTORE_ARGS[@]}" \
     "${THINKING_ARGS[@]}" \
+    "${REASONING_ARGS[@]}" \
     --thinking-budget-message $'\n\n Considering the tool error, I have to call an alternative tool such as web_search based on the thinking directly now.' \
     --host-context-mib 1024 \
     --tolerant-tool-calls \
@@ -241,4 +260,4 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --host "${HOST}" \
     --port "${PORT}" \
-    --model-id "qwen3.8-flash-next"
+    --model-id "${MODEL_ID}"

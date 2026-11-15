@@ -94,6 +94,7 @@ struct ServeOptions {
     bool use_cuda_graph                    = true;
     bool allow_prefix_reuse                = true;
     std::optional<bool> enable_thinking;
+    std::optional<infernix::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;

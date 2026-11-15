@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -11,6 +12,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -137,6 +139,44 @@ bool has_trailing_tool_error(const GenerationRequest& request) {
     return true;
 }
 
+bool is_simple_math_query(const GenerationRequest& request) {
+    for (const ChatTurn& turn : request.messages) {
+        if (turn.role == ChatRole::Tool || !turn.tool_calls.empty()) { return false; }
+    }
+    std::string text;
+    bool found_user = false;
+    for (auto it = request.messages.rbegin(); it != request.messages.rend(); ++it) {
+        if (it->role != ChatRole::User) { continue; }
+        found_user = true;
+        for (const ContentPart& part : it->content) {
+            if (part.kind == ContentKind::Text) { text += part.text; }
+        }
+        break;
+    }
+    if (!found_user || text.empty() || text.size() > 120U) { return false; }
+
+    std::string lower;
+    lower.reserve(text.size());
+    bool has_digit = false;
+    for (unsigned char ch : text) {
+        if (std::isdigit(ch) != 0) { has_digit = true; }
+        lower.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    if (!has_digit) { return false; }
+
+    for (const std::string_view word :
+         {"calculator", "search", "email", "weather", "stock", "file", "schedule", "meeting",
+          "reminder", "translate", "contact"}) {
+        if (lower.find(word) != std::string::npos) { return false; }
+    }
+
+    for (const std::string_view op :
+         {"%", "+", "*", "/", "×", "÷", "percent", "plus", "minus", "times", "divided"}) {
+        if (lower.find(op) != std::string::npos) { return true; }
+    }
+    return false;
+}
+
 } // namespace
 
 std::string render_loaded_tools(std::span<const ToolDefinition> tools) {
@@ -210,8 +250,10 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     // resolution concrete is what makes the assistant-continuation guard in the template layer
     // authoritative: a trailing-assistant request that would open a new thinking turn is
     // refused as invalid_prompt instead of being rendered as a mid-turn continuation.
+    const bool default_thinking = server.enable_thinking.value_or(
+        server.reasoning_effort != infernix::ReasoningEffort::None);
     ResolvedPromptSemantics result{
-        .enable_thinking           = thinking ? thinking : server.enable_thinking.value_or(true),
+        .enable_thinking           = thinking ? thinking : default_thinking,
         .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
         .chat_template_kwargs_json = kwargs.dump(),
     };
@@ -248,9 +290,16 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     }
     if (!thinking && !effort &&
         request.continuation == infernix::PromptContinuationMode::NewAssistantTurn &&
-        server.enable_thinking == false && has_trailing_tool_error(request)) {
-        result.enable_thinking  = true;
-        result.reasoning_effort = infernix::ReasoningEffort::Medium;
+        request.uses_tools() && (server.enable_thinking == false || server.restore_tool_reasoning)) {
+        if (has_trailing_tool_error(request) || is_simple_math_query(request)) {
+            result.enable_thinking = true;
+        } else {
+            result.enable_thinking = false;
+        }
+    }
+    if (!effort && result.enable_thinking == true && server.reasoning_effort &&
+        *server.reasoning_effort != infernix::ReasoningEffort::None) {
+        result.reasoning_effort = server.reasoning_effort;
     }
     return result;
 }
@@ -394,8 +443,9 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
         if (!options.execution.thinking.budget && request.token_constraint.empty() &&
-            server.enable_thinking == false && !request.enable_thinking &&
-            !request.reasoning_effort && has_trailing_tool_error(request)) {
+            (server.enable_thinking == false || server.restore_tool_reasoning) &&
+            !request.enable_thinking && !request.reasoning_effort &&
+            has_trailing_tool_error(request)) {
             options.execution.thinking.budget = 20U;
         }
         // Without a budget, the answer room (thinking_answer_room_budget) is set once the prompt

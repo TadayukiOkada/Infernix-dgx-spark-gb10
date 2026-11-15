@@ -966,6 +966,52 @@ int main() {
                           explicit_effort.enable_thinking == true,
                       "explicit reasoning effort did not remain the effective effort");
     request.reasoning_effort.reset();
+    {
+        const ServeOptions effort_medium =
+            parse({"infernix-serve", "model.ninfer", "--reasoning-effort", "medium"});
+        failures += check(effort_medium.reasoning_effort == infernix::ReasoningEffort::Medium &&
+                              !effort_medium.enable_thinking.has_value(),
+                          "--reasoning-effort medium did not preserve the configured effort");
+        const auto inherited_effort = resolve_prompt_semantics(request, effort_medium);
+        failures += check(inherited_effort.reasoning_effort == infernix::ReasoningEffort::Medium &&
+                              inherited_effort.enable_thinking == true,
+                          "thinking-enabled request did not inherit --reasoning-effort");
+        request.reasoning_effort = RequestedReasoningEffort::Low;
+        const auto request_override_effort = resolve_prompt_semantics(request, effort_medium);
+        failures += check(request_override_effort.reasoning_effort == infernix::ReasoningEffort::Low &&
+                              request_override_effort.enable_thinking == true,
+                          "request reasoning effort did not override --reasoning-effort");
+        request.reasoning_effort.reset();
+        request.enable_thinking = false;
+        const auto disabled_with_server_effort = resolve_prompt_semantics(request, effort_medium);
+        failures += check(disabled_with_server_effort.enable_thinking == false &&
+                              !disabled_with_server_effort.reasoning_effort.has_value(),
+                          "disabled thinking inherited server reasoning effort");
+        request.enable_thinking.reset();
+
+        const ServeOptions effort_none =
+            parse({"infernix-serve", "model.ninfer", "--reasoning-effort", "none"});
+        failures += check(effort_none.reasoning_effort == infernix::ReasoningEffort::None &&
+                              effort_none.enable_thinking == false,
+                          "--reasoning-effort none did not disable thinking by default");
+        const auto none_default = resolve_prompt_semantics(request, effort_none);
+        failures += check(none_default.enable_thinking == false && !none_default.reasoning_effort,
+                          "--reasoning-effort none left thinking enabled");
+        request.enable_thinking = true;
+        const auto explicit_thinking_on_none = resolve_prompt_semantics(request, effort_none);
+        failures += check(explicit_thinking_on_none.enable_thinking == true &&
+                              !explicit_thinking_on_none.reasoning_effort.has_value(),
+                          "explicit thinking inherited --reasoning-effort none");
+        request.enable_thinking.reset();
+
+        failures += check(!parse_error({"infernix-serve", "model.ninfer", "--reasoning-effort",
+                                        "ultra"})
+                               .empty(),
+                          "--reasoning-effort accepted an unknown effort level");
+        failures += check(serve_usage_text("infernix-serve").find("--reasoning-effort") !=
+                              std::string::npos,
+                          "serve help omits --reasoning-effort");
+    }
     failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == true,
                       "server preserve-thinking default was not resolved");
     request.preserve_thinking = false;
@@ -1203,6 +1249,7 @@ int main() {
                                                  "temperature = 0.7\n"
                                                  "greedy = true\n"
                                                  "no-thinking = true\n"
+                                                 "reasoning-effort = \"high\"\n"
                                                  "preserve-thinking = false\n"
                                                  "claude-code-prompt = \"local\"\n");
         const ServeOptions from_file = parse({"infernix-serve", "model.ninfer", "--config", config});
@@ -1210,6 +1257,7 @@ int main() {
                               from_file.kv_cache == infernix::KvCacheStorage::Int8Group64 &&
                               from_file.sampling_overrides.temperature == 0.7F &&
                               from_file.greedy && from_file.enable_thinking == false &&
+                              from_file.reasoning_effort == infernix::ReasoningEffort::High &&
                               !from_file.preserve_thinking.has_value() &&
                               from_file.claude_code_prompt == ClaudeCodePrompt::Local,
                           "--config values did not reach serving options");

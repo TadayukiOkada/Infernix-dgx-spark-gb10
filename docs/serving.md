@@ -495,8 +495,9 @@ example), keeps the request's value and its error. Request logs record the effor
 for.
 
 `preserve_thinking` controls reasoning retention according to the selected template. Request
-options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
-thinking, effort and preservation options use the template's defaults.
+options override server defaults set with `--no-thinking`, `--reasoning-effort` and
+`--preserve-thinking`. Unspecified thinking, effort and preservation options use the template's
+defaults.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -1298,6 +1299,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefix-cache-file PATH` | at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `infernix-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
 | `--prefix-cache-save-mins N` | with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp` and replaces `PATH` only once complete, so a crash or power loss leaves the previous file; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
 | `--no-thinking` | disable thinking by default | thinking on |
+| `--reasoning-effort E` | default reasoning effort passed to the selected template (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `none` disables thinking by default) | template default |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and complete calls stranded in thinking the model never closed | off |
 | `--cors` | permissive browser CORS headers | off |

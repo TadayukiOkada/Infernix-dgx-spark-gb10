@@ -69,6 +69,7 @@ int main() {
     options.enable_vision                  = false;
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
+    options.reasoning_effort               = infernix::ReasoningEffort::Medium;
     options.default_thinking_budget        = 512;
     options.sampling_overrides.temperature = 0.6F;
     options.startup_argv = {"infernix-serve", options.artifact_path, "--api-key", "<redacted>"};
@@ -238,6 +239,8 @@ int main() {
         "resolved context-cache configuration missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");
+    failures += check(server.at("server").at("default_reasoning_effort") == "medium",
+                      "server default reasoning effort missing");
     failures += check(server.at("server").at("claude_code_prompt") == "as-sent",
                       "server Claude Code prompt setting missing");
     failures +=

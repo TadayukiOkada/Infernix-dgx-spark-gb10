@@ -513,6 +513,10 @@ std::string format_server_start_json(
              {"default_output_tokens", options.default_max_tokens},
              {"default_thinking",
               options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
+             {"default_reasoning_effort",
+              options.reasoning_effort
+                  ? Json(infernix::reasoning_effort_name(*options.reasoning_effort))
+                  : Json(nullptr)},
              {"default_thinking_budget", std::move(default_thinking_budget)},
              {"thinking_answer_room", options.thinking_answer_room},
              {"reasoning_loop", reasoning_loop_name(options.reasoning_loop)},

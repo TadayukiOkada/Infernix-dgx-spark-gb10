@@ -960,6 +960,52 @@ int test_reasoning_and_extensions() {
     failures +=
         check(api_error([&] { (void)parse(body); }).code == "mm_processor_kwargs_not_supported",
               "non-empty media processor kwargs rejected");
+
+    {
+        ServeOptions restore_server;
+        restore_server.restore_tool_reasoning = true;
+        restore_server.reasoning_effort       = infernix::ReasoningEffort::Medium;
+        const Json calc_tool = Json{
+            {"type", "function"},
+            {"function", Json{{"name", "calculator"},
+                              {"description", "compute"},
+                              {"parameters", Json{{"type", "object"}}}}}};
+
+        Json plain_req = base_request();
+        const ResolvedPromptSemantics plain_sem =
+            resolve_prompt_semantics(parse(plain_req).generation, restore_server);
+        failures += check(plain_sem.enable_thinking == true &&
+                              plain_sem.reasoning_effort == infernix::ReasoningEffort::Medium,
+                          "restore_tool_reasoning keeps thinking and server reasoning effort on "
+                          "non-tool requests");
+
+        Json tool_req = Json{{"model", "qwen"},
+                             {"tools", Json::array({calc_tool})},
+                             {"messages", Json::array({Json{{"role", "user"},
+                                                            {"content", "weather in Berlin?"}}})}};
+        const ResolvedPromptSemantics tool_sem =
+            resolve_prompt_semantics(parse(tool_req).generation, restore_server);
+        failures += check(tool_sem.enable_thinking == false && !tool_sem.reasoning_effort.has_value(),
+                          "restore_tool_reasoning disables thinking by default on tool requests");
+
+        Json math_req = Json{{"model", "qwen"},
+                             {"tools", Json::array({calc_tool})},
+                             {"messages", Json::array({Json{{"role", "user"},
+                                                            {"content", "What is 15% of 200?"}}})}};
+        const ResolvedPromptSemantics math_sem =
+            resolve_prompt_semantics(parse(math_req).generation, restore_server);
+        failures += check(math_sem.enable_thinking == true &&
+                              math_sem.reasoning_effort == infernix::ReasoningEffort::Medium,
+                          "simple math query inherits configured server reasoning effort "
+                          "without shifting system tool prefix");
+
+        math_req["reasoning_effort"] = "high";
+        const ResolvedPromptSemantics override_sem =
+            resolve_prompt_semantics(parse(math_req).generation, restore_server);
+        failures += check(override_sem.enable_thinking == true &&
+                              override_sem.reasoning_effort == infernix::ReasoningEffort::High,
+                          "explicit request reasoning effort overrides server default");
+    }
     return failures;
 }
 
