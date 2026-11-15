@@ -30,8 +30,9 @@
 #   -h, --help          Show this help message and exit
 #
 # Environment overrides:
-#   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / KV_DTYPE override per-alias defaults
-#   SPEC_BACKEND (default: mtp, or dflash2), EXPERT_A4_ACTIVATIONS (default: 1)
+#   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / KV_DTYPE (default: nvfp4)
+#   SPEC_BACKEND (default: dflash2 if present else mtp), NGRAM_DRAFT_TOKENS (default: 3)
+#   THINKING_FLAG (default: --no-thinking), EXPERT_A4_ACTIVATIONS (default: 1 for FP4-Local)
 #   SKIP_BUILD=1 to skip rebuilding infernix-serve
 #
 
@@ -43,15 +44,18 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODELS_DIR="/opt/etc/models"
 DRAFT_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
 
-KV_DTYPE="${KV_DTYPE:-k8v4}"
+KV_DTYPE="${KV_DTYPE:-nvfp4}"
+NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-3}"
+THINKING_FLAG="${THINKING_FLAG:---no-thinking}"
 
 HOST="0.0.0.0"
 PORT="8000"
 MAX_CONTEXT="262144"
 MAX_CONCURRENCY="4"
 EXPLICIT_MODEL_ID=""
-MODEL_ALIAS=""
+MODEL_ALIAS="${MODEL_ALIAS:-}"
 EXPERT_A4_DEFAULT=1
+VISION_DEFAULT=0
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -88,10 +92,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${MODEL_ALIAS}" ]]; then
-    echo "Error: No model alias specified." >&2
-    echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4, hc4-w4dense (hc4)" >&2
-    echo "Usage: ./tools/run_server.sh [options] <model_alias>" >&2
-    exit 1
+    MODEL_ALIAS="nvfp4"
 fi
 
 # Resolve model alias -> weights, n-gram volume, residency
@@ -102,6 +103,7 @@ case "${MODEL_ALIAS}" in
         NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram"
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
         EXPERT_A4_DEFAULT=0
+        VISION_DEFAULT=0
         ;;
     nvfp4)
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-F4-Local-NVPF4-Dense"
@@ -109,6 +111,7 @@ case "${MODEL_ALIAS}" in
         NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-Local-NVFP4.ngram"
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
         EXPERT_A4_DEFAULT=0
+        VISION_DEFAULT=0
         ;;
     iqs_3|iq3s|iq3_s)
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix"
@@ -116,6 +119,7 @@ case "${MODEL_ALIAS}" in
         NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-Infernix.ngram"
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-ram}"
         EXPERT_A4_DEFAULT=0
+        VISION_DEFAULT=0
         ;;
     local-f4)
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New"
@@ -123,6 +127,7 @@ case "${MODEL_ALIAS}" in
         NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix.ngram"
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
         EXPERT_A4_DEFAULT=1
+        VISION_DEFAULT=1
         ;;
     hc4-w4dense|hc4)
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense"
@@ -131,6 +136,7 @@ case "${MODEL_ALIAS}" in
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
         SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
         EXPERT_A4_DEFAULT=1
+        VISION_DEFAULT=1
         ;;
     *)
         echo "Error: Unknown model alias '${MODEL_ALIAS}'." >&2
@@ -181,7 +187,7 @@ echo " N-gram Volume   : ${NGRAM_PATH} (${NGRAM_RESIDENCY})"
 echo " Listen Endpoint : http://${HOST}:${PORT}/v1"
 echo " Max Context     : ${MAX_CONTEXT} tokens"
 echo " Max Concurrency : ${MAX_CONCURRENCY}"
-echo " Speculative     : ${SPEC_BACKEND} (auto) + N-gram (31 drafts, min-match 4)"
+echo " Speculative     : ${SPEC_BACKEND} (auto) + N-gram (${NGRAM_DRAFT_TOKENS} drafts, min-match 4)"
 echo "========================================================================================"
 echo
 
@@ -193,6 +199,16 @@ if [[ "${EXPERT_A4_ACTIVATIONS:-${EXPERT_A4_DEFAULT}}" == "1" ]]; then
     EXPERT_A4_ARGS=(--expert-a4-activations)
 fi
 
+VISION_ARGS=()
+if [[ "${VISION:-${VISION_DEFAULT}}" == "1" ]]; then
+    VISION_ARGS=(--vision)
+fi
+
+THINKING_ARGS=()
+if [[ -n "${THINKING_FLAG}" ]]; then
+    THINKING_ARGS=("${THINKING_FLAG}")
+fi
+
 SPEC_ARGS=(--spec "${SPEC_BACKEND}" --draft-tokens auto)
 if [[ "${SPEC_BACKEND}" == "dflash2" ]]; then
     SPEC_ARGS+=(--draft-model "${DRAFT_PATH}")
@@ -200,12 +216,13 @@ fi
 
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
     "${EXPERT_A4_ARGS[@]}" \
+    "${VISION_ARGS[@]}" \
     "${SPEC_ARGS[@]}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
     --ngram-cache-mib 4096 \
     --kv-dtype "${KV_DTYPE}" \
-    --ngram-draft-tokens 31 \
+    --ngram-draft-tokens "${NGRAM_DRAFT_TOKENS}" \
     --ngram-min-match 4 \
     --temperature 1.0 \
     --top-p 0.9 \
@@ -215,9 +232,11 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --kv-capacity 524288 \
     --default-max-tokens 32768 \
     --preserve-thinking \
+    --restore-tool-reasoning \
+    "${THINKING_ARGS[@]}" \
+    --thinking-budget-message $'\n\n Considering the tool error, I have to call an alternative tool such as web_search based on the thinking directly now.' \
     --host-context-mib 1024 \
     --tolerant-tool-calls \
-    --vision \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
     --host "${HOST}" \

@@ -110,6 +110,33 @@ bool has_rendered_content(const infernix::ChatMessage& message) {
     });
 }
 
+bool is_tool_error_message(const ChatTurn& message) {
+    if (message.tool_result_is_error) { return true; }
+    for (const ContentPart& part : message.content) {
+        if (part.kind != ContentKind::Text) { continue; }
+        if (part.text.find("\"error_code\"") != std::string::npos ||
+            part.text.find("\"error\":") != std::string::npos ||
+            part.text.find("ERR_TOOL_") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Trailing tool errors on an otherwise non-thinking tool server often need brief recovery reasoning
+// to try an alternative tool instead of apologizing directly. Skip if any parallel tool call succeeded.
+bool has_trailing_tool_error(const GenerationRequest& request) {
+    if (!request.uses_tools() || request.messages.empty() ||
+        request.messages.back().role != ChatRole::Tool) {
+        return false;
+    }
+    for (auto it = request.messages.rbegin();
+         it != request.messages.rend() && it->role == ChatRole::Tool; ++it) {
+        if (!is_tool_error_message(*it)) { return false; }
+    }
+    return true;
+}
+
 } // namespace
 
 std::string render_loaded_tools(std::span<const ToolDefinition> tools) {
@@ -218,6 +245,12 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             result.reasoning_effort = infernix::ReasoningEffort::Max;
             break;
         }
+    }
+    if (!thinking && !effort &&
+        request.continuation == infernix::PromptContinuationMode::NewAssistantTurn &&
+        server.enable_thinking == false && has_trailing_tool_error(request)) {
+        result.enable_thinking  = true;
+        result.reasoning_effort = infernix::ReasoningEffort::Medium;
     }
     return result;
 }
@@ -360,6 +393,11 @@ infernix::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+        if (!options.execution.thinking.budget && request.token_constraint.empty() &&
+            server.enable_thinking == false && !request.enable_thinking &&
+            !request.reasoning_effort && has_trailing_tool_error(request)) {
+            options.execution.thinking.budget = 20U;
+        }
         // Without a budget, the answer room (thinking_answer_room_budget) is set once the prompt
         // length, and so the room the context leaves, is known.
         // A token constraint owns every output step, so the guard's injected close has no room.

@@ -942,7 +942,8 @@ void ProgramImpl::prefix_finish(Lane& lane, std::uint32_t index) {
         lane.prefix.resident_capture = lane.prefix.deepest == F ? lane.prefix.capture : 0;
         return;
     }
-    if (F >= lane.prefix.deepest + kBlock && full_blocks && lane.prefix.path.size() >= F / kBlock) {
+    if ((F >= lane.prefix.deepest + kBlock || F / kBlock > lane.prefix.deepest / kBlock) &&
+        full_blocks && lane.prefix.path.size() >= F / kBlock) {
         prefix_capture(lane, index, pc::SnapshotKind::Endpoint, true);
     } else if (!full_blocks) {
         ++prefix_->counters().endpoint_skipped_mtp;

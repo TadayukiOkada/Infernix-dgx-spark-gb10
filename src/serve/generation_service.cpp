@@ -539,14 +539,28 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
-        } else if (semantics.enable_thinking != false &&
-                   !request_options.execution.thinking.budget) {
+        } else if (semantics.enable_thinking != false && !request.thinking_budget) {
             // The answer room follows the limit the request actually has: a prompt that leaves
             // less context than max_tokens would otherwise think to the end of the context.
-            request_options.execution.thinking.budget = thinking_answer_room_budget(
-                options_, effective_output_limit(
-                              request_options.execution.requested_output_tokens,
-                              engine_->options().max_context, prompt.summary().prompt_tokens));
+            const std::uint32_t limit = effective_output_limit(
+                request_options.execution.requested_output_tokens,
+                engine_->options().max_context, prompt.summary().prompt_tokens);
+            const auto room_budget = thinking_answer_room_budget(options_, limit);
+            if (!request_options.execution.thinking.budget) {
+                request_options.execution.thinking.budget = room_budget;
+            } else if (room_budget) {
+                request_options.execution.thinking.budget =
+                    std::min(*request_options.execution.thinking.budget, *room_budget);
+            }
+            if (request_options.execution.thinking.budget &&
+                limit > *request_options.execution.thinking.budget &&
+                limit - *request_options.execution.thinking.budget < 64U) {
+                if (limit > 64U) {
+                    request_options.execution.thinking.budget = limit - 64U;
+                } else {
+                    request_options.execution.thinking.budget.reset();
+                }
+            }
             prepared.thinking_budget = request_options.execution.thinking.budget;
         }
         prepared.prompt_tokens           = static_cast<int>(prompt.summary().prompt_tokens);
