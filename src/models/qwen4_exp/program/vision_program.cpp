@@ -79,8 +79,8 @@ void ProgramImpl::vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmissi
 std::uint64_t ProgramImpl::vision_lendable() const noexcept {
     const std::uint64_t limit = testing::vision_lend_limit();
     std::uint64_t bytes = 0U;
-    if (residency_) {
-        bytes = residency_->frames() > 0 ? residency_->lendable_bytes() : 0U;
+    if (residency_ && residency_->frames() > 0) {
+        bytes = residency_->lendable_bytes();
     } else {
         std::size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
@@ -94,8 +94,8 @@ std::uint64_t ProgramImpl::vision_lendable() const noexcept {
 std::uint64_t ProgramImpl::vision_lend_capacity() const noexcept {
     const std::uint64_t limit = testing::vision_lend_limit();
     std::uint64_t bytes = 0U;
-    if (residency_) {
-        bytes = residency_->frames() > 0 ? residency_->lend_capacity_bytes() : 0U;
+    if (residency_ && residency_->frames() > 0) {
+        bytes = residency_->lend_capacity_bytes();
     } else {
         bytes = vision_lendable();
     }
@@ -120,11 +120,12 @@ std::optional<BindingReservation> ProgramImpl::vision_lend(Lane& lane, std::uint
     const VisionWindowPlan& window = v.admission->window;
     if (window.items.empty()) { return std::nullopt; } // every item lies in the reused prefix
     const std::uint64_t need = window.lease_bytes;
+    const bool has_cache = residency_ && residency_->frames() > 0;
     // Another prompt's stream ring, wide arena and walk area, and the wide workspace, go back between
     // its calls (its next streamed call lends again, design §19.3.8 F3), but not inside a layer walk's
     // span or a wide call. For a window that does not fit they go back only when they hold every lent
     // frame, so the window then fits: a window that waits leaves them alone.
-    if (residency_ && need > vision_lendable() && !walk_.active && !wide_active_ && need <= vision_lend_capacity()) {
+    if (has_cache && need > vision_lendable() && !walk_.active && !wide_active_ && need <= vision_lend_capacity()) {
         const std::uint64_t returnable = static_cast<std::uint64_t>(stream_lease_.count) + stream_wide_lease_.count +
                                          stream_walk_lease_.count + work_lease_.count;
         if (residency_->stats().lent_frames == returnable) {
@@ -133,7 +134,7 @@ std::optional<BindingReservation> ProgramImpl::vision_lend(Lane& lane, std::uint
         }
     }
     if (need <= vision_lendable()) {
-        if (residency_) {
+        if (has_cache) {
             return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
             // Promotions still landing in the run are waited for by compute and the weight stream's
             // transfer stream.
