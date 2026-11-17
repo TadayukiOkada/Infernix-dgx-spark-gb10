@@ -99,6 +99,108 @@ void check_compiled_grammar_lifetime() {
     session->accept(1);
     session->confirm();
     require(allows(mask(*session), 2), "evicted grammar did not complete");
+
+    // Repeated eviction in OrderedHashMap::Erase (#1003) must release evicted values cleanly
+    // while keeping newly compiled entries valid across slot reuse.
+    infernix::text::GrammarCompiler tiny({"a", "b", "c", ""}, {3}, 1);
+    for (int i = 0; i < 16; ++i) {
+        const std::string lit = std::string(1, static_cast<char>('a' + (i % 3))) +
+                                static_cast<char>('a' + ((i + 1) % 3));
+        auto active = compile(tiny, "root ::= \"" + lit + "\"", {}, {});
+        require(allows(mask(*active), i % 3), "recycled cache slot corrupted compiled grammar");
+    }
+}
+
+void check_mid_token_exclusion() {
+    // A token may finish a byte literal and enter ExcludeToken; Token still requires a boundary.
+    const std::vector<std::string> vocabulary{"\n\n",  "\n\n\n", "\n\n\n\n", "<",  "<hi",
+                                              "<end>", "<tool>", "x",        "hi", ""};
+    infernix::text::GrammarCompiler compiler(vocabulary, {9}, 4 * 1024 * 1024);
+
+    struct Case {
+        std::string source;
+        std::vector<std::int32_t> prefix;
+        int token;
+        bool accepted;
+    };
+
+    const std::vector<Case> cases{
+        {"root ::= \"\\n\\n\" ExcludeToken(5)* Token(5)", {}, 1, true},
+        {"root ::= prefix ExcludeToken(5)*\nprefix ::= \"\\n\\n\" | \"x\"", {}, 1, true},
+        {"root ::= \"<\" ExcludeToken(5)*", {}, 5, false},
+        {"root ::= \"<\" ExcludeToken(5)*", {}, 4, true},
+        {"root ::= \"\\n\\n\" ExcludeToken(1)* Token(5)", {}, 2, true},
+        {"root ::= prefix ExcludeToken(1)*\nprefix ::= \"\\n\\n\" | \"x\"", {}, 2, true},
+        {"root ::= Token(6) prefix ExcludeToken(5)\nprefix ::= \"<\"", {6}, 4, true},
+        {"root ::= \"<\" Token(4)", {}, 4, false},
+        {"root ::= Token(6) prefix Token(5)\nprefix ::= \"<\"", {6}, 5, false},
+    };
+    for (const auto& item : cases) {
+        auto session = compile(compiler, item.source, {}, {});
+        session->accept(item.prefix);
+        session->confirm();
+        const auto before = mask(*session);
+        require(allows(before, item.token) == item.accepted,
+                "mid-token exclusion mask differs from token-boundary semantics");
+        const std::array<std::int32_t, 1> draft{item.token};
+        std::vector<std::uint32_t> draft_masks(2 * session->mask_words());
+        require(session->masks(draft, draft_masks) == 0,
+                "mid-token exclusion lookahead reached an unexpected dead end");
+        require(mask(*session) == before, "mid-token lookahead changed the legal token set");
+        bool accepted = true;
+        try {
+            session->accept(item.token);
+        } catch (const std::logic_error&) { accepted = false; }
+        require(accepted == item.accepted, "mid-token matcher disagrees with its mask");
+        session->discard();
+        require(mask(*session) == before, "mid-token rollback changed the legal token set");
+        if (item.accepted) {
+            session->accept(item.token);
+            session->confirm();
+            require(mask(*session) ==
+                        std::vector<std::uint32_t>(draft_masks.begin() + session->mask_words(),
+                                                   draft_masks.end()),
+                    "committed mid-token state differs from speculative lookahead");
+        }
+    }
+}
+
+void check_scalar_string_fsms() {
+    std::vector<std::string> vocab;
+    for (int byte = 0; byte < 256; ++byte) { vocab.emplace_back(1, static_cast<char>(byte)); }
+    vocab.emplace_back(); // EOS = 256
+    infernix::text::GrammarCompiler compiler(std::move(vocab), {256}, 4 * 1024 * 1024);
+
+    // Unsatisfiable scalar string intersections must fail via ByteFSM productivity check.
+    for (const auto* schema : {R"({"type":"string","allOf":[{"pattern":"^a$"},{"pattern":"^b$"}]})",
+                               R"({"type":"string","pattern":"^a$","maxLength":0})"}) {
+        bool rejected = false;
+        try {
+            (void)compiler.compile(infernix::OutputConstraint::json_schema(schema), {}, {});
+        } catch (const infernix::RequestError& error) {
+            rejected = error.kind() == infernix::RequestErrorKind::UnsatisfiableJsonSchema;
+        }
+        require(rejected, "empty ByteFSM string intersection was not rejected as unsatisfiable");
+    }
+
+    // Scalar string FSM with JSON escaping + length + pattern + excluded property keys.
+    const char* schema = R"({
+        "type": "object",
+        "properties": {
+            "fixed": {"type": "string", "pattern": "^a.*z$", "minLength": 3, "maxLength": 5}
+        },
+        "required": ["fixed"],
+        "additionalProperties": {"const": {"k": "v\"1", "n": [1, 2]}}
+    })";
+    auto session = compiler.compile(infernix::OutputConstraint::json_schema(schema), {}, {});
+    consume(*session,
+            "{\n  \"fixed\": \"a\\\"z\",\n  \"extra\": { \"k\" : \"v\\\"1\" , \"n\" : [ 1 , 2 ] }\n}");
+    require(allows(mask(*session), 256), "ByteFSM + container literal schema did not complete");
+
+    auto invalid_dup = compiler.compile(infernix::OutputConstraint::json_schema(schema), {}, {});
+    consume(*invalid_dup, "{\"fixed\":\"abz\",\"fixed");
+    require(!allows(mask(*invalid_dup), '"'),
+            "excluded key ByteFSM admitted known property name as additionalProperties");
 }
 
 void check_counted_units() {
@@ -206,6 +308,8 @@ int main() {
         check_finite_language_masks();
         check_counted_units();
         check_compiled_grammar_lifetime();
+        check_mid_token_exclusion();
+        check_scalar_string_fsms();
         check_draft_lookahead();
         std::vector<std::string> vocab;
         for (int byte = 0; byte < 256; ++byte) { vocab.emplace_back(1, static_cast<char>(byte)); }
@@ -308,8 +412,9 @@ int main() {
         thinking->confirm();
         require(allows(mask(*thinking), 256), "thinking framing did not reach content completion");
 
-        for (const auto& source : {"bad grammar", "root ::= missing", "root ::= Token(256)",
-                                   "root ::= Regex(\".*\")", "root[temperature=0.5] ::= \"a\""}) {
+        for (const auto& source :
+             {"bad grammar", "root ::= missing", "root ::= Token(256)", "root ::= Regex(\".*\")",
+              "root ::= ByteFSM(1, 0, 1, 0)", "root[temperature=0.5] ::= \"a\""}) {
             bool rejected = false;
             try {
                 (void)compile(compiler, source, {}, {});

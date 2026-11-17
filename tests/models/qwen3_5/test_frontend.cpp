@@ -1477,6 +1477,48 @@ int test_template_file_execution() {
     return failures;
 }
 
+int test_tool_history_arguments() {
+    const auto frontend = make_frontend(
+        resources("{{ messages[1].tool_calls[1].function.arguments|tojson }}"), false);
+    infernix::PromptInput input;
+    input.messages = {
+        {.role = infernix::ChatRole::User, .parts = {{.text = "run the tool"}}},
+        {.role       = infernix::ChatRole::Assistant,
+         .tool_calls = {{.id = "first", .name = "noop", .arguments_json = "{}"},
+                        {.id = "second", .name = "legacy"}}},
+        {.role = infernix::ChatRole::Tool, .parts = {{.text = "done"}}, .tool_call_id = "second"}};
+    auto& arguments = input.messages[1].tool_calls[1].arguments_json;
+    int failures    = 0;
+    for (const auto bad : {R"({"x": nope})", R"({"x":)", "[]", "null", R"({"x":1e99999})"}) {
+        arguments     = bad;
+        bool rejected = false;
+        try {
+            (void)frontend.prepare(input);
+        } catch (const std::invalid_argument& error) {
+            rejected = true;
+            const std::string_view message(error.what());
+            failures += check(message.find("messages[1].tool_calls[1]") != message.npos &&
+                                  message.find("legacy") != message.npos,
+                              "invalid tool history lost its message and call identity");
+            if (arguments == R"({"x": nope})")
+                failures += check(message.find("byte 8") != message.npos,
+                                  "invalid tool history lost its JSON error position");
+        }
+        failures += check(rejected, "invalid tool history was accepted");
+    }
+    for (const auto valid : {"", "{}", R"({"z":[1,true,null,{"s":"a\nb\"c"}],"a":2})"}) {
+        arguments           = valid;
+        const auto prepared = frontend.prepare(input);
+        const auto rendered =
+            fixture_tokenizer().decode(FrontendFactory::inspect(prepared).token_ids);
+        const auto expected = arguments.empty() ? nlohmann::ordered_json::object()
+                                                : nlohmann::ordered_json::parse(arguments);
+        failures += check(nlohmann::ordered_json::parse(rendered).dump() == expected.dump(),
+                          "tool history changed argument values or object order");
+    }
+    return failures;
+}
+
 int test_media_token_ids_come_from_tokenizer() {
     auto source    = resources();
     auto tokenizer = nlohmann::json::parse(source.tokenizer_json);
@@ -4304,6 +4346,7 @@ int main() try {
     failures += test_checkpoint_template_prepare_lowers_instruction_roles();
     failures += test_checkpoint_lowering_precedes_leading_instruction_tap();
     failures += test_next_turn_history();
+    failures += test_tool_history_arguments();
     return failures == 0 ? 0 : 1;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "FAIL: uncaught exception: %s\n", error.what());

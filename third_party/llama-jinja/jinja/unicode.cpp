@@ -47,14 +47,20 @@ std::vector<Character> characters(std::string_view text) {
 
 std::size_t length(std::string_view text) {
     std::size_t result = 0;
-    for (std::size_t pos = 0; pos < text.size(); ++result) {
-        pos += utf8::utf8_codepoint_at(text, pos, "Jinja string").length;
+    for (std::size_t pos = 0; pos < text.size();) {
+        const auto begin = pos;
+        while (pos < text.size() && static_cast<unsigned char>(text[pos]) < 0x80) ++pos;
+        result += pos - begin;
+        if (pos < text.size()) {
+            pos += utf8::utf8_codepoint_at(text, pos, "Jinja string").length;
+            ++result;
+        }
     }
     return result;
 }
 
 bool whitespace(std::int32_t cp) {
-    return (cp >= 0x1c && cp <= 0x1f) || cp == 0x85 || utf8::is_whitespace(cp);
+    return utf8::is_python_whitespace(cp);
 }
 
 bool is_upper(std::string_view text) {

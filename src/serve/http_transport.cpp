@@ -3,6 +3,10 @@
 #include "serve/request_validation.h"
 #include "text/json_input.h"
 
+#if defined(__linux__)
+#    include <netinet/tcp.h>
+#    include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <charconv>
@@ -16,6 +20,17 @@ bool has_ngram_generation(const NgramArchiveStats& stats) noexcept {
     return stats.enabled && stats.bound && stats.published && stats.generation != 0;
 }
 
+#if defined(__linux__)
+constexpr int kKeepAliveIdleSeconds                = 10;
+constexpr int kKeepAliveIntervalSeconds            = 3;
+constexpr int kKeepAliveProbeCount                 = 3;
+constexpr unsigned int kTcpUserTimeoutMilliseconds = 15000;
+
+template <class T>
+void set_socket_option(socket_t socket, int level, int option, const T& value) noexcept {
+    (void)::setsockopt(socket, level, option, &value, sizeof(value));
+}
+#endif
 
 } // namespace
 
@@ -223,7 +238,18 @@ bool SseTransport::poll(Clock::time_point now) {
 }
 
 void configure_http_server_socket(socket_t socket) noexcept {
+#if defined(__linux__)
+    const int enabled = 1;
+    // Reuse closed connections' addresses while keeping the active listener exclusive.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
+    set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
+    set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+#else
     httplib::default_socket_options(socket);
+#endif
 }
 
 void set_owned_json_content(httplib::Response& response, std::string body,

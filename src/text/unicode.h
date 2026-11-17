@@ -57,6 +57,7 @@ bool is_decimal_digit(std::int32_t codepoint) noexcept;
 // ASCII \t..\r and space, U+0085, and the Z categories. U+001C-U+001F are not in it (Python's
 // isspace() adds them).
 bool is_whitespace(std::int32_t codepoint) noexcept;
+bool is_python_whitespace(std::int32_t codepoint) noexcept;
 // The Unicode simple lowercase mapping (UnicodeData.txt); the codepoint itself where none exists.
 std::int32_t simple_lowercase(std::int32_t codepoint) noexcept;
 // The Unicode simple uppercase mapping; the codepoint itself where none exists.

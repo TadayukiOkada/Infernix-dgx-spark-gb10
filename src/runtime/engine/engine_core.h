@@ -694,26 +694,33 @@ private:
     // wait_for_request's first step, read only: until the request crosses the admission boundary
     // that publishes its GenerationStart, or is answered before it. Nothing is consumed, so
     // wait_for_request still delivers the start and every later event. An error answered before
-    // admission is rethrown (the later wait rethrows it again); a request answered without
-    // admission and without an error (cancelled in the queue) returns. A cancellation marks the
-    // request and keeps waiting for the worker's answer, as the wait loop does.
+    // admission is rethrown (the later wait rethrows it again); a request cancelled before
+    // admission throws RequestErrorKind::Cancelled so streaming callers do not open a stream. A
+    // cancellation marks the request and keeps waiting for the worker's answer, as the wait loop
+    // does.
     void await_request_admission(const std::shared_ptr<Request>& request,
                                  const CancellationView& cancellation) {
         for (;;) {
             std::exception_ptr error;
-            bool settled = false;
+            bool cancelled_done = false;
+            bool settled        = false;
             {
                 std::unique_lock lock(request->mutex);
                 request->cv.wait_for(lock, std::chrono::milliseconds(10), [&] {
                     return request->response_done || request->stream_start.has_value();
                 });
                 settled = request->response_done || request->stream_start.has_value();
-                if (request->response_done && !request->stream_start.has_value()) {
+                if (request->response_done) {
                     error = request->error;
+                    cancelled_done =
+                        error == nullptr && request->result.finish_reason == FinishReason::Cancelled;
                 }
             }
             if (settled) {
                 if (error != nullptr) { std::rethrow_exception(error); }
+                if (cancelled_done) {
+                    throw RequestError(RequestErrorKind::Cancelled, "Request cancelled");
+                }
                 return;
             }
             bool cancel = false;

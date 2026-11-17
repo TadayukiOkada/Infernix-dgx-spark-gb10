@@ -2,10 +2,19 @@
 #include "serve/request.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#    include <arpa/inet.h>
+#    include <netinet/in.h>
+#    include <netinet/tcp.h>
+#    include <sys/socket.h>
+#    include <unistd.h>
+#endif
 
 
 namespace {
@@ -55,9 +64,15 @@ int test_sse_transport() {
                       "quiet SSE output did not resume heartbeats after a data event");
 
     transport.write(std::vector<std::string>{"data: one\n\n", "data: two\n\n"}, start + 16s);
-    failures +=
-        check(writes.size() == 5 && writes[3] == "data: one\n\n" && writes[4] == "data: two\n\n",
-              "SSE transport changed ordered multi-event output");
+    failures += check(writes.size() == 4 && writes[3] == "data: one\n\ndata: two\n\n",
+                      "SSE transport changed ordered multi-event output");
+
+    transport.write_buffered("data: buf1\n\n");
+    transport.write_buffered("data: buf2\n\n");
+    failures += check(writes.size() == 4, "SSE buffered write flushed prematurely");
+    transport.flush(start + 16s);
+    failures += check(writes.size() == 5 && writes[4] == "data: buf1\n\ndata: buf2\n\n",
+                      "SSE flush did not emit buffered events in order");
 
     writable = false;
     failures += check(transport.poll(start + 16s) && cancelled,
@@ -260,6 +275,148 @@ int test_schema_number_precision() {
     return failures;
 }
 
+#if defined(__linux__)
+class Socket final {
+public:
+    explicit Socket(int descriptor = -1) : descriptor_(descriptor) {}
+
+    ~Socket() {
+        if (descriptor_ >= 0) { ::close(descriptor_); }
+    }
+
+    Socket(const Socket&)            = delete;
+    Socket& operator=(const Socket&) = delete;
+
+    [[nodiscard]] int get() const noexcept { return descriptor_; }
+
+private:
+    int descriptor_ = -1;
+};
+
+template <class T>
+bool socket_option_equals(int socket, int level, int option, T expected) {
+    T actual{};
+    socklen_t size = sizeof(actual);
+    return ::getsockopt(socket, level, option, &actual, &size) == 0 && size == sizeof(actual) &&
+           actual == expected;
+}
+
+int test_inherited_socket_liveness() {
+    int failures = 0;
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    if (listener.get() < 0) { return check(false, "failed to create HTTP listener test socket"); }
+    infernix::serve::configure_http_server_socket(listener.get());
+
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port        = 0;
+    if (::bind(listener.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(listener.get(), 1) != 0) {
+        return check(false, "failed to bind HTTP listener test socket");
+    }
+    socklen_t address_size = sizeof(address);
+    if (::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
+        return check(false, "failed to inspect HTTP listener test address");
+    }
+
+    Socket client(::socket(AF_INET, SOCK_STREAM, 0));
+    if (client.get() < 0 || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
+                                      sizeof(address)) != 0) {
+        return check(false, "failed to connect HTTP liveness test socket");
+    }
+    Socket accepted(::accept(listener.get(), nullptr, nullptr));
+    if (accepted.get() < 0) { return check(false, "failed to accept HTTP liveness test socket"); }
+
+    failures += check(socket_option_equals(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
+                      "accepted HTTP socket did not inherit SO_KEEPALIVE");
+    failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPIDLE, 10),
+                      "accepted HTTP socket did not inherit TCP_KEEPIDLE");
+    failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPINTVL, 3),
+                      "accepted HTTP socket did not inherit TCP_KEEPINTVL");
+    failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPCNT, 3),
+                      "accepted HTTP socket did not inherit TCP_KEEPCNT");
+    failures += check(
+        socket_option_equals<unsigned int>(accepted.get(), IPPROTO_TCP, TCP_USER_TIMEOUT, 15000U),
+        "accepted HTTP socket did not inherit TCP_USER_TIMEOUT");
+    return failures;
+}
+
+using SocketSetup = void (*)(socket_t);
+
+void reuse_address_only(socket_t socket) {
+    const int enabled = 1;
+    (void)::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+}
+
+sockaddr_in listen_on_loopback(socket_t listener, SocketSetup setup) {
+    if (listener < 0) { return {}; }
+    setup(listener);
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t size          = sizeof(address);
+    if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), size) != 0 ||
+        ::listen(listener, 1) != 0 ||
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+        return {};
+    }
+    return address;
+}
+
+sockaddr_in leave_server_time_wait(SocketSetup setup) {
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    const auto address = listen_on_loopback(listener.get(), setup);
+    if (address.sin_port == 0) { return {}; }
+    Socket client(::socket(AF_INET, SOCK_STREAM, 0));
+    if (client.get() < 0 || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
+                                      sizeof(address)) != 0) {
+        return {};
+    }
+    Socket accepted(::accept(listener.get(), nullptr, nullptr));
+    // Complete the FIN handshake with the server closing first, before releasing its listener.
+    char byte = 0;
+    if (accepted.get() < 0 || ::shutdown(accepted.get(), SHUT_WR) != 0 ||
+        ::recv(client.get(), &byte, 1, 0) != 0 || ::shutdown(client.get(), SHUT_WR) != 0 ||
+        ::recv(accepted.get(), &byte, 1, 0) != 0) {
+        return {};
+    }
+    return address;
+}
+
+int test_listener_reuse() {
+    const auto configure = infernix::serve::configure_http_server_socket;
+
+    struct Case {
+        SocketSetup previous, next;
+    };
+
+    int failures = 0;
+    for (const Case c : {Case{configure, reuse_address_only}, Case{reuse_address_only, configure},
+                         Case{configure, configure}}) {
+        const auto address = leave_server_time_wait(c.previous);
+        if (address.sin_port == 0) {
+            failures += check(false, "failed to establish a closed HTTP connection");
+            continue;
+        }
+        Socket successor(::socket(AF_INET, SOCK_STREAM, 0));
+        c.next(successor.get());
+        failures += check(::bind(successor.get(), reinterpret_cast<const sockaddr*>(&address),
+                                 sizeof(address)) == 0,
+                          "closed listener prevented immediate port reuse");
+    }
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    const auto address = listen_on_loopback(listener.get(), configure);
+    if (address.sin_port == 0) { return failures + check(false, "failed to bind active listener"); }
+    Socket duplicate(::socket(AF_INET, SOCK_STREAM, 0));
+    configure(duplicate.get());
+    const int result =
+        ::bind(duplicate.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+    failures += check(result == -1 && errno == EADDRINUSE,
+                      "HTTP listener allowed another server to share its active port");
+    return failures;
+}
+#endif
 
 } // namespace
 
@@ -267,6 +424,10 @@ int main() {
     int failures = test_ngram_identity() + test_request_label() + test_ngram_generation() + test_sse_transport() +
                    test_sse_response_headers() + test_prompt_json_member_order() +
                    test_schema_number_precision();
+#if defined(__linux__)
+    failures += test_inherited_socket_liveness();
+    failures += test_listener_reuse();
+#endif
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -17,6 +17,8 @@
 namespace infernix::text {
 
 struct TemplateInputRegion {
+    // Descendants inherit whole-value origins; an explicit child region supplies its own origin.
+    // Only an explicitly tagged string has exact source-byte coordinates.
     std::string pointer;
     std::uint32_t tag = 0;
 };

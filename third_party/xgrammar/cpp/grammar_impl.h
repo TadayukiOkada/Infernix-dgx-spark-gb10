@@ -203,6 +203,9 @@ class Grammar::Impl {
     // and is carried through the grammar passes as-is; when GrammarFSMBuilder runs, it is
     // compiled into an automaton via a chunk-level suffix automaton (see SuffixAutomata).
     kSubstring,
+    // A self-contained terminal byte automaton: [states, start, end_count, ends...,
+    // (source, target, lower_byte, upper_byte)...]. No rule references or epsilon edges.
+    kByteFSM,
   };
 
   /*! \brief The object representing a grammar expr. */
@@ -307,6 +310,9 @@ class Grammar::Impl {
   std::vector<std::string> GetSubstringChunks(int32_t grammar_expr_id) const {
     return GetSubstringChunks(GetGrammarExpr(grammar_expr_id));
   }
+
+  static bool ValidByteFSM(const GrammarExpr& expression);
+  FSMWithStartEnd GetByteFSM(const GrammarExpr& expression) const;
 
   /*! \brief The object representing a tag dispatch. */
   struct TagDispatch {
@@ -414,6 +420,9 @@ class Grammar::Impl {
    */
   std::vector<std::optional<CompactFSMWithStartEndWithSize>> per_rule_fsms;
 
+  /*! \brief Whether complete_fsm has any kToken or kExcludeToken edge. */
+  bool has_token_edges = false;
+
   /*!
    * \brief The hash value for each rule's FSM.
    */
@@ -482,6 +491,8 @@ XGRAMMAR_MEMBER_TABLE(
     &Grammar::Impl::complete_fsm,
     "per_rule_fsms",
     &Grammar::Impl::per_rule_fsms,
+    "has_token_edges",
+    &Grammar::Impl::has_token_edges,
     "allow_empty_rule_ids",
     &Grammar::Impl::allow_empty_rule_ids,
     "optimized",

@@ -135,7 +135,8 @@ void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& 
     for (int i = 0; i < grammar->NumGrammarExprs(); ++i) {
         const auto expression = grammar->GetGrammarExpr(i);
         if (expression.type == Type::kTagDispatch || expression.type == Type::kTokenTagDispatch ||
-            expression.type == Type::kRegex || expression.type == Type::kSubstring) {
+            expression.type == Type::kRegex || expression.type == Type::kByteFSM ||
+            expression.type == Type::kSubstring) {
             throw std::invalid_argument("grammar uses an extension outside the GBNF contract");
         }
         if (expression.type == Type::kToken || expression.type == Type::kExcludeToken) {
