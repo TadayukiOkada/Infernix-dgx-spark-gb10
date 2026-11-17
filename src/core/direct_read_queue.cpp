@@ -164,6 +164,9 @@ struct DirectReadQueue::Impl {
     std::uint32_t open_file(const std::filesystem::path& path) {
         File f;
         int flags = O_RDONLY | O_CLOEXEC;
+#    ifdef O_DIRECT
+        flags |= O_DIRECT;
+#    endif
         f.fd = ::open(path.c_str(), flags);
 #    ifdef O_DIRECT
         // A filesystem without direct I/O (tmpfs, 9p, some FUSE mounts and Docker bind mounts)
