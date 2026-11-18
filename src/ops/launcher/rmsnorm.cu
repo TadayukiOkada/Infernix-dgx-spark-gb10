@@ -32,6 +32,39 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
 
     if constexpr (!rms_gated(Epilogue)) {
         if (aligned2 && d == 5120) {
+            const bool aligned16 = ((reinterpret_cast<std::uintptr_t>(x_bf16) |
+                                     reinterpret_cast<std::uintptr_t>(w_bf16) |
+                                     reinterpret_cast<std::uintptr_t>(out_bf16)) &
+                                    (alignof(uint4) - 1)) == 0;
+            if (aligned16) {
+                if (rows == 1) {
+                    CUDA_CHECK(pdl::launch_consumer(
+                        {dim3(5), dim3(128), 0, stream},
+                        rmsnorm_d5120_decode_vec16_kernel<Epilogue>,
+                        reinterpret_cast<const uint4*>(x_bf16),
+                        reinterpret_cast<const uint4*>(w_bf16),
+                        reinterpret_cast<uint4*>(out_bf16), eps));
+                    return;
+                }
+                if (rows == 16) {
+                    CUDA_CHECK(pdl::launch_consumer(
+                        {dim3(32), dim3(320), 0, stream},
+                        rmsnorm_d5120_verify_vec16_kernel<Epilogue>,
+                        reinterpret_cast<const uint4*>(x_bf16),
+                        reinterpret_cast<const uint4*>(w_bf16),
+                        reinterpret_cast<uint4*>(out_bf16), eps));
+                    return;
+                }
+                if (rows > 1 && rows < 64) {
+                    CUDA_CHECK(pdl::launch_consumer(
+                        {dim3(static_cast<unsigned>(rows)), dim3(256), 0, stream},
+                        rmsnorm_d5120_rows_vec16_kernel<Epilogue>,
+                        reinterpret_cast<const uint4*>(x_bf16),
+                        reinterpret_cast<const uint4*>(w_bf16),
+                        reinterpret_cast<uint4*>(out_bf16), eps));
+                    return;
+                }
+            }
             // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
             // with hoisted gains wins the hidden-row sweep through prefill.
             CUDA_CHECK(

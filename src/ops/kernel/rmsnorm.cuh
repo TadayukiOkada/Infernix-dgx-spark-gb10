@@ -397,34 +397,36 @@ void rmsnorm_d5120_decode_vec16_kernel(const uint4* __restrict__ x, const uint4*
     y[j]        = rms_vec_out<Epilogue>(x[j], w[j], inv);
 }
 
-// Three independently reduced copies per verification row (D=5120, rows=16 -> 48 CTAs on GB10).
+// Verify: rows=16, D=5120. Two CTAs per row, 320 threads each (10 warps).
+// Each thread loads exactly 2 uint4s (indices t and t+320), covering all 640.
+// Writeback index j = part*320+t matches one of the loaded values (register cache).
+// w[j] loaded before reduction to overlap L2 latency with shuffle steps.
 template <RmsEpilogue Epilogue>
-__launch_bounds__(256) __global__
+__launch_bounds__(320) __global__
 void rmsnorm_d5120_verify_vec16_kernel(const uint4* __restrict__ x, const uint4* __restrict__ w,
                                        uint4* __restrict__ y, float eps) {
     pdl::enter();
-    const int t        = static_cast<int>(threadIdx.x);
-    const int lane     = t & 31;
-    const int warp     = t >> 5;
-    const size_t row   = static_cast<size_t>(blockIdx.x) / 3;
-    const int part     = static_cast<int>(blockIdx.x % 3);
-    const size_t base  = row * 640;
-    float sum          = rms_vec_sq(x[base + t]) + rms_vec_sq(x[base + 256 + t]);
-    if (t < 128) { sum += rms_vec_sq(x[base + 512 + t]); }
+    const int t       = static_cast<int>(threadIdx.x);
+    const int lane    = t & 31;
+    const int warp    = t >> 5;
+    const size_t row  = static_cast<size_t>(blockIdx.x) >> 1;
+    const int part    = static_cast<int>(blockIdx.x) & 1;
+    const size_t base = row * 640;
+    const uint4 v0    = x[base + t];
+    const uint4 v1    = x[base + 320 + t];
+    const int j       = part * 320 + t;
+    const uint4 wv    = w[j];
+    float sum         = rms_vec_sq(v0) + rms_vec_sq(v1);
     sum = warp_reduce_sum(sum);
-    __shared__ float partial[8];
+    __shared__ float partial[10];
     if (lane == 0) { partial[warp] = sum; }
     __syncthreads();
-    float total = lane < 8 ? partial[lane] : 0.0f;
+    float total = lane < 10 ? partial[lane] : 0.0f;
     total       = warp_reduce_sum(total);
     float inv   = lane == 0 ? rsqrtf(total * (1.0f / 5120.0f) + eps) : 0.0f;
     inv         = __shfl_sync(kFullWarpMask, inv, 0);
-    const int start = part == 0 ? 0 : (part == 1 ? 224 : 432);
-    const int count = part == 0 ? 224 : 208;
-    if (t < count) {
-        const int j   = start + t;
-        y[base + j]   = rms_vec_out<Epilogue>(x[base + j], w[j], inv);
-    }
+    const uint4 xv = (part == 0) ? v0 : v1;
+    y[base + j] = rms_vec_out<Epilogue>(xv, wv, inv);
 }
 
 template <RmsEpilogue Epilogue>

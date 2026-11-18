@@ -574,7 +574,7 @@ struct TallQ8 {
     __device__ Chunk load(int row, int chunk) const {
         return {ld_nc_na_evict_first(
                     reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k) + chunk),
-                scales[static_cast<std::size_t>(row) * (padded_k / 32) + (chunk >> 2)]};
+                __ldcg(scales + static_cast<std::size_t>(row) * (padded_k / 32) + (chunk >> 2))};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const auto* v     = reinterpret_cast<const std::int8_t*>(&c.code);
@@ -587,7 +587,7 @@ struct TallQ8 {
         const uint2* row_codes;
         const __half* row_scales;
         __device__ __forceinline__ Chunk load(int chunk) const {
-            return {ld_nc_na_evict_first(row_codes + chunk), row_scales[chunk >> 2]};
+            return {ld_nc_na_evict_first(row_codes + chunk), __ldcg(row_scales + (chunk >> 2))};
         }
     };
     __device__ __forceinline__ RowLoader row(int r) const {
@@ -608,7 +608,7 @@ struct TallQ4 {
         return {ld_nc_na_evict_first_u32(
                     reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::size_t>(row) * (padded_k / 2)) +
                     chunk),
-                scales[static_cast<std::size_t>(row) * (padded_k / 64) + (chunk >> 3)]};
+                __ldcg(scales + static_cast<std::size_t>(row) * (padded_k / 64) + (chunk >> 3))};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const float scale = __half2float(c.scale);
@@ -623,7 +623,7 @@ struct TallQ4 {
         const std::uint32_t* row_codes;
         const __half* row_scales;
         __device__ __forceinline__ Chunk load(int chunk) const {
-            return {ld_nc_na_evict_first_u32(row_codes + chunk), row_scales[chunk >> 3]};
+            return {ld_nc_na_evict_first_u32(row_codes + chunk), __ldcg(row_scales + (chunk >> 3))};
         }
     };
     __device__ __forceinline__ RowLoader row(int r) const {

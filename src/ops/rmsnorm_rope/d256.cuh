@@ -19,14 +19,17 @@ __device__ __forceinline__ RmsnormRopeD256Head rmsnorm_rope_d256_normalize(
     std::int64_t base, int lane) {
     constexpr int kHeadDim   = 256;
     constexpr float kEpsilon = 1.0e-6F;
-    __nv_bfloat162 values[4];
     __nv_bfloat162 weights[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        weights[k] = weight[lane + k * 32];
+    }
+    __nv_bfloat162 values[4];
     float sum = 0.0F;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         const int pair  = lane + k * 32;
         values[k]       = input[base + pair];
-        weights[k]      = weight[pair];
         const float2 xf = __bfloat1622float2(values[k]);
         sum += xf.x * xf.x + xf.y * xf.y;
     }

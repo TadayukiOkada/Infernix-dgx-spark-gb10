@@ -85,7 +85,7 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
             return;
         }
         if (n == 98304) {
-            silu_and_mul_exact_kernel<128><<<96, 128, 0, stream>>>(gate_bf, up_bf, out_bf);
+            silu_and_mul_exact_kernel<256><<<48, 256, 0, stream>>>(gate_bf, up_bf, out_bf);
             CUDA_CHECK(cudaGetLastError());
             return;
         }

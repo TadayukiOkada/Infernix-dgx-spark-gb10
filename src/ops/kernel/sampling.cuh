@@ -165,11 +165,95 @@ __launch_bounds__(S::kSamplerBlock) __global__
         int bi               = INT_MAX;
         const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
         if (!penalties && cfg.mask.words == nullptr) {
-            for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = sampling_logit(logits[base + v]);
-                if (sampling_better(x, v, bv, bi)) {
-                    bv = x;
-                    bi = v;
+            if constexpr (std::is_same_v<Logit, float>) {
+                if ((reinterpret_cast<std::uintptr_t>(logits + base) % 16 == 0) && (token_domain >= 32)) {
+                    const auto* row4 = reinterpret_cast<const float4*>(logits + base);
+                    const int nvec   = token_domain >> 2;
+                    int v4           = tid;
+                    for (; v4 + 7 * blockDim.x < nvec; v4 += 8 * blockDim.x) {
+                        float4 val0 = row4[v4];
+                        float4 val1 = row4[v4 + blockDim.x];
+                        float4 val2 = row4[v4 + 2 * blockDim.x];
+                        float4 val3 = row4[v4 + 3 * blockDim.x];
+                        float4 val4 = row4[v4 + 4 * blockDim.x];
+                        float4 val5 = row4[v4 + 5 * blockDim.x];
+                        float4 val6 = row4[v4 + 6 * blockDim.x];
+                        float4 val7 = row4[v4 + 7 * blockDim.x];
+
+                        int b0 = v4 << 2;
+                        int s4 = blockDim.x << 2;
+
+                        if (sampling_better(val0.x, b0, bv, bi)) { bv = val0.x; bi = b0; }
+                        if (sampling_better(val0.y, b0 + 1, bv, bi)) { bv = val0.y; bi = b0 + 1; }
+                        if (sampling_better(val0.z, b0 + 2, bv, bi)) { bv = val0.z; bi = b0 + 2; }
+                        if (sampling_better(val0.w, b0 + 3, bv, bi)) { bv = val0.w; bi = b0 + 3; }
+
+                        if (sampling_better(val1.x, b0 + s4, bv, bi)) { bv = val1.x; bi = b0 + s4; }
+                        if (sampling_better(val1.y, b0 + s4 + 1, bv, bi)) { bv = val1.y; bi = b0 + s4 + 1; }
+                        if (sampling_better(val1.z, b0 + s4 + 2, bv, bi)) { bv = val1.z; bi = b0 + s4 + 2; }
+                        if (sampling_better(val1.w, b0 + s4 + 3, bv, bi)) { bv = val1.w; bi = b0 + s4 + 3; }
+
+                        if (sampling_better(val2.x, b0 + 2*s4, bv, bi)) { bv = val2.x; bi = b0 + 2*s4; }
+                        if (sampling_better(val2.y, b0 + 2*s4 + 1, bv, bi)) { bv = val2.y; bi = b0 + 2*s4 + 1; }
+                        if (sampling_better(val2.z, b0 + 2*s4 + 2, bv, bi)) { bv = val2.z; bi = b0 + 2*s4 + 2; }
+                        if (sampling_better(val2.w, b0 + 2*s4 + 3, bv, bi)) { bv = val2.w; bi = b0 + 2*s4 + 3; }
+
+                        if (sampling_better(val3.x, b0 + 3*s4, bv, bi)) { bv = val3.x; bi = b0 + 3*s4; }
+                        if (sampling_better(val3.y, b0 + 3*s4 + 1, bv, bi)) { bv = val3.y; bi = b0 + 3*s4 + 1; }
+                        if (sampling_better(val3.z, b0 + 3*s4 + 2, bv, bi)) { bv = val3.z; bi = b0 + 3*s4 + 2; }
+                        if (sampling_better(val3.w, b0 + 3*s4 + 3, bv, bi)) { bv = val3.w; bi = b0 + 3*s4 + 3; }
+
+                        if (sampling_better(val4.x, b0 + 4*s4, bv, bi)) { bv = val4.x; bi = b0 + 4*s4; }
+                        if (sampling_better(val4.y, b0 + 4*s4 + 1, bv, bi)) { bv = val4.y; bi = b0 + 4*s4 + 1; }
+                        if (sampling_better(val4.z, b0 + 4*s4 + 2, bv, bi)) { bv = val4.z; bi = b0 + 4*s4 + 2; }
+                        if (sampling_better(val4.w, b0 + 4*s4 + 3, bv, bi)) { bv = val4.w; bi = b0 + 4*s4 + 3; }
+
+                        if (sampling_better(val5.x, b0 + 5*s4, bv, bi)) { bv = val5.x; bi = b0 + 5*s4; }
+                        if (sampling_better(val5.y, b0 + 5*s4 + 1, bv, bi)) { bv = val5.y; bi = b0 + 5*s4 + 1; }
+                        if (sampling_better(val5.z, b0 + 5*s4 + 2, bv, bi)) { bv = val5.z; bi = b0 + 5*s4 + 2; }
+                        if (sampling_better(val5.w, b0 + 5*s4 + 3, bv, bi)) { bv = val5.w; bi = b0 + 5*s4 + 3; }
+
+                        if (sampling_better(val6.x, b0 + 6*s4, bv, bi)) { bv = val6.x; bi = b0 + 6*s4; }
+                        if (sampling_better(val6.y, b0 + 6*s4 + 1, bv, bi)) { bv = val6.y; bi = b0 + 6*s4 + 1; }
+                        if (sampling_better(val6.z, b0 + 6*s4 + 2, bv, bi)) { bv = val6.z; bi = b0 + 6*s4 + 2; }
+                        if (sampling_better(val6.w, b0 + 6*s4 + 3, bv, bi)) { bv = val6.w; bi = b0 + 6*s4 + 3; }
+
+                        if (sampling_better(val7.x, b0 + 7*s4, bv, bi)) { bv = val7.x; bi = b0 + 7*s4; }
+                        if (sampling_better(val7.y, b0 + 7*s4 + 1, bv, bi)) { bv = val7.y; bi = b0 + 7*s4 + 1; }
+                        if (sampling_better(val7.z, b0 + 7*s4 + 2, bv, bi)) { bv = val7.z; bi = b0 + 7*s4 + 2; }
+                        if (sampling_better(val7.w, b0 + 7*s4 + 3, bv, bi)) { bv = val7.w; bi = b0 + 7*s4 + 3; }
+                    }
+                    for (; v4 < nvec; v4 += blockDim.x) {
+                        float4 val = row4[v4];
+                        int base_idx = v4 << 2;
+                        if (sampling_better(val.x, base_idx, bv, bi)) { bv = val.x; bi = base_idx; }
+                        if (sampling_better(val.y, base_idx + 1, bv, bi)) { bv = val.y; bi = base_idx + 1; }
+                        if (sampling_better(val.z, base_idx + 2, bv, bi)) { bv = val.z; bi = base_idx + 2; }
+                        if (sampling_better(val.w, base_idx + 3, bv, bi)) { bv = val.w; bi = base_idx + 3; }
+                    }
+                    for (int v = nvec << 2; v < token_domain; ++v) {
+                        const float x = static_cast<const float*>(logits)[base + v];
+                        if (sampling_better(x, v, bv, bi)) {
+                            bv = x;
+                            bi = v;
+                        }
+                    }
+                } else {
+                    for (int v = tid; v < token_domain; v += blockDim.x) {
+                        const float x = sampling_logit(logits[base + v]);
+                        if (sampling_better(x, v, bv, bi)) {
+                            bv = x;
+                            bi = v;
+                        }
+                    }
+                }
+            } else {
+                for (int v = tid; v < token_domain; v += blockDim.x) {
+                    const float x = sampling_logit(logits[base + v]);
+                    if (sampling_better(x, v, bv, bi)) {
+                        bv = x;
+                        bi = v;
+                    }
                 }
             }
         } else {
