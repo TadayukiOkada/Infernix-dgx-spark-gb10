@@ -157,16 +157,23 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_direct_kern
     __syncthreads();
     const float a_scale = gate_stage.a_log_exp;
 
+    const std::int32_t head_ratio = heads / qk_heads;
+    const std::int32_t qk_head    = head / head_ratio;
+    std::int64_t vector_offset    = static_cast<std::int64_t>(head) * kStateDim;
+    std::int64_t query_offset     = static_cast<std::int64_t>(qk_head) * kStateDim;
+    const std::int64_t vector_stride = static_cast<std::int64_t>(heads) * kStateDim;
+    const std::int64_t query_stride  = static_cast<std::int64_t>(qk_heads) * kStateDim;
+    const float* head_dt_bias     = dt_bias + static_cast<std::int64_t>(head) * kStateDim;
+    const __nv_bfloat16* head_beta = beta + head;
+
     for (std::int32_t token = 0; token < width; ++token) {
-        const std::int64_t vector_offset =
-            (static_cast<std::int64_t>(token) * heads + head) * kStateDim;
-        const std::int64_t query_offset =
-            (static_cast<std::int64_t>(token) * qk_heads + head / (heads / qk_heads)) * kStateDim;
         run_recurrent_token(
             state, q + query_offset, k + query_offset, v + vector_offset, g + vector_offset,
-            beta + static_cast<std::int64_t>(token) * heads + head,
-            dt_bias + static_cast<std::int64_t>(head) * kStateDim, out + vector_offset, gate_stage,
+            head_beta + static_cast<std::int64_t>(token) * heads,
+            head_dt_bias, out + vector_offset, gate_stage,
             token & 1, lane, thread, dv_base, dqk_base, a_scale, lower_bound, scale);
+        vector_offset += vector_stride;
+        query_offset  += query_stride;
     }
 
     store_state(state, state_write + state_offset, dv_base, dqk_base);
@@ -202,8 +209,10 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_batch_updat
     if (thread == 0) { gate_stage.a_log_exp = expf(a_log[head]); }
     __syncthreads();
 
+    const std::int32_t head_ratio = heads / qk_heads;
+    const std::int32_t qk_head    = head / head_ratio;
     const std::int64_t query_offset =
-        (static_cast<std::int64_t>(batch) * qk_heads + head / (heads / qk_heads)) * kStateDim;
+        (static_cast<std::int64_t>(batch) * qk_heads + qk_head) * kStateDim;
     run_recurrent_token(state, q + query_offset, k + query_offset, v + vector_offset,
                         g + vector_offset, beta + static_cast<std::int64_t>(batch) * heads + head,
                         dt_bias + static_cast<std::int64_t>(head) * kStateDim, out + vector_offset,

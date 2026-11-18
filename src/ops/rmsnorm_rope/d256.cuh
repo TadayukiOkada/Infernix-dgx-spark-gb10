@@ -31,7 +31,7 @@ __device__ __forceinline__ RmsnormRopeD256Head rmsnorm_rope_d256_normalize(
         sum += xf.x * xf.x + xf.y * xf.y;
     }
     sum       = warp_reduce_sum(sum);
-    float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(kHeadDim) + kEpsilon) : 0.0F;
+    float inv = lane == 0 ? rsqrtf(sum * (1.0F / static_cast<float>(kHeadDim)) + kEpsilon) : 0.0F;
     inv       = __shfl_sync(kFullWarpMask, inv, 0);
 
     RmsnormRopeD256Head out;

@@ -626,7 +626,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
                 const int v          = tile_start + tile_index;
                 keys[item]           = (v < token_domain &&
                               (!cfg.mask.words ||
-                               (cfg.mask.words[col * cfg.mask.stride + v / 32] & (1u << (v % 32)))))
+                               (cfg.mask.words[col * cfg.mask.stride + (v >> 5)] & (1u << (v & 31)))))
                                            ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
                                            : 0u;
             }
@@ -1415,7 +1415,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
                 keys[item] =
                     (v < token_domain &&
                      (!cfg.mask.words ||
-                      (cfg.mask.words[col * cfg.mask.stride + v / 32] & (1u << (v % 32)))))
+                      (cfg.mask.words[col * cfg.mask.stride + (v >> 5)] & (1u << (v & 31)))))
                         ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
                         : 0u;
             }

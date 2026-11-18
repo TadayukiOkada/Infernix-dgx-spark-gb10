@@ -247,7 +247,7 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
-    if (c.mask.words && !(c.mask.words[overlay_len * c.mask.stride + v / 32] & (1u << (v % 32)))) {
+    if (c.mask.words && !(c.mask.words[overlay_len * c.mask.stride + (v >> 5)] & (1u << (v & 31)))) {
         return -CUDART_INF_F;
     }
     float x = raw;

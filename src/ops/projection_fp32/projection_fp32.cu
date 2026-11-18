@@ -554,6 +554,13 @@ struct TallBf16 {
     using Chunk = uint4;
     __device__ Chunk load(int row, int chunk) const { return ld_nc_na<uint4>(row_chunk(segments, row, k, chunk)); }
     __device__ static void decode(const Chunk& c, float (&w)[8]) { widen8(c, w); }
+
+    struct RowLoader {
+        const TallBf16& parent;
+        int r;
+        __device__ __forceinline__ Chunk load(int chunk) const { return parent.load(r, chunk); }
+    };
+    __device__ __forceinline__ RowLoader row(int r) const { return {*this, r}; }
 };
 
 struct TallQ8 {
@@ -567,13 +574,25 @@ struct TallQ8 {
     __device__ Chunk load(int row, int chunk) const {
         return {ld_nc_na_evict_first(
                     reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * padded_k) + chunk),
-                scales[static_cast<std::size_t>(row) * (padded_k / 32) + chunk / 4]};
+                scales[static_cast<std::size_t>(row) * (padded_k / 32) + (chunk >> 2)]};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const auto* v     = reinterpret_cast<const std::int8_t*>(&c.code);
         const float scale = __half2float(c.scale);
 #pragma unroll
         for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(v[i]) * scale; }
+    }
+
+    struct RowLoader {
+        const uint2* row_codes;
+        const __half* row_scales;
+        __device__ __forceinline__ Chunk load(int chunk) const {
+            return {ld_nc_na_evict_first(row_codes + chunk), row_scales[chunk >> 2]};
+        }
+    };
+    __device__ __forceinline__ RowLoader row(int r) const {
+        return {reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(r) * padded_k),
+                scales + static_cast<std::size_t>(r) * (padded_k / 32)};
     }
 };
 
@@ -589,7 +608,7 @@ struct TallQ4 {
         return {ld_nc_na_evict_first_u32(
                     reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::size_t>(row) * (padded_k / 2)) +
                     chunk),
-                scales[static_cast<std::size_t>(row) * (padded_k / 64) + chunk / 8]};
+                scales[static_cast<std::size_t>(row) * (padded_k / 64) + (chunk >> 3)]};
     }
     __device__ static void decode(const Chunk& c, float (&w)[8]) {
         const float scale = __half2float(c.scale);
@@ -598,6 +617,18 @@ struct TallQ4 {
             const int u = static_cast<int>((c.code >> (4 * i)) & 0xFU);
             w[i]        = static_cast<float>(u >= 8 ? u - 16 : u) * scale;
         }
+    }
+
+    struct RowLoader {
+        const std::uint32_t* row_codes;
+        const __half* row_scales;
+        __device__ __forceinline__ Chunk load(int chunk) const {
+            return {ld_nc_na_evict_first_u32(row_codes + chunk), row_scales[chunk >> 3]};
+        }
+    };
+    __device__ __forceinline__ RowLoader row(int r) const {
+        return {reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::size_t>(r) * (padded_k / 2)),
+                scales + static_cast<std::size_t>(r) * (padded_k / 64)};
     }
 };
 
@@ -608,18 +639,19 @@ __global__ void __launch_bounds__(
                                  float* __restrict__ out) {
     extern __shared__ uint4 staged[]; // [MaxCols][chunks]
     const int chunks    = k / 8;
-    const int lane      = static_cast<int>(threadIdx.x) % 32;
-    const int first_row = (static_cast<int>(blockIdx.x) * kTallWarps + static_cast<int>(threadIdx.x) / 32) *
-                          kTallRowsPerWarp;
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    const int warp      = static_cast<int>(threadIdx.x) >> 5;
+    const int first_row = (static_cast<int>(blockIdx.x) * kTallWarps + warp) * kTallRowsPerWarp;
     // 1. Every chunk of both rows, before x is staged.
     typename Codec::Chunk w[kTallRowsPerWarp][kMaxLaneChunks];
 #pragma unroll
     for (int r = 0; r < kTallRowsPerWarp; ++r) {
         const int row = min(first_row + r, rows - 1);
+        const auto row_loader = codec.row(row);
 #pragma unroll
         for (int i = 0; i < kMaxLaneChunks; ++i) {
             const int chunk = lane + 32 * i;
-            if (chunk < chunks) { w[r][i] = codec.load(row, chunk); }
+            if (chunk < chunks) { w[r][i] = row_loader.load(chunk); }
         }
     }
     for (int i = static_cast<int>(threadIdx.x); i < MaxCols * chunks; i += kTallThreads) {

@@ -57,6 +57,32 @@ __global__ void columns_permute_kernel(PermutationBatch batch_tensors, std::int3
     }
 }
 
+// Vectorized 16-byte uint4 transfer for aligned rows (4x fewer instructions and 64-bit divisions)
+__global__ void columns_permute_uint4_kernel(PermutationBatch batch_tensors, std::int32_t width,
+                                             std::int32_t batch, bool to_columns) {
+    const CausalColumnPermutation tensor = blockIdx.y == 0 ? batch_tensors.tensors[0]
+                                         : blockIdx.y == 1 ? batch_tensors.tensors[1]
+                                         : blockIdx.y == 2 ? batch_tensors.tensors[2]
+                                                           : batch_tensors.tensors[3];
+    const std::int64_t words_per_row     = tensor.row_bytes / 16;
+    const std::int64_t words             = words_per_row * width * batch;
+    const auto* source                   = static_cast<const uint4*>(tensor.source);
+    auto* destination                    = static_cast<uint4*>(tensor.destination);
+    for (std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < words; index += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+        const std::int64_t row  = index / words_per_row;
+        const std::int64_t word = index - row * words_per_row;
+        const std::int64_t column = row / batch;
+        const std::int64_t round  = row - column * batch;
+        const std::int64_t other  = round * width + column;
+        if (to_columns) {
+            destination[index] = source[other * words_per_row + word];
+        } else {
+            destination[other * words_per_row + word] = source[index];
+        }
+    }
+}
+
 } // namespace
 
 void causal_columns_permute_launch(const CausalColumnPermutation* tensors, std::int32_t count,
@@ -66,16 +92,27 @@ void causal_columns_permute_launch(const CausalColumnPermutation* tensors, std::
         throw std::invalid_argument("causal column permutation: invalid round shape");
     }
     PermutationBatch batch_tensors{};
+    bool all_uint4 = true;
     for (std::int32_t index = 0; index < count; ++index) {
         if (tensors[index].row_bytes <= 0 || tensors[index].row_bytes % 4 != 0 ||
             tensors[index].source == nullptr || tensors[index].destination == nullptr) {
             throw std::invalid_argument("causal column permutation: invalid tensor");
         }
+        if (tensors[index].row_bytes % 16 != 0 ||
+            reinterpret_cast<std::uintptr_t>(tensors[index].source) % 16 != 0 ||
+            reinterpret_cast<std::uintptr_t>(tensors[index].destination) % 16 != 0) {
+            all_uint4 = false;
+        }
         batch_tensors.tensors[index] = tensors[index];
     }
     constexpr int kThreads = 256;
-    columns_permute_kernel<<<dim3(64, static_cast<unsigned>(count)), kThreads, 0, stream>>>(
-        batch_tensors, width, batch, to_columns);
+    if (all_uint4) {
+        columns_permute_uint4_kernel<<<dim3(64, static_cast<unsigned>(count)), kThreads, 0, stream>>>(
+            batch_tensors, width, batch, to_columns);
+    } else {
+        columns_permute_kernel<<<dim3(64, static_cast<unsigned>(count)), kThreads, 0, stream>>>(
+            batch_tensors, width, batch, to_columns);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

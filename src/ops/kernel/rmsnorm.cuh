@@ -259,6 +259,202 @@ __launch_bounds__(512) __global__
                               rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
 }
 
+// Implements: include/infernix/ops/rmsnorm.h
+// Match: aligned contiguous BF16, plain or offset epilogue, D=5120, sm_120a / sm_121a.
+// Algorithm assumptions: exactly five BF16x2 values per thread; one 512-thread CTA owns one row.
+// Hoisted weights and inputs in registers eliminate memory roundtrips; (1.0f / 5120.0f) replaces
+// runtime division with single-cycle reciprocal multiplication.
+template <RmsEpilogue Epilogue>
+__launch_bounds__(512) __global__
+    void rmsnorm_d5120_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                     const __nv_bfloat162* z, __nv_bfloat162* out,
+                                     std::int64_t rows, float eps) {
+    pdl::enter();
+    constexpr int kBlock       = 512;
+    constexpr int kPairsPerRow = 2560;
+    const std::int64_t row     = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) { return; }
+
+    const std::int64_t row_base = row * kPairsPerRow;
+    const int pair0             = static_cast<int>(threadIdx.x);
+    const int pair1             = pair0 + kBlock;
+    const int pair2             = pair0 + kBlock * 2;
+    const int pair3             = pair0 + kBlock * 3;
+    const int pair4             = pair0 + kBlock * 4;
+
+    const __nv_bfloat162 value0 = x[row_base + pair0];
+    const __nv_bfloat162 value1 = x[row_base + pair1];
+    const __nv_bfloat162 value2 = x[row_base + pair2];
+    const __nv_bfloat162 value3 = x[row_base + pair3];
+    const __nv_bfloat162 value4 = x[row_base + pair4];
+
+    const __nv_bfloat162 w_val0 = weight[pair0];
+    const __nv_bfloat162 w_val1 = weight[pair1];
+    const __nv_bfloat162 w_val2 = weight[pair2];
+    const __nv_bfloat162 w_val3 = weight[pair3];
+    const __nv_bfloat162 w_val4 = weight[pair4];
+
+    const float2 x0 = __bfloat1622float2(value0);
+    const float2 x1 = __bfloat1622float2(value1);
+    const float2 x2 = __bfloat1622float2(value2);
+    const float2 x3 = __bfloat1622float2(value3);
+    const float2 x4 = __bfloat1622float2(value4);
+
+    const float local_sum = x0.x * x0.x + x0.y * x0.y +
+                            x1.x * x1.x + x1.y * x1.y +
+                            x2.x * x2.x + x2.y * x2.y +
+                            x3.x * x3.x + x3.y * x3.y +
+                            x4.x * x4.x + x4.y * x4.y;
+
+    __shared__ float warp_sums[kBlock / kWarpSize];
+    __shared__ float inv_shared;
+    const float sum = block_reduce_sum<kBlock>(local_sum, warp_sums);
+    if (threadIdx.x == 0) { inv_shared = rsqrtf(sum * (1.0f / 5120.0f) + eps); }
+    __syncthreads();
+    const float inv = inv_shared;
+
+    const float2 w0 = __bfloat1622float2(w_val0);
+    const float2 w1 = __bfloat1622float2(w_val1);
+    const float2 w2 = __bfloat1622float2(w_val2);
+    const float2 w3 = __bfloat1622float2(w_val3);
+    const float2 w4 = __bfloat1622float2(w_val4);
+
+    float2 z0{0.0f, 0.0f}, z1{0.0f, 0.0f}, z2{0.0f, 0.0f}, z3{0.0f, 0.0f}, z4{0.0f, 0.0f};
+    if constexpr (rms_gated(Epilogue)) {
+        z0 = __bfloat1622float2(z[row_base + pair0]);
+        z1 = __bfloat1622float2(z[row_base + pair1]);
+        z2 = __bfloat1622float2(z[row_base + pair2]);
+        z3 = __bfloat1622float2(z[row_base + pair3]);
+        z4 = __bfloat1622float2(z[row_base + pair4]);
+    }
+
+    out[row_base + pair0] =
+        __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x0.x, inv, w0.x, z0.x),
+                              rmsnorm_epilogue<Epilogue>(x0.y, inv, w0.y, z0.y));
+    out[row_base + pair1] =
+        __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x1.x, inv, w1.x, z1.x),
+                              rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
+    out[row_base + pair2] =
+        __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x2.x, inv, w2.x, z2.x),
+                              rmsnorm_epilogue<Epilogue>(x2.y, inv, w2.y, z2.y));
+    out[row_base + pair3] =
+        __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x3.x, inv, w3.x, z3.x),
+                              rmsnorm_epilogue<Epilogue>(x3.y, inv, w3.y, z3.y));
+    out[row_base + pair4] =
+        __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x4.x, inv, w4.x, z4.x),
+                              rmsnorm_epilogue<Epilogue>(x4.y, inv, w4.y, z4.y));
+}
+
+__device__ __forceinline__ float rms_pair_sq(unsigned p) {
+    const float a = __uint_as_float(p << 16);
+    const float b = __uint_as_float(p & 0xffff0000u);
+    return a * a + b * b;
+}
+
+__device__ __forceinline__ float rms_vec_sq(uint4 v) {
+    return rms_pair_sq(v.x) + rms_pair_sq(v.y) + rms_pair_sq(v.z) + rms_pair_sq(v.w);
+}
+
+template <RmsEpilogue Epilogue>
+__device__ __forceinline__ unsigned rms_pair_out(unsigned x, unsigned w, float inv) {
+    const float x0    = __uint_as_float(x << 16);
+    const float x1    = __uint_as_float(x & 0xffff0000u);
+    const float w0    = __uint_as_float(w << 16);
+    const float w1    = __uint_as_float(w & 0xffff0000u);
+    const __nv_bfloat162 v = __floats2bfloat162_rn(
+        rmsnorm_epilogue<Epilogue>(x0, inv, w0, 0.0f),
+        rmsnorm_epilogue<Epilogue>(x1, inv, w1, 0.0f));
+    return *reinterpret_cast<const unsigned*>(&v);
+}
+
+template <RmsEpilogue Epilogue>
+__device__ __forceinline__ uint4 rms_vec_out(uint4 x, uint4 w, float inv) {
+    return make_uint4(rms_pair_out<Epilogue>(x.x, w.x, inv), rms_pair_out<Epilogue>(x.y, w.y, inv),
+                      rms_pair_out<Epilogue>(x.z, w.z, inv), rms_pair_out<Epilogue>(x.w, w.w, inv));
+}
+
+// Five independent row reductions for D=5120 decode (rows=1). Each CTA writes one 128-vector tile.
+template <RmsEpilogue Epilogue>
+__launch_bounds__(128) __global__
+void rmsnorm_d5120_decode_vec16_kernel(const uint4* __restrict__ x, const uint4* __restrict__ w,
+                                       uint4* __restrict__ y, float eps) {
+    pdl::enter();
+    const int t    = static_cast<int>(threadIdx.x);
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const float a  = rms_vec_sq(x[t]) + rms_vec_sq(x[t + 256]);
+    const float b  = rms_vec_sq(x[t + 128]) + rms_vec_sq(x[t + 384]);
+    float sum      = a + b + rms_vec_sq(x[t + 512]);
+    sum            = warp_reduce_sum(sum);
+    __shared__ float partial[4];
+    if (lane == 0) { partial[warp] = sum; }
+    __syncthreads();
+    float total = lane < 4 ? partial[lane] : 0.0f;
+    total       = warp_reduce_sum(total);
+    float inv   = lane == 0 ? rsqrtf(total * (1.0f / 5120.0f) + eps) : 0.0f;
+    inv         = __shfl_sync(kFullWarpMask, inv, 0);
+    const int j = static_cast<int>(blockIdx.x) * 128 + t;
+    y[j]        = rms_vec_out<Epilogue>(x[j], w[j], inv);
+}
+
+// Three independently reduced copies per verification row (D=5120, rows=16 -> 48 CTAs on GB10).
+template <RmsEpilogue Epilogue>
+__launch_bounds__(256) __global__
+void rmsnorm_d5120_verify_vec16_kernel(const uint4* __restrict__ x, const uint4* __restrict__ w,
+                                       uint4* __restrict__ y, float eps) {
+    pdl::enter();
+    const int t        = static_cast<int>(threadIdx.x);
+    const int lane     = t & 31;
+    const int warp     = t >> 5;
+    const size_t row   = static_cast<size_t>(blockIdx.x) / 3;
+    const int part     = static_cast<int>(blockIdx.x % 3);
+    const size_t base  = row * 640;
+    float sum          = rms_vec_sq(x[base + t]) + rms_vec_sq(x[base + 256 + t]);
+    if (t < 128) { sum += rms_vec_sq(x[base + 512 + t]); }
+    sum = warp_reduce_sum(sum);
+    __shared__ float partial[8];
+    if (lane == 0) { partial[warp] = sum; }
+    __syncthreads();
+    float total = lane < 8 ? partial[lane] : 0.0f;
+    total       = warp_reduce_sum(total);
+    float inv   = lane == 0 ? rsqrtf(total * (1.0f / 5120.0f) + eps) : 0.0f;
+    inv         = __shfl_sync(kFullWarpMask, inv, 0);
+    const int start = part == 0 ? 0 : (part == 1 ? 224 : 432);
+    const int count = part == 0 ? 224 : 208;
+    if (t < count) {
+        const int j   = start + t;
+        y[base + j]   = rms_vec_out<Epilogue>(x[base + j], w[j], inv);
+    }
+}
+
+template <RmsEpilogue Epilogue>
+__launch_bounds__(256) __global__
+void rmsnorm_d5120_rows_vec16_kernel(const uint4* __restrict__ x, const uint4* __restrict__ w,
+                                     uint4* __restrict__ y, float eps) {
+    pdl::enter();
+    const int t       = static_cast<int>(threadIdx.x);
+    const int lane    = t & 31;
+    const int warp    = t >> 5;
+    const size_t base = static_cast<size_t>(blockIdx.x) * 640;
+    const uint4 a     = x[base + t];
+    const uint4 b     = x[base + 256 + t];
+    uint4 c           = make_uint4(0, 0, 0, 0);
+    if (t < 128) { c = x[base + 512 + t]; }
+    float sum = rms_vec_sq(a) + rms_vec_sq(b);
+    if (t < 128) { sum += rms_vec_sq(c); }
+    sum = warp_reduce_sum(sum);
+    __shared__ float partial[8];
+    if (lane == 0) { partial[warp] = sum; }
+    __syncthreads();
+    float total = lane < 8 ? partial[lane] : 0.0f;
+    total       = warp_reduce_sum(total);
+    float inv   = lane == 0 ? rsqrtf(total * (1.0f / 5120.0f) + eps) : 0.0f;
+    inv         = __shfl_sync(kFullWarpMask, inv, 0);
+    y[base + t]       = rms_vec_out<Epilogue>(a, w[t], inv);
+    y[base + 256 + t] = rms_vec_out<Epilogue>(b, w[256 + t], inv);
+    if (t < 128) { y[base + 512 + t] = rms_vec_out<Epilogue>(c, w[512 + t], inv); }
+}
+
 // Rows the preloading instance of the generic kernel serves: wider than every fast route, at most
 // kRmsPreloadMaxD (the Qwen4Exp MTP hidden_norm, d = 10240).
 inline constexpr std::int32_t kRmsPreloadMinD = 8192;

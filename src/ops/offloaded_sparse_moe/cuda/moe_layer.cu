@@ -1607,8 +1607,8 @@ __device__ __forceinline__ void stage_xplane_chunk(const std::uint8_t* x_plane, 
                                                    XPlaneChunk& dst) {
     const int total_vec16 = count * (kGateUpStageBlocks / 2); // 8 * count <= 64
     for (int idx = static_cast<int>(threadIdx.x); idx < total_vec16; idx += static_cast<int>(blockDim.x)) {
-        const int col           = idx / (kGateUpStageBlocks / 2);
-        const int v             = idx % (kGateUpStageBlocks / 2);
+        const int col           = idx >> 3;
+        const int v             = idx & 7;
         const std::uint8_t* src = x_plane + static_cast<std::size_t>(first + col) * moe::wide::kXRowBytes +
                                   kGateUpStageBlocks * 8 * chunk + 16 * v;
         const auto s = static_cast<unsigned>(__cvta_generic_to_shared(&dst.rows[col].codes[2 * v][0]));
@@ -1629,8 +1629,8 @@ __device__ __forceinline__ void quantize_split_chunk_xplane(const bf16* __restri
                                                           XPlaneChunk& gate_dst, XPlaneChunk& up_dst) {
     const int total_blocks = count * kGateUpStageBlocks; // <= 128 == kThreads
     for (int idx = static_cast<int>(threadIdx.x); idx < total_blocks; idx += static_cast<int>(blockDim.x)) {
-        const int col     = idx / kGateUpStageBlocks;
-        const int b_local = idx % kGateUpStageBlocks;
+        const int col     = idx >> 4;
+        const int b_local = idx & 15;
         const int pos     = moe::wide::plane_block(b_local);
         const int b       = chunk * kGateUpStageBlocks + b_local;
         const int t       = moe::wide::entry_column(dispatch.entries[first + col], top_k, dispatch.shared_first);
@@ -2056,19 +2056,20 @@ __global__ void __launch_bounds__(kThreads, 4)
     const int n_end       = pass_narrow[pass + 1];
     const int total_items = (n_end - n_begin) * kGateUpCtas;
     for (int idx = static_cast<int>(blockIdx.x); idx < total_items; idx += static_cast<int>(gridDim.x)) {
-        const int job              = narrow_jobs[n_begin + idx / kGateUpCtas];
-        const std::uint8_t* record = pass_record(PassPhase::All, source, dispatch.jobs[job], job_records, job);
+        const int job_idx          = idx / kGateUpCtas;
+        const int slice            = idx - job_idx * kGateUpCtas;
+        const int job              = narrow_jobs[n_begin + job_idx];
+        const int expert           = dispatch.jobs[job];
+        const std::uint8_t* record = pass_record(PassPhase::All, source, expert, job_records, job);
         if (record == nullptr) {
             __syncthreads();
             continue;
         }
-        const int expert = dispatch.jobs[job];
         const int first  = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
         if (count <= 0) {
             __syncthreads();
             continue;
         }
-        const int slice                        = idx % kGateUpCtas;
         const std::uint8_t* const record_slice =
             record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes;
         const bool split_input = source.scales[expert].input_up != source.scales[expert].input_gate;
@@ -2458,8 +2459,9 @@ __global__ void __launch_bounds__(kThreads, 4)
         first        = 0;
         count        = 0;
         if (idx >= total_items) { return; }
-        const int job              = narrow_jobs[n_begin + idx / kDownCtas];
-        tile                       = idx % kDownCtas;
+        const int job_idx          = idx / kDownCtas;
+        tile                       = idx - job_idx * kDownCtas;
+        const int job              = narrow_jobs[n_begin + job_idx];
         expert                     = dispatch.jobs[job];
         const std::uint8_t* record = pass_record(PassPhase::All, source, expert, job_records, job);
         if (record == nullptr) { return; }
@@ -2558,7 +2560,7 @@ __global__ void __launch_bounds__(kThreads, 4)
                     const std::uint16_t y = canon::a4_row_output(total, alpha_down);
                     const int column      = dispatch.entries[cur_first + c_outer + 2 * p + col_local];
                     reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden +
-                                                              16 * kDownGroups * cur_tile + row] = y;
+                                                              (cur_tile << 6) + row] = y;
                 }
             }
             __syncthreads();

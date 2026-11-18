@@ -18,14 +18,27 @@ void gelu_launch(Tensor& x, GeluMode mode, cudaStream_t stream) {
     if ((address & (alignof(Bf16x8Pack) - 1)) == 0 && (n % 8) == 0 &&
         n <= kBf16x8CacheSizedMaxElements) {
         const std::int64_t packs = n / 8;
-        const int grid           = static_cast<int>(std::min<std::int64_t>(
-            maxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(block)))));
-        if (mode == GeluMode::Tanh) {
-            gelu_bf16x8_kernel<true, block>
-                <<<grid, block, 0, stream>>>(static_cast<Bf16x8Pack*>(x.data), packs);
+        const auto launch_packs = [&]<int Block>() {
+            const int grid = static_cast<int>(std::min<std::int64_t>(
+                maxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(Block)))));
+            if (mode == GeluMode::Tanh) {
+                gelu_bf16x8_kernel<true, Block>
+                    <<<grid, Block, 0, stream>>>(static_cast<Bf16x8Pack*>(x.data), packs);
+            } else {
+                gelu_bf16x8_kernel<false, Block>
+                    <<<grid, Block, 0, stream>>>(static_cast<Bf16x8Pack*>(x.data), packs);
+            }
+        };
+        if (packs <= 768) {
+            launch_packs.template operator()<16>();
+        } else if (packs <= 1536) {
+            launch_packs.template operator()<32>();
+        } else if (packs <= 3072) {
+            launch_packs.template operator()<64>();
+        } else if (packs <= 12288) {
+            launch_packs.template operator()<128>();
         } else {
-            gelu_bf16x8_kernel<false, block>
-                <<<grid, block, 0, stream>>>(static_cast<Bf16x8Pack*>(x.data), packs);
+            launch_packs.template operator()<block>();
         }
         CUDA_CHECK(cudaGetLastError());
         return;

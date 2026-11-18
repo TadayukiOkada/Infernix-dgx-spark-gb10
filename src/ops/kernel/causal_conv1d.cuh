@@ -262,11 +262,10 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
         const __nv_bfloat16 s2 = conv_state[2 * C64 + c];
         const __nv_bfloat16 x0 = x[c];
 
-        float acc = 0.0f;
-        acc += __bfloat162float(weight[c]) * __bfloat162float(s0);
-        acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(s1);
-        acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
-        acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
+        float acc = __bfloat162float(weight[c]) * __bfloat162float(s0);
+        acc = fmaf(__bfloat162float(weight[C64 + c]), __bfloat162float(s1), acc);
+        acc = fmaf(__bfloat162float(weight[2 * C64 + c]), __bfloat162float(s2), acc);
+        acc = fmaf(__bfloat162float(weight[3 * C64 + c]), __bfloat162float(x0), acc);
 
         out[c]                  = __float2bfloat16_rn(silu(acc));
         conv_state[c]           = s1;
@@ -291,11 +290,10 @@ __global__ void causal_conv1d_decode_distinct_kernel(
         const __nv_bfloat16 s2 = conv_state_in[2 * C64 + c];
         const __nv_bfloat16 x0 = x[c];
 
-        float acc = 0.0f;
-        acc += __bfloat162float(weight[c]) * __bfloat162float(s0);
-        acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(s1);
-        acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
-        acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
+        float acc = __bfloat162float(weight[c]) * __bfloat162float(s0);
+        acc = fmaf(__bfloat162float(weight[C64 + c]), __bfloat162float(s1), acc);
+        acc = fmaf(__bfloat162float(weight[2 * C64 + c]), __bfloat162float(s2), acc);
+        acc = fmaf(__bfloat162float(weight[3 * C64 + c]), __bfloat162float(x0), acc);
 
         out[c]                      = __float2bfloat16_rn(silu(acc));
         conv_state_out[c]           = s1;
@@ -329,11 +327,10 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
         const __nv_bfloat16 s2 = init[2 * C64 + c];
         const __nv_bfloat16 x0 = x[c];
 
-        float acc = 0.0f;
-        acc += __bfloat162float(weight[c]) * __bfloat162float(s0);
-        acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(s1);
-        acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
-        acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
+        float acc = __bfloat162float(weight[c]) * __bfloat162float(s0);
+        acc = fmaf(__bfloat162float(weight[C64 + c]), __bfloat162float(s1), acc);
+        acc = fmaf(__bfloat162float(weight[2 * C64 + c]), __bfloat162float(s2), acc);
+        acc = fmaf(__bfloat162float(weight[3 * C64 + c]), __bfloat162float(x0), acc);
 
         *out.column(c64).at(0) = __float2bfloat16_rn(silu(acc));
         snapshot[c]           = s1;

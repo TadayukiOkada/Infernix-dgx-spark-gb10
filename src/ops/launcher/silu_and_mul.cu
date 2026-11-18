@@ -72,6 +72,53 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     const auto gate_addr = reinterpret_cast<std::uintptr_t>(gate.data);
     const auto up_addr   = reinterpret_cast<std::uintptr_t>(up.data);
     const auto out_addr  = reinterpret_cast<std::uintptr_t>(out.data);
+
+    // Fast 128-bit vectorized path for 16-byte aligned tensors (LDG.128 / STG.128)
+    constexpr std::int64_t kElemsPerVector = 8;
+    if (((gate_addr | up_addr | out_addr) & (alignof(uint4) - 1)) == 0 && n >= kElemsPerVector) {
+        const auto* gate_bf = static_cast<const __nv_bfloat16*>(gate.data);
+        const auto* up_bf   = static_cast<const __nv_bfloat16*>(up.data);
+        auto* out_bf        = static_cast<__nv_bfloat16*>(out.data);
+        if (n == 6144) {
+            silu_and_mul_exact_kernel<16><<<48, 16, 0, stream>>>(gate_bf, up_bf, out_bf);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        if (n == 98304) {
+            silu_and_mul_exact_kernel<128><<<96, 128, 0, stream>>>(gate_bf, up_bf, out_bf);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        if (n == 786432) {
+            silu_and_mul_prefill_staged_kernel<<<768, 128, 0, stream>>>(gate_bf, up_bf, out_bf);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        const std::int64_t num_vectors = n / kElemsPerVector;
+        constexpr int kBlock256 = 256;
+        const auto min_blocks = static_cast<unsigned int>(div_up(num_vectors, static_cast<std::int64_t>(kBlock256)));
+        const unsigned int grid = std::min<unsigned int>(min_blocks, 384u);
+
+        silu_and_mul_uint4_kernel<<<grid, kBlock256, 0, stream>>>(
+            reinterpret_cast<const uint4*>(gate.data),
+            reinterpret_cast<const uint4*>(up.data),
+            reinterpret_cast<uint4*>(out.data),
+            num_vectors);
+        CUDA_CHECK(cudaGetLastError());
+
+        const std::int64_t remainder = n % kElemsPerVector;
+        if (remainder > 0) {
+            const std::int64_t tail_start = num_vectors * kElemsPerVector;
+            silu_and_mul_scalar_kernel<<<1, static_cast<int>(remainder), 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(gate.data) + tail_start,
+                static_cast<const __nv_bfloat16*>(up.data) + tail_start,
+                static_cast<__nv_bfloat16*>(out.data) + tail_start,
+                remainder);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
     if (((gate_addr | up_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {
         const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
         silu_and_mul_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(

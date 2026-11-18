@@ -198,7 +198,9 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
 
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
-    constexpr int kBlock = 256;
+    // Block size 128 right-sizes grid extent for GB10 (48 SMs):
+    // C=6144 yields exactly 48 blocks (1 block/SM full wave) avoiding 50% idle SM under-occupancy.
+    constexpr int kBlock = 128;
     const std::int32_t C = x.ne[0];
 
     if (conv_state_in.data == conv_state_out.data) {
