@@ -59,7 +59,8 @@ struct QsaVqWindow {
 void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch,
                           const QsaGeometry& geometry, float scale, const std::int32_t* selected,
                           const std::int32_t* counts, Tensor& out, cudaStream_t stream,
-                          const QsaVqWindow& vq);
+                          const QsaVqWindow& vq, const Tensor* gate = nullptr,
+                          bool allow_fast_paths = false);
 
 /// Whether the one-stage calls (two CTAs per SM, 85+ columns at 2 KV heads) of `storage` run the split stage, in
 /// which each warp gathers its next tile's keys right after its scores and the values right after its P x V, and

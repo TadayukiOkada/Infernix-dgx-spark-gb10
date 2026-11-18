@@ -161,13 +161,25 @@ struct Bf16A16MmaSchedule {
     static_assert(kRaster != Bf16MmaRaster::Grouped || kRasterGroupRows > 0);
 };
 
+inline constexpr int gb10_bf16_max_blocks_by_smem(int dynamic_smem_bytes) {
+    const int alloc_bytes = ((dynamic_smem_bytes + 127) / 128) * 128 + 1024;
+    return 102400 / alloc_bytes;
+}
+
+inline constexpr int gb10_bf16_clamp_min_blocks(int requested, int dynamic_smem_bytes) {
+    const int max_by_smem = gb10_bf16_max_blocks_by_smem(dynamic_smem_bytes);
+    return requested < max_by_smem ? requested : max_by_smem;
+}
+
 template <int BlockRows, int BlockTokens, int KWarps, int WarpK = 64, int Stages = 2,
-          Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg, int MinBlocksPerSm = 1>
+          Cache WeightCache = Cache::cg, Cache ActivationCache = Cache::cg, int MinBlocksPerSm = 1,
+          int KPhaseStride = 0, Bf16MmaRaster Raster = Bf16MmaRaster::RowFast,
+          bool ReuseBFragments = false>
 struct Bf16A16SlicedKMmaSchedule {
     static_assert(BlockRows > 0 && BlockRows % 16 == 0);
     static_assert(BlockTokens > 0 && BlockTokens % 8 == 0);
     static_assert(KWarps > 0 && KWarps <= 32);
-    static_assert(WarpK > 0 && WarpK % 64 == 0);
+    static_assert(WarpK > 0 && WarpK % 16 == 0 && (KWarps * WarpK) % 64 == 0);
     static_assert(Stages >= 1 && Stages <= 8 && MinBlocksPerSm > 0);
     static constexpr int kStaticK            = 0;
     static constexpr int kBlockRows          = BlockRows;
@@ -177,7 +189,10 @@ struct Bf16A16SlicedKMmaSchedule {
     static constexpr int kBlockK             = KWarps * WarpK;
     static constexpr int kStages             = Stages;
     static constexpr int kThreads            = KWarps * 32;
-    static constexpr int kMinBlocksPerSm     = MinBlocksPerSm;
+    static constexpr int kKPhaseStride       = KPhaseStride;
+    static constexpr bool kReuseBFragments   = ReuseBFragments;
+    static constexpr Bf16MmaRaster kRaster   = Raster;
+    static constexpr int kRasterGroupRows    = 1;
     static constexpr int kMmaRows            = BlockRows / 16;
     static constexpr int kMmaTokens          = BlockTokens / 8;
     static constexpr Cache kWeightCache      = WeightCache;
@@ -185,15 +200,18 @@ struct Bf16A16SlicedKMmaSchedule {
     static constexpr Bf16MmaSwizzle kSwizzle = Bf16MmaSwizzle::Xor64;
     static constexpr int kStageElements      = (BlockRows + BlockTokens) * kBlockK;
     static constexpr int kStagingBytes       = Stages * kStageElements * 2;
-    static constexpr int kPartialBytes       = KWarps * BlockRows * BlockTokens * sizeof(float);
+    static constexpr int kPartialBytes =
+        ((KWarps + 1) / 2) * BlockRows * BlockTokens * static_cast<int>(sizeof(float));
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
+    static constexpr int kMinBlocksPerSm = gb10_bf16_clamp_min_blocks(MinBlocksPerSm, kSharedBytes);
     static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(KPhaseStride >= 0);
 };
 
 template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpTokens, int Stages,
           int MinBlocksPerSm = 1, Bf16MmaRaster Raster = Bf16MmaRaster::TokenFast,
-          int RasterGroupRows = 1, int ConsumerKUnroll = 1>
+          int RasterGroupRows = 1, int ConsumerKUnroll = 1, int KPhaseStride = 0>
 struct Bf16A16TmaMmaSchedule
     : Bf16A16MmaSchedule<BlockRows, BlockTokens, BlockK, WarpRows, WarpTokens, Stages,
                          MinBlocksPerSm, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong,
@@ -202,12 +220,15 @@ struct Bf16A16TmaMmaSchedule
     static constexpr int kConsumerWarps   = (BlockRows / WarpRows) * (BlockTokens / WarpTokens);
     static constexpr int kThreads         = kProducerThreads + kConsumerWarps * 32;
     static constexpr int kTensorBytes     = Stages * (BlockRows + BlockTokens) * BlockK * 2;
-    static constexpr int kBarrierBytes    = Stages * 2 * sizeof(std::uint64_t);
+    static constexpr int kBarrierBytes    = Stages * 2 * static_cast<int>(sizeof(std::uint64_t));
     static constexpr int kSharedBytes     = kTensorBytes + kBarrierBytes;
+    static constexpr int kMinBlocksPerSm  = gb10_bf16_clamp_min_blocks(MinBlocksPerSm, kSharedBytes);
     static constexpr int kConsumerKUnroll = ConsumerKUnroll;
+    static constexpr int kKPhaseStride    = KPhaseStride;
     static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
     static_assert(BlockRows <= 256 && BlockTokens <= 256 && BlockK <= 16384);
     static_assert(ConsumerKUnroll > 0);
+    static_assert(KPhaseStride >= 0);
 };
 
 // Row predicates preserve the compact physical matrix; full-tile schedules keep their fast path.

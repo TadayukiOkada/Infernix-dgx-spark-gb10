@@ -349,7 +349,8 @@ private:
     [[nodiscard]] bool head_logits_dtype(const Tensor& logits) const noexcept {
         return logits.dtype == DType::FP32 || (config_.lossless && logits.dtype == DType::BF16);
     }
-    void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
+    void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch,
+             const Tensor* next_norm_weight = nullptr, Tensor* next_norm_out = nullptr);
     // The call's PLE embedding (BF16 [embed, T]): its n-gram rows, decoded exactly and rounded to BF16.
     Tensor ple_embedding(const PleParameters& p, const ForwardBatch& batch);
     // The layer's routed-expert source without a call's scheduling (frames, host records, staging, the

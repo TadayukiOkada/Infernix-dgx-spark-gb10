@@ -23,13 +23,12 @@ void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias
                                              reinterpret_cast<std::uintptr_t>(out.data)) &
                                             0x3u) == 0;
     if (paired) {
-        constexpr int warps = vision_block / 32;
-        const unsigned grid = static_cast<unsigned>((rows + warps - 1) / warps);
-        layer_norm_d1152_warp_kernel<vision_block>
-            <<<grid, vision_block, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.data),
-                                                static_cast<const __nv_bfloat162*>(weight.data),
-                                                static_cast<const __nv_bfloat162*>(bias.data),
-                                                static_cast<__nv_bfloat162*>(out.data), rows, eps);
+        layer_norm_d1152_centered_kernel<vision_block>
+            <<<static_cast<unsigned>(rows), vision_block, 0, stream>>>(
+                static_cast<const __nv_bfloat162*>(x.data),
+                static_cast<const __nv_bfloat162*>(weight.data),
+                static_cast<const __nv_bfloat162*>(bias.data),
+                static_cast<__nv_bfloat162*>(out.data), rows, eps);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

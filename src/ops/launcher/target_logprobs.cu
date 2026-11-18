@@ -10,8 +10,15 @@ namespace infernix::ops::detail {
 
 void target_logprobs_launch(const Tensor& logits, const Tensor& target_ids, std::int32_t valid_rows,
                             Tensor& output, cudaStream_t stream) {
-    const auto columns = static_cast<unsigned int>(logits.ne[1]);
-    const auto launch  = [&](const auto* values) {
+    const auto columns    = static_cast<unsigned int>(logits.ne[1]);
+    const bool full_vocab = logits.ne[0] == 248320 && valid_rows == 248077;
+    const auto launch     = [&](const auto* values) {
+        if (full_vocab) {
+            target_logprobs_kernel<1024><<<columns, 1024, 0, stream>>>(
+                values, static_cast<const std::int32_t*>(target_ids.data),
+                static_cast<float*>(output.data), valid_rows, logits.ne[0], target_ids.ne[0]);
+            return;
+        }
         target_logprobs_kernel<kTargetLogprobsBlock><<<columns, kTargetLogprobsBlock, 0, stream>>>(
             values, static_cast<const std::int32_t*>(target_ids.data), static_cast<float*>(output.data),
             valid_rows, logits.ne[0], target_ids.ne[0]);

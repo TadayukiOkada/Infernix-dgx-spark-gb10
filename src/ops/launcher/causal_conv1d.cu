@@ -123,6 +123,59 @@ void smallt_split_launch(const Tensor& x, const Tensor& weight, const Tensor& co
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2, int Block, bool Publish>
+void launch_temporal_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                           Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                           cudaStream_t stream) {
+    constexpr int kChannels      = Rows0 + Rows1 + Rows2;
+    constexpr int kTokens        = 2;
+    constexpr int kChannelBlocks = (kChannels / 2 + Block - 1) / Block;
+    const std::int64_t blocks =
+        (static_cast<std::int64_t>(x.ne[1]) + kTokens - 1) / kTokens * kChannelBlocks;
+    if (blocks > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("causal_conv1d: temporal split grid exceeds CUDA limit");
+    }
+    const CausalConvSplitOutput3<__nv_bfloat162, Rows0 / 2, Rows1 / 2, Rows2 / 2> out_map{
+        reinterpret_cast<__nv_bfloat162*>(out0.data), reinterpret_cast<__nv_bfloat162*>(out1.data),
+        reinterpret_cast<__nv_bfloat162*>(out2.data)};
+    causal_conv_temporal_kernel<kChannels, kTokens, Block, Publish>
+        <<<static_cast<unsigned int>(blocks), Block, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat162*>(x.data),
+            reinterpret_cast<const __nv_bfloat162*>(weight.data),
+            reinterpret_cast<const __nv_bfloat162*>(conv_state_in.data),
+            reinterpret_cast<__nv_bfloat162*>(conv_state_out.data), out_map, x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_split_10240(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                        Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
+                        cudaStream_t stream) {
+    constexpr int kChannelBlock = 256;
+    const std::int32_t C        = x.ne[0];
+    const std::int32_t T        = x.ne[1];
+    if (2048 + 2048 + 6144 != C) {
+        throw std::invalid_argument("causal_conv1d: split geometry does not cover the channels");
+    }
+    if (conv_state_in.data != conv_state_out.data) {
+        launch_temporal_split<2048, 2048, 6144, 128, true>(
+            x, weight, conv_state_in, conv_state_out, out0, out1, out2, stream);
+    } else {
+        launch_temporal_split<2048, 2048, 6144, 128, false>(
+            x, weight, conv_state_in, conv_state_out, out0, out1, out2, stream);
+        // Other token tiles can still be reading the old history in the first kernel.
+        causal_conv1d_prefill_state_kernel<<<grid_for(C, kChannelBlock, "prefill state"),
+                                             kChannelBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(conv_state_in.data),
+            static_cast<__nv_bfloat16*>(conv_state_out.data), C, T);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+} // namespace
+
 void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                        const Tensor& conv_state_in, Tensor& conv_state_out,
                                        Tensor& out0, Tensor& out1, Tensor& out2,
@@ -133,6 +186,10 @@ void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                               out2, stream);
         return;
     case CausalConvSplitGeometry::Rows2048x2048x6144:
+        if (x.ne[1] > 16) {
+            launch_split_10240(x, weight, conv_state_in, conv_state_out, out0, out1, out2, stream);
+            return;
+        }
         smallt_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
                                               out2, stream);
         return;
@@ -185,8 +242,7 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
                                                out2, stream);
         return;
     case CausalConvSplitGeometry::Rows2048x2048x6144:
-        prefill_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
-                                               out2, stream);
+        launch_split_10240(x, weight, conv_state_in, conv_state_out, out0, out1, out2, stream);
         return;
     case CausalConvSplitGeometry::Rows2048x2048x8192:
         prefill_split_launch<2048, 2048, 8192>(x, weight, conv_state_in, conv_state_out, out0, out1,

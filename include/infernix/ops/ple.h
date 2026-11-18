@@ -54,10 +54,13 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
 /// destination_slots leaves every state unchanged (speculative verification, committed later by
 /// ple_conv_commit). weight: BF16 [C, K] (tap j of channel c at j*C + c); states: BF16
 /// [C, span, slots] with span = (K-1) * dilation, oldest column first. residual is updated in
-/// place.
+/// place. When next_norm_weight and next_norm_out are supplied, also writes the per-stream
+/// unit-offset RMSNorm of the updated residual (matching hyper_connection_norm over `streams`).
 void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor& weight,
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
-                     const Tensor& destination_slots, Tensor& residual, cudaStream_t stream);
+                     const Tensor& destination_slots, Tensor& residual, cudaStream_t stream,
+                     const Tensor* next_norm_weight = nullptr, Tensor* next_norm_out = nullptr,
+                     float next_norm_eps = 0.0F, std::int32_t streams = 4);
 
 /// ple_gate immediately followed by ple_conv_inject, fused into one kernel when the geometry is a
 /// decode column per sequence (one column each, so width == 1) with a state update, an aligned
@@ -65,12 +68,16 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
 /// gated and normalized values then stay in registers between the two stages and never reach
 /// global memory. The fused result is bitwise-identical to the composed pair; any other geometry
 /// (or an invalid one, which throws) takes exactly the composed ple_gate + ple_conv_inject, for
-/// which gated and normalized are the scratch (and must satisfy ple_gate's contract).
+/// which gated and normalized are the scratch (and must satisfy ple_gate's contract). Optional
+/// next_norm_weight / next_norm_out / next_norm_eps fuse the following block's per-stream HC
+/// RMSNorm of the updated residual.
 void ple_gate_conv_inject(const Tensor& key, const Tensor& value, Tensor& residual,
                           const Tensor& key_norm, const Tensor& query_norm, const Tensor& conv_norm,
                           std::int32_t streams, float eps, const Tensor& weight, std::int32_t dilation,
                           Tensor& states, const Tensor& source_slots, const Tensor& destination_slots,
-                          Tensor& gated, Tensor& normalized, cudaStream_t stream);
+                          Tensor& gated, Tensor& normalized, cudaStream_t stream,
+                          const Tensor* next_norm_weight = nullptr, Tensor* next_norm_out = nullptr,
+                          float next_norm_eps = 0.0F);
 
 /// Commits the first commit_columns[b] (I32 [B], each in [0, W]) of row b's verified columns to
 /// slot slots[b] (I32 [B]): the history becomes the trailing span columns of the old history

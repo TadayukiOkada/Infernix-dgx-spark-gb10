@@ -370,12 +370,27 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
     std::int32_t draft_mean_first = 0;
     try {
         auto scope = work_.scope();
-        if (block.ple) { ple(*block.ple, residual, batch); }
+        Tensor ple_norm;
+        const Tensor* active_pre_norm = pre_norm;
+        if (block.ple) {
+            const bool want_ple_norm =
+                !ops::hyper_connection_mix_is_fused(block.attn_hc.down.weight, block.attn_hc.up.weight,
+                                                    dim(config_.hidden_size), dim(config_.hc.streams),
+                                                    dim(config_.hc.rank), T);
+            if (want_ple_norm) {
+                ple_norm        = work_.alloc(DType::BF16, {residual.ne[0], T});
+                active_pre_norm = &ple_norm;
+            } else {
+                active_pre_norm = nullptr;
+            }
+            ple(*block.ple, residual, batch, want_ple_norm ? &block.attn_hc.norm : nullptr,
+                want_ple_norm ? &ple_norm : nullptr);
+        }
         // The attention half's coefficients, then the MLP half's (inject_mix reads the first while
         // the mix writes the second).
         Tensor inject_a = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
         Tensor inject   = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
-        Tensor xa       = mix(block.attn_hc, residual, &inject_a, nullptr, block.ple ? nullptr : pre_norm);
+        Tensor xa       = mix(block.attn_hc, residual, &inject_a, nullptr, active_pre_norm);
         Tensor y        = mixer(layer, batch, xa);
         Tensor xm       = inject_mix(block.mlp_hc, y, inject_a, residual, &inject);
         // The combine injects its output directly unless a tap records it.
@@ -471,9 +486,23 @@ void Forward::layer_mixer(std::uint32_t layer, const ForwardBatch& batch, Tensor
     wait_layer(batch, layer);
     try {
         auto scope = work_.scope();
-        if (block.ple) { ple(*block.ple, residual, batch); }
+        Tensor ple_norm;
+        const Tensor* active_pre_norm = nullptr;
+        if (block.ple) {
+            const std::int32_t T = residual.ne[1];
+            const bool want_ple_norm =
+                !ops::hyper_connection_mix_is_fused(block.attn_hc.down.weight, block.attn_hc.up.weight,
+                                                    dim(config_.hidden_size), dim(config_.hc.streams),
+                                                    dim(config_.hc.rank), T);
+            if (want_ple_norm) {
+                ple_norm        = work_.alloc(DType::BF16, {residual.ne[0], T});
+                active_pre_norm = &ple_norm;
+            }
+            ple(*block.ple, residual, batch, want_ple_norm ? &block.attn_hc.norm : nullptr,
+                want_ple_norm ? &ple_norm : nullptr);
+        }
         Tensor inject_a = work_.alloc(DType::FP32, {inject.ne[0], inject.ne[1]}); // the attention half's
-        Tensor xa       = mix(block.attn_hc, residual, &inject_a);
+        Tensor xa       = mix(block.attn_hc, residual, &inject_a, nullptr, active_pre_norm);
         Tensor y        = mixer(layer, batch, xa);
         (void)inject_mix(block.mlp_hc, y, inject_a, residual, &inject, &xm);
     } catch (const std::exception& error) {
@@ -677,7 +706,8 @@ Tensor Forward::ple_embedding(const PleParameters& p, const ForwardBatch& batch)
     return e;
 }
 
-void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch) {
+void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch,
+                  const Tensor* next_norm_weight, Tensor* next_norm_out) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1], W = residual.ne[0], H = dim(config_.hidden_size);
     auto scope = work_.scope();
@@ -707,7 +737,8 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     ops::ple_gate_conv_inject(key, value, residual, p.key_norm, p.query_norm, p.conv_norm,
                               dim(config_.hc.streams), config_.rms_norm_eps, p.convolution,
                               dim(config_.ple.conv_dilation), state_.ple_conv, batch.slots,
-                              batch.verify != nullptr ? Tensor{} : batch.slots, gated, normalized, s);
+                              batch.verify != nullptr ? Tensor{} : batch.slots, gated, normalized, s,
+                              next_norm_weight, next_norm_out, config_.rms_norm_eps);
 }
 
 Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
@@ -1057,14 +1088,16 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_, layer.kv.storage);
     const DeviceSpan span     = work_.alloc_bytes(scratch);
+    const bool encode_gate    = producer_encodes(p.output, QW, T, dense_routes(), scan_ != nullptr && eager_chunk_);
+    const bool qsa_fast       = fast_.dense_routes != ops::LinearRoutes::Exact ||
+                                fast_.prefill_routes != ops::LinearRoutes::Exact || fast_.expert_a4_terms != 0 ||
+                                fast_.expert_a4_narrow || fast_.router_mma || fast_.a8_experts || fast_.a8_experts_wide;
     ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s, vq ? &append : nullptr);
-    // Output gate: out * sigmoid(gate), then o_proj. Applying the gate in qsa_attention's split merge
-    // (candidates §7.3 D7) measured flat (removed 2026-10-28).
+                       span.bytes, out, s, vq ? &append : nullptr, encode_gate ? nullptr : &gate, qsa_fast);
     Tensor gated = out.view({QW, T});
     Tensor y     = work_.alloc(DType::BF16, {H, T});
-    if (producer_encodes(p.output, QW, T, dense_routes(), scan_ != nullptr && eager_chunk_)) {
+    if (encode_gate) {
         // The gate writes the output projection's input encoded (no encoding launch).
         ops::GgmlEncodedColumns encoded = alloc_encoded(work_, QW, T);
         ops::sigmoid_mul_ggml_encoded(gate, gated, p.output.input_perm, p.output.perm_block, encoded, s);
@@ -1072,7 +1105,6 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         ops::ggml_linear_encoded(encoded, p.output.ggml, outs, s);
         return y;
     }
-    ops::sigmoid_mul(gate, gated, s);
     scan_input(gated, scan_layer_, ActivationScan::Site::QsaOutput);
     project(gated, p.output, y, work_, s, dense_routes());
     return y;

@@ -163,6 +163,71 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     }
 }
 
+struct alignas(8) RopeBf16x4 {
+    __nv_bfloat16 word[4];
+};
+
+template <int Block, class Coefficients = NativeRopeCoefficients>
+__launch_bounds__(Block) __global__
+    void rope_axial_vector_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
+                                  std::int32_t tokens, std::int64_t q_token_stride,
+                                  std::int64_t k_token_stride, Coefficients coefficients = {}) {
+    pdl::enter();
+    constexpr int kVectors = 32 * 18;
+    constexpr int kItems   = (kVectors + Block - 1) / Block;
+    const int token        = static_cast<int>(blockIdx.x);
+    if (token >= tokens) { return; }
+
+    __shared__ float sine[36];
+    __shared__ float cosine[36];
+    if (threadIdx.x < 36) {
+        const int pair = static_cast<int>(threadIdx.x);
+        coefficients.template sincos<RopeKernelMode::Vision2D>(positions, tokens, token, pair,
+                                                               &sine[pair], &cosine[pair]);
+    }
+    RopeBf16x4 original[kItems];
+    RopeBf16x4 partner[kItems];
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+        const int index = static_cast<int>(threadIdx.x) + i * Block;
+        if (index < kVectors) {
+            const int head   = index / 18;
+            const int d      = (index % 18) * 4;
+            const auto* data = head < 16
+                                   ? q + static_cast<std::int64_t>(token) * q_token_stride +
+                                         static_cast<std::int64_t>(head) * 72
+                                   : k + static_cast<std::int64_t>(token) * k_token_stride +
+                                         static_cast<std::int64_t>(head - 16) * 72;
+            original[i] = *reinterpret_cast<const RopeBf16x4*>(data + d);
+            partner[i]  = *reinterpret_cast<const RopeBf16x4*>(data + (d < 36 ? d + 36 : d - 36));
+        }
+    }
+    // Every rotation pair is resident before any thread overwrites an input.
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+        const int index = static_cast<int>(threadIdx.x) + i * Block;
+        if (index < kVectors) {
+            const int head = index / 18;
+            const int d    = (index % 18) * 4;
+            auto* data     = head < 16
+                                 ? q + static_cast<std::int64_t>(token) * q_token_stride +
+                                       static_cast<std::int64_t>(head) * 72
+                                 : k + static_cast<std::int64_t>(token) * k_token_stride +
+                                       static_cast<std::int64_t>(head - 16) * 72;
+            RopeBf16x4 result;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float c  = cosine[d % 36 + j];
+                const float s  = sine[d % 36 + j] * (d < 36 ? -1.0F : 1.0F);
+                result.word[j] = __float2bfloat16_rn(__bfloat162float(original[i].word[j]) * c +
+                                                     __bfloat162float(partner[i].word[j]) * s);
+            }
+            *reinterpret_cast<RopeBf16x4*>(data + d) = result;
+        }
+    }
+}
+
 template <RopeKernelMode Mode, int QHeads, int KHeads, int HeadsPerBlock,
           class Coefficients = NativeRopeCoefficients>
 __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bfloat16* q,

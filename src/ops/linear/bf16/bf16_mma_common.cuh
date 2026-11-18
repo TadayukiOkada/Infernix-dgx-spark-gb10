@@ -17,10 +17,20 @@ int bf16_prepare_shared() {
     return Bytes;
 }
 
+template <int Rows>
+struct LinearFloatTileOutput {
+    float* data;
+    int row_begin, token_begin;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        data[(token - token_begin) * Rows + row - row_begin] = value;
+    }
+};
+
 template <class Schedule, class Epilogue>
 inline constexpr int bf16_epilogue_bytes = [] {
     if constexpr (requires { Epilogue::template kSharedBytes<Schedule>; })
-        return Epilogue::template kSharedBytes<Schedule>;
+        return static_cast<int>(Epilogue::template kSharedBytes<Schedule>);
     else
         return 0;
 }();
@@ -167,7 +177,15 @@ bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned ch
                       epilogue.template finish_tile<Schedule, FullTokens>(
                           destination, scratch, accum, row_begin, token_begin, rows, tokens);
                   }) {
-        static_assert(!bf16_predicated_rows<Schedule>, "row-tail MMA requires a scalar epilogue");
+        static_assert(
+            !bf16_predicated_rows<Schedule> ||
+                [] {
+                    if constexpr (requires { Epilogue::kPredicatedRows; })
+                        return Epilogue::kPredicatedRows;
+                    else
+                        return false;
+                }(),
+            "row-tail collective epilogue must own its row predicates");
         // All staging reads must have finished before a collective consumer reuses scratch.
         __syncthreads();
         epilogue.template finish_tile<Schedule, FullTokens>(destination, scratch, accum, row_begin,

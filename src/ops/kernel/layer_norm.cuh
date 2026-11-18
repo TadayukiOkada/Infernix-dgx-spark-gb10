@@ -1,9 +1,11 @@
 #pragma once
 
 #include "core/pdl.cuh"
+#include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace infernix::ops {
@@ -146,6 +148,63 @@ __launch_bounds__(Block) __global__
         const float2 shifts = __bfloat1622float2(bias[pair]);
         out[base + pair]    = __floats2bfloat162_rn((values.x - mean) * inv * scales.x + shifts.x,
                                                     (values.y - mean) * inv * scales.y + shifts.y);
+    }
+}
+
+template <int Block>
+__launch_bounds__(Block) __global__
+    void layer_norm_d1152_centered_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                          const __nv_bfloat162* bias, __nv_bfloat162* out,
+                                          std::int64_t rows, float eps) {
+    pdl::enter();
+    constexpr int kPairs   = 576;
+    constexpr int kItems   = (kPairs + Block - 1) / Block;
+    const int lane         = static_cast<int>(threadIdx.x);
+    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) { return; }
+    const std::int64_t base = row * kPairs;
+    // Center around a represented input before reducing, including large constant rows.
+    const float anchor = __low2float(x[base]);
+    float2 values[kItems];
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+        const int pair = lane + i * Block;
+        if (pair < kPairs) {
+            const float2 v = __bfloat1622float2(x[base + pair]);
+            values[i]      = {v.x - anchor, v.y - anchor};
+            sum += values[i].x + values[i].y;
+        }
+    }
+    __shared__ float sums[Block / kWarpSize];
+    __shared__ float scalar;
+    const auto reduce = [&](float value) {
+        value = block_reduce_sum<Block>(value, sums);
+        if (threadIdx.x == 0) { scalar = value; }
+        __syncthreads();
+        return scalar;
+    };
+    const float mean = reduce(sum) * (1.0f / 1152.0f);
+    float squares    = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+        if (lane + i * Block < kPairs) {
+            values[i].x -= mean;
+            values[i].y -= mean;
+            squares = fmaf(values[i].x, values[i].x, squares);
+            squares = fmaf(values[i].y, values[i].y, squares);
+        }
+    }
+    const float inverse = rsqrtf(reduce(squares) * (1.0f / 1152.0f) + eps);
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+        const int pair = lane + i * Block;
+        if (pair < kPairs) {
+            const float2 w   = __bfloat1622float2(weight[pair]);
+            const float2 b   = __bfloat1622float2(bias[pair]);
+            out[base + pair] = __floats2bfloat162_rn(values[i].x * inverse * w.x + b.x,
+                                                     values[i].y * inverse * w.y + b.y);
+        }
     }
 }
 

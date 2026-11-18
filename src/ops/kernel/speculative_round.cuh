@@ -599,7 +599,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if ((greedy && !penalties && cfg.mask.words == nullptr) || token_domain <= kSamplerTileItems) {
+    if (greedy && !penalties && cfg.mask.words == nullptr) {
         return;
     }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
@@ -618,7 +618,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     // BF16 logits without penalties: 32-bit tile keys (16 value bits, 16 tile-index bits). FP32
     // logits take the 64-bit keys below, which also carry the mask (masked rows rank below all).
     if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
-        if (!penalties) {
+        if (!greedy && !penalties) {
             unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
             for (int item = 0; item < kSamplerItemsPerThread; ++item) {
@@ -1386,7 +1386,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if ((greedy && !penalties && cfg.mask.words == nullptr) || token_domain <= kSamplerTileItems) {
+    if (greedy && !penalties && cfg.mask.words == nullptr) {
         return;
     }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
@@ -1406,7 +1406,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     // BF16 logits without penalties: 32-bit tile keys (16 value bits, 16 tile-index bits). FP32
     // logits take the 64-bit keys below (raw values without penalties, as the BF16 route).
     if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
-        if (!penalties) {
+        if (!greedy && !penalties) {
             unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
             for (int item = 0; item < kSamplerItemsPerThread; ++item) {

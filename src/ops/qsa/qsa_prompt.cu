@@ -3,11 +3,13 @@
 #include "ops/qsa/qsa_prompt.h"
 
 #include "core/pdl.cuh"
+#include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kernel/sigmoid_gate_mul_pair.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/q4_lloyd_codec.cuh"
 #include "ops/kv_cache/vq2_codec.cuh"
@@ -330,7 +332,462 @@ __device__ __forceinline__ void qsa_mma(float* c, const unsigned (&a)[4], unsign
     }
 }
 
-template <KvCacheStorage Storage, int Stages, bool SplitD>
+__device__ __forceinline__ bf16 apply_qsa_gate(bf16 x, const bf16* gate, std::int64_t idx) {
+    if (gate == nullptr) { return x; }
+    return __float2bfloat16_rn(__bfloat162float(x) * sigmoid(__bfloat162float(gate[idx])));
+}
+
+__device__ __forceinline__ __nv_bfloat162 apply_qsa_gate_pair(__nv_bfloat162 x, const bf16* gate, std::int64_t idx) {
+    if (gate == nullptr) { return x; }
+    if ((idx & 1) == 0 && (reinterpret_cast<std::uintptr_t>(gate) & 3U) == 0U) {
+        return sigmoid_gate_mul_pair(*reinterpret_cast<const __nv_bfloat162*>(gate + idx), x);
+    }
+    return __halves2bfloat162(apply_qsa_gate(__low2bfloat16(x), gate, idx),
+                              apply_qsa_gate(__high2bfloat16(x), gate, idx + 1));
+}
+
+constexpr int kGroupQueries    = 8;
+constexpr int kGroupHeadsPerKv = 12;
+constexpr int kGroupRows       = kGroupQueries * kGroupHeadsPerKv; // 96 MMA rows
+constexpr int kGroupKeyTile    = 32;                               // 32 consecutive tokens inside one 64-token page
+
+__device__ __forceinline__ bool dense_group_range_selected(int first, int last, const std::int32_t* counts,
+                                                           const std::int32_t* positions) {
+    if (last <= first) { return false; }
+    int prev = -1;
+    for (int q = first; q < last; ++q) {
+        const int p = positions[q];
+        if (counts[q] >= 0 || p < 0 || p < prev) { return false; }
+        prev = p;
+    }
+    return true;
+}
+
+__device__ __forceinline__ bool dense_prefix_group_selected(int t, int width, int columns,
+                                                            const std::int32_t* counts,
+                                                            const std::int32_t* positions) {
+    const int b         = t / width;
+    const int row_start = b * width;
+    const int first     = row_start + ((t - row_start) & ~(kGroupQueries - 1));
+    const int last      = min(columns, min(row_start + width, first + kGroupQueries));
+    return dense_group_range_selected(first, last, counts, positions);
+}
+
+struct GroupedOnlineSoftmax {
+    float maximum        = -INFINITY;
+    float sum            = 0.0f;
+    float scaled_maximum = 0.0f;
+
+    __device__ __forceinline__ float update(float tile_max, float scale_l2) {
+        const float previous = maximum;
+        maximum              = fmaxf(maximum, tile_max);
+        scaled_maximum       = maximum == -INFINITY ? 0.0f : maximum * scale_l2;
+        return previous == -INFINITY ? 0.0f : exp2_approx(__fmaf_rn(previous, scale_l2, -scaled_maximum));
+    }
+
+    __device__ __forceinline__ float probability(float score, float scale_l2) const {
+        return exp2_approx(__fmaf_rn(score, scale_l2, -scaled_maximum));
+    }
+
+    __device__ __forceinline__ void accumulate(float alpha, float tile_sum) {
+        sum = __fmaf_rn(sum, alpha, tile_sum);
+    }
+
+    __device__ __forceinline__ void finish() { sum = warp_sum<4>(sum, 0xffffffffu); }
+};
+
+template <KvCacheStorage Storage>
+__host__ __device__ constexpr int grouped_smem_bytes() {
+    using Shape               = PromptShape<Storage>;
+    constexpr bool Quantized  = Storage != KvCacheStorage::BFloat16;
+    constexpr int QsBytes     = kGroupRows * kD * 2;        // 49,152 B
+    constexpr int KvBytes     = 2 * kGroupKeyTile * kD * 2; // 32,768 B
+    constexpr int RawBytes    = Quantized ? (kGroupKeyTile * kD + kGroupKeyTile * 16 + 16) : 0; // 8,720 B
+    constexpr int Phase1Bytes = QsBytes + KvBytes + RawBytes;
+    constexpr int Phase2Bytes = (Shape::Value == Code::Nvfp4) ? (kGroupRows * kD * 4) : 0; // 98,304 B
+    return Phase1Bytes > Phase2Bytes ? Phase1Bytes : Phase2Bytes;
+}
+
+template <KvCacheStorage Storage>
+__global__ void __launch_bounds__(((Storage != KvCacheStorage::BFloat16) ? 2 : 1) * (kGroupRows / 16) * 32, 1)
+    qsa_grouped_prefix_kernel(const bf16* __restrict__ q, int heads, int kv_heads,
+                              const void* __restrict__ k_pages, const void* __restrict__ v_pages,
+                              const void* __restrict__ k_scales, const void* __restrict__ v_scales,
+                              const std::int32_t* __restrict__ tables, int table_stride,
+                              const std::int32_t* __restrict__ table_rows,
+                              const std::int32_t* __restrict__ positions, int width, int columns,
+                              const std::int32_t* __restrict__ counts, float scale, const bf16* __restrict__ gate,
+                              std::int64_t gate_col_stride, bf16* __restrict__ out, QsaPageSpaces spaces) {
+    using Shape                 = PromptShape<Storage>;
+    static_assert(Shape::Vq == 0, "grouped prefix serves scalar KV storages");
+    constexpr bool Quantized    = Storage != KvCacheStorage::BFloat16;
+    constexpr bool RotatedValue = Shape::Value == Code::Nvfp4;
+    constexpr int Parts         = Quantized ? 2 : 1;
+    constexpr int Warps         = (kGroupRows / 16) * Parts;
+    constexpr int Threads       = Warps * 32;
+    constexpr int OutCols       = kD / Parts / 8;
+    constexpr float Log2E       = 1.4426950408889634074f;
+    constexpr unsigned FullMask = 0xffffffffu;
+
+    const int groups_per_row = (width + kGroupQueries - 1) / kGroupQueries;
+    const int g_idx          = static_cast<int>(blockIdx.x);
+    const int kv_head        = static_cast<int>(blockIdx.y);
+    const int b              = g_idx / groups_per_row;
+    const int first          = b * width + (g_idx % groups_per_row) * kGroupQueries;
+    const int last           = min(columns, min((b + 1) * width, first + kGroupQueries));
+    if (!dense_group_range_selected(first, last, counts, positions)) { return; }
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    auto* qs         = reinterpret_cast<std::uint16_t*>(smem);                                // [96][256]
+    auto* ks         = reinterpret_cast<std::uint16_t*>(smem + kGroupRows * kD * 2);          // [32][256]
+    auto* vs         = ks + kGroupKeyTile * kD;                                               // [32][256]
+    auto* raw_codes  = smem + (kGroupRows + 2 * kGroupKeyTile) * kD * 2;                      // [32][<=256]
+    auto* raw_scales = raw_codes + kGroupKeyTile * kD;                                        // [32][<=16]
+    auto* meta_words = reinterpret_cast<unsigned*>(raw_scales + kGroupKeyTile * 16);          // [4]
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int end  = positions[last - 1] + 1;
+
+    if constexpr (Quantized) {
+        for (int row = warp; row < kGroupRows; row += Warps) {
+            const int q_col = first + row / kGroupHeadsPerKv;
+            const int h     = row % kGroupHeadsPerKv;
+            float vals[8]{};
+            if (q_col < last) {
+                const bf16* q_src =
+                    q + (static_cast<std::size_t>(q_col) * heads + kv_head * kGroupHeadsPerKv + h) * kD;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { vals[i] = __bfloat162float(q_src[lane + 32 * i]); }
+                normalized_hadamard_d256_inplace(vals, lane);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int d                           = lane + 32 * i;
+                qs[row * kD + (d ^ ((row & 7) << 3))] = __half_as_ushort(__float2half_rn(vals[i]));
+            }
+        }
+    } else {
+        for (int i = tid; i < kGroupRows * 32; i += Threads) {
+            const int row       = i >> 5;
+            const int d         = (i & 31) << 3;
+            std::uint16_t* dst  = qs + row * kD + (d ^ ((row & 7) << 3));
+            const int q_col     = first + row / kGroupHeadsPerKv;
+            if (q_col < last) {
+                const bf16* q_src = q +
+                                    (static_cast<std::size_t>(q_col) * heads + kv_head * kGroupHeadsPerKv +
+                                     (row % kGroupHeadsPerKv)) *
+                                        kD +
+                                    d;
+                cp_async<16>(dst, q_src);
+            } else {
+                store_vec(dst, make_int4(0, 0, 0, 0));
+            }
+        }
+        cp_commit();
+        cp_wait<0>();
+    }
+    __syncthreads();
+
+    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[b]) * table_stride;
+
+    auto stage_plane = [&]<bool IsKey>(int k0) {
+        constexpr Code C         = IsKey ? Shape::Key : Shape::Value;
+        using R                  = Row<C>;
+        const int id             = table[k0 >> kPagedKVPageShift];
+        const int slot0          = k0 & kPagedKVPageMask; // 0 or 32; all 32 tokens share this page
+        const int valid_rows     = min(kGroupKeyTile, end - k0);
+        int page                 = 0;
+        const auto* data_plane   = static_cast<const unsigned char*>(
+            IsKey ? qsa_space_plane(spaces, k_pages, spaces.host_k, spaces.lent_k, id, page)
+                  : qsa_space_plane(spaces, v_pages, spaces.host_v, spaces.lent_v, id, page));
+        const std::size_t row_at =
+            static_cast<std::size_t>(kv_head + kv_heads * page) * kPagedKVPageSize + slot0;
+        if constexpr (!Quantized) {
+            std::uint16_t* dst_plane = IsKey ? ks : vs;
+            for (int i = tid; i < kGroupKeyTile * 32; i += Threads) {
+                const int r            = i >> 5;
+                const int d            = (i & 31) << 3;
+                std::uint16_t* dst     = dst_plane + r * kD + (d ^ ((r & 7) << 3));
+                const unsigned char* s = data_plane + (row_at + r) * 512 + 2 * d;
+                cp_async_zfill<16, Cache::cg>(dst, s, r < valid_rows ? 16 : 0);
+            }
+        } else {
+            constexpr int Chunks = R::Bytes / 16;
+            for (int i = tid; i < kGroupKeyTile * Chunks; i += Threads) {
+                const int r            = i / Chunks;
+                const int c            = i % Chunks;
+                unsigned char* dst     = raw_codes + r * R::Bytes + 16 * c;
+                const unsigned char* s = data_plane + (row_at + r) * R::Bytes + 16 * c;
+                cp_async_zfill<16, Cache::cg>(dst, s, r < valid_rows ? 16 : 0);
+            }
+            int scale_page = 0;
+            const auto* scale_plane = static_cast<const unsigned char*>(
+                IsKey ? qsa_space_plane(spaces, k_scales, spaces.host_k_scale, spaces.lent_k_scale, id, scale_page)
+                      : qsa_space_plane(spaces, v_scales, spaces.host_v_scale, spaces.lent_v_scale, id, scale_page));
+            if (tid < kGroupKeyTile) {
+                const std::size_t r_at = row_at + tid;
+                const bool ok          = tid < valid_rows;
+                if constexpr (R::ScaleSlot == 4) {
+                    cp_async_zfill<4>(raw_scales + tid * 4, scale_plane + (2 * r_at & ~std::size_t{3}), ok ? 4 : 0);
+                } else if constexpr (R::ScaleSlot == 8) {
+                    cp_async_zfill<8>(raw_scales + tid * 8, scale_plane + 8 * r_at, ok ? 8 : 0);
+                } else {
+                    cp_async_zfill<16>(raw_scales + tid * 16, scale_plane + 16 * r_at, ok ? 16 : 0);
+                }
+            }
+            if constexpr (R::ScaleSlot == 4) {
+                if (warp == 0) {
+                    const unsigned odd = __ballot_sync(FullMask, lane < valid_rows && ((row_at + lane) & 1U) != 0U);
+                    if (lane == 0) { meta_words[0] = odd; }
+                }
+            }
+        }
+    };
+
+    auto expand_plane = [&]<Code C>(std::uint16_t* dst) -> float {
+        if constexpr (!Quantized) {
+            return 1.0f;
+        } else if constexpr (C == Code::Nvfp4) {
+            for (int i = tid; i < kGroupKeyTile * 32; i += Threads) {
+                const int r          = i >> 5;
+                const int c_idx      = i & 31;
+                const int d          = c_idx << 3;
+                const __half sc      = e4m3_to_half(raw_scales[r * 16 + (c_idx >> 1)]);
+                const __half2 s2     = __halves2half2(sc, sc);
+                const unsigned pack4 = reinterpret_cast<const unsigned*>(raw_codes + r * 128)[c_idx];
+                uint4 decoded;
+                decoded.x = e2m1x2_times(pack4 & 0xffu, s2);
+                decoded.y = e2m1x2_times((pack4 >> 8) & 0xffu, s2);
+                decoded.z = e2m1x2_times((pack4 >> 16) & 0xffu, s2);
+                decoded.w = e2m1x2_times(pack4 >> 24, s2);
+                store_vec(dst + r * kD + (d ^ ((r & 7) << 3)), decoded);
+            }
+            __syncthreads();
+            return 1.0f;
+        } else {
+            using R               = Row<C>;
+            const unsigned parity = (C == Code::Fp8) ? meta_words[0] : 0u;
+            if (warp == 0) {
+                float own_max = 0.0f;
+                if constexpr (C == Code::Fp8) {
+                    const __half s_h = reinterpret_cast<const __half*>(raw_scales)[2 * lane + ((parity >> lane) & 1u)];
+                    own_max          = fabsf(__half2float(s_h));
+                } else {
+                    const __half* row_s = reinterpret_cast<const __half*>(raw_scales + lane * 8);
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) { own_max = fmaxf(own_max, fabsf(__half2float(row_s[g]))); }
+                }
+                const float smax = warp_max(own_max, FullMask);
+                if (lane == 0) {
+                    int shift = 0;
+                    while (shift < 14 && ldexpf(smax, -shift) > R::MaxScale) { ++shift; }
+                    meta_words[1] = static_cast<unsigned>(shift);
+                }
+            }
+            __syncthreads();
+            const int shift  = static_cast<int>(meta_words[1]);
+            const float down = ldexpf(1.0f, -shift);
+            for (int i = tid; i < kGroupKeyTile * 32; i += Threads) {
+                const int r     = i >> 5;
+                const int c_idx = i & 31;
+                const int d     = c_idx << 3;
+                __half s_orig;
+                if constexpr (C == Code::Fp8) {
+                    s_orig = reinterpret_cast<const __half*>(raw_scales)[2 * r + ((parity >> r) & 1u)];
+                } else {
+                    s_orig = reinterpret_cast<const __half*>(raw_scales + r * 8)[c_idx >> 3];
+                }
+                const __half s_scaled = __float2half_rn(__half2float(s_orig) * down);
+                const __half2 s2      = __halves2half2(s_scaled, s_scaled);
+                const uint2 raw8      = reinterpret_cast<const uint2*>(raw_codes + r * 256)[c_idx];
+                unsigned lo0, hi0, lo1, hi1;
+                if constexpr (C == Code::Fp8) {
+                    widen_e4m3(raw8.x, lo0, hi0);
+                    widen_e4m3(raw8.y, lo1, hi1);
+                } else {
+                    widen_codes(raw8.x, lo0, hi0);
+                    widen_codes(raw8.y, lo1, hi1);
+                }
+                const __half2 v0 = __hmul2(load_vec<__half2>(&lo0), s2);
+                const __half2 v1 = __hmul2(load_vec<__half2>(&hi0), s2);
+                const __half2 v2 = __hmul2(load_vec<__half2>(&lo1), s2);
+                const __half2 v3 = __hmul2(load_vec<__half2>(&hi1), s2);
+                store_vec(dst + r * kD + (d ^ ((r & 7) << 3)),
+                          make_uint4(load_vec<unsigned>(&v0), load_vec<unsigned>(&v1), load_vec<unsigned>(&v2),
+                                     load_vec<unsigned>(&v3)));
+            }
+            __syncthreads();
+            return ldexpf(1.0f, shift);
+        }
+    };
+
+    const int rowbase  = (warp / Parts) * 16;
+    const int part     = warp % Parts;
+    const int gid      = lane >> 2;
+    const int lid      = lane & 3;
+    const float scale_l2 = scale * Log2E;
+    int q_pos[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int q_col = first + (rowbase + gid + 8 * j) / kGroupHeadsPerKv;
+        q_pos[j]        = q_col < last ? positions[q_col] : -1;
+    }
+
+    float acc[OutCols][4]{};
+    GroupedOnlineSoftmax state[2];
+
+    if (end > 0) {
+        stage_plane.template operator()<true>(0);
+        cp_commit();
+    }
+    for (int k0 = 0; k0 < end; k0 += kGroupKeyTile) {
+        cp_wait<0>();
+        __syncthreads();
+        const float k_up = expand_plane.template operator()<Shape::Key>(ks);
+        stage_plane.template operator()<false>(k0);
+        cp_commit();
+
+        float score[kGroupKeyTile / 8][4]{};
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            unsigned qf[4];
+            const int qr = rowbase + (lane & 7) + ((lane >> 3) & 1) * 8;
+            const int qd = k * 16 + (lane >> 4) * 8;
+            ldmatrix_x4(qf[0], qf[1], qf[2], qf[3], smem_addr(qs + qr * kD + (qd ^ ((qr & 7) << 3))));
+#pragma unroll
+            for (int n = 0; n < kGroupKeyTile / 8; ++n) {
+                unsigned bf[2];
+                const int r = n * 8 + (lane & 7);
+                const int d = k * 16 + ((lane >> 3) & 1) * 8;
+                ldmatrix_x2(bf[0], bf[1], smem_addr(ks + r * kD + (d ^ ((r & 7) << 3))));
+                qsa_mma<!Quantized>(score[n], qf, bf[0], bf[1]);
+            }
+        }
+        if constexpr (Shape::Key == Code::Int8 || Shape::Key == Code::Fp8) {
+#pragma unroll
+            for (int n = 0; n < kGroupKeyTile / 8; ++n) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) { score[n][j] *= k_up; }
+            }
+        }
+
+        cp_wait<0>();
+        __syncthreads();
+        const float v_up = expand_plane.template operator()<Shape::Value>(vs);
+        if (k0 + kGroupKeyTile < end) {
+            stage_plane.template operator()<true>(k0 + kGroupKeyTile);
+            cp_commit();
+        }
+
+        float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};
+#pragma unroll
+        for (int n = 0; n < kGroupKeyTile / 8; ++n) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (k0 + n * 8 + lid * 2 + (j & 1) > q_pos[j >> 1]) { score[n][j] = -CUDART_INF_F; }
+                maximum[j >> 1] = fmaxf(maximum[j >> 1], score[n][j]);
+            }
+        }
+        const float alpha[2] = {state[0].update(warp_max<4>(maximum[0], FullMask), scale_l2),
+                                state[1].update(warp_max<4>(maximum[1], FullMask), scale_l2)};
+        unsigned pf[kGroupKeyTile / 16][4];
+        float tile_sum[2]{};
+#pragma unroll
+        for (int n = 0; n < kGroupKeyTile / 8; ++n) {
+            const float p0 = state[0].probability(score[n][0], scale_l2);
+            const float p1 = state[0].probability(score[n][1], scale_l2);
+            const float p2 = state[1].probability(score[n][2], scale_l2);
+            const float p3 = state[1].probability(score[n][3], scale_l2);
+            tile_sum[0] += p0 + p1;
+            tile_sum[1] += p2 + p3;
+            if constexpr (Shape::Value == Code::Int8 || Shape::Value == Code::Fp8) {
+                pf[n >> 1][(n & 1) * 2]     = pack_f16x2(p0 * v_up, p1 * v_up);
+                pf[n >> 1][(n & 1) * 2 + 1] = pack_f16x2(p2 * v_up, p3 * v_up);
+            } else {
+                pf[n >> 1][(n & 1) * 2]     = pack_f16x2(p0, p1);
+                pf[n >> 1][(n & 1) * 2 + 1] = pack_f16x2(p2, p3);
+            }
+        }
+        state[0].accumulate(alpha[0], tile_sum[0]);
+        state[1].accumulate(alpha[1], tile_sum[1]);
+#pragma unroll
+        for (int n = 0; n < OutCols; ++n) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { acc[n][j] *= alpha[j >> 1]; }
+#pragma unroll
+            for (int k = 0; k < kGroupKeyTile / 16; ++k) {
+                unsigned vf[2];
+                const int r = k * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                const int d = part * (kD / Parts) + n * 8;
+                ldmatrix_x2_t(vf[0], vf[1], smem_addr(vs + r * kD + (d ^ ((r & 7) << 3))));
+                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[k][0], pf[k][1], pf[k][2], pf[k][3],
+                        vf[0], vf[1]);
+            }
+        }
+        __syncthreads();
+    }
+
+    state[0].finish();
+    state[1].finish();
+    float* result = reinterpret_cast<float*>(smem);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int row   = rowbase + gid + j * 8;
+        const int q_col = first + row / kGroupHeadsPerKv;
+        if (q_col >= last) { continue; }
+        const int h        = row % kGroupHeadsPerKv;
+        const int head_idx = kv_head * kGroupHeadsPerKv + h;
+        const float inv    = state[j].sum > 0.0f ? (1.0f / state[j].sum) : 0.0f;
+#pragma unroll
+        for (int n = 0; n < OutCols; ++n) {
+            const int d   = part * (kD / Parts) + n * 8 + lid * 2;
+            const float x = acc[n][2 * j] * inv;
+            const float y = acc[n][2 * j + 1] * inv;
+            if constexpr (RotatedValue) {
+                *reinterpret_cast<float2*>(result + row * kD + d) = make_float2(x, y);
+            } else {
+                const __nv_bfloat162 pair = __floats2bfloat162_rn(x, y);
+                const std::int64_t g_idx  = static_cast<std::int64_t>(q_col) * gate_col_stride + head_idx * kD + d;
+                *reinterpret_cast<__nv_bfloat162*>(out + (static_cast<std::size_t>(q_col) * heads + head_idx) * kD + d) =
+                    apply_qsa_gate_pair(pair, gate, g_idx);
+            }
+        }
+    }
+    if constexpr (RotatedValue) {
+        __syncthreads();
+        for (int row = warp; row < kGroupRows; row += Warps) {
+            const int q_col = first + row / kGroupHeadsPerKv;
+            if (q_col >= last) { continue; }
+            float vals[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { vals[i] = result[row * kD + lane * 8 + i]; }
+            normalized_hadamard_d256_contiguous_inplace(vals, lane);
+            const int head_idx = kv_head * kGroupHeadsPerKv + (row % kGroupHeadsPerKv);
+            __nv_bfloat162 out_pairs[4];
+#pragma unroll
+            for (int p_i = 0; p_i < 4; ++p_i) {
+                out_pairs[p_i] = __floats2bfloat162_rn(vals[2 * p_i], vals[2 * p_i + 1]);
+            }
+            if (gate != nullptr) {
+                const std::int64_t g_base =
+                    static_cast<std::int64_t>(q_col) * gate_col_stride + head_idx * kD + lane * 8;
+#pragma unroll
+                for (int p_i = 0; p_i < 4; ++p_i) {
+                    out_pairs[p_i] = apply_qsa_gate_pair(out_pairs[p_i], gate, g_base + 2 * p_i);
+                }
+            }
+            bf16* dst = out + (static_cast<std::size_t>(q_col) * heads + head_idx) * kD + lane * 8;
+#pragma unroll
+            for (int p_i = 0; p_i < 4; ++p_i) {
+                *reinterpret_cast<__nv_bfloat162*>(dst + 2 * p_i) = out_pairs[p_i];
+            }
+        }
+    }
+}
+
+template <KvCacheStorage Storage, int Stages, bool SplitD, bool SkipDenseGroups = false>
 __global__ void __launch_bounds__(prompt_warps<Storage, SplitD>() * 32,
                                   prompt_launch_min_blocks<Storage, Stages, SplitD>())
     qsa_prompt_kernel(const bf16* __restrict__ q, int heads, int kv_heads, const void* __restrict__ k_pages,
@@ -339,7 +796,14 @@ __global__ void __launch_bounds__(prompt_warps<Storage, SplitD>() * 32,
                       int table_stride, const std::int32_t* __restrict__ table_rows,
                       const std::int32_t* __restrict__ positions, int width, int ratio,
                       const std::int32_t* __restrict__ selected, const std::int32_t* __restrict__ counts,
-                      int top_blocks, float scale, bf16* __restrict__ out, QsaPageSpaces spaces, QsaVqWindow vq) {
+                      int top_blocks, float scale, const bf16* __restrict__ gate, std::int64_t gate_col_stride,
+                      bf16* __restrict__ out, QsaPageSpaces spaces, QsaVqWindow vq) {
+    if constexpr (SkipDenseGroups) {
+        if (dense_prefix_group_selected(static_cast<int>(blockIdx.x), width, static_cast<int>(gridDim.x), counts,
+                                        positions)) {
+            return;
+        }
+    }
     using Shape                 = PromptShape<Storage>;
     using S                     = Stage<Storage, SplitD>;
     using K                     = Row<Shape::Key>;
@@ -1121,7 +1585,10 @@ __global__ void __launch_bounds__(prompt_warps<Storage, SplitD>() * 32,
         if constexpr (S::RotatedValues) {
             rows[row * kD + d] = value;
         } else {
-            out[(static_cast<std::size_t>(t) * heads + kv_head * group + row) * kD + d] = __float2bfloat16_rn(value);
+            const int head_idx     = kv_head * group + row;
+            const std::int64_t g_i = static_cast<std::int64_t>(t) * gate_col_stride + head_idx * kD + d;
+            out[(static_cast<std::size_t>(t) * heads + head_idx) * kD + d] =
+                apply_qsa_gate(__float2bfloat16_rn(value), gate, g_i);
         }
     }
     if constexpr (S::RotatedValues) {
@@ -1132,10 +1599,13 @@ __global__ void __launch_bounds__(prompt_warps<Storage, SplitD>() * 32,
 #pragma unroll
             for (int k = 0; k < 8; ++k) { v[k] = rows[row * kD + lane + 32 * k]; }
             normalized_hadamard_d256_inplace(v, lane);
+            const int head_idx = kv_head * group + row;
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
-                out[(static_cast<std::size_t>(t) * heads + kv_head * group + row) * kD + lane + 32 * k] =
-                    __float2bfloat16_rn(v[k]);
+                const int d            = lane + 32 * k;
+                const std::int64_t g_i = static_cast<std::int64_t>(t) * gate_col_stride + head_idx * kD + d;
+                out[(static_cast<std::size_t>(t) * heads + head_idx) * kD + d] =
+                    apply_qsa_gate(__float2bfloat16_rn(v[k]), gate, g_i);
             }
         }
     }
@@ -1145,30 +1615,86 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("qsa prompt: ") + message); }
 }
 
-template <KvCacheStorage Storage, bool SplitD>
+void resolve_gate(const Tensor* gate, int heads, int columns, const bf16*& gate_ptr, std::int64_t& gate_col_stride) {
+    gate_ptr        = nullptr;
+    gate_col_stride = 0;
+    if (gate == nullptr || gate->data == nullptr) { return; }
+    require(gate->dtype == DType::BF16 && gate->nb[0] == 2, "gate must be BF16 with contiguous inner elements");
+    if (gate->ne[0] == heads * kD && gate->ne[2] == 1 && gate->ne[3] == 1 &&
+        (gate->ne[1] == columns || (columns == 1 && gate->ne[1] == 1))) {
+        gate_ptr        = static_cast<const bf16*>(gate->data);
+        gate_col_stride = columns == 1 ? 0 : static_cast<std::int64_t>(gate->nb[1] / 2);
+        return;
+    }
+    if (gate->is_contiguous() && gate->ne[0] == kD && gate->ne[1] == heads && gate->ne[2] == columns &&
+        gate->ne[3] == 1) {
+        gate_ptr        = static_cast<const bf16*>(gate->data);
+        gate_col_stride = static_cast<std::int64_t>(heads) * kD;
+        return;
+    }
+    require(false, "gate shape disagrees with attention output");
+}
+
+template <KvCacheStorage Storage>
+void launch_grouped_prefix(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g,
+                           float scale, const std::int32_t* counts, const bf16* gate_ptr,
+                           std::int64_t gate_col_stride, Tensor& out, cudaStream_t stream) {
+    constexpr int bytes = grouped_smem_bytes<Storage>();
+    static_assert(bytes <= 99 * 1024, "grouped prefix CTA shared memory on sm_120/sm_121");
+    static const cudaError_t configured = [&] {
+        const cudaError_t e1 = cudaFuncSetAttribute(
+            qsa_grouped_prefix_kernel<Storage>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        if (e1 != cudaSuccess) { return e1; }
+        return cudaFuncSetAttribute(qsa_grouped_prefix_kernel<Storage>,
+                                    cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+    }();
+    require(configured == cudaSuccess, "cannot reserve grouped prefix shared memory");
+    constexpr int Parts    = (Storage != KvCacheStorage::BFloat16) ? 2 : 1;
+    constexpr int Threads  = (kGroupRows / 16) * Parts * 32;
+    const int columns      = q.ne[2];
+    const int groups_row   = (batch.width + kGroupQueries - 1) / kGroupQueries;
+    const int total_groups = batch.batch * groups_row;
+    const dim3 grid(static_cast<unsigned>(total_groups), static_cast<unsigned>(g.kv_heads));
+    qsa_grouped_prefix_kernel<Storage><<<grid, Threads, bytes, stream>>>(
+        static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
+        layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
+        static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
+        static_cast<const std::int32_t*>(batch.table_rows.data),
+        static_cast<const std::int32_t*>(batch.positions.data), batch.width, columns, counts, scale, gate_ptr,
+        gate_col_stride, static_cast<bf16*>(out.data), layer.spaces);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("qsa grouped prefix attention: ") + cudaGetErrorString(error));
+    }
+}
+
+template <KvCacheStorage Storage, bool SplitD, bool SkipDenseGroups = false>
 void launch_split(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
-                  const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
-                  const QsaVqWindow& vq, int stages_choice) {
+                  const std::int32_t* selected, const std::int32_t* counts, const bf16* gate_ptr,
+                  std::int64_t gate_col_stride, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq,
+                  int stages_choice) {
     const auto run = [&]<int Stages>() {
         constexpr int bytes = prompt_smem_bytes<Storage, Stages, SplitD>();
         static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
         static const cudaError_t configured = [&] {
             const cudaError_t e1 = cudaFuncSetAttribute(
-                qsa_prompt_kernel<Storage, Stages, SplitD>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+                qsa_prompt_kernel<Storage, Stages, SplitD, SkipDenseGroups>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
             if (e1 != cudaSuccess) { return e1; }
-            return cudaFuncSetAttribute(qsa_prompt_kernel<Storage, Stages, SplitD>,
+            return cudaFuncSetAttribute(qsa_prompt_kernel<Storage, Stages, SplitD, SkipDenseGroups>,
                                         cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         }();
         require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
         const int columns = q.ne[2];
         const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
-        qsa_prompt_kernel<Storage, Stages, SplitD><<<grid, prompt_warps<Storage, SplitD>() * 32, bytes, stream>>>(
-            static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
-            layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
-            static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
-            static_cast<const std::int32_t*>(batch.table_rows.data),
-            static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
-            g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
+        qsa_prompt_kernel<Storage, Stages, SplitD, SkipDenseGroups>
+            <<<grid, prompt_warps<Storage, SplitD>() * 32, bytes, stream>>>(
+                static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
+                layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
+                static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
+                static_cast<const std::int32_t*>(batch.table_rows.data),
+                static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
+                g.budget / g.ratio, scale, gate_ptr, gate_col_stride, static_cast<bf16*>(out.data), layer.spaces, vq);
     };
     if (stages_choice == 1) {
         run.template operator()<1>();
@@ -1181,8 +1707,9 @@ void launch_split(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batc
 
 template <KvCacheStorage Storage>
 void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
-            const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
-            const QsaVqWindow& vq) {
+            const std::int32_t* selected, const std::int32_t* counts, const bf16* gate_ptr,
+            std::int64_t gate_col_stride, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq,
+            bool allow_fast_paths) {
     static const int sms = [] {
         int device = 0, count = 0;
         if (cudaGetDevice(&device) != cudaSuccess ||
@@ -1211,14 +1738,30 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
         return (blocks_1 > blocks_2 && q.ne[2] * g.kv_heads > blocks_2 * sms) ? 1 : 2;
     };
     if constexpr (PromptShape<Storage>::Vq == 0) {
+        const bool use_grouped = allow_fast_paths && forced < 0 && g.heads == 24 && g.kv_heads == 2 &&
+                                 q.ne[2] >= 256 && batch.width >= kGroupQueries &&
+                                 (kPagedKVPageSize % kGroupKeyTile) == 0;
+        if (use_grouped) {
+            launch_grouped_prefix<Storage>(q, layer, batch, g, scale, counts, gate_ptr, gate_col_stride, out, stream);
+            if (use_split_d) {
+                launch_split<Storage, true, true>(q, layer, batch, g, scale, selected, counts, gate_ptr,
+                                                  gate_col_stride, out, stream, vq,
+                                                  pick_stages.template operator()<true>());
+            } else {
+                launch_split<Storage, false, true>(q, layer, batch, g, scale, selected, counts, gate_ptr,
+                                                   gate_col_stride, out, stream, vq,
+                                                   pick_stages.template operator()<false>());
+            }
+            return;
+        }
         if (use_split_d) {
-            launch_split<Storage, true>(q, layer, batch, g, scale, selected, counts, out, stream, vq,
-                                        pick_stages.template operator()<true>());
+            launch_split<Storage, true>(q, layer, batch, g, scale, selected, counts, gate_ptr, gate_col_stride, out,
+                                        stream, vq, pick_stages.template operator()<true>());
             return;
         }
     }
-    launch_split<Storage, false>(q, layer, batch, g, scale, selected, counts, out, stream, vq,
-                                 pick_stages.template operator()<false>());
+    launch_split<Storage, false>(q, layer, batch, g, scale, selected, counts, gate_ptr, gate_col_stride, out, stream,
+                                 vq, pick_stages.template operator()<false>());
 }
 
 } // namespace
@@ -1240,29 +1783,40 @@ bool qsa_prompt_supported(const QsaKVLayer& layer, const QsaGeometry& geometry) 
 
 void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch,
                           const QsaGeometry& geometry, float scale, const std::int32_t* selected,
-                          const std::int32_t* counts, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq) {
+                          const std::int32_t* counts, Tensor& out, cudaStream_t stream, const QsaVqWindow& vq,
+                          const Tensor* gate, bool allow_fast_paths) {
     require(qsa_prompt_supported(layer, geometry), "the prompt route does not serve this layer");
+    const bf16* gate_ptr         = nullptr;
+    std::int64_t gate_col_stride = 0;
+    resolve_gate(gate, geometry.heads, q.ne[2], gate_ptr, gate_col_stride);
     switch (layer.kv.storage) {
     case KvCacheStorage::Int8Group64:
-        launch<KvCacheStorage::Int8Group64>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Int8Group64>(q, layer, batch, geometry, scale, selected, counts, gate_ptr,
+                                            gate_col_stride, out, stream, vq, allow_fast_paths);
         break;
     case KvCacheStorage::Fp8E4M3Row256:
-        launch<KvCacheStorage::Fp8E4M3Row256>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Fp8E4M3Row256>(q, layer, batch, geometry, scale, selected, counts, gate_ptr,
+                                              gate_col_stride, out, stream, vq, allow_fast_paths);
         break;
     case KvCacheStorage::Nvfp4Group16:
-        launch<KvCacheStorage::Nvfp4Group16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Nvfp4Group16>(q, layer, batch, geometry, scale, selected, counts, gate_ptr,
+                                             gate_col_stride, out, stream, vq, allow_fast_paths);
         break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
-        launch<KvCacheStorage::Fp8KeyNvfp4Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Fp8KeyNvfp4Value>(q, layer, batch, geometry, scale, selected, counts, gate_ptr,
+                                                 gate_col_stride, out, stream, vq, allow_fast_paths);
         break;
     case KvCacheStorage::Vq2:
-        launch<KvCacheStorage::Vq2>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Vq2>(q, layer, batch, geometry, scale, selected, counts, gate_ptr, gate_col_stride,
+                                    out, stream, vq, allow_fast_paths);
         break;
     case KvCacheStorage::Q4KeyVq2Value:
-        launch<KvCacheStorage::Q4KeyVq2Value>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::Q4KeyVq2Value>(q, layer, batch, geometry, scale, selected, counts, gate_ptr,
+                                              gate_col_stride, out, stream, vq, allow_fast_paths);
         break;
     default:
-        launch<KvCacheStorage::BFloat16>(q, layer, batch, geometry, scale, selected, counts, out, stream, vq);
+        launch<KvCacheStorage::BFloat16>(q, layer, batch, geometry, scale, selected, counts, gate_ptr, gate_col_stride,
+                                         out, stream, vq, allow_fast_paths);
         break;
     }
 }

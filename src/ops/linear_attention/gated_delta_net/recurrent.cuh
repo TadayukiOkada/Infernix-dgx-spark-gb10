@@ -792,46 +792,59 @@ __device__ __forceinline__ void store_state_tile(const float (&state)[kDvPerWarp
     }
 }
 
-template <bool NormalizeInputs, class Effects, class Access>
+template <bool NormalizeInputs, class Effects, bool PrefetchKey = true, class Access>
 __device__ __forceinline__ void
 run_recurrent_sequence(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
                        const RecurrentCoordinates& coord, std::int32_t valid) {
+    if (valid <= 0) { return; }
     RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
     Effects::observe_key(access, coord, 0, key);
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
 
-    // Gate and value for the next token are issued before this token's transition, so their
-    // global-memory latency overlaps the warp reductions. Values and reduction order are unchanged.
-    RawGatePair gate = access.load_gate(coord, 0);
-    RawValueLane value =
-        load_value_lane(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
-    for (std::int32_t token = 0; token < valid; ++token) {
-        const bool has_next = token + 1 < valid;
-        // Issue every next-token load (key, gate and value) before this token's transition, so all
-        // three global-latency chains overlap the warp reductions instead of only gate/value. The
-        // key stays raw until observe_key records it and normalize_qk_lane runs, matching the
-        // reference's store-before-normalize order exactly; values and reduction order are unchanged.
-        RawQkLane next_key{};
-        RawGatePair next_gate{};
-        RawValueLane next_value{};
-        if (has_next) {
-            next_key   = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
-            next_gate  = access.load_gate(coord, token + 1);
-            next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
+    if constexpr (PrefetchKey) {
+        // Gate and value for the next token are issued before this token's transition, so their
+        // global-memory latency overlaps the warp reductions. Values and reduction order are unchanged.
+        RawGatePair gate = access.load_gate(coord, 0);
+        RawValueLane value =
+            load_value_lane(access.value_ptr(coord, 0), coord.lane, coord.dv_base);
+        for (std::int32_t token = 0; token < valid; ++token) {
+            const bool has_next = token + 1 < valid;
+            RawQkLane next_key{};
+            RawGatePair next_gate{};
+            RawValueLane next_value{};
+            if (has_next) {
+                next_key   = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
+                next_gate  = access.load_gate(coord, token + 1);
+                next_value = load_value_lane(access.value_ptr(coord, token + 1), coord.lane, coord.dv_base);
+            }
+            Effects::observe_value_gate(access, coord, token, value, gate);
+
+            apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+
+            if (has_next) {
+                Effects::observe_key(access, coord, token + 1, next_key);
+                normalize_qk_lane<NormalizeInputs>(next_key.value, coord.lane);
+            }
+
+            Effects::template publish_output<NormalizeInputs>(state, access, coord, token);
+            key   = next_key;
+            gate  = next_gate;
+            value = next_value;
         }
-        Effects::observe_value_gate(access, coord, token, value, gate);
-
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
-
-        if (has_next) {
-            Effects::observe_key(access, coord, token + 1, next_key);
-            normalize_qk_lane<NormalizeInputs>(next_key.value, coord.lane);
+    } else {
+        for (std::int32_t token = 0; token < valid; ++token) {
+            const RawGatePair gate = access.load_gate(coord, token);
+            const RawValueLane value =
+                load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
+            Effects::observe_value_gate(access, coord, token, value, gate);
+            apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+            if (token + 1 < valid) {
+                key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
+                Effects::observe_key(access, coord, token + 1, key);
+                normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
+            }
+            Effects::template publish_output<NormalizeInputs>(state, access, coord, token);
         }
-
-        Effects::template publish_output<NormalizeInputs>(state, access, coord, token);
-        key   = next_key;
-        gate  = next_gate;
-        value = next_value;
     }
 }
 
@@ -876,18 +889,113 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     store_state_tile(state, access.state_write_base(coord), coord);
 }
 
+template <int Capacity>
+struct alignas(16) RecordWindow {
+    __nv_bfloat16 key[Capacity][kStateDim];
+    __nv_bfloat16 query[Capacity][kStateDim];
+    __nv_bfloat16 value[Capacity][kBlockDv];
+    float g[Capacity];
+    float beta[Capacity];
+};
+
+template <bool Masked, class State, int Capacity>
+struct WindowedRecordAccess {
+    const RecordAccess<Masked, State>& record;
+    const RecordWindow<Capacity>& window;
+    float scale;
+
+    __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates&,
+                                                            std::int32_t token) const {
+        return window.key[token];
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* query_ptr(const RecurrentCoordinates&,
+                                                              std::int32_t token) const {
+        return window.query[token];
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
+                                                              std::int32_t token) const {
+        return window.value[token] - coord.state_tile * kBlockDv;
+    }
+
+    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates&,
+                                                     std::int32_t token) const {
+        const float gv = window.g[token], bv = window.beta[token];
+        return {make_uint2(__float_as_uint(gv), __float_as_uint(bv)), gv, bv};
+    }
+
+    __device__ __forceinline__ __nv_bfloat16* output_ptr(const RecurrentCoordinates& coord,
+                                                         std::int32_t token) const {
+        return record.output_ptr(coord, token);
+    }
+
+    __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
+                                              const RawQkLane& raw) const {
+        record.store_key(coord, token, raw);
+    }
+
+    __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
+                                                std::int32_t token, const RawValueLane& raw) const {
+        record.store_value(coord, token, raw);
+    }
+
+    __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord,
+                                               std::int32_t token, const RawGatePair& raw) const {
+        record.store_gate(coord, token, raw);
+    }
+};
+
+template <bool Masked, class State, int Capacity>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+    recurrent_record_window_kernel(RecordAccess<Masked, State> access) {
+    __shared__ __align__(16) RecordWindow<Capacity> window;
+    const RecurrentCoordinates coord = access.coordinates();
+    pdl::enter_streaming();
+    const std::int32_t valid = access.active_columns(coord);
+    if constexpr (Masked) {
+        if (valid <= 0) {
+            zero_output_suffix(access, coord, 0, access.width);
+            return;
+        }
+    }
+    const int tid = coord.warp * kWarpSize + coord.lane;
+    for (int i = tid; i < valid * (kStateDim / 8); i += kWarpSize * kNumWarps) {
+        const int token = i / (kStateDim / 8), column = (i % (kStateDim / 8)) * 8;
+        cp_async<16, Cache::ca>(&window.key[token][column], access.key_ptr(coord, token) + column);
+        cp_async<16, Cache::ca>(&window.query[token][column],
+                                access.query_ptr(coord, token) + column);
+    }
+    for (int i = tid; i < valid * (kBlockDv / 8); i += kWarpSize * kNumWarps) {
+        const int token = i / (kBlockDv / 8), column = (i % (kBlockDv / 8)) * 8;
+        cp_async<16, Cache::ca>(
+            &window.value[token][column],
+            access.value_ptr(coord, token) + coord.state_tile * kBlockDv + column);
+    }
+    if (tid < valid) {
+        const RawGatePair gate = access.load_gate(coord, tid);
+        window.g[tid]          = gate.g;
+        window.beta[tid]       = gate.beta;
+    }
+    cp_commit();
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state_tile(state, access.state_read_base(coord), coord);
+    cp_wait<0>();
+    __syncthreads();
+    const WindowedRecordAccess<Masked, State, Capacity> staged{access, window, access.scale};
+    run_recurrent_sequence<true, RecordEffects, false>(state, staged, coord, valid);
+    zero_output_suffix(access, coord, valid, access.width);
+}
+
 template <bool Masked, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
-    // Verification leaves the persistent state unchanged: it was last written by the preceding
-    // round's fold, which completes before this round's graph starts, and its slot comes from the
-    // round's ingress. The tile therefore loads before waiting on the projection that feeds q/k/v.
     load_state_tile(state, access.state_read_base(coord), coord);
     pdl::enter_streaming();
     const std::int32_t valid = access.active_columns(coord);
-    run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
+    run_recurrent_sequence<true, RecordEffects, false>(state, access, coord, valid);
     zero_output_suffix(access, coord, valid, access.width);
 }
 
@@ -1160,9 +1268,158 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
     zero_output_suffix(access, coord, live, access.width);
 }
 
+inline constexpr int kFoldWarps  = 8;
+inline constexpr int kFoldDv     = 32;
+inline constexpr int kFoldTiles  = kStateDim / kFoldDv;
+inline constexpr int kFoldWindow = 16;
+inline constexpr int kFoldLanes  = 16;
+inline constexpr int kFoldRows   = 2;
+inline constexpr int kFoldCols   = 8;
+
+struct alignas(16) FoldWindow {
+    float key[kFoldWindow][kStateDim];
+    __nv_bfloat16 value[kFoldWindow][kFoldDv];
+    float alpha[kFoldWindow];
+    float beta[kFoldWindow];
+};
+
+// 256-thread, 16-lane subgroup fold for committed widths <= 16: halves CTAs (4 tiles/head of
+// Dv=32), overlaps cp.async value staging with state loads, and normalizes each token's key +
+// expf(gate) once in shared memory across all 16 state-row subgroups while preserving the exact
+// 32-lane warp FP32 reduction tree ((lo4) + (hi4) then xor 8,4,2,1).
+template <class Geometry, class State>
+__global__ void __launch_bounds__(kWarpSize* kFoldWarps, 2)
+    recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, State> access) {
+    pdl::enter_streaming();
+    const int lane  = threadIdx.x % kFoldLanes;
+    const int group = threadIdx.x / kFoldLanes;
+    const unsigned sub_mask = 0xffffu << (group * kFoldLanes);
+    const int tid   = threadIdx.y * kWarpSize + threadIdx.x;
+    const int tile  = static_cast<int>(blockIdx.x) % kFoldTiles;
+    const int head  = static_cast<int>(blockIdx.x) / kFoldTiles;
+    const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
+    const std::int32_t layer = static_cast<std::int32_t>(blockIdx.z);
+    constexpr std::uint32_t kGroup = Geometry::kValueHeads / Geometry::kQkHeads;
+    const RecurrentCoordinates coord{
+        static_cast<int>(threadIdx.x),
+        static_cast<int>(threadIdx.y),
+        batch,
+        layer,
+        tile,
+        static_cast<std::uint32_t>(head),
+        static_cast<std::uint32_t>(head) / kGroup,
+        static_cast<std::uint32_t>(tile * kFoldDv + threadIdx.y * 4 + group * kFoldRows),
+        static_cast<std::uint32_t>(lane * 4)};
+
+    const GdnReplayFoldKernelRow row = access.row_of(batch);
+    const std::int32_t valid         = row.commit_columns;
+    if (valid <= 0) { return; }
+    __shared__ FoldWindow sm;
+
+    for (int i = tid; i < valid * (kFoldDv / 8); i += kFoldWarps * kWarpSize) {
+        const int token = i / (kFoldDv / 8), col = (i % (kFoldDv / 8)) * 8;
+        cp_async<16, Cache::cg>(&sm.value[token][col],
+                                access.value_ptr(coord, token) + tile * kFoldDv + col);
+    }
+    cp_commit();
+
+    __align__(16) float state[kFoldRows][kFoldCols];
+    const State* source = access.state_read_base(coord, row);
+#pragma unroll
+    for (int r = 0; r < kFoldRows; ++r) {
+#pragma unroll
+        for (int p = 0; p < kFoldCols / 4; ++p) {
+            const std::uint32_t col = static_cast<std::uint32_t>(lane * 4 + p * kFoldLanes * 4);
+            float chunk[4];
+            load_qk_lane(chunk, source + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim, col);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { state[r][p * 4 + j] = chunk[j]; }
+        }
+    }
+
+    const int token = threadIdx.y * 2 + group;
+    if (token < valid) {
+        __align__(16) float key[kFoldCols];
+#pragma unroll
+        for (int p = 0; p < kFoldCols / 4; ++p) {
+            const std::uint32_t col = static_cast<std::uint32_t>(lane * 4 + p * kFoldLanes * 4);
+            const RawQkLane raw     = load_raw_qk_lane(access.key_ptr(coord, token), col);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { key[p * 4 + j] = raw.value[j]; }
+        }
+        float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            s0 += key[j] * key[j];
+            s1 += key[j + 4] * key[j + 4];
+        }
+        const float sum = warp_sum<kFoldLanes>(s0 + s1, sub_mask);
+        const float inv = rsqrtf(sum + kQkL2NormEps);
+#pragma unroll
+        for (int j = 0; j < kFoldCols; ++j) { key[j] *= inv; }
+#pragma unroll
+        for (int p = 0; p < kFoldCols / 4; ++p) {
+            store_vec(&sm.key[token][lane * 4 + p * kFoldLanes * 4], load_vec<float4>(key + p * 4));
+        }
+        if (lane == 0) {
+            const RawGatePair gate = access.load_gate(coord, token);
+            sm.alpha[token]        = expf(gate.g);
+            sm.beta[token]         = gate.beta;
+        }
+    }
+    cp_wait<0>();
+    __syncthreads();
+
+    for (int t = 0; t < valid; ++t) {
+        __align__(16) float key[kFoldCols];
+#pragma unroll
+        for (int p = 0; p < kFoldCols / 4; ++p) {
+            store_vec(key + p * 4, load_vec<float4>(&sm.key[t][lane * 4 + p * kFoldLanes * 4]));
+        }
+        const float alpha = sm.alpha[t], beta = sm.beta[t];
+#pragma unroll
+        for (int r = 0; r < kFoldRows; ++r) {
+            const float value = __bfloat162float(sm.value[t][coord.dv_base % kFoldDv + r]);
+            float d0 = 0.0f, d1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                d0 += state[r][j] * key[j];
+                d1 += state[r][j + 4] * key[j + 4];
+            }
+            const float dot   = warp_sum<kFoldLanes>(d0 + d1, sub_mask);
+            const float delta = beta * (value - alpha * dot);
+#pragma unroll
+            for (int j = 0; j < kFoldCols; ++j) {
+                state[r][j] = alpha * state[r][j] + delta * key[j];
+            }
+        }
+    }
+
+    State* destination = access.state_write_base(coord, row);
+#pragma unroll
+    for (int r = 0; r < kFoldRows; ++r) {
+#pragma unroll
+        for (int p = 0; p < kFoldCols / 4; ++p) {
+            const std::uint32_t col = static_cast<std::uint32_t>(lane * 4 + p * kFoldLanes * 4);
+            float chunk[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { chunk[j] = state[r][p * 4 + j]; }
+            store_qk_lane(chunk, destination + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim, col);
+        }
+    }
+
+    RecurrentCoordinates history = coord;
+    history.warp %= kNumWarps;
+    const int conv_block =
+        static_cast<int>(blockIdx.x) * (kFoldWarps / kNumWarps) + static_cast<int>(threadIdx.y) / kNumWarps;
+    history.value_head = static_cast<std::uint32_t>(conv_block / 8);
+    history.state_tile = conv_block % 8;
+    access.publish_final_conv_history(history, row, valid);
+}
+
 template <class Geometry, class State>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 8)
-    recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, State> access) {
+    recurrent_fold_fallback_kernel(const __grid_constant__ FoldAccess<Geometry, State> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const GdnReplayFoldKernelRow row = access.row_of(coord.batch);
     const std::int32_t valid         = row.commit_columns;

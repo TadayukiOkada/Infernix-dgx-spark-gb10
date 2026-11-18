@@ -30,43 +30,25 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     // consults the grid, and the un-prefetched instantiation is compiled only where it is reached.
     constexpr bool kGateOnGrid = rms_gated(Epilogue);
 
-    if constexpr (Epilogue == RmsEpilogue::Plain || Epilogue == RmsEpilogue::Offset) {
-        const auto x_addr   = reinterpret_cast<std::uintptr_t>(x.data);
-        const auto w_addr   = reinterpret_cast<std::uintptr_t>(weight.data);
-        const auto out_addr = reinterpret_cast<std::uintptr_t>(out.data);
-        const bool aligned16 = ((x_addr | w_addr | out_addr) & (alignof(uint4) - 1)) == 0;
-        if (aligned16 && d == 5120) {
-            const auto* x16 = static_cast<const uint4*>(x.data);
-            const auto* w16 = static_cast<const uint4*>(weight.data);
-            auto* out16     = static_cast<uint4*>(out.data);
-            if (rows == 1) {
-                CUDA_CHECK(pdl::launch_consumer({dim3(5), dim3(128), 0, stream},
-                                                rmsnorm_d5120_decode_vec16_kernel<Epilogue>, x16,
-                                                w16, out16, eps));
-                return;
-            }
-            if (rows == 16) {
-                CUDA_CHECK(pdl::launch_consumer({dim3(48), dim3(256), 0, stream},
-                                                rmsnorm_d5120_verify_vec16_kernel<Epilogue>, x16,
-                                                w16, out16, eps));
-                return;
-            }
-            CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(rows)), dim3(256), 0, stream},
-                                            rmsnorm_d5120_rows_vec16_kernel<Epilogue>, x16, w16,
-                                            out16, eps));
-            return;
-        }
-    }
     if constexpr (!rms_gated(Epilogue)) {
         if (aligned2 && d == 5120) {
-            // Specialized 512-thread CTA with compile-time offsets and hoisted weights eliminates
-            // loop overhead, runtime div, and memory roundtrips.
+            // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
+            // with hoisted gains wins the hidden-row sweep through prefill.
             CUDA_CHECK(
-                pdl::launch_consumer({dim3(static_cast<unsigned>(rows)), dim3(512), 0, stream},
-                                     rmsnorm_d5120_bf16x2_kernel<Epilogue>,
+                pdl::launch_consumer({dim3(static_cast<unsigned>(rows)), dim3(256), 0, stream},
+                                     rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 10, true, 5120>,
                                      reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                                      reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
-                                     reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps));
+                                     reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
+            return;
+        }
+        if (aligned2 && d == 10240) {
+            CUDA_CHECK(
+                pdl::launch_consumer({dim3(static_cast<unsigned>(rows)), dim3(512), 0, stream},
+                                     rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 10, true, 10240>,
+                                     reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                                     reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
+                                     reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
             return;
         }
     }
@@ -155,9 +137,8 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                                  reinterpret_cast<const __nv_bfloat162*>(z_bf16),
                                  reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
     } else if (!rms_gated(Epilogue) && d > kRmsPreloadMinD && d <= kRmsPreloadMaxD) {
-        // Rows too wide for the fast routes (the Qwen4Exp MTP hidden_norm, d = 10240): the generic
-        // kernel's preloading instance, same bits with every load issued at once. The bf16x2 CTA
-        // kernel would also take d = 10240 but sums in another order, so it would change the bits.
+        // Wide ungated rows outside the aligned fast routes (8192 < d <= 16384, including unaligned
+        // d = 10240 and d = 16384): the generic kernel's preloading instance issues every load at once.
         if constexpr (!rms_gated(Epilogue)) {
             if (d <= kRmsPreloadMidD) {
                 rmsnorm_generic_kernel<Epilogue, kRmsPreloadMidD / 256>

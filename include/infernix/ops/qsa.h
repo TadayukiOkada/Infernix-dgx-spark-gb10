@@ -247,6 +247,7 @@ struct QsaAppend {
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr);
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr,
+                   const Tensor* gate = nullptr, bool allow_fast_paths = false);
 
 } // namespace infernix::ops

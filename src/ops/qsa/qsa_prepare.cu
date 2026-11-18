@@ -142,12 +142,63 @@ __device__ __forceinline__ void load_row(const bf16* row, float (&x)[N], int lan
 }
 
 template <int N>
-__device__ __forceinline__ void store_row(bf16* row, const float (&x)[N], int lane) {
+__device__ __forceinline__ void load_row_contiguous(const bf16* row, float (&x)[N], int lane) {
+    static_assert(N == 4 || N == 8);
+    const bf16* p = row + lane * N;
+    if constexpr (N == 8) {
+        if ((reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U) {
+            const uint4 raw        = *reinterpret_cast<const uint4*>(p);
+            const unsigned words[4]{raw.x, raw.y, raw.z, raw.w};
 #pragma unroll
-    for (int j = 0; j < N; ++j) { row[lane + 32 * j] = __float2bfloat16_rn(x[j]); }
+            for (int j = 0; j < 8; ++j) {
+                x[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffffU) << 16);
+            }
+            return;
+        }
+    } else {
+        if ((reinterpret_cast<std::uintptr_t>(p) & 7U) == 0U) {
+            const uint2 raw        = *reinterpret_cast<const uint2*>(p);
+            const unsigned words[2]{raw.x, raw.y};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                x[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffffU) << 16);
+            }
+            return;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < N; ++j) { x[j] = __bfloat162float(p[j]); }
 }
 
-// RMSNorm of a 32 N-dimensional row with the unit-offset weight, in FP32.
+template <int N>
+__device__ __forceinline__ void store_row_contiguous(bf16* row, const float (&x)[N], int lane) {
+    static_assert(N == 4 || N == 8);
+    bf16* p = row + lane * N;
+    unsigned words[N / 2];
+#pragma unroll
+    for (int j = 0; j < N / 2; ++j) {
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(x[2 * j], x[2 * j + 1]);
+        words[j]                  = *reinterpret_cast<const unsigned*>(&pair);
+    }
+    if constexpr (N == 8) {
+        if ((reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U) {
+            *reinterpret_cast<uint4*>(p) = make_uint4(words[0], words[1], words[2], words[3]);
+            return;
+        }
+    } else {
+        if ((reinterpret_cast<std::uintptr_t>(p) & 7U) == 0U) {
+            *reinterpret_cast<uint2*>(p) = make_uint2(words[0], words[1]);
+            return;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        reinterpret_cast<std::uint16_t*>(p)[j] =
+            static_cast<std::uint16_t>(words[j / 2] >> (16 * (j % 2)));
+    }
+}
+
+// RMSNorm of a 32 N-dimensional row with the unit-offset weight, in FP32 (strided layout for pool_block).
 template <int N>
 __device__ __forceinline__ void normalize_row(float (&x)[N], const bf16* weight, float eps, int lane) {
     float squares = 0.0F;
@@ -159,6 +210,29 @@ __device__ __forceinline__ void normalize_row(float (&x)[N], const bf16* weight,
     for (int j = 0; j < N; ++j) { x[j] = x[j] * inverse * (1.0F + __bfloat162float(weight[lane + 32 * j])); }
 }
 
+// Contiguous N-feature per lane RMSNorm + half-split RoPE using CTA-shared (cos, sin) coefficients.
+template <int N>
+__device__ __forceinline__ void normalize_rotate_contiguous(float (&x)[N], const bf16* weight, float eps,
+                                                            const float2* coeff, int lane) {
+    float squares = 0.0F;
+#pragma unroll
+    for (int j = 0; j < N; ++j) { squares += x[j] * x[j]; }
+    squares             = warp_sum(squares);
+    const float inverse = rsqrtf(squares / static_cast<float>(32 * N) + eps);
+    float w[N];
+    load_row_contiguous(weight, w, lane);
+#pragma unroll
+    for (int j = 0; j < N; ++j) { x[j] = x[j] * inverse * (1.0F + w[j]); }
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const float mate = __shfl_xor_sync(kFullMask, x[j], 32 / N);
+        if (lane * N < kRotary) {
+            const float2 sc = coeff[(lane * N + j) % kPairs];
+            x[j]            = lane * N < kPairs ? (x[j] * sc.x - mate * sc.y) : (x[j] * sc.x + mate * sc.y);
+        }
+    }
+}
+
 // The half-split rotation of pair `lane`: dimensions lane (x[0]) and lane + 32 (x[1]).
 template <int N>
 __device__ __forceinline__ void rotate_pair(float (&x)[N], float c, float s) {
@@ -168,81 +242,80 @@ __device__ __forceinline__ void rotate_pair(float (&x)[N], float c, float s) {
 }
 
 // ------------------------------------------------------------------------------- cache codecs
-// Each writes one FP32 row in kv_cache_append's encoding (ops/kv_cache/append): the same codec
-// functions in the same order, so a row's bytes are those kv_cache_append writes for that FP32 row.
+// Each writes one contiguous FP32 row (x[j] is feature 8 * lane + j) in kv_cache_append's encoding,
+// matching kv_cache_append's stored bytes without shared memory or warp barriers.
 
 template <class Geometry>
-__device__ __forceinline__ void store_int8_row(const float (&x)[8], std::int8_t* codes, __half* scales, int page,
-                                               int head, int slot, int lane) {
+__device__ __forceinline__ void store_int8_row_contiguous(const float (&x)[8], std::int8_t* codes, __half* scales,
+                                                          int page, int head, int slot, int lane) {
+    float local_max = 0.0F;
 #pragma unroll
-    for (int group = 0; group < kKVCacheInt8Groups; ++group) {
-        const float x0   = x[2 * group];
-        const float x1   = x[2 * group + 1];
-        const auto quant = kv_cache_int8_quant_params(warp_max(fmaxf(fabsf(x0), fabsf(x1)), kFullMask));
-        const std::int64_t base =
-            kv_cache_int8_quant_code_index<Geometry>(page, head, group * kKVCacheInt8Group, slot);
-        codes[base + lane]      = kv_cache_int8_quant_code(x0, quant.inverse_scale);
-        codes[base + lane + 32] = kv_cache_int8_quant_code(x1, quant.inverse_scale);
-        if (lane == 0) { scales[kv_cache_int8_quant_scale_index<Geometry>(page, head, group, slot)] = quant.scale; }
+    for (int j = 0; j < 8; ++j) { local_max = fmaxf(local_max, fabsf(x[j])); }
+    const auto quant   = kv_cache_int8_quant_params(warp_max<8>(local_max));
+    std::int8_t* out_p = codes + kv_cache_int8_quant_code_index<Geometry>(page, head, 8 * lane, slot);
+    unsigned words[2]{};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        words[j / 4] |=
+            static_cast<unsigned>(static_cast<std::uint8_t>(kv_cache_int8_quant_code(x[j], quant.inverse_scale)))
+            << (8 * (j % 4));
+    }
+    store_vec(out_p, make_uint2(words[0], words[1]));
+    if ((lane & 7) == 0) {
+        scales[kv_cache_int8_quant_scale_index<Geometry>(page, head, lane >> 3, slot)] = quant.scale;
     }
 }
 
 template <class Geometry>
-__device__ __forceinline__ void store_fp8_row(const float (&x)[8], std::uint8_t* codes, __half* scales, int page,
-                                              int head, int slot, int lane) {
+__device__ __forceinline__ void store_fp8_row_contiguous(const float (&x)[8], std::uint8_t* codes, __half* scales,
+                                                         int page, int head, int slot, int lane) {
     float absmax = 0.0F;
 #pragma unroll
-    for (int r = 0; r < 8; ++r) { absmax = fmaxf(absmax, fabsf(x[r])); }
-    const auto quant = kv_cache_fp8_quant_params(warp_max(absmax, kFullMask));
+    for (int j = 0; j < 8; ++j) { absmax = fmaxf(absmax, fabsf(x[j])); }
+    const auto quant    = kv_cache_fp8_quant_params(warp_max(absmax, kFullMask));
+    std::uint8_t* out_p = codes + kv_cache_fp8_code_index<Geometry>(page, head, 8 * lane, slot);
+    unsigned words[2]{};
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        codes[kv_cache_fp8_code_index<Geometry>(page, head, lane + 32 * r, slot)] =
-            kv_cache_fp8_quant_code(x[r], quant.inverse_scale);
+    for (int j = 0; j < 8; ++j) {
+        words[j / 4] |= static_cast<unsigned>(kv_cache_fp8_quant_code(x[j], quant.inverse_scale)) << (8 * (j % 4));
     }
+    store_vec(out_p, make_uint2(words[0], words[1]));
     if (lane == 0) { scales[kv_cache_fp8_scale_index<Geometry>(page, head, slot)] = quant.scale; }
 }
 
-// `scratch`: this warp's 256 FP32 values in shared memory.
 template <class Geometry>
-__device__ __forceinline__ void store_nvfp4_row(const float (&x)[8], std::uint8_t* codes, std::uint8_t* scales,
-                                                int page, int head, int slot, int lane, float* scratch) {
-#pragma unroll
-    for (int r = 0; r < 8; ++r) { scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = x[r]; }
-    __syncwarp();
-    const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
-    if (lane < kKVCacheNvfp4Groups) {
-        store_vec(codes + kv_cache_nvfp4_code_index<Geometry>(page, head, lane * kKVCacheNvfp4Group, slot),
+__device__ __forceinline__ void store_nvfp4_row_contiguous(const float (&x)[8], std::uint8_t* codes,
+                                                           std::uint8_t* scales, int page, int head, int slot,
+                                                           int lane) {
+    const auto quantized = kv_cache_nvfp4_quantize_group16_contiguous(x, lane);
+    if ((lane & 1) == 0) {
+        const int group = lane >> 1;
+        store_vec(codes + kv_cache_nvfp4_code_index<Geometry>(page, head, group * kKVCacheNvfp4Group, slot),
                   make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scales[kv_cache_nvfp4_scale_index<Geometry>(page, head, lane, slot)] = quantized.scale;
+        scales[kv_cache_nvfp4_scale_index<Geometry>(page, head, group, slot)] = quantized.scale;
     }
-    __syncwarp(); // every lane has read the row before the warp reuses its scratch
 }
 
 // ------------------------------------------------------------------------------- tasks
 
 // Query head `head` (index = false) or index-query head `head` (index = true) of `column`.
 template <int N, bool Index>
-__device__ __forceinline__ void prepare_query(const PrepareArgs& a, int column, int head, int lane) {
-    constexpr int kDim     = 32 * N;
-    const int heads        = Index ? a.index_heads : a.heads;
-    const std::size_t row  = (static_cast<std::size_t>(column) * heads + head) * kDim;
-    const bf16* in         = (Index ? a.index_q : a.q) + row;
+__device__ __forceinline__ void prepare_query(const PrepareArgs& a, int column, int head, int lane,
+                                              const float2* coeff) {
+    constexpr int kDim    = 32 * N;
+    const int heads       = Index ? a.index_heads : a.heads;
+    const std::size_t row = (static_cast<std::size_t>(column) * heads + head) * kDim;
+    const bf16* in        = (Index ? a.index_q : a.q) + row;
     float x[N];
-    load_row(in, x, lane);
-    normalize_row(x, Index ? a.index_query_norm : a.query_norm, a.eps, lane);
-    float c, s;
-    if constexpr (Index) {
-        index_sincos(a, lane, column_coordinate(a, column, lane), c, s);
-    } else {
-        attention_sincos(a, lane, column_coordinate(a, column, lane), c, s);
-    }
-    rotate_pair(x, c, s);
-    store_row((Index ? a.index_q_out : a.q_out) + row, x, lane); // every load preceded the warp sum
+    load_row_contiguous(in, x, lane);
+    normalize_rotate_contiguous(x, Index ? a.index_query_norm : a.query_norm, a.eps, coeff, lane);
+    store_row_contiguous((Index ? a.index_q_out : a.q_out) + row, x, lane);
 }
 
 // KV head `head` of `column`: the normalized, rotated FP32 key and the value into their codec.
 template <KvCacheStorage Storage, class Geometry>
-__device__ __forceinline__ void prepare_kv(const PrepareArgs& a, int column, int head, int lane, float* scratch) {
+__device__ __forceinline__ void prepare_kv(const PrepareArgs& a, int column, int head, int lane,
+                                           const float2* attn_coeff) {
     const int sequence        = column / a.width;
     const int position        = a.positions[column];
     const std::int32_t* table = a.tables + static_cast<std::int64_t>(a.table_rows[sequence]) * a.table_stride;
@@ -250,61 +323,43 @@ __device__ __forceinline__ void prepare_kv(const PrepareArgs& a, int column, int
     const int slot            = position & kPagedKVPageMask;
     const std::size_t row     = (static_cast<std::size_t>(column) * Geometry::KVHeads + head) * kHeadDim;
     float key[8];
-    load_row(a.k + row, key, lane);
-    normalize_row(key, a.key_norm, a.eps, lane);
-    float c, s;
-    attention_sincos(a, lane, column_coordinate(a, column, lane), c, s);
-    rotate_pair(key, c, s);
+    load_row_contiguous(a.k + row, key, lane);
+    normalize_rotate_contiguous(key, a.key_norm, a.eps, attn_coeff, lane);
     if constexpr (Storage == KvCacheStorage::BFloat16) {
-        // K stored as BF16 (its one rounding); V as FP16_RNE(BF16 v), kv_cache_append's conversion.
         const std::int64_t base = paged_kv_element_offset<kHeadDim, Geometry::KVHeads>(page, head, slot, 0);
-        store_row(static_cast<bf16*>(a.k_pages) + base, key, lane);
+        store_row_contiguous(static_cast<bf16*>(a.k_pages) + base, key, lane);
         const int4 value = load_vec<int4>(a.v + row + 8 * lane);
         store_vec(static_cast<__half*>(a.v_pages) + base + 8 * lane, bf16x8_bits_to_f16x8_bits(value));
     } else {
-        // Keys of every quantized storage, and NVFP4 values, take the normalized D256 Hadamard
-        // preparation; the codecs read FP32 rows.
-        normalized_hadamard_d256_inplace(key, lane);
+        normalized_hadamard_d256_contiguous_inplace(key, lane);
         if constexpr (Storage == KvCacheStorage::Nvfp4Group16) {
-#pragma unroll
-            for (int r = 0; r < 8; ++r) { scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = key[r]; }
+            store_nvfp4_row_contiguous<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages),
+                                                 static_cast<std::uint8_t*>(a.k_scales), page, head, slot, lane);
             float value[8];
-            load_row(a.v + row, value, lane);
-            normalized_hadamard_d256_inplace(value, lane);
-#pragma unroll
-            for (int r = 0; r < 8; ++r) { scratch[kHeadDim + kv_cache_nvfp4_swizzle(lane + 32 * r)] = value[r]; }
-            __syncwarp();
-            const std::int64_t code_idx  = kv_cache_nvfp4_code_index<Geometry>(page, head, lane * kKVCacheNvfp4Group, slot);
-            const std::int64_t scale_idx = kv_cache_nvfp4_scale_index<Geometry>(page, head, lane, slot);
-#pragma unroll 1
-            for (int role = 0; role < 2; ++role) {
-                const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch + role * kHeadDim, lane);
-                if (lane < kKVCacheNvfp4Groups) {
-                    store_vec(static_cast<std::uint8_t*>(role ? a.v_pages : a.k_pages) + code_idx,
-                              make_uint2(quantized.codes_lo, quantized.codes_hi));
-                    static_cast<std::uint8_t*>(role ? a.v_scales : a.k_scales)[scale_idx] = quantized.scale;
-                }
-            }
+            load_row_contiguous(a.v + row, value, lane);
+            normalized_hadamard_d256_contiguous_inplace(value, lane);
+            store_nvfp4_row_contiguous<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages),
+                                                 static_cast<std::uint8_t*>(a.v_scales), page, head, slot, lane);
         } else {
             float value[8];
-            load_row(a.v + row, value, lane);
+            load_row_contiguous(a.v + row, value, lane);
             if constexpr (Storage == KvCacheStorage::Int8Group64) {
-                store_int8_row<Geometry>(key, static_cast<std::int8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
-                                         page, head, slot, lane);
-                store_int8_row<Geometry>(value, static_cast<std::int8_t*>(a.v_pages), static_cast<__half*>(a.v_scales),
-                                         page, head, slot, lane);
+                store_int8_row_contiguous<Geometry>(key, static_cast<std::int8_t*>(a.k_pages),
+                                                    static_cast<__half*>(a.k_scales), page, head, slot, lane);
+                store_int8_row_contiguous<Geometry>(value, static_cast<std::int8_t*>(a.v_pages),
+                                                    static_cast<__half*>(a.v_scales), page, head, slot, lane);
             } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256) {
-                store_fp8_row<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
-                                        page, head, slot, lane);
-                store_fp8_row<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages), static_cast<__half*>(a.v_scales),
-                                        page, head, slot, lane);
+                store_fp8_row_contiguous<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages),
+                                                   static_cast<__half*>(a.k_scales), page, head, slot, lane);
+                store_fp8_row_contiguous<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages),
+                                                   static_cast<__half*>(a.v_scales), page, head, slot, lane);
             } else {
                 static_assert(Storage == KvCacheStorage::Fp8KeyNvfp4Value, "a storage without a fused prepare");
-                store_fp8_row<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages), static_cast<__half*>(a.k_scales),
-                                        page, head, slot, lane);
-                normalized_hadamard_d256_inplace(value, lane);
-                store_nvfp4_row<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages),
-                                          static_cast<std::uint8_t*>(a.v_scales), page, head, slot, lane, scratch);
+                store_fp8_row_contiguous<Geometry>(key, static_cast<std::uint8_t*>(a.k_pages),
+                                                   static_cast<__half*>(a.k_scales), page, head, slot, lane);
+                normalized_hadamard_d256_contiguous_inplace(value, lane);
+                store_nvfp4_row_contiguous<Geometry>(value, static_cast<std::uint8_t*>(a.v_pages),
+                                                     static_cast<std::uint8_t*>(a.v_scales), page, head, slot, lane);
             }
         }
     }
@@ -390,22 +445,37 @@ __device__ __forceinline__ void prepare_pool(const PrepareArgs& a, int column, i
 
 template <KvCacheStorage Storage, class Geometry>
 __global__ void __launch_bounds__(kThreads) qsa_prepare_kernel(const __grid_constant__ PrepareArgs a) {
-    constexpr int kScratchStride = Storage == KvCacheStorage::Nvfp4Group16 ? 2 * kHeadDim : kHeadDim;
-    __shared__ float scratch[kWarps][kScratchStride]; // the NVFP4 codec's rows
-    pdl::enter();                               // launched as a programmatic dependent
-    const int warp   = static_cast<int>(threadIdx.x) / 32;
-    const int lane   = static_cast<int>(threadIdx.x) % 32;
-    const int column = static_cast<int>(blockIdx.x) / a.groups;
-    const int task   = a.first_task + (static_cast<int>(blockIdx.x) % a.groups) * kWarps + warp;
+    __shared__ float2 attn_coeff[kPairs];
+    __shared__ float2 index_coeff[kPairs];
+    pdl::enter(); // launched as a programmatic dependent
+    const int warp      = static_cast<int>(threadIdx.x) / 32;
+    const int lane      = static_cast<int>(threadIdx.x) % 32;
+    const int column    = static_cast<int>(blockIdx.x) / a.groups;
+    const int cta_first = a.first_task + (static_cast<int>(blockIdx.x) % a.groups) * kWarps;
+    const int cta_last  = cta_first + kWarps - 1;
+    const int task      = cta_first + warp;
     const int index_begin = a.heads;
     const int kv_begin    = index_begin + a.index_heads;
     const int pool_task   = kv_begin + Geometry::KVHeads;
+    const bool need_attn  = cta_first < index_begin || (cta_last >= kv_begin && cta_first < pool_task);
+    const bool need_index = cta_last >= index_begin && cta_first < kv_begin;
+    if (need_attn && warp == 0) {
+        float c, s;
+        attention_sincos(a, lane, column_coordinate(a, column, lane), c, s);
+        attn_coeff[lane] = make_float2(c, s);
+    }
+    if (need_index && warp == 1) {
+        float c, s;
+        index_sincos(a, lane, column_coordinate(a, column, lane), c, s);
+        index_coeff[lane] = make_float2(c, s);
+    }
+    __syncthreads();
     if (task < index_begin) {
-        prepare_query<kHeadDim / 32, false>(a, column, task, lane);
+        prepare_query<kHeadDim / 32, false>(a, column, task, lane, attn_coeff);
     } else if (task < kv_begin) {
-        prepare_query<kIndexDim / 32, true>(a, column, task - index_begin, lane);
+        prepare_query<kIndexDim / 32, true>(a, column, task - index_begin, lane, index_coeff);
     } else if (task < pool_task) {
-        prepare_kv<Storage, Geometry>(a, column, task - kv_begin, lane, scratch[warp]);
+        prepare_kv<Storage, Geometry>(a, column, task - kv_begin, lane, attn_coeff);
     } else if (task == pool_task) {
         prepare_pool(a, column, lane);
     }

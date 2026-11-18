@@ -8,6 +8,7 @@
 #include "ops/linear/bf16/bf16_a16_mma.cuh"
 #include "ops/linear/bf16/bf16_a16_sliced_k_mma.cuh"
 #include "ops/linear/bf16/bf16_a16_tma_mma.cuh"
+#include "ops/linear/bf16/bf16_a16_tma_register_b.cuh"
 
 namespace infernix::ops::detail {
 
@@ -114,15 +115,22 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
         throw std::invalid_argument("BF16 sliced-K requires compatible row/K tiles");
     // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
     static constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
-    const int bytes              = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
+    const int bytes = bf16_prepare_shared<bf16_mma_shared_bytes<Schedule, Epilogue>, kernel>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(bf16_predicated_rows<Schedule> ? div_up(p.rows, Schedule::kBlockRows)
-                                                       : p.rows / Schedule::kBlockRows,
-                        div_up(count, Schedule::kBlockTokens));
+        const int row_tiles = bf16_predicated_rows<Schedule> ? div_up(p.rows, Schedule::kBlockRows)
+                                                             : p.rows / Schedule::kBlockRows;
+        const int token_tiles = div_up(count, Schedule::kBlockTokens);
+        dim3 grid(row_tiles, token_tiles);
+        if constexpr (Schedule::kRaster != Bf16MmaRaster::RowFast) {
+            const auto blocks = static_cast<std::int64_t>(row_tiles) * token_tiles;
+            if (blocks > 2147483647LL)
+                throw std::invalid_argument("BF16 sliced-K grid exceeds CUDA grid.x capacity");
+            grid = dim3(static_cast<unsigned>(blocks));
+        }
         CUDA_CHECK(pdl::launch_with(
             dependency,
             {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel, p.x,
-            p.weight, output, epilogue, p.rows, p.k, p.tokens, offset));
+            p.weight, output, epilogue, p.rows, p.k, p.tokens, offset, count));
     });
 }
 

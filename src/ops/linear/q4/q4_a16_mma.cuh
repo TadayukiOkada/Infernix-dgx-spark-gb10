@@ -44,7 +44,8 @@ inline constexpr int q4_mma_shared_bytes = [] {
 }();
 
 // clang-format off
-template <class Schedule, bool Full, class Output, class Epilogue, class RowPolicy>
+template <class Schedule, bool Full, class Output, class Epilogue, class RowPolicy,
+          bool FullTokens = Full>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
 void q4_a16_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -56,7 +57,8 @@ void q4_a16_mma_kernel(
     std::int32_t cols,
     std::int32_t padded_k, std::int32_t token_begin) {
     // clang-format on
-    constexpr bool kFull = Full;
+    constexpr bool kFull     = Full;
+    constexpr bool kFullTile = Full && FullTokens;
     constexpr int BM     = Schedule::kBlockRows;
     constexpr int BN     = Schedule::kBlockTokens;
     constexpr int BK     = Schedule::kBlockK;
@@ -144,11 +146,11 @@ void q4_a16_mma_kernel(
             const int kk        = k0 + k8 * 8;
             const int col       = col0 + local_col;
             auto* dst = &Bs[stage][local_col * BK + q4_mma_swizzle_k64(local_col, k8 * 8)];
-            if constexpr (kFull) {
+            if constexpr (kFullTile) {
                 cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
-                if (col < cols && kk + 8 <= k) {
+                if ((FullTokens || col < cols) && (kFull || kk + 8 <= k)) {
                     cp_async<16, Schedule::kActivationCache>(
                         dst, &x[static_cast<std::int64_t>(col) * k + kk]);
                 } else {
@@ -415,11 +417,11 @@ void q4_a16_mma_kernel(
     }
 
     if constexpr (requires {
-                      epilogue.template finish_tile<Schedule, kFull>(
+                      epilogue.template finish_tile<Schedule, kFullTile>(
                           output, smem_raw, accum, row0, token_begin + col0, rows,
                           token_begin + cols);
                   }) {
-        epilogue.template finish_tile<Schedule, kFull>(
+        epilogue.template finish_tile<Schedule, kFullTile>(
             output, smem_raw, accum, row0, token_begin + col0, rows, token_begin + cols);
     } else {
 #pragma unroll
@@ -429,7 +431,7 @@ void q4_a16_mma_kernel(
             for (int ni = 0; ni < NT; ++ni) {
                 const int token0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
                 const auto store = [&](int row, int token, float value) {
-                    if (kFull || (row < rows && token < cols)) {
+                    if ((kFull || row < rows) && (FullTokens || token < cols)) {
                         const int global_token = token_begin + token;
                         output.store(row, global_token, epilogue.apply(row, global_token, value));
                     }

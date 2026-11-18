@@ -180,9 +180,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     const std::uint8_t* __restrict__ weight_codes, const std::uint8_t* __restrict__ weight_scales,
     int rows, int input_rows, std::int64_t code_plane, std::int64_t scale_plane, float alpha,
     OutputPolicy output, Epilogue epilogue, RowPolicy row_policy, int token_offset, int count) {
-    // Streams its weights through the K loop: wait for the producer (the activation quantizer),
-    // and let dependents launch only once that loop is done.
-    pdl::enter_streaming();
+    // Streams its weights through the K loop: stage 0 immutable weight fetch can overlap with the
+    // upstream producer (activation quantizer) before waiting on its programmatic dependency,
+    // and dependents launch only once the K loop is done.
     constexpr bool PairRows = RowPolicy::kPaired;
     const int k             = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     const int tokens        = token_offset + count;
@@ -194,8 +194,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     const int kKTiles           = k / Schedule::kBlockK;
     constexpr int kWaitGroups   = Schedule::kStages - 1;
 
+    if (0 < kKTiles) {
+        stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, 0, 0, row_begin,
+                                        row_policy, rows, k);
+    }
+    pdl::wait_for_dependencies();
+    if (0 < kKTiles) {
+        stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, code_plane, scale_plane, shared, 0, 0,
+                                            token_begin, tokens);
+        cp_commit();
+    }
+
 #pragma unroll
-    for (int stage = 0; stage < Schedule::kStages; ++stage) {
+    for (int stage = 1; stage < Schedule::kStages; ++stage) {
         if (stage < kKTiles) {
             stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, code_plane, scale_plane, shared,
                                                 stage, stage, token_begin, tokens);

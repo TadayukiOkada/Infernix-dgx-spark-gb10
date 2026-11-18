@@ -10,10 +10,142 @@
 #include "ops/kernel/sampling_device.cuh"
 #include "core/pdl.cuh"
 
+#include <type_traits>
+
 namespace infernix::ops {
 
-template <class Logit>
-__launch_bounds__(kSamplerBlock) __global__
+template <int SamplerBlock, int ItemsPerThread, int GroupBlock, int GroupItemsPerThread,
+          int PartialsPerGroup>
+struct TopKSchedule {
+    static constexpr int kSamplerBlock                   = SamplerBlock;
+    static constexpr int kSamplerTileItems               = 256;
+    static constexpr int kSamplerItemsPerThread          = ItemsPerThread;
+    static constexpr int kSamplerPartialTileItems        = SamplerBlock * ItemsPerThread;
+    static constexpr int kSamplerGroupBlock              = GroupBlock;
+    static constexpr int kSamplerGroupItemsPerThread     = GroupItemsPerThread;
+    static constexpr int kSamplerGroupTileItems          = GroupBlock * GroupItemsPerThread;
+    static constexpr int kSamplerPartialsPerGroup        = PartialsPerGroup;
+    static constexpr int kSamplingTileWarps              = SamplerBlock / 32;
+    static constexpr int kSamplingTileIndexBits          = 9;
+    static constexpr unsigned int kSamplingTileIndexMask = (1u << kSamplingTileIndexBits) - 1u;
+    static_assert(kSamplerPartialTileItems == (1 << kSamplingTileIndexBits));
+    static_assert((kSamplingTileWarps & (kSamplingTileWarps - 1)) == 0);
+};
+
+using SamplerRowSchedule      = TopKSchedule<256, 2, 256, 2, 25>;
+using SamplerParallelSchedule = TopKSchedule<128, 4, 128, 4, 25>;
+
+static_assert(SamplerParallelSchedule::kSamplerPartialTileItems == kSamplerPartialTileItems);
+static_assert(SamplerParallelSchedule::kSamplerGroupTileItems == kSamplerGroupTileItems);
+static_assert(SamplerParallelSchedule::kSamplerPartialsPerGroup == kSamplerPartialsPerGroup);
+
+template <class S>
+using SchedulePartialSort =
+    cub::BlockMergeSort<unsigned long long, S::kSamplerBlock, S::kSamplerItemsPerThread>;
+template <class S>
+using ScheduleGroupSort =
+    cub::BlockMergeSort<unsigned long long, S::kSamplerGroupBlock, S::kSamplerGroupItemsPerThread>;
+template <class S>
+using ScheduleTileWarpSort = cub::WarpMergeSort<unsigned long long, S::kSamplerItemsPerThread>;
+template <class S>
+using ScheduleBf16TileWarpSort = cub::WarpMergeSort<unsigned int, S::kSamplerItemsPerThread>;
+
+template <class S>
+struct ScheduleTileTopKStorage {
+    typename ScheduleTileWarpSort<S>::TempStorage warp[S::kSamplingTileWarps];
+    unsigned long long candidates[S::kSamplingTileWarps * kSamplerCandidateCap];
+};
+
+template <class S>
+struct ScheduleBf16TileTopKStorage {
+    typename ScheduleBf16TileWarpSort<S>::TempStorage warp[S::kSamplingTileWarps];
+    unsigned int candidates[S::kSamplingTileWarps * kSamplerCandidateCap];
+};
+
+template <class S>
+union SchedulePartialTopKStorage {
+    ScheduleTileTopKStorage<S> fp32;
+    ScheduleBf16TileTopKStorage<S> bf16;
+};
+
+// Warp-local lists are already sorted. Merge their upper halves in parallel;
+// only the global top cap entries are needed by the next stage.
+template <class S, class Key>
+__device__ inline Key sampling_merge_tile_lists(Key* candidates, int cap) {
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    Key key        = 0;
+#pragma unroll
+    for (int span = 1; span < S::kSamplingTileWarps; span *= 2) {
+        if (warp < S::kSamplingTileWarps / (2 * span)) {
+            const int first   = warp * 2 * span * kSamplerCandidateCap;
+            key               = lane < cap ? candidates[first + lane] : Key{0};
+            const int reverse = 31 - lane;
+            const Key other =
+                reverse < cap ? candidates[first + span * kSamplerCandidateCap + reverse] : Key{0};
+            key = key > other ? key : other;
+#pragma unroll
+            for (int distance = 16; distance > 0; distance /= 2) {
+                const Key opposite = __shfl_xor_sync(0xffffffffU, key, distance);
+                key                = (lane & distance) == 0 ? (key > opposite ? key : opposite)
+                                                            : (key < opposite ? key : opposite);
+            }
+            if (lane < cap) { candidates[first + lane] = key; }
+        }
+        __syncthreads();
+    }
+    return key;
+}
+
+template <class S>
+__device__ inline void
+sampling_schedule_store_tile_topk(unsigned long long (&keys)[S::kSamplerItemsPerThread], int cap,
+                                  SamplingWorkspace workspace, int col, int partial,
+                                  ScheduleTileTopKStorage<S>& storage) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    ScheduleTileWarpSort<S>(storage.warp[warp]).Sort(keys, SamplingKeyGreater{});
+#pragma unroll
+    for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
+        const int rank = lane * S::kSamplerItemsPerThread + item;
+        if (rank < kSamplerCandidateCap) {
+            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
+        }
+    }
+    __syncthreads();
+
+    const auto key = sampling_merge_tile_lists<S>(storage.candidates, cap);
+    if (warp == 0 && lane < cap) {
+        workspace.partial_keys[sampling_partial_offset(workspace, col, partial, lane)] = key;
+    }
+}
+
+template <class S>
+__device__ inline void
+sampling_schedule_store_bf16_tile_topk(unsigned int (&keys)[S::kSamplerItemsPerThread], int cap,
+                                       int tile_start, SamplingWorkspace workspace, int col,
+                                       int partial, ScheduleBf16TileTopKStorage<S>& storage) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    ScheduleBf16TileWarpSort<S>(storage.warp[warp]).Sort(keys, SamplingUintGreater{});
+#pragma unroll
+    for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
+        const int rank = lane * S::kSamplerItemsPerThread + item;
+        if (rank < kSamplerCandidateCap) {
+            storage.candidates[warp * kSamplerCandidateCap + rank] = keys[item];
+        }
+    }
+    __syncthreads();
+
+    const auto key = sampling_merge_tile_lists<S>(storage.candidates, cap);
+    if (warp == 0 && lane < cap) {
+        workspace.partial_keys[sampling_partial_offset(workspace, col, partial, lane)] =
+            sampling_expand_bf16_tile_sort_key(key, tile_start);
+    }
+}
+
+template <class Logit, class S = SamplerRowSchedule>
+__launch_bounds__(S::kSamplerBlock) __global__
     void sample_row_kernel(const Logit* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
                            std::int32_t purpose, std::int32_t token_domain,
@@ -24,8 +156,8 @@ __launch_bounds__(kSamplerBlock) __global__
     const int tid            = threadIdx.x;
     const SamplingConfig cfg = configs[row];
 
-    __shared__ float red_val[kSamplerBlock];
-    __shared__ int red_idx[kSamplerBlock];
+    __shared__ float red_val[S::kSamplerBlock];
+    __shared__ int red_idx[S::kSamplerBlock];
 
     // With penalties disabled this remains the exact raw-logit argmax route.
     if (!(cfg.temperature > 0.0f)) {
@@ -79,10 +211,10 @@ __launch_bounds__(kSamplerBlock) __global__
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
     __shared__ int n_support;
-    __shared__ float merge_val[kSamplerBlock * kSamplerFastCandidates];
-    __shared__ int merge_idx[kSamplerBlock * kSamplerFastCandidates];
+    __shared__ float merge_val[S::kSamplerBlock * kSamplerFastCandidates];
+    __shared__ int merge_idx[S::kSamplerBlock * kSamplerFastCandidates];
 
-    if (token_domain <= kSamplerTileItems) {
+    if (token_domain <= S::kSamplerTileItems) {
         sampling_build_truncated_small(logits, base, token_domain, cfg, red_val, red_idx, cand_val,
                                        cand_idx, prob, &n_support);
     } else {
@@ -111,8 +243,8 @@ __launch_bounds__(kSamplerBlock) __global__
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
-template <class Logit>
-__launch_bounds__(kSamplerBlock) __global__
+template <class Logit, class S = SamplerParallelSchedule, bool WarpTiles = true>
+__launch_bounds__(S::kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
                                       SamplingWorkspace workspace) {
@@ -122,17 +254,37 @@ __launch_bounds__(kSamplerBlock) __global__
     const SamplingConfig cfg = cfg_ptr[col];
     if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
 
-    __shared__ typename SamplingPartialSort::TempStorage sort_storage;
-    __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
-    unsigned long long keys[kSamplerItemsPerThread];
+    using SortStorage = std::conditional_t<WarpTiles, SchedulePartialTopKStorage<S>,
+                                           typename SchedulePartialSort<S>::TempStorage>;
+    __shared__ SortStorage sort_storage;
+    __shared__ unsigned long long greedy_warp_keys[S::kSamplerBlock / 32];
+    unsigned long long keys[S::kSamplerItemsPerThread];
 
     const bool greedy       = !(cfg.temperature > 0.0f);
     const bool penalties    = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
-    const int tile_start    = partial * kSamplerPartialTileItems;
+    const int tile_start    = partial * S::kSamplerPartialTileItems;
+    if constexpr (WarpTiles && std::is_same_v<Logit, __nv_bfloat16>) {
+        if (!greedy && !penalties) {
+            unsigned int raw_keys[S::kSamplerItemsPerThread];
 #pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
+                const int local = item * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+                const int v     = tile_start + local;
+                raw_keys[item]  = (v < token_domain &&
+                                  (!cfg.mask.words || (cfg.mask.words[v / 32] & (1u << (v % 32)))))
+                                      ? sampling_bf16_tile_sort_key(logits[base + v], local)
+                                      : 0u;
+            }
+            sampling_schedule_store_bf16_tile_topk<S>(raw_keys, cap, tile_start, workspace, col,
+                                                      partial, sort_storage.bf16);
+            return;
+        }
+    }
+
+#pragma unroll
+    for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float raw = sampling_logit(logits[base + v]);
@@ -146,7 +298,7 @@ __launch_bounds__(kSamplerBlock) __global__
     if (greedy) {
         unsigned long long best = keys[0];
 #pragma unroll
-        for (int item = 1; item < kSamplerItemsPerThread; ++item) {
+        for (int item = 1; item < S::kSamplerItemsPerThread; ++item) {
             if (keys[item] > best) { best = keys[item]; }
         }
         best = sampling_block_max_key(best, greedy_warp_keys);
@@ -156,19 +308,24 @@ __launch_bounds__(kSamplerBlock) __global__
         }
         return;
     }
-    SamplingPartialSort(sort_storage).Sort(keys, SamplingKeyGreater{});
+    if constexpr (WarpTiles) {
+        sampling_schedule_store_tile_topk<S>(keys, cap, workspace, col, partial, sort_storage.fp32);
+    } else {
+        SchedulePartialSort<S>(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int rank = threadIdx.x * kSamplerItemsPerThread + item;
-        if (rank < cap) {
-            const int off               = sampling_partial_offset(workspace, col, partial, rank);
-            workspace.partial_keys[off] = keys[item];
+        for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
+            const int rank = threadIdx.x * S::kSamplerItemsPerThread + item;
+            if (rank < cap) {
+                const int off               = sampling_partial_offset(workspace, col, partial, rank);
+                workspace.partial_keys[off] = keys[item];
+            }
         }
     }
 }
 
-__launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
+template <class S = SamplerParallelSchedule, bool DirectGreedy = true>
+__launch_bounds__(S::kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
     std::int32_t group_count, SamplingWorkspace workspace) {
@@ -177,24 +334,45 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     const int col            = static_cast<int>(blockIdx.y);
     const int tid            = threadIdx.x;
     const SamplingConfig cfg = cfg_ptr[col];
-    __shared__ typename SamplingGroupSort::TempStorage sort_storage;
+    __shared__ typename ScheduleGroupSort<S>::TempStorage sort_storage;
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
     __shared__ int n_support;
     __shared__ int is_last;
-    __shared__ unsigned long long greedy_warp_keys[kSamplerGroupBlock / 32];
-    unsigned long long keys[kSamplerGroupItemsPerThread];
+    __shared__ unsigned long long greedy_warp_keys[S::kSamplerGroupBlock / 32];
+    unsigned long long keys[S::kSamplerGroupItemsPerThread];
 
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes group_done[col], so caller-owned
     // workspace does not rely on prior contents or a separate memset launch.
 
-    const int group_begin = group * kSamplerPartialsPerGroup;
+    const int group_begin = group * S::kSamplerPartialsPerGroup;
     int group_partials    = partial_blocks - group_begin;
     if (group_partials < 0) { group_partials = 0; }
-    if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
+    if (group_partials > S::kSamplerPartialsPerGroup) {
+        group_partials = S::kSamplerPartialsPerGroup;
+    }
+
+    if constexpr (DirectGreedy) {
+        if (greedy) {
+            if (group != 0) { return; }
+            unsigned long long best = 0ull;
+            for (int p = tid; p < partial_blocks; p += blockDim.x) {
+                const int off = sampling_partial_offset(workspace, col, p, 0);
+                if (workspace.partial_keys[off] > best) { best = workspace.partial_keys[off]; }
+            }
+            best = sampling_block_max_key(best, greedy_warp_keys);
+            if (tid == 0) {
+                const int picked = isfinite(sampling_key_float(best)) ? sampling_key_index(best)
+                                                                      : sampling_report_nonfinite(cfg);
+                out[col]         = picked;
+                if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+            }
+            return;
+        }
+    }
 
     if (greedy) {
         unsigned long long best = 0ull;
@@ -231,7 +409,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
 
     const int group_n = group_partials * cap;
 #pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+    for (int item = 0; item < S::kSamplerGroupItemsPerThread; ++item) {
         const int p = item * blockDim.x + tid;
         if (p < group_n) {
             const int partial = group_begin + p / cap;
@@ -242,11 +420,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
             keys[item] = 0ull;
         }
     }
-    SamplingGroupSort(sort_storage).Sort(keys, SamplingKeyGreater{});
+    ScheduleGroupSort<S>(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int rank = tid * kSamplerGroupItemsPerThread + item;
+    for (int item = 0; item < S::kSamplerGroupItemsPerThread; ++item) {
+        const int rank = tid * S::kSamplerGroupItemsPerThread + item;
         if (rank < cap) {
             const int out_off =
                 sampling_partial_offset(workspace, col, partial_blocks + group, rank);
@@ -265,7 +443,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
 
     const int final_n = group_count * cap;
 #pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+    for (int item = 0; item < S::kSamplerGroupItemsPerThread; ++item) {
         const int p = item * blockDim.x + tid;
         if (p < final_n) {
             const int partial = partial_blocks + p / cap;
@@ -276,11 +454,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
             keys[item] = 0ull;
         }
     }
-    SamplingGroupSort(sort_storage).Sort(keys, SamplingKeyGreater{});
+    ScheduleGroupSort<S>(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int rank = tid * kSamplerGroupItemsPerThread + item;
+    for (int item = 0; item < S::kSamplerGroupItemsPerThread; ++item) {
+        const int rank = tid * S::kSamplerGroupItemsPerThread + item;
         if (rank < cap) {
             cand_val[rank] = sampling_key_float(keys[item]);
             cand_idx[rank] = sampling_key_index(keys[item]);

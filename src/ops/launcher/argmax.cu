@@ -33,7 +33,7 @@ int tiled_block_for(std::int32_t physical_rows, std::int32_t valid_rows, std::in
     return kArgmaxBlock;
 }
 
-template <class Logit>
+template <class Logit, int MaxBlock = kArgmaxBlock, int Items = kArgmaxItemsPerThread>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream);
 
@@ -42,13 +42,20 @@ void argmax_typed(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cu
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t t_count       = logits.ne[1];
     // One CTA per column up to one block of rows; the tiled kernel beyond (each CTA covers
-    // kArgmaxItemsPerThread rows per thread).
+    // Items rows per thread).
     if (div_up(valid_rows, kArgmaxBlock) < 2) {
         argmax_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
             static_cast<const Logit*>(logits.data), static_cast<std::int32_t*>(out.data), valid_rows,
             physical_rows);
         CUDA_CHECK(cudaGetLastError());
         return;
+    }
+    if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
+        if (physical_rows == kFullPhysicalRows && valid_rows == kFullValidRows &&
+            (reinterpret_cast<std::uintptr_t>(logits.data) & 15U) == 0) {
+            argmax_tiled_atomic_launch<__nv_bfloat16, 256, 8>(logits, out, valid_rows, 256, stream);
+            return;
+        }
     }
     argmax_tiled_atomic_launch<Logit>(logits, out, valid_rows, tiled_block_for(physical_rows, valid_rows, t_count),
                                       stream);
@@ -146,12 +153,12 @@ void argmax_map_launch(const Tensor& row_ids, Tensor& out, cudaStream_t stream) 
 
 namespace {
 
-template <class Logit>
+template <class Logit, int MaxBlock, int Items>
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t t_count       = logits.ne[1];
-    const int tiled_blocks           = div_up(valid_rows, block * kArgmaxItemsPerThread);
+    const int tiled_blocks           = div_up(valid_rows, block * Items);
     for_each_token_slice(t_count, 1, [&](int token_offset, int token_count) {
         const Tensor logits_slice = logits.slice(1, token_offset, token_count);
         Tensor out_slice          = out.slice(0, token_offset, token_count);
@@ -161,7 +168,7 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
         const dim3 grid(static_cast<unsigned int>(tiled_blocks),
                         static_cast<unsigned int>(token_count));
         CUDA_CHECK(pdl::launch_consumer(
-            {dim3(grid), dim3(block), 0, stream}, argmax_tiled_atomic_kernel<Logit>,
+            {dim3(grid), dim3(block), 0, stream}, argmax_tiled_atomic_kernel<Logit, MaxBlock, Items>,
             static_cast<const Logit*>(logits_slice.data),
             static_cast<std::int32_t*>(out_slice.data), valid_rows, physical_rows));
         CUDA_CHECK(cudaGetLastError());

@@ -28,24 +28,28 @@ void sample_batch(const Logit* logits, Tensor& out, std::int32_t token_domain, s
                   std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch);
     if (!layout.multiblock) {
-        sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
-            logits, static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
-            physical_rows);
+        sample_row_kernel<Logit, SamplerRowSchedule>
+            <<<static_cast<unsigned int>(batch), SamplerRowSchedule::kSamplerBlock, 0, stream>>>(
+                logits, static_cast<std::int32_t*>(out.data), configs, positions, purpose,
+                token_domain, physical_rows);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const std::int32_t groups         = sampler_group_count(partial_blocks);
-    const SamplingWorkspace scratch   = layout.bind(workspace);
+    const std::int32_t partial_blocks =
+        div_up(token_domain, SamplerParallelSchedule::kSamplerPartialTileItems);
+    const std::int32_t groups       = sampler_group_count(partial_blocks);
+    const SamplingWorkspace scratch = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(batch));
-    sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(logits, configs, token_domain,
-                                                                             physical_rows, scratch);
+    sampling_partial_topk_kernel<Logit, SamplerParallelSchedule, true>
+        <<<partial_grid, SamplerParallelSchedule::kSamplerBlock, 0, stream>>>(
+            logits, configs, token_domain, physical_rows, scratch);
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
-    sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
-        static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
-        partial_blocks, groups, scratch);
+    sampling_group_finalize_sample_kernel<SamplerParallelSchedule, true>
+        <<<group_grid, SamplerParallelSchedule::kSamplerGroupBlock, 0, stream>>>(
+            static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
+            partial_blocks, groups, scratch);
     CUDA_CHECK(cudaGetLastError());
 }
 

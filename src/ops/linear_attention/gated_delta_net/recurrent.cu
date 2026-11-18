@@ -123,8 +123,24 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    CUDA_CHECK(
-        pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_kernel<Masked, State>, access));
+    const auto alignment = reinterpret_cast<std::uintptr_t>(q.data) |
+                           reinterpret_cast<std::uintptr_t>(k.data) |
+                           reinterpret_cast<std::uintptr_t>(v.data);
+    if ((alignment & 15U) == 0U && q.ne[2] <= 16) {
+        if (q.ne[2] <= 4) {
+            CUDA_CHECK(pdl::launch_consumer(
+                {grid, block, 0, stream}, recurrent_record_window_kernel<Masked, State, 4>, access));
+        } else if (q.ne[2] <= 8) {
+            CUDA_CHECK(pdl::launch_consumer(
+                {grid, block, 0, stream}, recurrent_record_window_kernel<Masked, State, 8>, access));
+        } else {
+            CUDA_CHECK(pdl::launch_consumer(
+                {grid, block, 0, stream}, recurrent_record_window_kernel<Masked, State, 16>, access));
+        }
+    } else {
+        CUDA_CHECK(
+            pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_kernel<Masked, State>, access));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -147,16 +163,31 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
         records.spec.width,
         rows,
     };
+    std::int32_t max_valid = records.spec.width;
     if (device_rows != nullptr) {
         access.device_slots  = device_rows->slots;
         access.device_commit = device_rows->commit_columns;
         access.slot_count    = states.spec.slot_count;
+    } else {
+        max_valid = 0;
+        for (std::int32_t r = 0; r < active_rows; ++r) {
+            if (rows.row[r].commit_columns > max_valid) { max_valid = rows.row[r].commit_columns; }
+        }
     }
-    const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
-                    static_cast<unsigned>(active_rows),
-                    static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
-    const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_fold_kernel<Geometry, State><<<grid, block, 0, stream>>>(access);
+    if (max_valid <= kFoldWindow &&
+        (reinterpret_cast<std::uintptr_t>(records.value.data) & 15U) == 0U) {
+        const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads * kFoldTiles),
+                        static_cast<unsigned>(active_rows),
+                        static_cast<unsigned>(Geometry::kLayers));
+        const dim3 block(kWarpSize, kFoldWarps, 1);
+        recurrent_fold_kernel<Geometry, State><<<grid, block, 0, stream>>>(access);
+    } else {
+        const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
+                        static_cast<unsigned>(active_rows),
+                        static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
+        const dim3 block(kWarpSize, kNumWarps, 1);
+        recurrent_fold_fallback_kernel<Geometry, State><<<grid, block, 0, stream>>>(access);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

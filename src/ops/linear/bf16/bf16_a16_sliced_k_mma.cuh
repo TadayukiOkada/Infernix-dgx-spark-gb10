@@ -6,13 +6,15 @@
 #include <cstdint>
 
 namespace infernix::ops::detail {
-// An Output may gather its tile rows (screened_head's exact rescore of listed rows): with
-// `weight_row(row)` the kernel reads weight row weight_row(row) for output row `row`, and with
-// `skip_tile(row0)` a tile it reports empty exits after the dependency wait. Every row's arithmetic
-// is the dense call's, so a gathered row carries the same bits.
-template <class Output>
+// An Output may gather its tile rows (screened_head's exact rescore of listed rows), or a Schedule
+// may reorder rows (dynamic_grouped_conv's paired gate/up coefficients): with `weight_row(row)` the
+// kernel reads weight row weight_row(row) for output row `row`, and with `skip_tile(row0)` a tile it
+// reports empty exits after the dependency wait.
+template <class Schedule, class Output>
 __device__ __forceinline__ std::int64_t bf16_sliced_k_weight_row(const Output& output, int row) {
-    if constexpr (requires { output.weight_row(row); }) {
+    if constexpr (requires { Schedule::weight_row(row); }) {
+        return static_cast<std::int64_t>(Schedule::weight_row(row));
+    } else if constexpr (requires { output.weight_row(row); }) {
         return output.weight_row(row);
     } else {
         return static_cast<std::int64_t>(row);
@@ -20,16 +22,11 @@ __device__ __forceinline__ std::int64_t bf16_sliced_k_weight_row(const Output& o
 }
 
 template <class Schedule, class Output, class Epilogue>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
-    Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset) {
-    // Streams its weights through the K loop: wait for the producer first, and let dependents
-    // launch only once that loop is done.
-    pdl::enter_streaming();
-    if constexpr (requires { output.skip_tile(0); }) {
-        if (output.skip_tile(static_cast<int>(blockIdx.x) * Schedule::kBlockRows)) { return; }
-    }
+__device__ __forceinline__ void
+bf16_a16_sliced_k_mma_body(const __nv_bfloat16* __restrict__ x,
+                           const __nv_bfloat16* __restrict__ weight, Output output,
+                           Epilogue epilogue, int rows, int input_rows, int tokens, int row_tile,
+                           int token0, unsigned char* shared_raw) {
     const int kHidden          = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kMmaRows     = Schedule::kBlockRows;
     constexpr int kMmaK        = Schedule::kWarpK;
@@ -37,21 +34,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     constexpr int kBlockTokens = Schedule::kBlockTokens;
     constexpr int kTokenMmas   = Schedule::kMmaTokens;
     constexpr int kBlockK      = Schedule::kBlockK;
+    constexpr bool kCollective = requires { Epilogue::kSlicedTile; };
     const int kGroups = kHidden / kBlockK + (bf16_predicated_k<Schedule> && kHidden % kBlockK != 0);
     static_assert((kMmaK % 16) == 0);
 
-    extern __shared__ __align__(16) unsigned char shared_raw[];
     auto* staging = reinterpret_cast<__nv_bfloat16*>(shared_raw);
     auto* partial = reinterpret_cast<float*>(shared_raw);
 
-    const int tid          = static_cast<int>(threadIdx.x);
-    const int warp         = tid >> 5;
-    const int lane         = tid & 31;
-    const int gid          = lane >> 2;
-    const int lid          = lane & 3;
-    const int row0         = static_cast<int>(blockIdx.x) * Schedule::kBlockRows;
-    const int token0       = token_offset + static_cast<int>(blockIdx.y) * kBlockTokens;
-    const auto destination = linear_output_tile<Schedule::kBlockRows>(output, row0);
+    const int tid              = static_cast<int>(threadIdx.x);
+    const int warp             = tid >> 5;
+    const int lane             = tid & 31;
+    const int gid              = lane >> 2;
+    const int lid              = lane & 3;
+    const int row0             = row_tile * Schedule::kBlockRows;
+    const auto destination     = linear_output_tile<Schedule::kBlockRows>(output, row0);
+    constexpr int kPhaseStride = Schedule::kKPhaseStride;
+    const int phase =
+        kPhaseStride ? static_cast<int>(static_cast<std::int64_t>(row_tile) * kPhaseStride % kGroups)
+                     : 0;
 
     const int a_matrix     = lane >> 3;
     const int a_inner_row  = lane & 7;
@@ -65,7 +65,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     float accum[kFragments][4] = {};
 
     const auto stage_group = [&](int stage, int group) {
-        const int group_k0  = group * kBlockK;
+        int ordered_group = group;
+        if constexpr (kPhaseStride > 0) {
+            ordered_group += phase;
+            if (ordered_group >= kGroups) ordered_group -= kGroups;
+        }
+        const int group_k0  = ordered_group * kBlockK;
         auto* weight_shared = staging + stage * Schedule::kStageElements;
         auto* x_shared      = weight_shared + kMmaRows * kBlockK;
 
@@ -78,12 +83,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                 const bool valid = (!bf16_predicated_rows<Schedule> || row0 + row < rows) &&
                                    (!bf16_predicated_k<Schedule> || group_k0 + k8 * 8 < kHidden);
                 const auto source =
-                    valid ? bf16_sliced_k_weight_row(output, row0 + row) * kHidden + group_k0 + k8 * 8 : 0;
+                    valid
+                        ? bf16_sliced_k_weight_row<Schedule>(output, row0 + row) * kHidden +
+                              group_k0 + k8 * 8
+                        : 0;
                 cp_async_zfill<16, Schedule::kWeightCache>(dst, weight + source, valid ? 16 : 0);
             } else {
                 cp_async<16, Schedule::kWeightCache>(
-                    dst,
-                    &weight[bf16_sliced_k_weight_row(output, row0 + row) * kHidden + group_k0 + k8 * 8]);
+                    dst, &weight[bf16_sliced_k_weight_row<Schedule>(output, row0 + row) * kHidden +
+                                 group_k0 + k8 * 8]);
             }
         }
 
@@ -106,25 +114,52 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         const auto* x_shared      = weight_shared + kMmaRows * kBlockK;
 #pragma unroll
         for (int k_step = 0; k_step < kMmaK / 16; ++k_step) {
-#pragma unroll
-            for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
-                unsigned a_frag[4];
-                const int a_col = warp_k0 + k_step * 16 + a_col_offset;
-                const int a_row = mi * 16 + a_row_offset;
-                ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-                            smem_addr(weight_shared + a_row * kBlockK +
-                                      bf16_mma_shared_col<Schedule>(a_row, a_col)));
+            if constexpr (Schedule::kReuseBFragments) {
+                unsigned b_frag[kTokenMmas][2];
 #pragma unroll
                 for (int ni = 0; ni < kTokenMmas; ++ni) {
-                    unsigned b_frag[2];
                     const int b_row = ni * 8 + b_inner_row;
                     const int b_col = warp_k0 + k_step * 16 + b_k_offset;
-                    ldmatrix_x2(b_frag[0], b_frag[1],
+                    ldmatrix_x2(b_frag[ni][0], b_frag[ni][1],
                                 smem_addr(x_shared + b_row * kBlockK +
                                           bf16_mma_shared_col<Schedule>(b_row, b_col)));
-                    auto& c = accum[mi * kTokenMmas + ni];
-                    mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2], a_frag[3],
-                             b_frag[0], b_frag[1]);
+                }
+#pragma unroll
+                for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
+                    unsigned a_frag[4];
+                    const int a_col = warp_k0 + k_step * 16 + a_col_offset;
+                    const int a_row = mi * 16 + a_row_offset;
+                    ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                                smem_addr(weight_shared + a_row * kBlockK +
+                                          bf16_mma_shared_col<Schedule>(a_row, a_col)));
+#pragma unroll
+                    for (int ni = 0; ni < kTokenMmas; ++ni) {
+                        auto& c = accum[mi * kTokenMmas + ni];
+                        mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                                 b_frag[ni][0], b_frag[ni][1]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int mi = 0; mi < Schedule::kMmaRows; ++mi) {
+                    unsigned a_frag[4];
+                    const int a_col = warp_k0 + k_step * 16 + a_col_offset;
+                    const int a_row = mi * 16 + a_row_offset;
+                    ldmatrix_x4(a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                                smem_addr(weight_shared + a_row * kBlockK +
+                                          bf16_mma_shared_col<Schedule>(a_row, a_col)));
+#pragma unroll
+                    for (int ni = 0; ni < kTokenMmas; ++ni) {
+                        unsigned b_frag[2];
+                        const int b_row = ni * 8 + b_inner_row;
+                        const int b_col = warp_k0 + k_step * 16 + b_k_offset;
+                        ldmatrix_x2(b_frag[0], b_frag[1],
+                                    smem_addr(x_shared + b_row * kBlockK +
+                                              bf16_mma_shared_col<Schedule>(b_row, b_col)));
+                        auto& c = accum[mi * kTokenMmas + ni];
+                        mma_bf16(c[0], c[1], c[2], c[3], a_frag[0], a_frag[1], a_frag[2], a_frag[3],
+                                 b_frag[0], b_frag[1]);
+                    }
                 }
             }
         }
@@ -158,11 +193,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
     }
     pdl::trigger_dependents();
 
+    // Each warp pair reuses one partial tile: odd publishes, even consumes and replaces it.
     if ((warp & 1) != 0) {
 #pragma unroll
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t base =
-                (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
+                (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
             store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
                       make_float4(accum[fragment][0], accum[fragment][1], accum[fragment][2],
                                   accum[fragment][3]));
@@ -174,7 +210,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
 #pragma unroll
         for (int fragment = 0; fragment < kFragments; ++fragment) {
             const std::int64_t partner_base =
-                (static_cast<std::int64_t>(warp + 1) * kFragments + fragment) * 32 * 4;
+                (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
             float4 partner = {};
             if constexpr (kKWarps % 2 == 0) {
                 partner =
@@ -189,7 +225,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
             accum[fragment][3] += partner.w;
             if (warp != 0) {
                 const std::int64_t base =
-                    (static_cast<std::int64_t>(warp) * kFragments + fragment) * 32 * 4;
+                    (static_cast<std::int64_t>(warp / 2) * kFragments + fragment) * 32 * 4;
                 store_vec(partial + base + static_cast<std::int64_t>(lane) * 4,
                           make_float4(accum[fragment][0], accum[fragment][1], accum[fragment][2],
                                       accum[fragment][3]));
@@ -206,7 +242,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
 #pragma unroll
             for (int split = 2; split < kKWarps; split += 2) {
                 const std::int64_t base =
-                    (static_cast<std::int64_t>(split) * kFragments + fragment) * 32 * 4;
+                    (static_cast<std::int64_t>(split / 2) * kFragments + fragment) * 32 * 4;
                 const float4 value =
                     load_vec<float4>(partial + base + static_cast<std::int64_t>(lane) * 4);
                 sum.x += value.x;
@@ -214,12 +250,55 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
                 sum.z += value.z;
                 sum.w += value.w;
             }
-            const int mi = fragment / kTokenMmas, ni = fragment % kTokenMmas;
+            const int mi    = fragment / kTokenMmas;
+            const int ni    = fragment % kTokenMmas;
             const int token = token0 + ni * 8 + 2 * lid;
-            bf16_finish_fragment<false, decltype(destination), Epilogue,
-                                 !bf16_predicated_rows<Schedule>>(
-                destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            if constexpr (kCollective) {
+                const LinearFloatTileOutput<kMmaRows> tile{partial, row0, token0};
+                bf16_finish_fragment<false, decltype(tile), LinearIdentityEpilogue,
+                                     !bf16_predicated_rows<Schedule>>(
+                    tile, LinearIdentityEpilogue{}, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            } else {
+                bf16_finish_fragment<false, decltype(destination), Epilogue,
+                                     !bf16_predicated_rows<Schedule>>(
+                    destination, epilogue, row0 + mi * 16 + gid, token, sum, rows, tokens);
+            }
         }
     }
+    if constexpr (kCollective) {
+        __syncthreads();
+        epilogue.template finish_sliced_tile<Schedule>(output, partial, row0, token0, rows, tokens);
+    }
+}
+
+template <class Schedule, class Output, class Epilogue>
+__global__ __launch_bounds__(
+    Schedule::kThreads,
+    gb10_bf16_clamp_min_blocks(Schedule::kMinBlocksPerSm,
+                               bf16_mma_shared_bytes<Schedule, Epilogue>)) void
+bf16_a16_sliced_k_mma_kernel(const __nv_bfloat16* __restrict__ x,
+                             const __nv_bfloat16* __restrict__ weight, Output output,
+                             Epilogue epilogue, int rows, int input_rows, int tokens,
+                             int token_offset, int count) {
+    // Streams its weights through the K loop: wait for the producer first, and let dependents
+    // launch only once that loop is done.
+    pdl::enter_streaming();
+    int row_tile   = static_cast<int>(blockIdx.x);
+    int token_tile = static_cast<int>(blockIdx.y);
+    if constexpr (Schedule::kRaster != Bf16MmaRaster::RowFast) {
+        const int row_tiles = bf16_predicated_rows<Schedule>
+                                  ? (rows + Schedule::kBlockRows - 1) / Schedule::kBlockRows
+                                  : rows / Schedule::kBlockRows;
+        bf16_mma_tile_coordinates<Schedule>(
+            static_cast<int>(blockIdx.x), row_tiles,
+            (count + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens, row_tile, token_tile);
+    }
+    if constexpr (requires { output.skip_tile(0); }) {
+        if (output.skip_tile(row_tile * Schedule::kBlockRows)) { return; }
+    }
+    extern __shared__ __align__(16) unsigned char shared_raw[];
+    bf16_a16_sliced_k_mma_body<Schedule>(
+        x, weight, output, epilogue, rows, input_rows, tokens, row_tile,
+        token_offset + token_tile * Schedule::kBlockTokens, shared_raw);
 }
 } // namespace infernix::ops::detail

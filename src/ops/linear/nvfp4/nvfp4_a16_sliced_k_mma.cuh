@@ -177,27 +177,64 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
 #pragma unroll
         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
-            const int code_col = k_step * 16 + lid * 2;
-            const int byte0    = (warp_k0 + code_col) / 2;
-            const int byte_hi  = byte0 / 16;
-            const int byte_lo  = byte0 & 15;
-            const auto load_two_pairs = [&](int row, std::uint32_t scale_f16x2, unsigned& out0,
-                                            unsigned& out1) {
-                const int offset = (byte_hi ^ (row & kCodeSwizzle)) * 16 + byte_lo;
-                nvfp4_scaled_two_pairs_bf16_f16scale(code_shared[stage][row][offset], code_shared[stage][row][offset + 4],
-                                                     scale_f16x2, out0, out1);
-            };
+            constexpr bool kVectorCodes = [] {
+                if constexpr (requires { Schedule::kVectorCodes; }) {
+                    return Schedule::kVectorCodes;
+                } else {
+                    return true;
+                }
+            }();
             unsigned a[kRowTiles][4];
+            if constexpr (kVectorCodes) {
+                const int byte0    = (warp_k0 + k_step * 16) / 2;
+                const int byte_hi  = byte0 / 16;
+                const int byte_lo  = byte0 & 15;
+                const int lid_bits = lid * 8;
+                const auto load_two_pairs = [&](int row, std::uint32_t scale_f16x2, unsigned& out0,
+                                                unsigned& out1) {
+                    const int offset   = (byte_hi ^ (row & kCodeSwizzle)) * 16 + byte_lo;
+                    const uint2 packed = load_vec<uint2>(&code_shared[stage][row][offset]);
+                    nvfp4_scaled_two_pairs_bf16_f16scale(
+                        static_cast<std::uint8_t>((packed.x >> lid_bits) & 0xffu),
+                        static_cast<std::uint8_t>((packed.y >> lid_bits) & 0xffu), scale_f16x2,
+                        out0, out1);
+                };
 #pragma unroll
-            for (int tile = 0; tile < kRowTiles; ++tile) {
-                const int top    = tile * 16 + gid;
-                // The row pair's two E4M3 scales go through one cvt.rn.f16x2.e4m3x2.
-                std::uint32_t mult_top, mult_bot;
-                nvfp4_unpack_two_scales_f16x2(
-                    static_cast<std::uint8_t>(scale_top[tile] >> (k_step * 8)),
-                    static_cast<std::uint8_t>(scale_bot[tile] >> (k_step * 8)), mult_top, mult_bot);
-                load_two_pairs(top, mult_top, a[tile][0], a[tile][2]);
-                load_two_pairs(top + 8, mult_bot, a[tile][1], a[tile][3]);
+                for (int tile = 0; tile < kRowTiles; ++tile) {
+                    const int top = tile * 16 + gid;
+                    // The row pair's two E4M3 scales go through one cvt.rn.f16x2.e4m3x2.
+                    std::uint32_t mult_top, mult_bot;
+                    nvfp4_unpack_two_scales_f16x2(
+                        static_cast<std::uint8_t>(scale_top[tile] >> (k_step * 8)),
+                        static_cast<std::uint8_t>(scale_bot[tile] >> (k_step * 8)), mult_top,
+                        mult_bot);
+                    load_two_pairs(top, mult_top, a[tile][0], a[tile][2]);
+                    load_two_pairs(top + 8, mult_bot, a[tile][1], a[tile][3]);
+                }
+            } else {
+                const int code_col = k_step * 16 + lid * 2;
+                const int byte0    = (warp_k0 + code_col) / 2;
+                const int byte_hi  = byte0 / 16;
+                const int byte_lo  = byte0 & 15;
+                const auto load_two_pairs = [&](int row, std::uint32_t scale_f16x2, unsigned& out0,
+                                                unsigned& out1) {
+                    const int offset = (byte_hi ^ (row & kCodeSwizzle)) * 16 + byte_lo;
+                    nvfp4_scaled_two_pairs_bf16_f16scale(
+                        code_shared[stage][row][offset], code_shared[stage][row][offset + 4],
+                        scale_f16x2, out0, out1);
+                };
+#pragma unroll
+                for (int tile = 0; tile < kRowTiles; ++tile) {
+                    const int top = tile * 16 + gid;
+                    // The row pair's two E4M3 scales go through one cvt.rn.f16x2.e4m3x2.
+                    std::uint32_t mult_top, mult_bot;
+                    nvfp4_unpack_two_scales_f16x2(
+                        static_cast<std::uint8_t>(scale_top[tile] >> (k_step * 8)),
+                        static_cast<std::uint8_t>(scale_bot[tile] >> (k_step * 8)), mult_top,
+                        mult_bot);
+                    load_two_pairs(top, mult_top, a[tile][0], a[tile][2]);
+                    load_two_pairs(top + 8, mult_bot, a[tile][1], a[tile][3]);
+                }
             }
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {

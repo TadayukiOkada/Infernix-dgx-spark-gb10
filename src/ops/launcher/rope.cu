@@ -145,8 +145,24 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
             }
         }
     }
-    if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) {
-        launch_fixed<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, execution, coefficients);
+    if (axes == 2 && q.ne[0] == 72 && k.ne[0] == 72 && rotary_dim == 72 && theta == 10'000.0F &&
+        q.ne[1] == 16 && k.ne[1] == 16) {
+        const int tokens = positions.ne[0];
+        if (tokens < 32) {
+            launch_fixed_block<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, 512, stream,
+                                                                 coefficients);
+        } else if (((reinterpret_cast<std::uintptr_t>(q.data) |
+                     reinterpret_cast<std::uintptr_t>(k.data)) &
+                    7U) == 0 &&
+                   q.nb[2] % 8 == 0 && k.nb[2] % 8 == 0) {
+            rope_axial_vector_kernel<256, Coefficients><<<tokens, 256, 0, stream>>>(
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), tokens,
+                token_stride(&q), token_stride(&k), coefficients);
+        } else {
+            launch_fixed_block<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, 256, stream,
+                                                                 coefficients);
+        }
         return true;
     }
     return false;

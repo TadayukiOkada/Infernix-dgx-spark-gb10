@@ -179,6 +179,49 @@ kv_cache_nvfp4_quantize_group16_warp(const float* row, int lane) {
     return best;
 }
 
+// Register-only D256 group-16 encoder for contiguous lane layout (`half_group[j]` is feature
+// `8 * lane + j`). Lane pair `(2*g, 2*g + 1)` owns group `g`: even lane evaluates targets [0, 3)
+// and odd lane evaluates targets [3, 5) over the shared 16-value group, producing the exact same
+// bytes as `kv_cache_nvfp4_quantize_group16_warp` without shared memory or warp barriers. Even
+// lanes `(lane & 1) == 0` hold the winning result for group `lane >> 1`.
+__device__ __forceinline__ KVCacheNvfp4QuantizedGroup16
+kv_cache_nvfp4_quantize_group16_contiguous(const float (&half_group)[8], int lane) {
+    constexpr unsigned FullMask = 0xffffffffU;
+    const bool even             = (lane & 1) == 0;
+    float local_max             = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { local_max = fmaxf(local_max, fabsf(half_group[j])); }
+    const float max_abs = fmaxf(local_max, __shfl_xor_sync(FullMask, local_max, 1));
+
+    float values[16];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float peer = __shfl_xor_sync(FullMask, half_group[j], 1);
+        values[j]        = even ? half_group[j] : peer;
+        values[j + 8]    = even ? peer : half_group[j];
+    }
+
+    KVCacheNvfp4QuantizedGroup16 best{};
+    float error = CUDART_INF_F;
+    if (max_abs != 0.0F) {
+        constexpr int Split = (kKVCacheNvfp4ScaleTargetCount + 1) / 2;
+        kv_cache_nvfp4_group16_targets(values, max_abs, even ? 0 : Split,
+                                       even ? Split : kKVCacheNvfp4ScaleTargetCount, even, best,
+                                       error);
+    }
+    const float odd_error = __shfl_xor_sync(FullMask, error, 1);
+    const auto odd_lo     = __shfl_xor_sync(FullMask, best.codes_lo, 1);
+    const auto odd_hi     = __shfl_xor_sync(FullMask, best.codes_hi, 1);
+    const auto odd_scale =
+        static_cast<std::uint8_t>(__shfl_xor_sync(FullMask, static_cast<unsigned>(best.scale), 1));
+    if (even && max_abs != 0.0F && odd_error < error) {
+        best.codes_lo = odd_lo;
+        best.codes_hi = odd_hi;
+        best.scale    = odd_scale;
+    }
+    return best;
+}
+
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t* codes,
                                                              std::uint8_t scale_code) {
     // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable

@@ -84,7 +84,7 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4A4Workspace 
         nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
         Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
                             static_cast<__nv_bfloat16*>(z.data)},
-        LinearIdentityEpilogue{}, stream);
+        LinearIdentityEpilogue{}, stream, {}, pdl::Dependency::Programmatic);
 }
 
 void launch_a4_schedule(Nvfp4GdnInputA4ScheduleId schedule, const Tensor& x, const Weight& weight,

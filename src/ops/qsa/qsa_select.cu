@@ -8,6 +8,8 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/pdl.cuh"
+#include "ops/common/memory.cuh"
+#include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
@@ -443,6 +445,227 @@ __global__ void __launch_bounds__(kWideThreads, kWideCtasPerSm)
     pdl::trigger_dependents();
 }
 
+// ------------------------------------------------------------------------- Tensor Core scoring
+
+// Fast-path BF16 Tensor Core m16n8k16 scoring for width >= 4 (verify, MTP, and prompt chunks).
+// Each CTA walks a persistent work-map of (query tile, 64-key block) jobs, staging 64 pooled BF16
+// keys with cp.async into bank-conflict-free swizzled shared memory and scoring 4 queries x 4 heads
+// per 16 MMA rows with FP32 accumulation.
+constexpr int kMmaKeyTile  = 64;
+constexpr int kMmaMaxTiles = 64; // at width >= 4, a 128-column pass has at most 34 row tiles
+
+__device__ __forceinline__ void cp_async_cg_l2_retain_16(void* smem_dst, const void* gmem_src) {
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, 16, %2;\n"
+                 :
+                 : "r"(smem_addr(smem_dst)), "l"(gmem_src), "l"(policy));
+}
+
+template <int Capacity>
+struct MmaWorkMap {
+    static_assert(Capacity % 32 == 0);
+    int length[Capacity];
+    int prefix[Capacity + 1];
+    int groups;
+
+    __device__ __forceinline__ int group_for(int job) const {
+        int lo = 0, hi = groups;
+        while (lo + 1 < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (prefix[mid] <= job) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+};
+
+template <int Tile, bool Vector, int Stages, bool RetainKeys = false>
+__global__ void __launch_bounds__(Tile > 16 ? Tile * 8 : 128)
+    qsa_score_mma_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
+                         const std::int32_t* __restrict__ tables, int table_stride,
+                         const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
+                         int width, int ratio, int top_blocks, int group_begin, int group_columns,
+                         const ScoreTiles tiles, float* __restrict__ scores, int score_stride,
+                         std::uint32_t* __restrict__ clear, int clear_words, QsaPageSpaces spaces) {
+    constexpr int Threads   = Tile > 16 ? Tile * 8 : 128;
+    constexpr int KeyGroups = Tile > 16 ? 1 : 16 / Tile;
+    constexpr int WarpKeys  = kMmaKeyTile / KeyGroups;
+    constexpr int NT        = WarpKeys / 8;
+    static_assert(Tile >= 4 && Tile <= 128 && (Tile & (Tile - 1)) == 0);
+    static_assert(Stages == 1 || Stages == 2);
+
+    pdl::enter_streaming();
+    const int tid = static_cast<int>(threadIdx.x);
+    if (clear != nullptr) {
+        const int total_threads = static_cast<int>(gridDim.x) * Threads;
+        const int global_tid    = static_cast<int>(blockIdx.x) * Threads + tid;
+        for (int i = global_tid; i < clear_words; i += total_threads) { clear[i] = 0; }
+    }
+
+    __shared__ MmaWorkMap<kMmaMaxTiles> jobs;
+    __shared__ int col_blocks[kQsaSelectGroupColumns];
+    extern __shared__ __align__(1024) bf16 pipe_keys[];
+
+    int my_blocks = 0;
+    if (tid < group_columns) {
+        my_blocks       = (positions[group_begin + tid] + 1) / ratio;
+        col_blocks[tid] = my_blocks;
+    }
+    if (!__syncthreads_or(my_blocks > top_blocks)) {
+        pdl::trigger_dependents();
+        return;
+    }
+    if (tid < tiles.count) {
+        const int c0 = tiles.first[tid], nc = tiles.columns[tid];
+        int tile_max = 0;
+        for (int c = 0; c < nc; ++c) { tile_max = max(tile_max, col_blocks[c0 + c]); }
+        jobs.length[tid] = tile_max;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        int carry = 0;
+#pragma unroll
+        for (int part = 0; part < kMmaMaxTiles / 32; ++part) {
+            const int g   = part * 32 + tid;
+            const int n_b = g < tiles.count ? jobs.length[g] : 0;
+            int sum       = n_b > top_blocks ? (n_b + kMmaKeyTile - 1) / kMmaKeyTile : 0;
+#pragma unroll
+            for (int shift = 1; shift < 32; shift <<= 1) {
+                const int x = __shfl_up_sync(kFullMask, sum, shift);
+                if (tid >= shift) { sum += x; }
+            }
+            if (g < tiles.count) { jobs.prefix[g + 1] = carry + sum; }
+            carry += __shfl_sync(kFullMask, sum, 31);
+        }
+        if (tid == 0) {
+            jobs.prefix[0] = 0;
+            jobs.groups    = tiles.count;
+        }
+    }
+    __syncthreads();
+
+    const int total = jobs.prefix[jobs.groups];
+    if (static_cast<int>(blockIdx.x) >= total) {
+        pdl::trigger_dependents();
+        return;
+    }
+
+    const int lane       = tid & 31;
+    const int warp       = tid >> 5;
+    const int slot_width = kIndexDim / ratio;
+    const float scale    = rsqrtf(static_cast<float>(kIndexDim));
+
+    auto stage = [&](int job, int buffer) {
+        const int group           = jobs.group_for(job);
+        const int c0              = tiles.first[group];
+        const int row_idx         = (group_begin + c0) / width;
+        const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[row_idx]) * table_stride;
+        const int g0              = (job - jobs.prefix[group]) * kMmaKeyTile;
+        const int group_len       = jobs.length[group];
+        bf16* dst                 = pipe_keys + buffer * kMmaKeyTile * kIndexDim;
+        for (int i = tid; i < kMmaKeyTile * 16; i += Threads) {
+            const int k_row = i / 16;
+            const int d     = (i % 16) * 8;
+            bf16* out       = dst + k_row * kIndexDim + (d ^ ((k_row & 7) << 3));
+            if (g0 + k_row < group_len) {
+                const int token = ratio * (g0 + k_row);
+                int local;
+                const bf16* plane = qsa_pooled_plane(spaces, pooled, table[token >> kPagedKVPageShift], local);
+                const bf16* in    = plane + static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * local +
+                                    static_cast<std::int64_t>(slot_width) * (token & kPagedKVPageMask) + d;
+                if constexpr (Vector) {
+                    if constexpr (RetainKeys) {
+                        cp_async_cg_l2_retain_16(out, in);
+                    } else {
+                        cp_async<16, Cache::cg>(out, in);
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { out[j] = in[j]; }
+                }
+            } else {
+                store_vec(out, make_int4(0, 0, 0, 0));
+            }
+        }
+        if constexpr (Vector) { cp_commit(); }
+    };
+
+    if constexpr (Stages == 2) { stage(static_cast<int>(blockIdx.x), 0); }
+    unsigned qf[8][4];
+    int previous = -1, limit[2], col_slot[2];
+    const int grid_stride = static_cast<int>(gridDim.x);
+    for (int job = static_cast<int>(blockIdx.x), step_job = 0; job < total; job += grid_stride, ++step_job) {
+        const int group  = jobs.group_for(job);
+        const int g0     = (job - jobs.prefix[group]) * kMmaKeyTile;
+        const int buffer = Stages == 2 ? (step_job & 1) : 0;
+        if constexpr (Stages == 1) { stage(job, buffer); }
+        if (group != previous) {
+            const int c0 = tiles.first[group], nc = tiles.columns[group];
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int row         = (warp / KeyGroups) * 16 + (lane >> 2) + half * 8;
+                const int t           = row >> 2;
+                const int h           = row & 3;
+                col_slot[half]        = c0 + t;
+                limit[half]           = t < nc ? col_blocks[c0 + t] : 0;
+                const bool active_row = limit[half] > top_blocks && h < index_heads;
+                const bf16* q_row =
+                    active_row
+                        ? index_q + (static_cast<std::size_t>(group_begin + c0 + t) * index_heads + h) * kIndexDim
+                        : nullptr;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+#pragma unroll
+                    for (int col = 0; col < 2; ++col) {
+                        const int d = k * 16 + (lane & 3) * 2 + col * 8;
+                        qf[k][half + 2 * col] =
+                            active_row ? __ldg(reinterpret_cast<const unsigned*>(q_row + d)) : 0U;
+                    }
+                }
+            }
+            previous = group;
+        }
+        if constexpr (Vector) { cp_wait<0>(); }
+        __syncthreads();
+        if constexpr (Stages == 2) {
+            if (job + grid_stride < total) { stage(job + grid_stride, 1 - buffer); }
+        }
+        const bf16* ks = pipe_keys + buffer * kMmaKeyTile * kIndexDim;
+        float acc[NT][4]{};
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                unsigned bf[2];
+                const int k_row = (warp % KeyGroups) * WarpKeys + n * 8 + (lane & 7);
+                const int d     = k * 16 + ((lane >> 3) & 1) * 8;
+                ldmatrix_x2(bf[0], bf[1], smem_addr(ks + k_row * kIndexDim + (d ^ ((k_row & 7) << 3))));
+                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], qf[k][0], qf[k][1], qf[k][2], qf[k][3],
+                         bf[0], bf[1]);
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float v = fmaxf(acc[n][j], 0.0F);
+                v += __shfl_xor_sync(kFullMask, v, 4);
+                v += __shfl_xor_sync(kFullMask, v, 8);
+                const int g = g0 + (warp % KeyGroups) * WarpKeys + n * 8 + (lane & 3) * 2 + (j & 1);
+                if (((lane >> 2) & 3) == 0 && limit[j >> 1] > top_blocks && g < limit[j >> 1]) {
+                    scores[static_cast<std::size_t>(col_slot[j >> 1]) * score_stride + g] = v * scale;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    pdl::trigger_dependents();
+}
+
 // ----------------------------------------------------------------------------------- selection
 
 struct SelectShared {
@@ -853,18 +1076,89 @@ Layout layout(const QsaGeometry& g, std::int32_t columns, std::int32_t max_conte
     return l;
 }
 
-ScoreTiles score_tiles(std::int32_t begin, std::int32_t columns, std::int32_t width) {
+ScoreTiles score_tiles(std::int32_t begin, std::int32_t columns, std::int32_t width,
+                       std::int32_t max_tile_cols = kScoreTileColumns) {
     ScoreTiles tiles;
     for (std::int32_t c = 0; c < columns;) {
         const std::int32_t t       = begin + c;
         const std::int32_t row_end = (t / width + 1) * width;
-        const std::int32_t n       = std::min({kScoreTileColumns, columns - c, row_end - t});
+        const std::int32_t n       = std::min({max_tile_cols, columns - c, row_end - t});
         tiles.first[tiles.count]   = static_cast<std::uint8_t>(c);
         tiles.columns[tiles.count] = static_cast<std::uint8_t>(n);
         ++tiles.count;
         c += n;
     }
     return tiles;
+}
+
+template <int Tile, bool Vector, int Stages, bool RetainKeys = false>
+void launch_mma_score_impl(int workers, cudaStream_t stream, const bf16* index, int index_heads,
+                           const bf16* pooled, const std::int32_t* tables, int table_stride,
+                           const std::int32_t* rows, const std::int32_t* positions, int width, int ratio,
+                           int top_blocks, int begin, int n, const ScoreTiles& tiles, float* scores,
+                           int score_stride, std::uint32_t* pass_state, int pass_clear_words,
+                           const QsaPageSpaces& spaces) {
+    constexpr int Threads          = Tile > 16 ? Tile * 8 : 128;
+    constexpr std::size_t SmemSize = static_cast<std::size_t>(Stages) * kMmaKeyTile * kIndexDim * sizeof(bf16);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>(workers)), dim3(Threads), SmemSize, stream},
+        qsa_score_mma_kernel<Tile, Vector, Stages, RetainKeys>, index, index_heads, pooled, tables,
+        table_stride, rows, positions, width, ratio, top_blocks, begin, n, tiles, scores, score_stride,
+        pass_state, pass_clear_words, spaces));
+}
+
+template <bool Vector>
+void launch_mma_score(int tile, int stages, bool retain_keys, int workers, cudaStream_t stream,
+                      const bf16* index, int index_heads, const bf16* pooled, const std::int32_t* tables,
+                      int table_stride, const std::int32_t* rows, const std::int32_t* positions, int width,
+                      int ratio, int top_blocks, int begin, int n, const ScoreTiles& tiles, float* scores,
+                      int score_stride, std::uint32_t* pass_state, int pass_clear_words,
+                      const QsaPageSpaces& spaces) {
+    const auto submit = [&]<int Tile>() {
+        if (stages == 2) {
+            launch_mma_score_impl<Tile, Vector, 2>(workers, stream, index, index_heads, pooled, tables,
+                                                   table_stride, rows, positions, width, ratio, top_blocks,
+                                                   begin, n, tiles, scores, score_stride, pass_state,
+                                                   pass_clear_words, spaces);
+        } else {
+            launch_mma_score_impl<Tile, Vector, 1>(workers, stream, index, index_heads, pooled, tables,
+                                                   table_stride, rows, positions, width, ratio, top_blocks,
+                                                   begin, n, tiles, scores, score_stride, pass_state,
+                                                   pass_clear_words, spaces);
+        }
+    };
+    switch (tile) {
+    case 4:
+        submit.template operator()<4>();
+        break;
+    case 8:
+        submit.template operator()<8>();
+        break;
+    case 16:
+        submit.template operator()<16>();
+        break;
+    case 32:
+        submit.template operator()<32>();
+        break;
+    case 64:
+        submit.template operator()<64>();
+        break;
+    default:
+        if constexpr (Vector) {
+            if (retain_keys) {
+                launch_mma_score_impl<64, true, 2, true>(workers, stream, index, index_heads, pooled, tables,
+                                                         table_stride, rows, positions, width, ratio,
+                                                         top_blocks, begin, n, tiles, scores, score_stride,
+                                                         pass_state, pass_clear_words, spaces);
+                break;
+            }
+        }
+        launch_mma_score_impl<64, Vector, 2>(workers, stream, index, index_heads, pooled, tables,
+                                              table_stride, rows, positions, width, ratio, top_blocks, begin,
+                                              n, tiles, scores, score_stride, pass_state, pass_clear_words,
+                                              spaces);
+        break;
+    }
 }
 
 // Opts a kernel into `bytes` of dynamic shared memory beyond the default 48 KiB, once per size.
@@ -897,7 +1191,7 @@ QsaSelectScores qsa_select_scores(const void* scratch, const QsaGeometry& geomet
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
                 std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,
-                const QsaPageSpaces& spaces) {
+                const QsaPageSpaces& spaces, bool allow_mma_score) {
     const std::int32_t columns = batch.batch * batch.width;
     require(geometry.index_head_dim == kIndexDim && geometry.index_heads >= 1 &&
                 geometry.index_heads <= kScoreHeadSlots && geometry.ratio > 1 && kIndexDim % geometry.ratio == 0 &&
@@ -933,8 +1227,14 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
     const auto* positions  = static_cast<const std::int32_t*>(batch.positions.data);
     const int sms          = multiprocessors();
     const int max_steps    = ceil_div(max_blocks + 1, kScoreStepBlocks);
+    const bool mma = allow_mma_score && batch.width >= 4 && (kPagedKVPageSize % geometry.ratio) == 0 &&
+                     (kIndexDim / geometry.ratio) % 8 == 0 &&
+                     (reinterpret_cast<std::uintptr_t>(index) & 3U) == 0U;
+    const bool mma_vector = (reinterpret_cast<std::uintptr_t>(pooled) & 15U) == 0U &&
+                            (spaces.pooled == nullptr ||
+                             (reinterpret_cast<std::uintptr_t>(spaces.pooled) & 15U) == 0U);
     // Wide rows take the register-tiled kernel when a block's key is 16-byte aligned in one page.
-    const bool wide = batch.width >= kWideMinWidth && geometry.ratio <= kPagedKVPageSize &&
+    const bool wide = !mma && batch.width >= kWideMinWidth && geometry.ratio <= kPagedKVPageSize &&
                       (kIndexDim / geometry.ratio) % 8 == 0;
     if (wide) { reserve_shared(qsa_score_wide_kernel, kWideSharedBytes, g_wide_reserved); }
     for (std::int32_t begin = 0; begin < columns; begin += l.group) {
@@ -943,8 +1243,51 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                                                 1, kMaxSlices);
         const int pass_clear_words = (slices > 1 && max_blocks > top_blocks) ? n * (1 + kScoreBins) : 0;
         std::uint32_t* pass_state  = pass_clear_words > 0 ? state : nullptr;
-        const ScoreTiles tiles     = score_tiles(begin, n, batch.width);
-        if (wide) {
+        if (mma) {
+            const int eff_width   = std::min(batch.width, n);
+            const int tile        = eff_width <= 4    ? 4
+                                    : eff_width <= 8  ? 8
+                                    : eff_width <= 16 ? 16
+                                    : eff_width <= 32 ? 32
+                                    : eff_width <= 64 ? 64
+                                                      : 128;
+            const ScoreTiles mma_tiles = score_tiles(begin, n, batch.width, tile);
+            if (mma_tiles.count <= kMmaMaxTiles) {
+                const int mma_key_tiles = std::max(1, ceil_div(max_blocks + 1, kMmaKeyTile));
+                const int mma_columns   = mma_key_tiles * kMmaKeyTile;
+                const int partitions    = ceil_div(max_blocks + 1, kSliceBlocks);
+                const int stages =
+                    (tile >= 32 && mma_columns <= 8192) || (tile <= 16 && mma_columns >= 8192) || tile == 128 ? 2 : 1;
+                const int resident = tile == 128                  ? 1
+                                     : (stages == 2 || tile >= 32) ? 2
+                                     : tile == 16                  ? 4
+                                                                   : 5;
+                const int tasks       = mma_tiles.count * mma_key_tiles;
+                const int workers     = std::max(1, std::min(resident * sms, tasks));
+                const bool retain     = tile == 128 && partitions >= 6 && partitions <= 9;
+                if (mma_vector) {
+                    launch_mma_score<true>(tile, stages, retain, workers, stream, index, geometry.index_heads,
+                                           pooled, tables, table_stride, rows, positions, batch.width,
+                                           geometry.ratio, top_blocks, begin, n, mma_tiles, scores, l.stride,
+                                           pass_state, pass_clear_words, spaces);
+                } else {
+                    launch_mma_score<false>(tile, stages, false, workers, stream, index, geometry.index_heads,
+                                            pooled, tables, table_stride, rows, positions, batch.width,
+                                            geometry.ratio, top_blocks, begin, n, mma_tiles, scores, l.stride,
+                                            pass_state, pass_clear_words, spaces);
+                }
+            } else {
+                const ScoreTiles tiles = score_tiles(begin, n, batch.width);
+                const int ctas         = std::clamp(ceil_div(std::int64_t{kScoreCtasPerSm} * sms, tiles.count), 1,
+                                                    std::max(1, ceil_div(max_steps, kScoreWarps)));
+                CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)),
+                                                 dim3(kScoreThreads), 0, stream},
+                                                qsa_score_kernel, index, geometry.index_heads, pooled, tables,
+                                                table_stride, rows, positions, batch.width, geometry.ratio, top_blocks,
+                                                begin, tiles, scores, l.stride, pass_state, pass_clear_words, spaces));
+            }
+        } else if (wide) {
+            const ScoreTiles tiles = score_tiles(begin, n, batch.width);
             const int ctas = std::clamp(ceil_div(std::int64_t{kWideCtasPerSm} * sms, tiles.count), 1,
                                         std::max(1, ceil_div(max_blocks + 1, kWideBlocks)));
             CUDA_CHECK(pdl::launch_consumer(
@@ -954,6 +1297,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                 batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, pass_state, pass_clear_words,
                 spaces));
         } else {
+            const ScoreTiles tiles = score_tiles(begin, n, batch.width);
             const int ctas = std::clamp(ceil_div(std::int64_t{kScoreCtasPerSm} * sms, tiles.count), 1,
                                         std::max(1, ceil_div(max_steps, kScoreWarps)));
             CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)),

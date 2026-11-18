@@ -10,32 +10,36 @@ namespace infernix::ops::detail {
 template <class Schedule>
 void launch_q4_a16_gemv_instance(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
-    launch_q4_a16_gemv<Schedule>(q4_linear_operands(x, w),
-                                 LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-                                 LinearIdentityEpilogue{}, stream);
+    with_linear_output(out, w.n, [&](auto output) {
+        launch_q4_a16_gemv<Schedule>(q4_linear_operands(x, w), output, LinearIdentityEpilogue{},
+                                     stream);
+    });
 }
 
 template <class Schedule>
 void launch_q4_a16_simt_instance(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
-    launch_q4_a16_simt<Schedule>(q4_linear_operands(x, w),
-                                 LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-                                 LinearIdentityEpilogue{}, stream);
+    with_linear_output(out, w.n, [&](auto output) {
+        launch_q4_a16_simt<Schedule>(q4_linear_operands(x, w), output, LinearIdentityEpilogue{},
+                                     stream);
+    });
 }
 
 template <class Schedule>
 void launch_q4_a16_mma_instance(const Tensor& x, const Weight& w, Tensor& out,
                                 cudaStream_t stream) {
-    launch_q4_a16_mma<Schedule>(q4_linear_operands(x, w),
-                                LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-                                LinearIdentityEpilogue{}, stream);
+    with_linear_output(out, w.n, [&](auto output) {
+        launch_q4_a16_mma<Schedule>(q4_linear_operands(x, w), output, LinearIdentityEpilogue{},
+                                    stream);
+    });
 }
 
 template <class Schedule>
 void launch_q4_a16_sliced_instance(const Tensor& x, const Weight& w, Tensor& out,
                                    cudaStream_t stream) {
-    launch_q4_a16_sliced_k_mma<Schedule>(
-        q4_linear_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-        LinearIdentityEpilogue{}, stream);
+    with_linear_output(out, w.n, [&](auto output) {
+        launch_q4_a16_sliced_k_mma<Schedule>(q4_linear_operands(x, w), output,
+                                             LinearIdentityEpilogue{}, stream);
+    });
 }
 } // namespace infernix::ops::detail

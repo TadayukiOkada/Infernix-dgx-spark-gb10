@@ -559,9 +559,22 @@ int value_tile(int value_heads, int multiprocessor_count) {
     return 16;
 }
 
+namespace {
+
+int select_recurrence_value_tile(int qk_heads, int value_heads, int tokens,
+                                 int multiprocessor_count) {
+    if (qk_heads == 8 && value_heads == 24) return tokens <= 128 ? 32 : 64;
+    if (static_cast<std::int64_t>(value_heads) * 16 <= multiprocessor_count) return 8;
+    if (tokens <= 128) return 16;
+    return value_tile(value_heads, multiprocessor_count);
+}
+
+} // namespace
+
 void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
                        DeviceExecutionView execution, bool fp16) {
-    switch (value_tile(args.value_heads, execution.multiprocessor_count)) {
+    switch (select_recurrence_value_tile(args.qk_heads, args.value_heads, args.tokens,
+                                         execution.multiprocessor_count)) {
     case 64:
         return dispatch<64>(args, qk, control, execution.stream, fp16);
     case 32:

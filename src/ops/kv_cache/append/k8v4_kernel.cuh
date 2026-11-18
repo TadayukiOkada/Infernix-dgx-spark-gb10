@@ -19,50 +19,70 @@
 
 namespace infernix::ops {
 
+__device__ __forceinline__ void kv_cache_k8v4_load_bf16x8_contiguous(const __nv_bfloat16* row,
+                                                                      int lane,
+                                                                      float (&values)[8]) {
+    const __nv_bfloat16* p = row + 8 * lane;
+    if ((reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U) {
+        const uint4 raw        = *reinterpret_cast<const uint4*>(p);
+        const unsigned words[4]{raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            values[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffffU) << 16);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { values[j] = __bfloat162float(p[j]); }
+    }
+}
+
 template <typename Geometry>
 __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     __half* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token, int kv_head,
-    int physical_page, int page_offset, int lane, float* scratch) {
+    int physical_page, int page_offset, int lane) {
     constexpr unsigned FullMask = 0xffffffffU;
     float values[8];
+    kv_cache_k8v4_load_bf16x8_contiguous(k + kv_cache_fp8_src_index<Geometry>(kv_head, 0, token),
+                                         lane, values);
+    normalized_hadamard_d256_contiguous_inplace(values, lane);
     float local_absmax = 0.0F;
-#pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(k[kv_cache_fp8_src_index<Geometry>(kv_head, d, token)]);
-    }
-    normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
     for (float value : values) local_absmax = fmaxf(local_absmax, fabsf(value));
     const auto k_quant = kv_cache_fp8_quant_params(warp_max(local_absmax, FullMask));
+    std::uint8_t* k_dst =
+        cache_k + kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, 8 * lane, page_offset);
+    if ((reinterpret_cast<std::uintptr_t>(k_dst) & 7U) == 0U) {
+        unsigned words[2]{};
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const int d = lane + 32 * r;
-        cache_k[kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, d, page_offset)] =
-            kv_cache_fp8_quant_code(values[r], k_quant.inverse_scale);
+        for (int j = 0; j < 8; ++j) {
+            words[j / 4] |=
+                static_cast<unsigned>(kv_cache_fp8_quant_code(values[j], k_quant.inverse_scale))
+                << (8 * (j % 4));
+        }
+        store_vec(k_dst, make_uint2(words[0], words[1]));
+    } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            k_dst[j] = kv_cache_fp8_quant_code(values[j], k_quant.inverse_scale);
+        }
     }
     if (lane == 0) {
         scale_k[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head, page_offset)] =
             k_quant.scale;
     }
 
-#pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const int d = lane + 32 * r;
-        values[r]   = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
-    }
-    normalized_hadamard_d256_inplace(values, lane);
-#pragma unroll
-    for (int r = 0; r < 8; ++r) scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = values[r];
-    __syncwarp();
-    const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
-    if (lane < kKVCacheNvfp4Groups) {
+    kv_cache_k8v4_load_bf16x8_contiguous(v + kv_cache_nvfp4_src_index<Geometry>(kv_head, 0, token),
+                                         lane, values);
+    normalized_hadamard_d256_contiguous_inplace(values, lane);
+    const auto quantized = kv_cache_nvfp4_quantize_group16_contiguous(values, lane);
+    if ((lane & 1) == 0) {
+        const int group                = lane >> 1;
         const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-            physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+            physical_page, kv_head, group * kKVCacheNvfp4Group, page_offset);
         store_vec(cache_v + code_offset, make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scale_v[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, lane, page_offset)] =
+        scale_v[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, group, page_offset)] =
             quantized.scale;
     }
 }
@@ -87,7 +107,6 @@ __launch_bounds__(256) __global__
     }
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffU;
-    __shared__ float scratch[Warps][kKVCacheNvfp4HeadDim];
     const int tokens = metadata.valid_tokens(width);
     const int warp   = static_cast<int>(threadIdx.x) >> 5;
     const int lane   = static_cast<int>(threadIdx.x) & 31;
@@ -103,7 +122,7 @@ __launch_bounds__(256) __global__
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
     kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                             kv_head, physical_page, position & kPagedKVPageMask,
-                                            lane, scratch[warp]);
+                                            lane);
 }
 
 template <typename Geometry, typename Metadata>
@@ -112,10 +131,8 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
     const std::int32_t* __restrict__ positions, Metadata metadata,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     __half* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, std::int32_t width) {
-    constexpr int Warps         = 8;
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffU;
-    __shared__ float scratch[Warps][kKVCacheNvfp4HeadDim];
     const int tokens        = metadata.valid_tokens(width);
     const int warp          = static_cast<int>(threadIdx.x) >> 5;
     const int lane          = static_cast<int>(threadIdx.x) & 31;
@@ -133,7 +150,7 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
     const int position = base_position + token;
     kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                             kv_head, physical_page, position & kPagedKVPageMask,
-                                            lane, scratch[warp]);
+                                            lane);
 }
 
 } // namespace infernix::ops

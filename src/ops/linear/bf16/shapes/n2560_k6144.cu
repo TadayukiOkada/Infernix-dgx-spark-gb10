@@ -46,7 +46,7 @@ Bf16Launch select_bf16_n2560_k6144(std::int32_t tokens) {
     if (tokens <= 128) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<128, 64, 128, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>; // tma_r128t64k128s2_rows
     if (tokens <= 256) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2, 1, Bf16MmaRaster::RowFast>>; // tail_r64t128s2_rows
     if (tokens <= 384) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<128, 64, 64, 32, 32, 4>>; // tma_r128t64k64s4
-    if (tokens <= 1536) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3>>; // tma_r128t128k64s3_w64x32 (1.4-1.7x)
-    return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1, Bf16MmaRaster::Grouped, 8>>; // tma_r128t128k64s3_w64x32_group8
+    if (tokens <= 1536) return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1, Bf16MmaRaster::TokenFast, 1, 3>, 6144>>;
+    return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1, Bf16MmaRaster::Grouped, 8, 3>, 6144>>;
 }
 } // namespace infernix::ops::detail

@@ -13,35 +13,45 @@
 
 namespace infernix::ops {
 
+__device__ __forceinline__ void kv_cache_load_bf16x8_contiguous(const __nv_bfloat16* row,
+                                                                 int lane, float (&values)[8]) {
+    const __nv_bfloat16* p = row + 8 * lane;
+    if ((reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U) {
+        const uint4 raw        = *reinterpret_cast<const uint4*>(p);
+        const unsigned words[4]{raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            values[j] = __uint_as_float(((words[j / 2] >> (16 * (j % 2))) & 0xffffU) << 16);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { values[j] = __bfloat162float(p[j]); }
+    }
+}
+
 template <typename Geometry>
 __device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token, int kv_head,
-    int physical_page, int page_offset, int lane, float* scratch) {
+    int physical_page, int page_offset, int lane) {
+    const int group = lane >> 1;
 #pragma unroll 1
     for (int role = 0; role < 2; ++role) {
-        const __nv_bfloat16* src = role ? v : k;
+        const __nv_bfloat16* src =
+            (role ? v : k) + kv_cache_nvfp4_src_index<Geometry>(kv_head, 0, token);
         float values[8];
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            const int d = lane + 32 * r;
-            values[r]   = __bfloat162float(src[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
-        }
-        normalized_hadamard_d256_inplace(values, lane);
-#pragma unroll
-        for (int r = 0; r < 8; ++r) scratch[kv_cache_nvfp4_swizzle(lane + 32 * r)] = values[r];
-        __syncwarp();
-        const auto quantized = kv_cache_nvfp4_quantize_group16_warp(scratch, lane);
-        if (lane < kKVCacheNvfp4Groups) {
+        kv_cache_load_bf16x8_contiguous(src, lane, values);
+        normalized_hadamard_d256_contiguous_inplace(values, lane);
+        const auto quantized = kv_cache_nvfp4_quantize_group16_contiguous(values, lane);
+        if ((lane & 1) == 0) {
             const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
-                physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
+                physical_page, kv_head, group * kKVCacheNvfp4Group, page_offset);
             store_vec((role ? cache_v : cache_k) + code_offset,
                       make_uint2(quantized.codes_lo, quantized.codes_hi));
             (role ? scale_v : scale_k)[kv_cache_nvfp4_scale_index<Geometry>(
-                physical_page, kv_head, lane, page_offset)] = quantized.scale;
+                physical_page, kv_head, group, page_offset)] = quantized.scale;
         }
-        if (role == 0) { __syncwarp(); }
     }
 }
 
@@ -65,7 +75,6 @@ __launch_bounds__(256) __global__
     }
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffU;
-    __shared__ float scratch[Warps][kKVCacheNvfp4HeadDim];
     const int tokens = metadata.valid_tokens(width);
     const int warp   = static_cast<int>(threadIdx.x) >> 5;
     const int lane   = static_cast<int>(threadIdx.x) & 31;
@@ -81,7 +90,7 @@ __launch_bounds__(256) __global__
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
     kv_cache_append_full_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                              kv_head, physical_page, position & kPagedKVPageMask,
-                                             lane, scratch[warp]);
+                                             lane);
 }
 
 template <typename Geometry, typename Metadata>
@@ -90,10 +99,8 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_nvfp4_page_kernel(
     const std::int32_t* __restrict__ positions, Metadata metadata,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, std::int32_t width) {
-    constexpr int Warps         = 8;
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffU;
-    __shared__ float scratch[Warps][kKVCacheNvfp4HeadDim];
     const int tokens        = metadata.valid_tokens(width);
     const int warp          = static_cast<int>(threadIdx.x) >> 5;
     const int lane          = static_cast<int>(threadIdx.x) & 31;
@@ -111,7 +118,7 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_nvfp4_page_kernel(
     const int position = base_position + token;
     kv_cache_append_full_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
                                              kv_head, physical_page, position & kPagedKVPageMask,
-                                             lane, scratch[warp]);
+                                             lane);
 }
 
 } // namespace infernix::ops
