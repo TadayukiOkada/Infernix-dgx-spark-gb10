@@ -254,6 +254,47 @@ __global__ void __launch_bounds__(kQuantizeThreads, 3)
     }
 }
 
+// Decode / small-batch form of quantize_token_kernel: one CTA per (token, top_k slot) with
+// kGateUpBlocks threads (one 16-element block per thread), eliminating the 5x10 sequential loops
+// and saturating GB10's 48 SMs instead of leaving 46-47 SMs idle at T <= 16.
+__global__ void __launch_bounds__(kGateUpBlocks)
+    quantize_token_small_kernel(const std::uint16_t* __restrict__ x, int top_k,
+                                const ExpertScales* __restrict__ scales,
+                                const std::int32_t* __restrict__ pass_tiles,
+                                const std::int32_t* __restrict__ pass_narrow, int passes,
+                                const std::int32_t* __restrict__ map, std::uint8_t* __restrict__ plane) {
+    if (pass_tiles[passes] == 0 && pass_narrow[passes] == 0) { return; }
+    const int t      = static_cast<int>(blockIdx.x);
+    const int slot   = static_cast<int>(blockIdx.y);
+    const int b      = static_cast<int>(threadIdx.x);
+    const int entry  = t * top_k + slot;
+    const int expert = map[2 * entry + 1];
+    if (expert < 0) { return; }
+    const ExpertScales sc = scales[expert];
+    if (sc.input_gate != sc.input_up) { return; }
+    const int p        = map[2 * entry];
+    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
+    const uint4 v0 = source[0], v1 = source[1];
+    const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    float v[16];
+    float amax = 0.0F;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        const float f0 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] & 0xFFFFU));
+        const float f1 = canon::bf16_to_f32(static_cast<std::uint16_t>(words[w] >> 16));
+        v[2 * w]       = f0;
+        v[2 * w + 1]   = f1;
+        amax           = fmaxf(amax, fmaxf(fabsf(f0), fabsf(f1)));
+    }
+    unsigned low = 0U, high = 0U;
+    std::uint8_t scale_word = 0U;
+    canon::quantize_a4_plane_from_f32(v, amax, sc.input_gate, low, high, scale_word);
+    const int position      = plane_block(b);
+    std::uint8_t* const row = plane + static_cast<std::size_t>(p) * kXRowBytes;
+    *reinterpret_cast<uint2*>(row + 8 * position) = make_uint2(low, high);
+    row[kXCodeBytes + position]                   = scale_word;
+}
+
 Descriptors make_descriptors(const std::uint8_t* x_plane, const std::uint8_t* h_plane, int entries) {
     const auto rows = static_cast<std::uint64_t>(entries);
     auto* x = const_cast<std::uint8_t*>(x_plane);
@@ -909,15 +950,22 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         return call;
     }
     if (map_tokens) {
-        constexpr int kWarps   = kQuantizeThreads / 32;
-        const int map_blocks   = std::max(1, std::min<int>(max_jobs, persistent_ctas()));
-        const int token_blocks = std::max(1, std::min<int>(persistent_ctas() * 2,
-                                                           (static_cast<int>(x.ne[1]) + kWarps - 1) / kWarps));
+        constexpr int kWarps = kQuantizeThreads / 32;
+        const int map_blocks = std::max(1, std::min<int>(max_jobs, persistent_ctas()));
+        const int tokens     = static_cast<int>(x.ne[1]);
         map_entries_kernel<<<map_blocks, kQuantizeThreads, 0, stream>>>(
             dispatch, workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map);
-        quantize_token_kernel<<<token_blocks, kQuantizeThreads, 0, stream>>>(
-            static_cast<const std::uint16_t*>(x.data), top_k, static_cast<int>(x.ne[1]), source.scales,
-            workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map, workspace.x_plane);
+        if (tokens <= 16) {
+            quantize_token_small_kernel<<<dim3(tokens, top_k), kGateUpBlocks, 0, stream>>>(
+                static_cast<const std::uint16_t*>(x.data), top_k, source.scales,
+                workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map, workspace.x_plane);
+        } else {
+            const int token_blocks = std::max(1, std::min<int>(persistent_ctas() * 2,
+                                                               (tokens + kWarps - 1) / kWarps));
+            quantize_token_kernel<<<token_blocks, kQuantizeThreads, 0, stream>>>(
+                static_cast<const std::uint16_t*>(x.data), top_k, tokens, source.scales,
+                workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map, workspace.x_plane);
+        }
     } else {
         const int quant_blocks = std::max(1, std::min<int>(persistent_ctas() * 2, max_tiles(max_jobs, entries)));
         quantize_kernel<<<quant_blocks, kQuantizeThreads, 0, stream>>>(
