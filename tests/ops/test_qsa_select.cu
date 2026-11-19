@@ -473,12 +473,13 @@ struct ProductionBuffers {
           counts(sizeof(std::int32_t) * static_cast<std::size_t>(f.columns)) {}
 };
 
-void launch_production(const Fixture& f, ProductionBuffers& buffers, cudaStream_t stream) {
+void launch_production(const Fixture& f, ProductionBuffers& buffers, cudaStream_t stream,
+                       bool allow_mma_score = false) {
     infernix::ops::detail::qsa_select(f.index_q(), f.pooled(), f.batch_view(), f.g, f.max_context,
                                     buffers.scratch.data(), buffers.scratch.bytes(),
                                     {static_cast<std::int32_t*>(buffers.selected.data()),
                                      static_cast<std::int32_t*>(buffers.counts.data())},
-                                    stream);
+                                    stream, {}, allow_mma_score);
 }
 
 Selection read_production(const Fixture& f, ProductionBuffers& buffers, const std::string& tag) {
@@ -630,6 +631,21 @@ void run_case(const Case& c) {
     const Selection got = read_production(f, buffers, tag);
     compare(f, ref, got, tag);
     for (const auto& [t, o] : oracle) { check_fp64(f, got, t, o, tag); }
+    if (f.width >= 4 && (infernix::kPagedKVPageSize % f.g.ratio) == 0 && (f.g.index_head_dim / f.g.ratio) % 8 == 0) {
+        const std::string mma_tag = tag + " [mma]";
+        buffers.scratch.fill(0x7F);
+        buffers.selected.fill(0x7F);
+        buffers.counts.fill(0x7F);
+        launch_production(f, buffers, nullptr, true);
+        cuda_check(cudaStreamSynchronize(nullptr), "production mma select");
+        const Selection mma_got = read_production(f, buffers, mma_tag);
+        for (const auto& [t, o] : oracle) { check_fp64(f, mma_got, t, o, mma_tag); }
+        for (int t = 0; t < f.columns; ++t) {
+            const int n = blocks_of(f, t);
+            const int expected_count = n <= f.top ? -1 : f.top;
+            check(mma_got.counts[t] == expected_count, mma_tag + " col " + std::to_string(t) + ": count mismatch");
+        }
+    }
     std::printf("  %-44s %5d columns, %6d..%6d blocks\n", c.name.c_str(), f.columns, blocks_of(f, 0),
                 blocks_of(f, f.columns - 1));
 }

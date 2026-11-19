@@ -1241,7 +1241,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
         const std::int32_t n       = std::min(l.group, columns - begin);
         const int slices           = std::clamp(std::min(ceil_div(max_blocks, kSliceBlocks), ceil_div(std::int64_t{16} * sms, n)),
                                                 1, kMaxSlices);
-        const int pass_clear_words = (slices > 1 && max_blocks > top_blocks) ? n * (1 + kScoreBins) : 0;
+        const int pass_clear_words = (slices > 1 && max_blocks > top_blocks) ? (l.group + n * kScoreBins) : 0;
         std::uint32_t* pass_state  = pass_clear_words > 0 ? state : nullptr;
         if (mma) {
             const int eff_width   = std::min(batch.width, n);
@@ -1251,7 +1251,9 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                                     : eff_width <= 32 ? 32
                                     : eff_width <= 64 ? 64
                                                       : 128;
-            const ScoreTiles mma_tiles = score_tiles(begin, n, batch.width, tile);
+            // launch_mma_score dispatches Tile <= 64 (max 512 threads/CTA); split wider passes into
+            // 64-column tiles so every column in the group is scored.
+            const ScoreTiles mma_tiles = score_tiles(begin, n, batch.width, std::min(tile, 64));
             if (mma_tiles.count <= kMmaMaxTiles) {
                 const int mma_key_tiles = std::max(1, ceil_div(max_blocks + 1, kMmaKeyTile));
                 const int mma_columns   = mma_key_tiles * kMmaKeyTile;
