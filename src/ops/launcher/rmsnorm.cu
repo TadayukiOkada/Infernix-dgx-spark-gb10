@@ -64,6 +64,16 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                         reinterpret_cast<uint4*>(out_bf16), eps));
                     return;
                 }
+                if (rows >= 64) {
+                    const unsigned grid = static_cast<unsigned>((rows + 1) / 2);
+                    CUDA_CHECK(pdl::launch_consumer(
+                        {dim3(grid), dim3(320), 0, stream},
+                        rmsnorm_d5120_prefill_2row_vec16_kernel<Epilogue>,
+                        reinterpret_cast<const uint4*>(x_bf16),
+                        reinterpret_cast<const uint4*>(w_bf16),
+                        reinterpret_cast<uint4*>(out_bf16), static_cast<size_t>(rows), eps));
+                    return;
+                }
             }
             // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
             // with hoisted gains wins the hidden-row sweep through prefill.

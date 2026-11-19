@@ -457,6 +457,62 @@ void rmsnorm_d5120_rows_vec16_kernel(const uint4* __restrict__ x, const uint4* _
     if (t < 128) { y[base + 512 + t] = rms_vec_out<Epilogue>(c, w[512 + t], inv); }
 }
 
+template <RmsEpilogue Epilogue>
+__launch_bounds__(320) __global__
+void rmsnorm_d5120_prefill_2row_vec16_kernel(const uint4* __restrict__ x, const uint4* __restrict__ w,
+                                             uint4* __restrict__ y, size_t rows, float eps) {
+    pdl::enter();
+    const int t        = static_cast<int>(threadIdx.x);
+    const int lane     = t & 31;
+    const int warp     = t >> 5;
+    const size_t row0  = static_cast<size_t>(blockIdx.x) * 2;
+    const size_t base0 = row0 * 640;
+    const size_t base1 = base0 + 640;
+    const bool has1    = (row0 + 1) < rows;
+
+    const uint4 v0 = x[base0 + t];
+    const uint4 v1 = x[base0 + 320 + t];
+    uint4 u0 = make_uint4(0, 0, 0, 0);
+    uint4 u1 = make_uint4(0, 0, 0, 0);
+    if (has1) {
+        u0 = x[base1 + t];
+        u1 = x[base1 + 320 + t];
+    }
+    const uint4 w0 = w[t];
+    const uint4 w1 = w[320 + t];
+
+    float s0 = rms_vec_sq(v0) + rms_vec_sq(v1);
+    float s1 = has1 ? (rms_vec_sq(u0) + rms_vec_sq(u1)) : 0.0f;
+
+    s0 = warp_reduce_sum(s0);
+    s1 = warp_reduce_sum(s1);
+
+    __shared__ float p0[10];
+    __shared__ float p1[10];
+    if (lane == 0) {
+        p0[warp] = s0;
+        p1[warp] = s1;
+    }
+    __syncthreads();
+
+    float t0 = p0[0];
+    float t1 = p1[0];
+#pragma unroll
+    for (int i = 1; i < 10; ++i) {
+        t0 += p0[i];
+        t1 += p1[i];
+    }
+    const float inv0 = rsqrtf(t0 * (1.0f / 5120.0f) + eps);
+    const float inv1 = rsqrtf(t1 * (1.0f / 5120.0f) + eps);
+
+    y[base0 + t]       = rms_vec_out<Epilogue>(v0, w0, inv0);
+    y[base0 + 320 + t] = rms_vec_out<Epilogue>(v1, w1, inv0);
+    if (has1) {
+        y[base1 + t]       = rms_vec_out<Epilogue>(u0, w0, inv1);
+        y[base1 + 320 + t] = rms_vec_out<Epilogue>(u1, w1, inv1);
+    }
+}
+
 // Rows the preloading instance of the generic kernel serves: wider than every fast route, at most
 // kRmsPreloadMaxD (the Qwen4Exp MTP hidden_norm, d = 10240).
 inline constexpr std::int32_t kRmsPreloadMinD = 8192;
