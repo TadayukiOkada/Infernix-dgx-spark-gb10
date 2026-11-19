@@ -1,3 +1,5 @@
+#include "ops/linear/bf16/bf16_mma_epilogue.cuh"
+#include "ops/linear/q8/q8_a16_tma_k32.cuh"
 #include "ops/linear/q8/q8_gemv_launch.cuh"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 #include "ops/linear/q8/q8_instances.cuh"
@@ -33,21 +35,36 @@ void launch_decode_routes(const Q8LinearOperands& operands, Output output, Epilo
     launch_q8_a16_stream<Stream<8, 8>>(operands, output, epilogue, stream);
 }
 
+using TmaHot96   = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 2560>;
+using TmaBulk128 = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 2560>;
+using TmaK32     = Q8A16TmaK32Schedule<8, 2560>;
+
 // One route table for both outputs: the packed [16384,T] linear result, and the q/k/v rows and z rows
 // written straight to their two destinations (gdn_input_proj). The output map changes only where a
 // value is stored, so both produce the same bits.
 template <class Output>
 void launch_routes(const Q8LinearOperands& operands, Output output, cudaStream_t stream) {
     const LinearIdentityEpilogue epilogue{};
+    const Bf16MmaCtaWarpStoreEpilogue<> tma_epilogue{};
     const std::int32_t tokens = operands.tokens;
     if (tokens <= 2) return launch_decode_routes(operands, output, epilogue, stream);
     if (tokens <= 4) return launch_q8_a16_simt<q8_instances::SimtR8T4>(operands, output, epilogue, stream);
     if (tokens <= 5) return launch_q8_a16_simt<q8_instances::SimtR8T5>(operands, output, epilogue, stream);
     if (tokens <= 6) return launch_q8_a16_simt<q8_instances::SimtR8T6>(operands, output, epilogue, stream);
     if (tokens <= 8) return launch_q8_a16_simt<q8_instances::SimtR8T8>(operands, output, epilogue, stream);
-    if (tokens <= 48) return launch_q8_a16_mma<q8_instances::MmaR64x16T48K128A1>(operands, output, epilogue, stream);
-    if (tokens <= 64) return launch_q8_a16_mma<q8_instances::MmaR64x32T64K128A1>(operands, output, epilogue, stream);
+    if (tokens <= 16) return launch_q8_a16_sliced_k_mma<q8_instances::SlicedR16T16W8S2>(operands, output, epilogue, stream);
+    if (tokens <= 32) return launch_q8_a16_sliced_k_mma<q8_instances::SlicedR16T32W8S1M2>(operands, output, epilogue, stream);
+    if (tokens <= 64) return launch_q8_a16_mma<q8_instances::MmaR128x16T64K128A2M1>(operands, output, epilogue, stream);
+    if (operands.k == 2560 && operands.padded_k == 2560 && operands.rows % 128 == 0) {
+        if (tokens <= 96 || (tokens > 128 && tokens <= 192))
+            return launch_q8_a16_tma_mma<TmaHot96>(operands, output, tma_epilogue, stream);
+        if (tokens <= 511)
+            return launch_q8_a16_tma_mma<TmaBulk128>(operands, output, tma_epilogue, stream);
+        return launch_q8_a16_tma_k32<TmaK32>(operands, output, tma_epilogue, stream);
+    }
     if (tokens <= 96) return launch_q8_a16_mma<q8_instances::MmaR96T96>(operands, output, epilogue, stream);
+    if (tokens <= 128) return launch_q8_a16_mma<q8_instances::MmaR64T128>(operands, output, epilogue, stream);
+    if (tokens <= 192) return launch_q8_a16_mma<q8_instances::MmaR64x32T96K128A1>(operands, output, epilogue, stream);
     if (tokens <= 384) {
         return launch_q8_a16_mma<q8_instances::MmaR64T128>(operands, output, epilogue, stream);
     }

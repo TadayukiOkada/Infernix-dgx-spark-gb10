@@ -41,7 +41,6 @@ Q4Launch select_q4_invariant(std::int32_t t) {
     return launch_q4_a16_sliced_r32_t32_w4_s1;
 }
 Q4Launch select_q4_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
-    (void)n;
     if (k % 128 != 0) {
         if (t <= 32) return launch_q4_a16_mma_r32_t32_k64_wr16_wt16_s3_a3_b2;
         return launch_q4_a16_mma_r32_t64_k64_wr16_wt32_s2_a2_b2;
@@ -51,6 +50,8 @@ Q4Launch select_q4_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 8) return launch_q4_a16_sliced_r32_t8_w4_s2;
     if (t <= 16) return launch_q4_a16_sliced_r32_t16_w4_s1;
     if (t <= 32) return launch_q4_a16_sliced_r32_t32_w4_s1;
+    if (t <= 64 && (n % 32) == 0) return launch_q4_a16_sliced_r32_t32_w2_s2;
+    if ((n % 64) == 0) return launch_q4_a16_mma_r64_t64_k128_s2_a1;
     return launch_q4_a16_mma_r32_t64_k64_wr16_wt32_s2_a2_b2;
 }
 } // namespace

@@ -107,6 +107,26 @@ void q5_linear_add_mma_r32_t32_k128_launch(const Tensor& x, const Weight& w, Ten
     launch_pointwise<q5_instances::MmaR32T32K128S2A2>(x, w, residual, stream);
 }
 
+void q5_linear_add_mma_r64_t64_k128_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                           cudaStream_t stream) {
+    launch_pointwise<q5_instances::MmaR64T64K128S1A1>(x, w, residual, stream);
+}
+
+void q5_linear_add_mma_r64_t80_k128_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                           cudaStream_t stream) {
+    launch_pointwise<q5_instances::MmaR64T80K128S1A1>(x, w, residual, stream);
+}
+
+void q5_linear_add_mma_r64_t96_k128_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                           cudaStream_t stream) {
+    launch_pointwise<q5_instances::MmaR64T96K128S1A1>(x, w, residual, stream);
+}
+
+void q5_linear_add_mma_r64_t128_k128_launch(const Tensor& x, const Weight& w, Tensor& residual,
+                                            cudaStream_t stream) {
+    launch_pointwise<q5_instances::MmaR64T128K128S1A1>(x, w, residual, stream);
+}
+
 void q5_linear_add_mma_r32_t128_launch(const Tensor& x, const Weight& w, Tensor& residual,
                                        cudaStream_t stream) {
     launch_pointwise<q5_instances::MmaR32T128>(x, w, residual, stream);

@@ -180,7 +180,26 @@ struct Point {
     std::string route;
     bool bit_exact;    // reproduces production's bits at this same width
     bool t_invariant;  // reproduces the per-column results of a T=1 call (the linear contract)
+    bool numeric_ok;   // numerically agrees with production within BF16 tolerance
 };
+
+bool check_numeric_bf16(const std::vector<std::uint16_t>& got,
+                        const std::vector<std::uint16_t>& ref) {
+    if (got.size() != ref.size() || got.empty()) return false;
+    bool any_nonzero = false;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        __nv_bfloat16 gb, rb;
+        std::memcpy(&gb, &got[i], 2);
+        std::memcpy(&rb, &ref[i], 2);
+        const float g = __bfloat162float(gb);
+        const float r = __bfloat162float(rb);
+        if (!std::isfinite(g) || !std::isfinite(r)) return false;
+        if (g != 0.0f) any_nonzero = true;
+        const float tol = std::max(0.0625f, 0.03125f * std::fabs(r));
+        if (std::fabs(g - r) > tol) return false;
+    }
+    return any_nonzero;
+}
 
 std::vector<std::uint16_t> download(const Tensor& t) {
     std::vector<std::uint16_t> host(t.ne[0] * t.ne[1]);
@@ -333,35 +352,46 @@ int main(int argc, char** argv) {
                 const auto got = download(os);
                 const bool exact = std::memcmp(got.data(), ref_host.data(), got.size() * 2) == 0;
                 const bool invariant = std::memcmp(got.data(), alone.data(), got.size() * 2) == 0;
+                const bool num_ok = exact || check_numeric_bf16(got, ref_host);
+                if (!num_ok && std::strcmp(route.name, "production") != 0) { continue; }
 
                 const auto samples = cold(route, t);
                 const double median = samples[samples.size() / 2];
                 const double gbs = bytes / (median * 1.0e-6) / 1.0e9;
                 Point p{t, median, samples.front(), samples[(samples.size() * 95) / 100], gbs,
-                        route.name, exact, invariant};
+                        route.name, exact, invariant, num_ok};
                 points.push_back(p);
                 std::printf("%6d %-24s %11.2f %11.2f %11.2f %8.1f %6.1f%% %s %s\n", t, route.name,
                             p.median_us, p.min_us, p.p95_us, p.gbs,
-                            100.0 * p.gbs / bench::kSustainedReadGBs, exact ? "yes" : "NO",
+                            100.0 * p.gbs / bench::kSustainedReadGBs, exact ? "yes" : "num",
                             invariant ? "exact" : "T-DEPENDENT");
             }
-            // Best adoptable route for this width: it must be bit-exact AND T-invariant, because the
-            // Linear contract compares a T-column call against T width-1 calls.
-            const Point* best = nullptr;
+            const Point* prod = nullptr;
+            const Point* best_inv = nullptr;
+            const Point* best_num = nullptr;
             for (const Point& p : points) {
-                if (p.tokens != t || !p.bit_exact || !p.t_invariant) continue;
-                if (best == nullptr || p.median_us < best->median_us) best = &p;
+                if (p.tokens != t) continue;
+                if (p.route == "production") prod = &p;
+                if (p.bit_exact && p.t_invariant &&
+                    (best_inv == nullptr || p.median_us < best_inv->median_us)) {
+                    best_inv = &p;
+                }
+                if (p.numeric_ok &&
+                    (best_num == nullptr || p.median_us < best_num->median_us)) {
+                    best_num = &p;
+                }
             }
-            if (best != nullptr) {
-                const Point* prod = nullptr;
-                for (const Point& p : points) {
-                    if (p.tokens == t && p.route == "production") prod = &p;
-                }
-                if (prod != nullptr && prod->median_us > best->median_us * 1.01) {
-                    std::printf("  => T=%d: production %.2f us, best exact '%s' %.2f us  (%.1f%% faster)\n",
-                                t, prod->median_us, best->route.c_str(), best->median_us,
-                                100.0 * (prod->median_us - best->median_us) / prod->median_us);
-                }
+            if (prod != nullptr && best_inv != nullptr && prod->median_us > best_inv->median_us * 1.01) {
+                std::printf("  => T=%d: production %.2f us, best exact '%s' %.2f us  (%.1f%% faster)\n",
+                            t, prod->median_us, best_inv->route.c_str(), best_inv->median_us,
+                            100.0 * (prod->median_us - best_inv->median_us) / prod->median_us);
+            }
+            if (prod != nullptr && best_num != nullptr && best_num != best_inv &&
+                prod->median_us > best_num->median_us * 1.01) {
+                std::printf("  => T=%d: production %.2f us, best numeric '%s' %.2f us  (%.1f%% faster, exact=%s)\n",
+                            t, prod->median_us, best_num->route.c_str(), best_num->median_us,
+                            100.0 * (prod->median_us - best_num->median_us) / prod->median_us,
+                            best_num->bit_exact ? "yes" : "no");
             }
             std::printf("\n");
         }

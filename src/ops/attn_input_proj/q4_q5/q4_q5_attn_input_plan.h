@@ -17,6 +17,7 @@ enum class Q4Q5AttnInputScheduleId {
     PairR32C64S3,
     MixedR64C128S2,
     PairR32C64S4,
+    SplitMmaK128,
     // Request-invariant exact route: one sliced-K reduction per parent at every width.
     ColumnInvariant,
 };

@@ -112,9 +112,17 @@ void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, T
     else if (x.ne[1] <= 32)
         launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 2>, 5120>>(
             p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
-    else
+    else if (x.ne[1] <= 128)
         launch_nvfp4_a16_mma<
             Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluMmaRows{});
+    else if (x.ne[1] <= 384)
+        launch_nvfp4_a16_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluMmaRows{});
+    else
+        launch_nvfp4_a16_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 5120>>(
             p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluMmaRows{});
 }
 

@@ -31,9 +31,11 @@ struct Q8PairRouteSpec {
 // a coin flip between the tiles (r128 leads by 3-6% at 512/640/704/960 and trails by the same at
 // 576/832/896/1024, i.e. wave quantisation on 48 SMs rather than a schedule property), so it keeps
 // the incumbent 32x128 tile instead of freezing an unstable argmin.
-constexpr std::array<Q8PairRouteSpec, 4> kK5120Routes{{
-    {1, 20, Q8PairScheduleId::TwoSimtR8C4},
-    {21, 256, Q8PairScheduleId::DualMmaR32C64},
+constexpr std::array<Q8PairRouteSpec, 6> kK5120Routes{{
+    {1, 4, Q8PairScheduleId::TwoSimtR8C4},
+    {5, 16, Q8PairScheduleId::TwoSlicedR16T16W8S2},
+    {17, 64, Q8PairScheduleId::TwoSlicedR16T32W4S1},
+    {65, 256, Q8PairScheduleId::TwoMmaR32T32K128A1},
     {257, 1535, Q8PairScheduleId::DualMmaR32C128},
     {1536, kAnyCols, Q8PairScheduleId::DualMmaR128C128},
 }};
@@ -313,6 +315,12 @@ const char* q8_pair_schedule_name(Q8PairScheduleId schedule) {
     switch (schedule) {
     case Q8PairScheduleId::TwoSimtR8C4:
         return "q8_pair.two_simt.r8.c4";
+    case Q8PairScheduleId::TwoSlicedR16T16W8S2:
+        return "q8_pair.two_sliced.r16.t16.w8.s2";
+    case Q8PairScheduleId::TwoSlicedR16T32W4S1:
+        return "q8_pair.two_sliced.r16.t32.w4.s1";
+    case Q8PairScheduleId::TwoMmaR32T32K128A1:
+        return "q8_pair.two_mma.r32.t32.k128.a1";
     case Q8PairScheduleId::DualDecodeR4:
         return "q8_pair.dual_decode.k2048.r4";
     case Q8PairScheduleId::DualDecodeR8:
@@ -536,6 +544,18 @@ void q8_pair_execute_plan(Q8PairPlan plan, const Tensor& x, const Weight& first_
     }
 
     switch (plan.schedule) {
+    case Q8PairScheduleId::TwoSlicedR16T16W8S2:
+        q8_pair_two_sliced_r16_t16_w8_s2_launch(x, first_weight, second_weight, first_out,
+                                                second_out, stream);
+        return;
+    case Q8PairScheduleId::TwoSlicedR16T32W4S1:
+        q8_pair_two_sliced_r16_t32_w4_s1_launch(x, first_weight, second_weight, first_out,
+                                                second_out, stream);
+        return;
+    case Q8PairScheduleId::TwoMmaR32T32K128A1:
+        q8_pair_two_mma_r32_t32_k128_a1_launch(x, first_weight, second_weight, first_out,
+                                               second_out, stream);
+        return;
     case Q8PairScheduleId::DualDecodeR4:
         q8_pair_decode_r4_launch(x, first_weight, second_weight, first_out, second_out, stream);
         return;

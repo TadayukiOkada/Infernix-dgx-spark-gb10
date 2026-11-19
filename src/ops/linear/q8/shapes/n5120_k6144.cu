@@ -42,9 +42,10 @@ Q8Launch select_q8_n5120_k6144(std::int32_t tokens) {
     if (tokens <= 16) return launch_q8_a16_sliced<Geometry, 16, C16>;
     if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
     if (tokens <= 32) return launch_q8_a16_sliced<Geometry, 32, C32>;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 64) return launch_q8_a16_mma_r128x16_t64_k128_a2;
     if (tokens <= 96) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
+    if (tokens <= 192) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 

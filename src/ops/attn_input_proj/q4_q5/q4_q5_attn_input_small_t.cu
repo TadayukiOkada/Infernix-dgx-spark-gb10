@@ -6,10 +6,12 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
+#include "ops/linear/q4/q4_mma_launch.cuh"
 #include "ops/linear/q4/q4_simt_launch.cuh"
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/q5/q5_mma_launch.cuh"
 #include "ops/linear/q5/q5_sliced_k_launch.cuh"
 
 #include <cuda_bf16.h>
@@ -278,6 +280,32 @@ void q4_q5_attn_input_column_invariant_launch(const Tensor& x, const Weight& que
     }
     launch_q4_invariant(x, query_key_weight, q, k, stream);
     launch_q5_invariant(x, gate_value_weight, gate, v, stream);
+}
+
+void q4_q5_attn_input_split_mma_k128_launch(const Tensor& x, const Weight& query_key_weight,
+                                            const Weight& gate_value_weight, Tensor& q,
+                                            Tensor& gate, Tensor& k, Tensor& v,
+                                            cudaStream_t stream) {
+    const auto qk_out = LinearBf16SplitOutput2<kSplitRow>{
+        {static_cast<__nv_bfloat16*>(q.data),
+         static_cast<std::int64_t>(q.nb[1] / sizeof(__nv_bfloat16)), 0},
+        {static_cast<__nv_bfloat16*>(k.data),
+         static_cast<std::int64_t>(k.nb[1] / sizeof(__nv_bfloat16)), 0}};
+    launch_q4_a16_mma<q4_instances::MmaR64T64K128S2A1>(
+        q4_linear_operands(x, query_key_weight), qk_out, LinearIdentityEpilogue{}, stream);
+
+    const std::int32_t cols = x.ne[1];
+    const auto gv_out       = q5_projection_output(gate, v);
+    if (cols <= 64) {
+        launch_q5_a16_mma<q5_instances::MmaR64T64K128S1A1>(
+            q5_linear_operands(x, gate_value_weight), gv_out, LinearIdentityEpilogue{}, stream);
+    } else if (cols <= 96) {
+        launch_q5_a16_mma<q5_instances::MmaR64T96K128S1A1>(
+            q5_linear_operands(x, gate_value_weight), gv_out, LinearIdentityEpilogue{}, stream);
+    } else {
+        launch_q5_a16_mma<q5_instances::MmaR64T128>(
+            q5_linear_operands(x, gate_value_weight), gv_out, LinearIdentityEpilogue{}, stream);
+    }
 }
 
 } // namespace infernix::ops::detail

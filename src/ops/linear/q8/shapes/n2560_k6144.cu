@@ -23,10 +23,14 @@ Q8Launch select_q8_n2560_k6144(std::int32_t tokens) {
     if (tokens <= 5) return launch_q8_a16_simt_r8_t5;
     if (tokens <= 6) return launch_q8_a16_simt_r8_t6;
     if (tokens <= 8) return launch_q8_a16_simt_r8_t8;
-    if (tokens <= 32) return launch_q8_a16_mma_r64x16_t128_k128_a2;
+    // GB10 (sm_121a, 48 SMs) retune 2026-11-19: sliced-K MMA beats r64x16_t128_k128_a2 by +38.5%
+    // at T=16 (78.7 vs 109.0 us, 87.8% vs 63.3% READ) and +29.5% at T=32 (85.6 vs 110.8 us).
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
     if (tokens <= 64) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
+    if (tokens <= 192) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     if (tokens <= 256) return launch_q8_a16_mma_r64_t128;
     if (tokens <= 512) return launch_q8_a16_mma_r128x64_t128_k64_a1;
     if (tokens <= 1024) return launch_q8_a16_mma_r64x32_t128_k64_a2;

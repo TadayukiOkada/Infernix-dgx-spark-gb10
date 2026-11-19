@@ -5,8 +5,10 @@
 #include "ops/linear_pair/q8/q8_pair_kernels.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ops/linear/q8/q8_instances.cuh"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 #include "ops/linear/q8/q8_simt_launch.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 
 #include <cstdint>
 
@@ -70,6 +72,45 @@ void q8_pair_simt_r8_c4_launch(const Tensor& x, const Weight& first_weight,
                                const Weight& second_weight, Tensor& first_out, Tensor& second_out,
                                cudaStream_t stream) {
     launch_two_simt<4>(x, first_weight, second_weight, first_out, second_out, stream);
+}
+
+void q8_pair_two_sliced_r16_t16_w8_s2_launch(const Tensor& x, const Weight& first_weight,
+                                             const Weight& second_weight, Tensor& first_out,
+                                             Tensor& second_out, cudaStream_t stream) {
+    launch_q8_a16_sliced_k_mma<q8_instances::SlicedR16T16W8S2>(
+        q8_linear_operands(x, first_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(first_out.data), first_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+    launch_q8_a16_sliced_k_mma<q8_instances::SlicedR16T16W8S2>(
+        q8_linear_operands(x, second_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(second_out.data), second_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void q8_pair_two_sliced_r16_t32_w4_s1_launch(const Tensor& x, const Weight& first_weight,
+                                             const Weight& second_weight, Tensor& first_out,
+                                             Tensor& second_out, cudaStream_t stream) {
+    launch_q8_a16_sliced_k_mma<q8_instances::SlicedR16T32W4S1>(
+        q8_linear_operands(x, first_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(first_out.data), first_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+    launch_q8_a16_sliced_k_mma<q8_instances::SlicedR16T32W4S1>(
+        q8_linear_operands(x, second_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(second_out.data), second_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void q8_pair_two_mma_r32_t32_k128_a1_launch(const Tensor& x, const Weight& first_weight,
+                                            const Weight& second_weight, Tensor& first_out,
+                                            Tensor& second_out, cudaStream_t stream) {
+    launch_q8_a16_mma<q8_instances::MmaR32T32K128A1>(
+        q8_linear_operands(x, first_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(first_out.data), first_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+    launch_q8_a16_mma<q8_instances::MmaR32T32K128A1>(
+        q8_linear_operands(x, second_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(second_out.data), second_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
 }
 
 void q8_pair_gemm_mma_r32_c64_launch(bool full, const Tensor& x, const Weight& first_weight,

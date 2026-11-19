@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/linear/q8/q8_instances.cuh"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 
 #include <cstdint>
@@ -145,6 +146,21 @@ void q8_linear_add_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tensor&
                                        cudaStream_t stream) {
     using Schedule = Q8A16MmaSchedule<128, 80, 64, 64, 16, 2, 2>;
     launch_variant<Schedule>(x, w, residual_out, stream);
+}
+
+void q8_linear_add_mma_r16_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                           cudaStream_t stream) {
+    launch_variant<q8_instances::MmaR16T32K128A1>(x, w, residual_out, stream);
+}
+
+void q8_linear_add_mma_r32_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                           cudaStream_t stream) {
+    launch_variant<q8_instances::MmaR32T32K128A1>(x, w, residual_out, stream);
+}
+
+void q8_linear_add_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                           cudaStream_t stream) {
+    launch_variant<q8_instances::MmaR32T64W16x32K128A1>(x, w, residual_out, stream);
 }
 
 } // namespace infernix::ops::detail

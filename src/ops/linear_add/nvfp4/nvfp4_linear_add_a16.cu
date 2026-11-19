@@ -48,7 +48,7 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, bool
                                                                             stream);
             return;
         }
-        if (tokens <= 128) {
+        if (tokens <= 64) {
             launch_nvfp4_a16_mma<
                 Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>, 6144>>(
                 p, output, epilogue, stream);

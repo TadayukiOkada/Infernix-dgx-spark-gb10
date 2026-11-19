@@ -30,7 +30,8 @@ using C2 = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::Sh
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
-    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
+    if (tokens <= 8)
+        return nvfp4_linear_a16_sliced_k_dyn<Geometry, Nvfp4SlicedInstance<8, 8, 2, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2, 2>>;
     if (tokens <= 24) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 4, 2, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 1, 2>>;
@@ -53,8 +54,7 @@ void launch_routes(const Nvfp4A16Operands& operands, Output output, cudaStream_t
         return;
     }
     if (tokens <= 8) {
-        launch_nvfp4_a16_sliced_k_mma<
-            Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2, 2>, Geometry::kInputRows>>(
+        launch_nvfp4_a16_sliced_k_mma<Nvfp4SlicedInstance<8, 8, 2, 2>>(
             operands, output, epilogue, stream);
         return;
     }

@@ -84,7 +84,7 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
         Nvfp4AttentionInputOutput{
             static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
             static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)},
-        LinearIdentityEpilogue{}, stream);
+        LinearIdentityEpilogue{}, stream, {}, pdl::Dependency::Programmatic);
 }
 
 void launch_a4_schedule(Nvfp4AttnInputA4ScheduleId schedule, const Tensor& x, const Weight& weight,

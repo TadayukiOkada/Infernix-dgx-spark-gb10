@@ -27,6 +27,15 @@ void q8_pair_splitk_medium_launch(Q8PairScheduleId schedule, const Tensor& x,
 void q8_pair_simt_r8_c4_launch(const Tensor& x, const Weight& first_weight,
                                const Weight& second_weight, Tensor& first_out, Tensor& second_out,
                                cudaStream_t stream);
+void q8_pair_two_sliced_r16_t16_w8_s2_launch(const Tensor& x, const Weight& first_weight,
+                                             const Weight& second_weight, Tensor& first_out,
+                                             Tensor& second_out, cudaStream_t stream);
+void q8_pair_two_sliced_r16_t32_w4_s1_launch(const Tensor& x, const Weight& first_weight,
+                                             const Weight& second_weight, Tensor& first_out,
+                                             Tensor& second_out, cudaStream_t stream);
+void q8_pair_two_mma_r32_t32_k128_a1_launch(const Tensor& x, const Weight& first_weight,
+                                            const Weight& second_weight, Tensor& first_out,
+                                            Tensor& second_out, cudaStream_t stream);
 void q8_pair_gemm_mma_r32_c64_launch(bool full, const Tensor& x, const Weight& first_weight,
                                      const Weight& second_weight, Tensor& first_out,
                                      Tensor& second_out, cudaStream_t stream);

@@ -2,62 +2,53 @@
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
 #include "infernix/ops/rmsnorm.h"
-#include <algorithm>
+
+#include <cstdint>
 #include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
-DynamicConvPrepareRoute resolve_route(int tokens) {
-    // GB10 tuning (#132): full cold-cache graph timings across every legal W x B
-    // show the R16/split-8 family only leads for the very smallest token counts
-    // (draft steps <= 4). From 5 tokens upward R32/split-4 wins everywhere and
-    // halves the split scratch. Within R32 the wide tile (columns 64) wins for the
-    // mid-range (13..64) and again above 96; the narrow tile (columns 32) wins in
-    // 5..12 and 65..96. Paired interleaved A/B confirmed each band every rep.
-    if (tokens <= 4) return {16, 8, 8};
-    const int columns = ((tokens >= 13 && tokens <= 64) || tokens > 96) ? 64 : 32;
-    return {32, columns, 4};
+
+constexpr std::size_t workspace_bytes(std::int32_t hidden, std::int32_t tokens) noexcept {
+    return static_cast<std::size_t>(hidden) * static_cast<std::size_t>(tokens) *
+           sizeof(std::uint16_t);
 }
 
-// The split partials of every coefficient row (H / 4 of them).
-std::size_t capacity(int hidden, DynamicConvPrepareRoute route, int tokens) {
-    return static_cast<std::size_t>(hidden / 4) * tokens * route.split_k * sizeof(float);
-}
-
-void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor& norm, float eps,
-             const Tensor& base, const Weight& weight, Tensor& prepared, Tensor& finish,
-             WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope       = workspace.scope();
-    const int tokens = residual.ne[1] * residual.ne[2];
-    float* partial   = static_cast<float*>(
-        workspace.alloc_bytes(capacity(residual.ne[0], route, tokens)).data);
-    rmsnorm(residual, norm, eps, false, prepared, stream);
-    bf16_dynamic_grouped_conv_prepare_partial_launch(route, prepared, weight, partial, stream);
-    bf16_dynamic_grouped_conv_prepare_reduce_launch(route, base, partial, prepared, finish, stream);
-}
 } // namespace
 
-std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(int hidden, int min_width,
-                                                                       int max_width,
-                                                                       int min_batch,
-                                                                       int max_batch) {
-    if (hidden != 5120 && hidden != 2560 && hidden != 3072)
-        throw std::invalid_argument("dynamic grouped conv prepare workspace: H must be 5120, 2560 or 3072");
+std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(std::int32_t hidden,
+                                                                       std::int32_t min_width,
+                                                                       std::int32_t max_width,
+                                                                       std::int32_t min_batch,
+                                                                       std::int32_t max_batch) {
+    if (hidden != 5120 && hidden != 2560 && hidden != 3072) {
+        throw std::invalid_argument(
+            "dynamic grouped conv prepare workspace: H must be 5120, 2560 or 3072");
+    }
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
-        max_batch > 8 || min_batch > max_batch)
+        max_batch > 8 || min_batch > max_batch) {
         throw std::invalid_argument("dynamic grouped conv prepare workspace: invalid W/B interval");
-    std::size_t maximum = 0;
-    for (int w = min_width; w <= max_width; ++w)
-        for (int b = min_batch; b <= max_batch; ++b)
-            maximum = std::max(maximum, capacity(hidden, resolve_route(w * b), w * b));
-    return maximum;
+    }
+    return workspace_bytes(hidden, max_width * max_batch);
 }
 
 void bf16_dynamic_grouped_conv_prepare_dispatch(const Tensor& residual, const Tensor& norm,
                                                 float eps, const Tensor& base, const Weight& weight,
                                                 Tensor& prepared, Tensor& finish,
                                                 WorkspaceArena& workspace, cudaStream_t stream) {
-    execute(resolve_route(residual.ne[1] * residual.ne[2]), residual, norm, eps, base, weight,
-            prepared, finish, workspace, stream);
+    auto scope              = workspace.scope();
+    const std::int32_t rows = residual.ne[0];
+    const std::int32_t cols = residual.ne[1] * residual.ne[2];
+    const auto span         = workspace.alloc_bytes(workspace_bytes(rows, cols));
+    Tensor normalized(span.data, DType::BF16, {rows, residual.ne[1], residual.ne[2]});
+    rmsnorm(residual, norm, eps, false, normalized, stream);
+    if (cols <= 64) {
+        bf16_dynamic_grouped_conv_prepare_fused_sliced_launch(normalized, base, weight, prepared,
+                                                              finish, stream);
+    } else {
+        bf16_dynamic_grouped_conv_prepare_fused_tma_launch(normalized, base, weight, prepared,
+                                                           finish, stream);
+    }
 }
+
 } // namespace infernix::ops::detail

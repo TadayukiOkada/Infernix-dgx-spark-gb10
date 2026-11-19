@@ -1,172 +1,122 @@
-#include "core/weight.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
-#include "core/device.h"
-#include "core/pdl.cuh"
-#include "ops/common/memory.cuh"
-#include "ops/common/mma.cuh"
-#include "ops/common/rowsplit_mma.cuh"
-#include <cuda_bf16.h>
+#include "ops/linear/bf16/bf16_template_launch.cuh"
+
+#include <cstdint>
 #include <stdexcept>
 
 namespace infernix::ops::detail {
 namespace {
-constexpr int kBlockK = 64, kStages = 2;
 
-// The coefficient rows of hidden width H: 2 sides x 2 taps x H / 16 groups.
-template <int Hidden>
-constexpr int kCoefficientRows = Hidden / 4;
+constexpr int kGroupWidth = 16;
 
-__device__ __forceinline__ int shared_col(int row, int col) { return gemm_swz64(row, col); }
-
-template <int Rows, int Columns>
-struct Tile {
-    static constexpr int column_warps = Rows == 16 ? Columns / 8 : 4;
-    static constexpr int threads      = Rows / 16 * column_warps * 32;
-    static constexpr int mmas         = Columns / column_warps / 8;
+template <int Hidden, class S>
+struct GroupedCoefficients : Bf16ScheduleInstance<S, Hidden> {
+    static constexpr int kGroups = Hidden / kGroupWidth;
+    // Four adjacent coefficient rows belong to one group. Native P remains [side, tap, group].
+    __device__ __forceinline__ static int weight_row(int row) {
+        return (row % 4) * kGroups + row / 4;
+    }
 };
 
-template <int Hidden, int Rows, int Columns, int SplitK>
-__global__
-__launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_prepare_partial_kernel(
-    const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ weight,
-    float* __restrict__ partial, int tokens) {
-    pdl::enter_streaming();
-    constexpr int threads         = Tile<Rows, Columns>::threads;
-    constexpr int mmas            = Tile<Rows, Columns>::mmas;
-    constexpr int tiles_per_split = Hidden / kBlockK / SplitK;
-    __shared__ __align__(16) __nv_bfloat16 ws[kStages][Rows * kBlockK];
-    __shared__ __align__(16) __nv_bfloat16 xs[kStages][Columns * kBlockK];
-    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, gid = lane / 4, lid = lane % 4;
-    const int row0 = blockIdx.x * Rows, col0 = blockIdx.y * Columns, split = blockIdx.z;
-    const int warp_row = warp / Tile<Rows, Columns>::column_warps;
-    const int warp_col = warp % Tile<Rows, Columns>::column_warps;
-    const int kt_begin = split * tiles_per_split;
-    float acc[mmas][4] = {};
-    auto stage_inputs  = [&](int stage, int kt) {
-        for (int item = tid; item < Rows * (kBlockK / 8); item += threads) {
-            int row = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
-            cp_async<16, Cache::cg>(&ws[stage][row * kBlockK + shared_col(row, kk)],
-                                     weight + static_cast<std::int64_t>(row0 + row) * Hidden +
-                                         kt * kBlockK + kk);
-        }
-        for (int item = tid; item < Columns * (kBlockK / 8); item += threads) {
-            int col = item / (kBlockK / 8), kk = item % (kBlockK / 8) * 8;
-            const int safe_col = col0 + col < tokens ? col0 + col : 0;
-            cp_async_zfill<16, Cache::cg>(&xs[stage][col * kBlockK + shared_col(col, kk)],
-                                           input + static_cast<std::int64_t>(safe_col) * Hidden +
-                                               kt * kBlockK + kk,
-                                          col0 + col < tokens ? 16 : 0);
-        }
-    };
-    for (int stage = 0; stage < kStages; ++stage) {
-        stage_inputs(stage, kt_begin + stage);
-        cp_commit();
-    }
-#pragma unroll 1
-    for (int tile = 0; tile < tiles_per_split; ++tile) {
-        const int stage = tile % kStages;
-        if (tile + kStages <= tiles_per_split) {
-            cp_wait<kStages - 1>();
-        } else {
-            cp_wait<0>();
-        }
-        __syncthreads();
-#pragma unroll
-        for (int ki = 0; ki < kBlockK / 16; ++ki) {
-            unsigned a[4];
-            const int ar = warp_row * 16 + (lane & 7) + (((lane >> 3) & 1) * 8);
-            const int ak = ki * 16 + (lane >> 4) * 8;
-            ldmatrix_x4(a[0], a[1], a[2], a[3],
-                        smem_addr(&ws[stage][ar * kBlockK + shared_col(ar, ak)]));
-#pragma unroll
-            for (int m = 0; m < mmas; ++m) {
-                unsigned b[2];
-                const int br = (warp_col * mmas + m) * 8 + (lane & 7);
-                const int bk = ki * 16 + ((lane >> 3) & 1) * 8;
-                ldmatrix_x2(b[0], b[1], smem_addr(&xs[stage][br * kBlockK + shared_col(br, bk)]));
-                mma_bf16(acc[m][0], acc[m][1], acc[m][2], acc[m][3], a[0], a[1], a[2], a[3], b[0],
-                         b[1]);
+template <int Hidden>
+struct InputConvolution {
+    enum { kSlicedTile = true };
+    static constexpr int kGroups = Hidden / kGroupWidth;
+
+    template <class S>
+    __device__ __forceinline__ void finish_sliced_tile(DynamicConvFusedOutputs out,
+                                                       const float* coefficients, int row0,
+                                                       int token0, int, int tokens) const {
+        constexpr int groups_per_tile = S::kBlockRows / 4;
+        constexpr int pairs_per_tile  = groups_per_tile * (kGroupWidth / 2);
+        const int columns             = min(S::kBlockTokens, tokens - token0);
+        for (int item = threadIdx.x; item < columns * pairs_per_tile; item += S::kThreads) {
+            const int column  = item / pairs_per_tile;
+            const int token   = token0 + column;
+            const int local   = item - column * pairs_per_tile;
+            const int g       = local / (kGroupWidth / 2);
+            const int h       = row0 / 4 * kGroupWidth + local * 2;
+            const auto offset = static_cast<std::int64_t>(token) * Hidden + h;
+            const auto c      = column * S::kBlockRows + 4 * g;
+            const float d0    = coefficients[c];
+            const float2 base0 =
+                __bfloat1622float2(load_vec<__nv_bfloat162>(out.base + h));
+            const float2 norm0 =
+                __bfloat1622float2(load_vec<__nv_bfloat162>(out.normalized + offset));
+            float2 value{(base0.x + d0) * norm0.x, (base0.y + d0) * norm0.y};
+            if (token % out.width) {
+                const float d1 = coefficients[c + 1];
+                const float2 base1 =
+                    __bfloat1622float2(load_vec<__nv_bfloat162>(out.base + Hidden + h));
+                const float2 norm1 = __bfloat1622float2(
+                    load_vec<__nv_bfloat162>(out.normalized + offset - Hidden));
+                value.x = fmaf(base1.x + d1, norm1.x, value.x);
+                value.y = fmaf(base1.y + d1, norm1.y, value.y);
             }
+            store_vec(out.prepared + offset, __floats2bfloat162_rn(value.x, value.y));
         }
-        __syncthreads();
-        if (tile + kStages < tiles_per_split) stage_inputs(stage, kt_begin + tile + kStages);
-        cp_commit();
-    }
-    // Scratch is [split][coefficient row][token], so each MMA accumulator's adjacent token
-    // columns are adjacent in memory: the four lanes sharing a row store 8 contiguous floats and
-    // even `tokens` (every production width) admits aligned float2 stores.
-#pragma unroll
-    for (int m = 0; m < mmas; ++m) {
-        const int row = row0 + warp_row * 16 + gid,
-                  col = col0 + (warp_col * mmas + m) * 8 + 2 * lid;
-        const std::int64_t row_base =
-            (static_cast<std::int64_t>(split) * kCoefficientRows<Hidden> + row) * tokens;
-        const std::int64_t row8_base = row_base + 8 * tokens;
-        if ((tokens & 1) == 0 && col + 1 < tokens) {
-            *reinterpret_cast<float2*>(partial + row_base + col) =
-                make_float2(acc[m][0], acc[m][1]);
-            *reinterpret_cast<float2*>(partial + row8_base + col) =
-                make_float2(acc[m][2], acc[m][3]);
-        } else {
-            if (col < tokens) {
-                partial[row_base + col]     = acc[m][0];
-                partial[row8_base + col]    = acc[m][2];
-            }
-            if (col + 1 < tokens) {
-                partial[row_base + col + 1]  = acc[m][1];
-                partial[row8_base + col + 1] = acc[m][3];
-            }
+        for (int item = threadIdx.x; item < columns * groups_per_tile * 2; item += S::kThreads) {
+            const int group  = item % groups_per_tile;
+            const int tap    = (item / groups_per_tile) % 2;
+            const int column = item / (groups_per_tile * 2);
+            const int token  = token0 + column;
+            const auto offset =
+                (static_cast<std::int64_t>(token) * 2 + tap) * kGroups + row0 / 4 + group;
+            out.finish[offset] =
+                __float2bfloat16_rn(coefficients[column * S::kBlockRows + group * 4 + 2 + tap]);
         }
     }
+};
+
+template <int Hidden, int Columns, int Warps, int WarpK>
+void run_sliced(const Tensor& normalized, const Tensor& base, const Weight& projection,
+                Tensor& prepared, Tensor& finish, cudaStream_t stream) {
+    using S = GroupedCoefficients<
+        Hidden, Bf16A16SlicedKMmaSchedule<16, Columns, Warps, WarpK, 2, Cache::cg, Cache::cg, 1, 7>>;
+    const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(normalized.data),
+                            static_cast<const __nv_bfloat16*>(projection.qdata), Hidden / 4, Hidden,
+                            normalized.ne[1] * normalized.ne[2]};
+    const DynamicConvFusedOutputs out{static_cast<const __nv_bfloat16*>(normalized.data),
+                                      static_cast<const __nv_bfloat16*>(base.data),
+                                      static_cast<__nv_bfloat16*>(prepared.data),
+                                      static_cast<__nv_bfloat16*>(finish.data), normalized.ne[1]};
+    launch_bf16_a16_sliced_k_mma<S>(p, out, InputConvolution<Hidden>{}, stream,
+                                    pdl::Dependency::Programmatic);
 }
 
-template <int H, int R, int C, int S>
-void launch(const Tensor& input, const Weight& weight, float* partial, cudaStream_t stream) {
-    static_assert(H % (kBlockK * S) == 0 && kCoefficientRows<H> % R == 0);
-    const int tokens = input.ne[1] * input.ne[2];
-    const dim3 grid(kCoefficientRows<H> / R, (tokens + C - 1) / C, S);
-    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(Tile<R, C>::threads), 0, stream},
-                                    dynamic_grouped_conv_prepare_partial_kernel<H, R, C, S>,
-                                    static_cast<const __nv_bfloat16*>(input.data),
-                                    static_cast<const __nv_bfloat16*>(weight.qdata), partial,
-                                    tokens));
-    CUDA_CHECK(cudaGetLastError());
+template <int Hidden>
+void launch_hidden_sliced(const Tensor& normalized, const Tensor& base, const Weight& projection,
+                          Tensor& prepared, Tensor& finish, cudaStream_t stream) {
+    const int columns = normalized.ne[1] * normalized.ne[2];
+    if (columns <= 8)
+        return run_sliced<Hidden, 8, 16, 32>(normalized, base, projection, prepared, finish, stream);
+    if (columns <= 16)
+        return run_sliced<Hidden, 16, 16, 32>(normalized, base, projection, prepared, finish,
+                                              stream);
+    if (columns <= 32)
+        return run_sliced<Hidden, 32, 16, 32>(normalized, base, projection, prepared, finish,
+                                              stream);
+    if (columns <= 64)
+        return run_sliced<Hidden, 64, 8, 32>(normalized, base, projection, prepared, finish, stream);
+    throw std::logic_error("dynamic grouped conv prepare: sliced route requires columns <= 64");
 }
 
-template <int H>
-void launch_route(DynamicConvPrepareRoute route, const Tensor& input, const Weight& weight,
-                  float* partial, cudaStream_t stream) {
-    if (route.rows == 16 && route.split_k == 8) {
-        switch (route.columns) {
-#define COL(C)                                                                                     \
-    case C:                                                                                        \
-        return launch<H, 16, C, 8>(input, weight, partial, stream)
-            COL(8);
-            COL(16);
-            COL(32);
-            COL(48);
-#undef COL
-        }
-    }
-    if (route.rows == 32 && route.split_k == 4) {
-        if (route.columns == 32) return launch<H, 32, 32, 4>(input, weight, partial, stream);
-        if (route.columns == 64) return launch<H, 32, 64, 4>(input, weight, partial, stream);
-    }
-    throw std::logic_error("dynamic grouped conv prepare: invalid production tile");
-}
 } // namespace
 
-void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute route,
-                                                      const Tensor& input, const Weight& weight,
-                                                      float* partial, cudaStream_t stream) {
-    switch (input.ne[0]) {
+void bf16_dynamic_grouped_conv_prepare_fused_sliced_launch(const Tensor& normalized,
+                                                           const Tensor& base,
+                                                           const Weight& projection,
+                                                           Tensor& prepared, Tensor& finish,
+                                                           cudaStream_t stream) {
+    switch (normalized.ne[0]) {
     case 5120:
-        return launch_route<5120>(route, input, weight, partial, stream);
+        return launch_hidden_sliced<5120>(normalized, base, projection, prepared, finish, stream);
     case 2560:
-        return launch_route<2560>(route, input, weight, partial, stream);
+        return launch_hidden_sliced<2560>(normalized, base, projection, prepared, finish, stream);
     case 3072:
-        return launch_route<3072>(route, input, weight, partial, stream);
+        return launch_hidden_sliced<3072>(normalized, base, projection, prepared, finish, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: unregistered hidden width");
 }
+
 } // namespace infernix::ops::detail

@@ -24,10 +24,12 @@ namespace infernix::ops::detail {
 // 403 us is inside the family band. The T > 64 tail mirrors the [2560, 6144] shape's MMA ladder:
 // unmeasured here, it replaces the narrower generic tiles that lost 20%+ at every measured width.
 Q8Launch select_q8_n2560_k12800(std::int32_t tokens) {
-    if (tokens <= 32) return select_q8_n2560_k12800_invariant(tokens);
-    if (tokens <= 48) return launch_q8_a16_mma_r64x16_t128_k128_a2;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x16_t48_k128_a1;
+    if (tokens <= 16) return select_q8_n2560_k12800_invariant(tokens);
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
+    if (tokens <= 48) return launch_q8_a16_sliced_r32_t48_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t32_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
+    if (tokens <= 192) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     if (tokens <= 448) return launch_q8_a16_mma_r64_t128;
     // T1 2026-10-31: the 128x128 Grouped-8 tile now runs to the top (production: 72.7 vs
     // 59.6 TFLOP/s at T = 1024, 75.8..76.2 vs 60.1..60.5 at T = 4096 over the r64x32 a2

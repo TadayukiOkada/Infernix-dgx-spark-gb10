@@ -244,6 +244,9 @@ int main(int argc, char** argv) {
             RUN_MMA(mma_r64_c128);
             RUN_MMA(mma_r128_c64);
             RUN_MMA(mma_r128_c80);
+            RUN_MMA(mma_r16_c32_k128);
+            RUN_MMA(mma_r32_c32_k128);
+            RUN_MMA(mma_r32_c64_k128);
 #undef RUN_MMA
         }
 

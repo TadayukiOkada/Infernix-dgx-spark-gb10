@@ -8,6 +8,8 @@
 // Generated at: 2026-10-24 17:58:04 UTC
 // =============================================================================
 
+#include "ops/linear/bf16/bf16_mma_epilogue.cuh"
+#include "ops/linear/q8/q8_a16_tma_k32.cuh"
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_gemv_launch.cuh"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
@@ -65,6 +67,33 @@ void sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t str
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
         LinearIdentityEpilogue{}, stream);
 }
+
+using TmaHot96   = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 2560>;
+using TmaBulk128 = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 2560>;
+using TmaK32     = Q8A16TmaK32Schedule<8, 2560>;
+
+template <class Schedule, Q8Launch Fallback>
+void tma_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.padded_shape[1] != 2560 || out.dtype != DType::BF16 || weight.n % 64 != 0) {
+        Fallback(x, weight, out, stream);
+        return;
+    }
+    launch_q8_a16_tma_mma<Schedule>(
+        q8_linear_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        Bf16MmaCtaWarpStoreEpilogue<>{}, stream);
+}
+
+void tma_k32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.padded_shape[1] != 2560 || out.dtype != DType::BF16 || weight.n % 128 != 0) {
+        launch_q8_a16_mma_r128x64_t128_k64_a1(x, weight, out, stream);
+        return;
+    }
+    launch_q8_a16_tma_k32<TmaK32>(
+        q8_linear_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        Bf16MmaCtaWarpStoreEpilogue<>{}, stream);
+}
 } // namespace
 
 Q8Launch select_q8_n6144_k2560(std::int32_t tokens) {
@@ -74,10 +103,9 @@ Q8Launch select_q8_n6144_k2560(std::int32_t tokens) {
     if (tokens <= 32) return grouped<S3>;
     if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
-    if (tokens <= 511) return launch_q8_a16_mma_r64_t128;
-    // T1 2026-10-31: the sweep kept r64_t128 ahead through T = 513 (275 us vs 285) with the
-    // 128x128 Grouped-8 tile taking over beyond (production-equal at T = 1024/4096); the
-    // blanket 256 crossover first shipped today regressed T = 257 by 11%.
-    return launch_q8_a16_mma_r128x64_t128_k64_a1;
+    if (tokens <= 128) return launch_q8_a16_mma_r64_t128;
+    if (tokens <= 192) return tma_mma<TmaHot96, launch_q8_a16_mma_r64_t128>;
+    if (tokens <= 512) return tma_mma<TmaBulk128, launch_q8_a16_mma_r64_t128>;
+    return tma_k32;
 }
 } // namespace infernix::ops::detail

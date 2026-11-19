@@ -12,6 +12,9 @@ namespace infernix::ops::detail {
 
 enum class Q8PairScheduleId {
     TwoSimtR8C4,
+    TwoSlicedR16T16W8S2,
+    TwoSlicedR16T32W4S1,
+    TwoMmaR32T32K128A1,
     DualDecodeR4,
     DualDecodeR8,
     DualDecodeR16,

@@ -28,6 +28,8 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
         return "attn_input_proj.q4_q5.mixed.r64.c128.s2";
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         return "attn_input_proj.q4_q5.pair.r32.c64.s4";
+    case Q4Q5AttnInputScheduleId::SplitMmaK128:
+        return "attn_input_proj.q4_q5.split_mma.k128";
     case Q4Q5AttnInputScheduleId::ColumnInvariant:
         return "attn_input_proj.q4_q5.sliced.column_invariant";
     }
@@ -50,8 +52,11 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
     // 65+ band, and mixed.r32.c64.s3 owns 13-64. The 5090-inherited pair.r32.c64.s3 (65-104) and
     // pair.r32.c64.s4 (129-192) bands are severely mis-routed (~36% / ~20% penalties); mixed.r32.c32.s2
     // never wins a sustained band. Those lanes stay legal in the candidate API but are dropped here.
-    if (problem.cols <= 12) return {Q4Q5AttnInputScheduleId::ParentSplitFixed};
-    if (problem.cols <= 64) return {Q4Q5AttnInputScheduleId::MixedR32C64S3};
+    if (problem.cols <= 4 || (problem.cols >= 7 && problem.cols <= 9)) {
+        return {Q4Q5AttnInputScheduleId::ParentSplitFixed};
+    }
+    if (problem.cols <= 32) return {Q4Q5AttnInputScheduleId::ColumnInvariant};
+    if (problem.cols <= 96) return {Q4Q5AttnInputScheduleId::SplitMmaK128};
     return {Q4Q5AttnInputScheduleId::MixedR64C128S2};
 }
 
@@ -98,6 +103,10 @@ void q4_q5_attn_input_execute_candidate(Q4Q5AttnInputScheduleId schedule, const 
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
         return;
+    case Q4Q5AttnInputScheduleId::SplitMmaK128:
+        q4_q5_attn_input_split_mma_k128_launch(x, query_key_weight, gate_value_weight, q, gate, k,
+                                               v, stream);
+        return;
     }
     throw std::logic_error("Q4/Q5 attention input: unknown candidate schedule");
 }
@@ -137,6 +146,10 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
                                                        gate, k, v, stream);
+        return;
+    case Q4Q5AttnInputScheduleId::SplitMmaK128:
+        q4_q5_attn_input_split_mma_k128_launch(x, query_key_weight, gate_value_weight, q, gate, k,
+                                               v, stream);
         return;
     case Q4Q5AttnInputScheduleId::ColumnInvariant:
         q4_q5_attn_input_column_invariant_launch(x, query_key_weight, gate_value_weight, q, gate,

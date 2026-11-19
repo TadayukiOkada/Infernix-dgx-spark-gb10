@@ -63,6 +63,12 @@ void q8_linear_add_mma_r128_c64_launch(const Tensor& x, const Weight& w, Tensor&
                                        cudaStream_t stream);
 void q8_linear_add_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream);
+void q8_linear_add_mma_r16_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                           cudaStream_t stream);
+void q8_linear_add_mma_r32_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                           cudaStream_t stream);
+void q8_linear_add_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                           cudaStream_t stream);
 
 void q8_linear_add_splitk_capacity_launch(const Tensor& x, const Weight& w, Tensor& residual,
                                           cudaStream_t stream);

@@ -42,16 +42,17 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 // chosen per band. The prior 5090-fitted bands regressed badly here: the pairwise/w4_s1 schedules
 // cost 20-38% more than SlicedR32T64W2S1 across cols 33-64, and the narrow-MMA/w2_s2 schedules
 // cost 25-52% more than MmaResidualR64T128 across cols 65-128 and 161-256.
-constexpr std::array<RouteSpec, 12> kK6144Routes{{
+constexpr std::array<RouteSpec, 13> kK6144Routes{{
     {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
     {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
-    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
-    {{49, 64}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
-    {{65, 128}, Q5LinearAddScheduleId::MmaResidualR64T128},
-    {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
+    {{33, 64}, Q5LinearAddScheduleId::MmaResidualR64T64K128},
+    {{65, 80}, Q5LinearAddScheduleId::MmaResidualR64T80K128},
+    {{81, 96}, Q5LinearAddScheduleId::MmaResidualR64T96K128},
+    {{97, 128}, Q5LinearAddScheduleId::MmaResidualR64T128},
+    {{129, 160}, Q5LinearAddScheduleId::MmaResidualR64T80K128},
     {{161, 256}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
@@ -59,16 +60,17 @@ constexpr std::array<RouteSpec, 12> kK6144Routes{{
 
 // Retuned to the same GB10 winners as K6144; the measured per-band champion was identical for both
 // K values on sm_121a. See the kK6144Routes comment for the candidate-sweep evidence.
-constexpr std::array<RouteSpec, 12> kK17408Routes{{
+constexpr std::array<RouteSpec, 13> kK17408Routes{{
     {{1, 4}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{5, 8}, Q5LinearAddScheduleId::SlicedR16T8W4S2},
     {{9, 16}, Q5LinearAddScheduleId::SlicedR16T16W4S2},
     {{17, 24}, Q5LinearAddScheduleId::SlicedR16T24W4S2},
     {{25, 32}, Q5LinearAddScheduleId::SlicedR32T32W4S2},
-    {{33, 48}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
-    {{49, 64}, Q5LinearAddScheduleId::SlicedR32T32W4S1},
-    {{65, 128}, Q5LinearAddScheduleId::MmaResidualR64T128},
-    {{129, 160}, Q5LinearAddScheduleId::SlicedR32T64W2S1},
+    {{33, 64}, Q5LinearAddScheduleId::MmaResidualR64T64K128},
+    {{65, 80}, Q5LinearAddScheduleId::MmaResidualR64T80K128},
+    {{81, 96}, Q5LinearAddScheduleId::MmaResidualR64T96K128},
+    {{97, 128}, Q5LinearAddScheduleId::MmaResidualR64T128},
+    {{129, 160}, Q5LinearAddScheduleId::MmaResidualR64T80K128},
     {{161, 256}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{257, 512}, Q5LinearAddScheduleId::MmaResidualR64T128},
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64T128Tail},
@@ -151,6 +153,14 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.sliced.r32.t64.w2.s1.residual";
     case Q5LinearAddScheduleId::MmaResidualR32T32K128:
         return "linear_add.q5.mma.r32.t32.k128.residual";
+    case Q5LinearAddScheduleId::MmaResidualR64T64K128:
+        return "linear_add.q5.mma.r64.t64.k128.residual";
+    case Q5LinearAddScheduleId::MmaResidualR64T80K128:
+        return "linear_add.q5.mma.r64.t80.k128.residual";
+    case Q5LinearAddScheduleId::MmaResidualR64T96K128:
+        return "linear_add.q5.mma.r64.t96.k128.residual";
+    case Q5LinearAddScheduleId::MmaResidualR64T128K128:
+        return "linear_add.q5.mma.r64.t128.k128.residual";
     case Q5LinearAddScheduleId::MmaResidualR32T128:
         return "linear_add.q5.mma.r32.t128.residual";
     case Q5LinearAddScheduleId::MmaResidualR64T128:
@@ -248,6 +258,18 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     case Q5LinearAddScheduleId::MmaResidualR32T32K128:
         q5_linear_add_mma_r32_t32_k128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64T64K128:
+        q5_linear_add_mma_r64_t64_k128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64T80K128:
+        q5_linear_add_mma_r64_t80_k128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64T96K128:
+        q5_linear_add_mma_r64_t96_k128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::MmaResidualR64T128K128:
+        q5_linear_add_mma_r64_t128_k128_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR32T128:
         q5_linear_add_mma_r32_t128_launch(x, w, residual_out, stream);

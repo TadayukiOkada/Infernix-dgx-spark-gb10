@@ -37,12 +37,15 @@ using C56 = Q8A16SlicedKMmaSchedule<56, 4, 1, 3, Access::Shared, Cache::ca, Cach
 
 Q8Launch select_q8_n14336_k5120(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_sliced<Geometry, 4, C4>;
-    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w4_s2;
-    if (tokens <= 24) return launch_q8_a16_sliced<Geometry, 24, C24>;
-    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s2;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 8) return launch_q8_a16_sliced_r16_t16_w4_s2;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w16_s1_m2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
+    if (tokens <= 48) return launch_q8_a16_sliced_r32_t48_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t32_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64x32_t96_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
+    if (tokens <= 192) return launch_q8_a16_mma_r64x32_t96_k128_a1;
+    if (tokens <= 256) return launch_q8_a16_mma_r64x32_t128_k64_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;
 }
 

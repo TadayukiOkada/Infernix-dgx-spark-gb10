@@ -8,7 +8,9 @@
 // Generated at: 2026-10-24 16:34:19 UTC
 // =============================================================================
 
+#include "ops/linear/bf16/bf16_mma_epilogue.cuh"
 #include "ops/linear/common/output.cuh"
+#include "ops/linear/q8/q8_a16_tma_k32.cuh"
 #include "ops/linear/q8/q8_f16acc.h"
 #include "ops/linear/q8/q8_instances.cuh"
 #include "ops/linear/q8/q8_mma_launch.cuh"
@@ -23,11 +25,38 @@ namespace {
 // Qwen3.8-Flash-Next MTP attention group: the register-streamed route up to 8 columns (4-28 % faster than
 // SIMT), the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per pass.
 template <int MaxCols, int ColsPerPass>
-using Stream = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
+using Stream     = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
+using TmaHot96   = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 2560>;
+using TmaBulk128 = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 2560>;
+using TmaK32     = Q8A16TmaK32Schedule<8, 2560>;
+
+template <class Schedule, Q8Launch Fallback>
+void tma_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.padded_shape[1] != 2560 || out.dtype != DType::BF16 || weight.n % 64 != 0) {
+        Fallback(x, weight, out, stream);
+        return;
+    }
+    launch_q8_a16_tma_mma<Schedule>(
+        q8_linear_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        Bf16MmaCtaWarpStoreEpilogue<>{}, stream);
+}
+
+void tma_k32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.padded_shape[1] != 2560 || out.dtype != DType::BF16 || weight.n % 128 != 0) {
+        launch_q8_a16_mma_r128x64_t128_k64_a1(x, weight, out, stream);
+        return;
+    }
+    launch_q8_a16_tma_k32<TmaK32>(
+        q8_linear_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        Bf16MmaCtaWarpStoreEpilogue<>{}, stream);
+}
 
 template <class Output>
 void launch_routes(const Q8LinearOperands& operands, Output output, cudaStream_t stream) {
     const LinearIdentityEpilogue epilogue{};
+    const Bf16MmaCtaWarpStoreEpilogue<> tma_epilogue{};
     const std::int32_t tokens = operands.tokens;
     if (tokens <= 4) return launch_q8_a16_stream<Stream<4, 4>>(operands, output, epilogue, stream);
     if (tokens <= 8) return launch_q8_a16_stream<Stream<8, 8>>(operands, output, epilogue, stream);
@@ -36,6 +65,13 @@ void launch_routes(const Q8LinearOperands& operands, Output output, cudaStream_t
     if (tokens <= 64) return launch_q8_a16_mma<q8_instances::MmaR64x32T64K128A1>(operands, output, epilogue, stream);
     if (tokens <= 96) return launch_q8_a16_mma<q8_instances::MmaR64x16T48K128A1>(operands, output, epilogue, stream);
     if (tokens <= 128) return launch_q8_a16_mma<q8_instances::MmaR64x16T128K128A2>(operands, output, epilogue, stream);
+    if (operands.k == 2560 && operands.padded_k == 2560 && operands.rows % 128 == 0) {
+        if (tokens <= 192)
+            return launch_q8_a16_tma_mma<TmaHot96>(operands, output, tma_epilogue, stream);
+        if (tokens <= 512)
+            return launch_q8_a16_tma_mma<TmaBulk128>(operands, output, tma_epilogue, stream);
+        return launch_q8_a16_tma_k32<TmaK32>(operands, output, tma_epilogue, stream);
+    }
     if (tokens <= 384) return launch_q8_a16_mma<q8_instances::MmaR64T128>(operands, output, epilogue, stream);
     if (tokens <= 512) return launch_q8_a16_mma<q8_instances::MmaR64x32T128K64A2>(operands, output, epilogue, stream);
     launch_q8_a16_mma<q8_instances::MmaR128x64T128K64A1>(operands, output, epilogue, stream);
@@ -48,14 +84,15 @@ Q8Launch select_q8_n13952_k2560(std::int32_t tokens) {
     if (tokens <= 5) return launch_q8_a16_simt_r8_t5;
     if (tokens <= 6) return launch_q8_a16_simt_r8_t6;
     if (tokens <= 8) return launch_q8_a16_simt_r8_t8;
-    if (tokens <= 32) return launch_q8_a16_mma_r64x16_t48_k128_a1;
-    if (tokens <= 48) return launch_q8_a16_mma_r32_t48;
-    if (tokens <= 64) return launch_q8_a16_mma_r64x32_t64_k128_a1;
+    if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
+    if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
+    if (tokens <= 48) return launch_q8_a16_sliced_r32_t48_w4_s1;
+    if (tokens <= 64) return launch_q8_a16_mma_r128x16_t64_k128_a2;
     if (tokens <= 96) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
-    if (tokens <= 384) return launch_q8_a16_mma_r64_t128;
-    if (tokens <= 512) return launch_q8_a16_mma_r64x32_t128_k64_a2;
-    return launch_q8_a16_mma_r128x64_t128_k64_a1;
+    if (tokens <= 192) return tma_mma<TmaHot96, launch_q8_a16_mma_r64_t128>;
+    if (tokens <= 512) return tma_mma<TmaBulk128, launch_q8_a16_mma_r64x32_t128_k64_a2>;
+    return tma_k32;
 }
 
 void q8_qsa_group(const Tensor& x, const Weight& w, const QsaGroupParts& parts, LinearRoutes routes,

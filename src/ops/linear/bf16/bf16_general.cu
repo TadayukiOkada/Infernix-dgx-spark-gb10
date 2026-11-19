@@ -1,7 +1,11 @@
 #include "ops/linear/bf16/bf16_general.cuh"
 #include "core/device.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/bf16/bf16_instances.cuh"
 #include "ops/linear/bf16/bf16_skinny.cuh"
+#include "ops/linear/bf16/bf16_template_launch.cuh"
+#include "ops/linear/common/epilogue.cuh"
+#include "ops/linear/common/output.cuh"
 
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +47,16 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     const std::int32_t N = weight.n;
     const std::int32_t K = weight.k;
     const std::int32_t T = x.ne[1];
+    // Route aligned BF16-output runtime shapes onto Tensor Core MMA instead of the SIMT fallback.
+    if (out.dtype == DType::BF16 && N > 0 && K > 0 && (N % 32) == 0 && (K % 128) == 0 &&
+        reinterpret_cast<std::uintptr_t>(weight.qdata) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0) {
+        launch_bf16_a16_mma<Bf16A16MmaR32T32K128S3>(
+            bf16_a16_operands(x, weight),
+            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), N},
+            LinearIdentityEpilogue{}, stream);
+        return;
+    }
     const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
                     static_cast<unsigned>((T + kTileT - 1) / kTileT));
     const auto* xs = static_cast<const __nv_bfloat16*>(x.data);

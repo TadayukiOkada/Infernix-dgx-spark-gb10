@@ -37,8 +37,8 @@ struct RouteSpec {
 constexpr std::array<RouteSpec, 20> kK4096Routes{{
     {1, 1, Q8LinearAddScheduleId::DecodeR16},
     {2, 48, Q8LinearAddScheduleId::SplitKMmaExactT},
-    {49, 71, Q8LinearAddScheduleId::MmaR32C128},
-    {72, 195, Q8LinearAddScheduleId::MmaR32C64},
+    {49, 64, Q8LinearAddScheduleId::MmaR16C32K128},
+    {65, 195, Q8LinearAddScheduleId::MmaR32C64K128},
     {196, 259, Q8LinearAddScheduleId::MmaR48C128},
     {260, 291, Q8LinearAddScheduleId::MmaR64C96},
     {292, 391, Q8LinearAddScheduleId::MmaR64C128},
@@ -68,13 +68,12 @@ constexpr std::array<RouteSpec, 20> kK4096Routes{{
 // 2026-10-31 T8: from col 1792 the 128-row/64-column tile beats the 64x128 incumbent by 7-10%
 // (1509 us against 1620 at T = 4096, 68.3 against 63.6 TFLOP/s); it still loses below 1536, where the
 // 64-row tile's 32 row tiles are what keeps enough CTAs in flight.
-constexpr std::array<RouteSpec, 19> kK6144Routes{{
+constexpr std::array<RouteSpec, 18> kK6144Routes{{
     {1, 1, Q8LinearAddScheduleId::DecodeR16},
     {2, 48, Q8LinearAddScheduleId::SplitKMmaExactT},
-    {49, 79, Q8LinearAddScheduleId::MmaR32C128},
-    {80, 94, Q8LinearAddScheduleId::MmaR32C64},
-    {95, 111, Q8LinearAddScheduleId::MmaR32C128},
-    {112, 195, Q8LinearAddScheduleId::MmaR32C64},
+    {49, 64, Q8LinearAddScheduleId::MmaR16C32K128},
+    {65, 96, Q8LinearAddScheduleId::MmaR32C32K128},
+    {97, 195, Q8LinearAddScheduleId::MmaR32C64K128},
     {196, 259, Q8LinearAddScheduleId::MmaR48C128},
     {260, 291, Q8LinearAddScheduleId::MmaR64C96},
     {292, 343, Q8LinearAddScheduleId::MmaR64C112},
@@ -136,6 +135,9 @@ std::int32_t schedule_rows(Q8LinearAddScheduleId schedule) {
     case Q8LinearAddScheduleId::SplitKMmaCapacity:
     case Q8LinearAddScheduleId::GroupedSplitK:
     case Q8LinearAddScheduleId::ColumnInvariant:
+    case Q8LinearAddScheduleId::MmaR16C32K128:
+    case Q8LinearAddScheduleId::MmaR32C32K128:
+    case Q8LinearAddScheduleId::MmaR32C64K128:
         break;
     }
     throw std::logic_error("q8 linear_add: exact-T schedule has no row tile");
@@ -171,6 +173,9 @@ std::int32_t schedule_cols(Q8LinearAddScheduleId schedule) {
     case Q8LinearAddScheduleId::SplitKMmaCapacity:
     case Q8LinearAddScheduleId::GroupedSplitK:
     case Q8LinearAddScheduleId::ColumnInvariant:
+    case Q8LinearAddScheduleId::MmaR16C32K128:
+    case Q8LinearAddScheduleId::MmaR32C32K128:
+    case Q8LinearAddScheduleId::MmaR32C64K128:
         break;
     }
     throw std::logic_error("q8 linear_add: exact-T schedule is not token-sliced");
@@ -216,6 +221,12 @@ const char* q8_linear_add_schedule_name(Q8LinearAddScheduleId schedule) noexcept
         return "linear_add.q8.mma.r128.c64.residual";
     case Q8LinearAddScheduleId::MmaR128C80:
         return "linear_add.q8.mma.r128.c80.residual";
+    case Q8LinearAddScheduleId::MmaR16C32K128:
+        return "linear_add.q8.mma.r16.c32.k128.residual";
+    case Q8LinearAddScheduleId::MmaR32C32K128:
+        return "linear_add.q8.mma.r32.c32.k128.residual";
+    case Q8LinearAddScheduleId::MmaR32C64K128:
+        return "linear_add.q8.mma.r32.c64.k128.residual";
     case Q8LinearAddScheduleId::ColumnInvariant:
         return "linear_add.q8.splitk16.mma.column_invariant.residual";
     }
@@ -283,6 +294,18 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
         q8_linear_add_splitk_mma_launch(x, w, residual_out, stream);
         return;
     }
+    if (plan.schedule == Q8LinearAddScheduleId::MmaR16C32K128) {
+        q8_linear_add_mma_r16_c32_k128_launch(x, w, residual_out, stream);
+        return;
+    }
+    if (plan.schedule == Q8LinearAddScheduleId::MmaR32C32K128) {
+        q8_linear_add_mma_r32_c32_k128_launch(x, w, residual_out, stream);
+        return;
+    }
+    if (plan.schedule == Q8LinearAddScheduleId::MmaR32C64K128) {
+        q8_linear_add_mma_r32_c64_k128_launch(x, w, residual_out, stream);
+        return;
+    }
     for_each_token_slice(
         x.ne[1], schedule_cols(plan.schedule), [&](std::int32_t offset, std::int32_t count) {
             const Tensor x_slice  = x.slice(1, offset, count);
@@ -336,6 +359,9 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
             case Q8LinearAddScheduleId::SplitKMmaCapacity:
             case Q8LinearAddScheduleId::SplitKMmaExactT:
             case Q8LinearAddScheduleId::ColumnInvariant:
+            case Q8LinearAddScheduleId::MmaR16C32K128:
+            case Q8LinearAddScheduleId::MmaR32C32K128:
+            case Q8LinearAddScheduleId::MmaR32C64K128:
                 break;
             }
             throw std::logic_error("q8 linear_add: unknown tiled schedule");

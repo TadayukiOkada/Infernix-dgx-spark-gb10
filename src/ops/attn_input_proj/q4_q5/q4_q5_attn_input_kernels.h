@@ -14,6 +14,10 @@ void q4_q5_attn_input_column_invariant_launch(const Tensor& x, const Weight& que
                                               const Weight& gate_value_weight, Tensor& q,
                                               Tensor& gate, Tensor& k, Tensor& v,
                                               cudaStream_t stream);
+void q4_q5_attn_input_split_mma_k128_launch(const Tensor& x, const Weight& query_key_weight,
+                                            const Weight& gate_value_weight, Tensor& q,
+                                            Tensor& gate, Tensor& k, Tensor& v,
+                                            cudaStream_t stream);
 
 void q4_q5_attn_input_mixed_r32_c32_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
