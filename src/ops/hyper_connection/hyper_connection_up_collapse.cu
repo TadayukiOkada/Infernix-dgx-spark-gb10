@@ -75,31 +75,72 @@ struct HcCollapseEpilogue {
         __syncthreads();
         const bool full_tokens  = Full || (n0 + BN <= n);
         const std::size_t width = static_cast<std::size_t>(kStreams) * hidden;
-        for (int item = tid; item < Quads * BN; item += Cfg::kThreads) {
-            const int j = (item % Quads) * 4, c = item / Quads;
-            const int t = n0 + c, d = m0 + j;
-            if (!full_tokens && t >= n) { continue; }
-            float sum0 = 0.0F, sum1 = 0.0F, sum2 = 0.0F, sum3 = 0.0F;
+        if constexpr (Features % 8 == 0) {
+            constexpr int Octets = Features / 8;
+            for (int item = tid; item < Octets * BN; item += Cfg::kThreads) {
+                const int j = (item % Octets) * 8, c = item / Octets;
+                const int t = n0 + c, d = m0 + j;
+                if (!full_tokens && t >= n) { continue; }
+                const std::size_t base_t = static_cast<std::size_t>(t) * width + d;
+                uint4 nv[kStreams];
+                uint4 uv[kStreams];
 #pragma unroll
-            for (int s = 0; s < kStreams; ++s) {
-                const uint2 uv      = *reinterpret_cast<const uint2*>(&u[c * Pitch + s * Features + j]);
-                const std::size_t i = static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden + d;
-                const uint2 nv      = *reinterpret_cast<const uint2*>(&normalized[i]);
-                const __nv_bfloat162 u01 = *reinterpret_cast<const __nv_bfloat162*>(&uv.x);
-                const __nv_bfloat162 u23 = *reinterpret_cast<const __nv_bfloat162*>(&uv.y);
-                const __nv_bfloat162 n01 = *reinterpret_cast<const __nv_bfloat162*>(&nv.x);
-                const __nv_bfloat162 n23 = *reinterpret_cast<const __nv_bfloat162*>(&nv.y);
-                sum0 += hc_sigmoid(__bfloat162float(u01.x)) * __bfloat162float(n01.x);
-                sum1 += hc_sigmoid(__bfloat162float(u01.y)) * __bfloat162float(n01.y);
-                sum2 += hc_sigmoid(__bfloat162float(u23.x)) * __bfloat162float(n23.x);
-                sum3 += hc_sigmoid(__bfloat162float(u23.y)) * __bfloat162float(n23.y);
+                for (int s = 0; s < kStreams; ++s) {
+                    nv[s] = *reinterpret_cast<const uint4*>(&normalized[base_t + static_cast<std::size_t>(s) * hidden]);
+                    uv[s] = *reinterpret_cast<const uint4*>(&u[c * Pitch + s * Features + j]);
+                }
+                float sum[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+                for (int s = 0; s < kStreams; ++s) {
+                    const auto* up = reinterpret_cast<const __nv_bfloat162*>(&uv[s]);
+                    const auto* np = reinterpret_cast<const __nv_bfloat162*>(&nv[s]);
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        sum[2 * p] += hc_sigmoid(__bfloat162float(up[p].x)) * __bfloat162float(np[p].x);
+                        sum[2 * p + 1] += hc_sigmoid(__bfloat162float(up[p].y)) * __bfloat162float(np[p].y);
+                    }
+                }
+                constexpr float kInvS = 1.0F / static_cast<float>(kStreams);
+                uint4 out_vec;
+                auto* op = reinterpret_cast<__nv_bfloat162*>(&out_vec);
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    op[p] = __floats2bfloat162_rn(sum[2 * p] * kInvS, sum[2 * p + 1] * kInvS);
+                }
+                *reinterpret_cast<uint4*>(&x[static_cast<std::size_t>(t) * hidden + d]) = out_vec;
             }
-            const __nv_bfloat162 out01 =
-                __floats2bfloat162_rn(sum0 / static_cast<float>(kStreams), sum1 / static_cast<float>(kStreams));
-            const __nv_bfloat162 out23 =
-                __floats2bfloat162_rn(sum2 / static_cast<float>(kStreams), sum3 / static_cast<float>(kStreams));
-            *reinterpret_cast<uint2*>(&x[static_cast<std::size_t>(t) * hidden + d]) =
-                uint2{*reinterpret_cast<const unsigned*>(&out01), *reinterpret_cast<const unsigned*>(&out23)};
+        } else {
+            for (int item = tid; item < Quads * BN; item += Cfg::kThreads) {
+                const int j = (item % Quads) * 4, c = item / Quads;
+                const int t = n0 + c, d = m0 + j;
+                if (!full_tokens && t >= n) { continue; }
+                const std::size_t base_t = static_cast<std::size_t>(t) * width + d;
+                uint2 nv[kStreams];
+                uint2 uv[kStreams];
+#pragma unroll
+                for (int s = 0; s < kStreams; ++s) {
+                    nv[s] = *reinterpret_cast<const uint2*>(&normalized[base_t + static_cast<std::size_t>(s) * hidden]);
+                    uv[s] = *reinterpret_cast<const uint2*>(&u[c * Pitch + s * Features + j]);
+                }
+                float sum0 = 0.0F, sum1 = 0.0F, sum2 = 0.0F, sum3 = 0.0F;
+#pragma unroll
+                for (int s = 0; s < kStreams; ++s) {
+                    const __nv_bfloat162 u01 = *reinterpret_cast<const __nv_bfloat162*>(&uv[s].x);
+                    const __nv_bfloat162 u23 = *reinterpret_cast<const __nv_bfloat162*>(&uv[s].y);
+                    const __nv_bfloat162 n01 = *reinterpret_cast<const __nv_bfloat162*>(&nv[s].x);
+                    const __nv_bfloat162 n23 = *reinterpret_cast<const __nv_bfloat162*>(&nv[s].y);
+                    sum0 += hc_sigmoid(__bfloat162float(u01.x)) * __bfloat162float(n01.x);
+                    sum1 += hc_sigmoid(__bfloat162float(u01.y)) * __bfloat162float(n01.y);
+                    sum2 += hc_sigmoid(__bfloat162float(u23.x)) * __bfloat162float(n23.x);
+                    sum3 += hc_sigmoid(__bfloat162float(u23.y)) * __bfloat162float(n23.y);
+                }
+                const __nv_bfloat162 out01 =
+                    __floats2bfloat162_rn(sum0 / static_cast<float>(kStreams), sum1 / static_cast<float>(kStreams));
+                const __nv_bfloat162 out23 =
+                    __floats2bfloat162_rn(sum2 / static_cast<float>(kStreams), sum3 / static_cast<float>(kStreams));
+                *reinterpret_cast<uint2*>(&x[static_cast<std::size_t>(t) * hidden + d]) =
+                    uint2{*reinterpret_cast<const unsigned*>(&out01), *reinterpret_cast<const unsigned*>(&out23)};
+            }
         }
     }
 };
@@ -154,6 +195,11 @@ void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized,
     if (up.qtype == QType::Q4_G64_FP16) {
         if (T <= 32) return launch_q4<q4_instances::MmaR32T32K64Wr16Wt16S3A3B2>(m, up, normalized, x, stream);
         if (T <= 64) return launch_q4<q4_instances::MmaR32T64K64Wr16Wt32S2A2B2>(m, up, normalized, x, stream);
+        if (hidden % 32 == 0) {
+            using MmaR128T64 = Q4A16MmaSchedule<128, 64, 64, 32, 32, 2, 2, Q4MmaFragmentPipeline::Serial,
+                                                Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 2>;
+            return launch_q4<MmaR128T64>(m, up, normalized, x, stream);
+        }
         return launch_q4<q4_instances::MmaR64T64K64Wr32Wt16S2A2B2>(m, up, normalized, x, stream);
     }
     // The linear family's measured argmin for this shape at 9..32 columns rides the same tile: the

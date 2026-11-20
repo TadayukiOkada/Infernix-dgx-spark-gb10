@@ -1,6 +1,12 @@
+#include "ops/linear/q4/q4_instance_launch.cuh"
 #include "ops/linear/q4/q4_shapes.h"
 
 namespace infernix::ops::detail {
+namespace {
+using MmaR64T128B2 = Q4A16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Q4MmaFragmentPipeline::Serial,
+                                      Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 2>;
+} // namespace
+
 Q4Launch select_q4_n324_k10240(std::int32_t tokens) {
     // Selected with complete-Op cold-L2 route sweeps on GB10.
     if (tokens <= 1) return launch_q4_a16_simt_r4_t1_w2_g8_s2;
@@ -17,6 +23,6 @@ Q4Launch select_q4_n324_k10240(std::int32_t tokens) {
     if (tokens <= 1280) return launch_q4_a16_mma_r64_t80;
     if (tokens <= 1536) return launch_q4_a16_mma_r64_t96;
     if (tokens <= 1792) return launch_q4_a16_mma_r64_t112;
-    return launch_q4_a16_mma_r64_t64_k64_wr32_wt16_s2_a2_b2;
+    return launch_q4_a16_mma_instance<MmaR64T128B2>;
 }
 } // namespace infernix::ops::detail

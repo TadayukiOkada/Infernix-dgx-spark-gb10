@@ -39,7 +39,9 @@ void projection_fp32_bf16_wide_mma(const Tensor& x, const void* weight, int rows
     const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight),
                             rows, static_cast<int>(x.ne[0]), static_cast<int>(x.ne[1])};
     const ProjectionFp32Output output{out, out_rows};
-    if (p.tokens <= 8192) {
+    if (p.tokens > 512 && rows <= 2048) {
+        launch_bf16_a16_tma_mma<Bf16A16TmaR64T128K64S2Rows>(p, output, LinearIdentityEpilogue{}, stream);
+    } else if (p.tokens <= 8192) {
         launch_bf16_a16_tma_mma<Bf16A16TmaR64T64K64S3>(p, output, LinearIdentityEpilogue{}, stream);
     } else {
         launch_bf16_a16_tma_mma<Bf16A16TmaR64T128K64S2>(p, output, LinearIdentityEpilogue{}, stream);
