@@ -1837,10 +1837,10 @@ public:
                                                                                        : kMtpCumulativeBase);
         if (lane.sampling.temperature > 0.0F) {
             const double t = static_cast<double>(lane.sampling.temperature);
-            lane.ngram_accept[0] = kNgramAcceptancePriors[0] * std::clamp(std::exp(-1.5 * t), 0.15, 1.0);
-            lane.ngram_accept[1] = kNgramAcceptancePriors[1] * std::clamp(std::exp(-1.0 * t), 0.30, 1.0);
-            lane.ngram_accept[2] = kNgramAcceptancePriors[2] * std::clamp(std::exp(-0.7 * t), 0.45, 1.0);
-            lane.ngram_accept[3] = kNgramAcceptancePriors[3] * std::clamp(std::exp(-0.4 * t), 0.65, 1.0);
+            lane.ngram_accept[0] = ngram_process_accept_[0] * std::clamp(std::exp(-1.5 * t), 0.15, 1.0);
+            lane.ngram_accept[1] = ngram_process_accept_[1] * std::clamp(std::exp(-1.0 * t), 0.30, 1.0);
+            lane.ngram_accept[2] = ngram_process_accept_[2] * std::clamp(std::exp(-0.7 * t), 0.45, 1.0);
+            lane.ngram_accept[3] = ngram_process_accept_[3] * std::clamp(std::exp(-0.4 * t), 0.65, 1.0);
             const bool is_nvfp4_kv = options_.kv_cache == KvCacheStorage::Nvfp4Group16;
             const double base_mtp  = (is_nvfp4_kv ? 0.65 : kAcceptancePrior) * std::clamp(std::exp(-0.5 * t), 0.35, 1.0);
             const double pos_decay = is_nvfp4_kv ? 0.65 : 0.80;
@@ -1850,7 +1850,7 @@ public:
                 reach *= pos_decay;
             }
         } else {
-            lane.ngram_accept = kNgramAcceptancePriors;
+            lane.ngram_accept = ngram_process_accept_;
             lane.mtp_accept.fill(kAcceptancePrior);
         }
         lane.readout        = b.readout_tokens;
@@ -2630,7 +2630,8 @@ public:
                 if (!match.tokens.empty() && options_.auto_draft_length) {
                     const std::int32_t opt = best_copy_length(
                         static_cast<std::int32_t>(match.tokens.size()),
-                        lane.ngram_accept[static_cast<std::size_t>(bucket)], copy_width_cost);
+                        lane.ngram_accept[static_cast<std::size_t>(bucket)], copy_width_cost,
+                        kMinCopyAcceptance);
                     match.tokens.resize(static_cast<std::size_t>(opt));
                 }
                 // Any non-empty copy proposal competes with the row's MTP drafts on expected tokens per
@@ -2706,9 +2707,7 @@ public:
                     ngram_proposal_bucket_[b] = -1;
                     continue;
                 }
-                if (batch == 1) {
-                    extents[b] = chain_ext;
-                }
+                extents[b] = chain_ext;
                 drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
             }
             if (max_width_ > 1) {
@@ -5438,12 +5437,17 @@ private:
                 ++stats.ngram_rounds;
                 stats.ngram_drafted_tokens += n;
                 stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
-                // The bucket's acceptance per position; back off faster on complete 0-token misses.
+                // The bucket's acceptance per position; back off quickly on <50% rounds and
+                // ramp up quickly on full hits, while maintaining process-level calibration.
                 if (ngram_bucket_[b] >= 0) {
-                    double& a           = lane.ngram_accept[static_cast<std::size_t>(ngram_bucket_[b])];
+                    const auto bi       = static_cast<std::size_t>(ngram_bucket_[b]);
+                    double& a           = lane.ngram_accept[bi];
                     const double hit    = n > 0 ? static_cast<double>(A) / static_cast<double>(n) : 0.0;
-                    const double weight = A == 0 ? std::min(2.5 * kAcceptanceWeight, 0.5) : kAcceptanceWeight;
+                    const bool full_hit = n >= 8 && static_cast<std::uint64_t>(A) == n;
+                    const double weight = full_hit ? 0.65 : (hit < 0.50 || static_cast<std::uint64_t>(A) == n) ? 0.40 : 0.15;
                     a                   = (1.0 - weight) * a + weight * hit;
+                    double& pa          = ngram_process_accept_[bi];
+                    pa                  = std::clamp(0.95 * pa + 0.05 * hit, kNgramProcessFloors[bi], 0.995);
                 }
             }
             for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
@@ -6982,7 +6986,10 @@ private:
     // acceptance learned per match-length bucket (4-7, 8-11, 12-15, 16+ tokens; Strata's priors).
     // IQ3_S import, 4K + 512 tokens, MTP 4 and 7 n-gram drafts: 190.2 -> 194.2 tok/s (2026-10-15).
     static int ngram_bucket(std::uint32_t matched) { return matched < 8 ? 0 : matched < 12 ? 1 : matched < 16 ? 2 : 3; }
-    static constexpr std::array<double, 4> kNgramAcceptancePriors{0.85, 0.92, 0.96, 0.985};
+    static constexpr std::array<double, 4> kNgramAcceptancePriors{0.62, 0.72, 0.84, 0.97};
+    static constexpr std::array<double, 4> kNgramProcessFloors{0.45, 0.55, 0.72, 0.90};
+    static constexpr double kMinCopyAcceptance = 0.60;
+    std::array<double, 4> ngram_process_accept_{kNgramAcceptancePriors};
     std::array<int, kMaximumConcurrency> ngram_bucket_{};
     // A copy proposal the neural chain won before the round was drafted, kept for the round's cut: when
     // the cut leaves the row fewer drafts than this copy, the round verifies the copy instead of

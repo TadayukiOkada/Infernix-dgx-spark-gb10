@@ -105,7 +105,7 @@ void check_table() {
     require(graph_gate_rate(kRateMidLogprob, kMtpCumulativeBins) == 0.51F, "the middle bin is 0.51");
     require(graph_gate_rate(kRateGoodLogprob, kMtpCumulativeBins) == 0.66F, "the good bin is 0.66");
     require(graph_gate_rate(kRateTopLogprob, kMtpCumulativeBins) == 0.96F, "the top bin is 0.96");
-    require(kMtpCumulativeBase == 0.35F, "the continuation threshold starts at 0.35");
+    require(kMtpCumulativeBase == 0.40F, "the continuation threshold starts at 0.40");
 }
 
 // Where the continuation cut lands, and which steps a gated chain paid for. The cut step is dropped
@@ -223,6 +223,18 @@ void check_copy_fallback() {
     // is the same rule before the drafter ran and after its cut.
     require(copy_beats_chain(8, 0.9, kCopyCost, good, 2, kChainCost), "a long good copy beats a short chain");
     require(!copy_beats_chain(8, 0.2, kCopyCost, good, 2, kChainCost), "a long poor copy does not");
+
+    // Acceptance-floored best_copy_length: below the floor, no copy drafts are admitted; above the
+    // floor, length is capped so expected acceptance stays >= min_accept while high-confidence
+    // copies still reach the full window.
+    using infernix::models::qwen4_exp::best_copy_length;
+    require(best_copy_length(31, 0.55, kCopyCost, 0.60) == 0, "below min_accept floor yields zero drafts");
+    const std::int32_t mid = best_copy_length(31, 0.72, kCopyCost, 0.60);
+    require(mid >= 1 && mid <= 3, "moderate prior probes short instead of drafting 10+ tokens");
+    const std::int32_t high = best_copy_length(31, 0.985, kCopyCost, 0.60);
+    require(high >= 24, "confirmed high-confidence copy still expands to a wide window");
+    require(best_copy_length(31, 0.995, kCopyCost, 0.60) == 31,
+            "near-exact copy reaches the full 31-token window");
 }
 
 // The two expected-token helpers against a direct evaluation.

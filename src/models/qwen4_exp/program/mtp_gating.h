@@ -40,8 +40,8 @@ namespace infernix::models::qwen4_exp {
 inline constexpr GraphGateBins kMtpCumulativeBins{
     {-1.20397280F, -0.693147181F, -0.356674944F, -0.223143551F, -0.105360516F, -0.0512932944F, -0.0100503359F},
     {0.12F, 0.26F, 0.43F, 0.51F, 0.59F, 0.66F, 0.79F, 0.96F}};
-inline constexpr float kMtpCumulativeBase  = 0.35F;
-inline constexpr float kMtpCumulativeFloor = 0.25F;
+inline constexpr float kMtpCumulativeBase  = 0.40F;
+inline constexpr float kMtpCumulativeFloor = 0.32F;
 
 // The cumulative table for sampled 16-rank MTP chains (temperature > 0): because the drafter draws
 // across up to 16 ranks and verification preserves target mass over that candidate set (block
@@ -136,18 +136,21 @@ struct MtpDraftCut {
 }
 
 // The prefix length in [0, copies] that maximizes expected tokens per round time under `copy_accept`
-// and `copy_cost`. Prevents a long --ngram-draft-tokens limit (e.g. 15) from diluting a 4-7 token
-// match's score below the neural chain's or inflating multi-row verification width with low-probability
-// tail positions.
+// and `copy_cost`, while enforcing an optional minimum expected per-draft acceptance rate
+// `min_accept` (sum_{j=1..k} copy_accept^j / k >= min_accept). Prevents a long --ngram-draft-tokens
+// limit from diluting a match's score or drafting low-probability tails that drag mixed acceptance
+// below target.
 [[nodiscard]] inline std::int32_t best_copy_length(std::int32_t copies, double copy_accept,
-                                                   double copy_cost) noexcept {
+                                                   double copy_cost,
+                                                   double min_accept = 0.0) noexcept {
     std::int32_t best = 0;
     double best_score = 1.0;
-    double reach = 1.0, tokens = 1.0;
+    double reach = 1.0, accepted = 0.0;
     for (std::int32_t k = 1; k <= copies; ++k) {
         reach *= copy_accept;
-        tokens += reach;
-        const double score = tokens / (1.0 + copy_cost * static_cast<double>(k));
+        accepted += reach;
+        if (min_accept > 0.0 && accepted < min_accept * static_cast<double>(k)) { break; }
+        const double score = (1.0 + accepted) / (1.0 + copy_cost * static_cast<double>(k));
         if (score > best_score) {
             best_score = score;
             best       = k;
