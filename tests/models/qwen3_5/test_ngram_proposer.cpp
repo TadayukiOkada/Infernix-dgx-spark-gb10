@@ -221,6 +221,31 @@ int main() {
         require(ngram_numbered_sources(std::string("1: a") + '\0' + "b\n2: c\n3: d") ==
                     std::vector<std::string>{std::string("a") + '\0' + "b\nc\nd"},
                 "embedded NUL must not truncate a proposal source");
+        // Verify priority order: Suffix Automaton is queried first and original hash-table N-gram
+        // only provides tokens when Suffix Automaton has nothing to provide.
+        {
+            NgramProposer priority(256, 1024);
+            // Pattern [10, 20, 30, 40] occurs first with a shorter continuation [100, 101, 102]
+            // (chosen by SAM's earliest-occurrence pos), and second with a longer continuation
+            // [200, 201, 202, 203, 204] (which the hash-table N-gram would prefer).
+            priority.ingest(std::vector<int>{10, 20, 30, 40, 100, 101, 102});
+            priority.ingest(std::vector<int>{10, 20, 30, 40, 200, 201, 202, 203, 204});
+            const auto sa_first = priority.propose(std::vector<int>{10, 20, 30, 40}, 15, 4);
+            require(sa_first.matched == 4, "SAM-first match length");
+            require(sa_first.tokens == std::vector<int>({100, 101, 102}),
+                    "Suffix Automaton must take priority over hash-table N-gram");
+
+            // When SAM's earliest occurrence ends at a boundary and no suffix >= min_match has
+            // a valid continuation, original hash-table N-gram must supply the fallback tokens.
+            NgramProposer fallback(256, 1024);
+            fallback.ingest(std::vector<int>{10, 20, 30, 40});
+            fallback.ingest(std::vector<int>{10, 20, 30, 40, 200, 201, 202});
+            const auto ng_fallback = fallback.propose(std::vector<int>{10, 20, 30, 40}, 15, 4);
+            require(ng_fallback.matched == 4, "N-gram fallback match length");
+            require(ng_fallback.tokens == std::vector<int>({200, 201, 202}),
+                    "N-gram fallback must trigger when Suffix Automaton has nothing to provide");
+        }
+
         std::cout << "ngram CPU tests passed; oracle proposals=" << proposals << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

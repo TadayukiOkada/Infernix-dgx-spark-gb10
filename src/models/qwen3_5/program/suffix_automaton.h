@@ -117,7 +117,15 @@ public:
         last_ = cur;
     }
 
+    void reserve_additional(std::size_t extra_tokens) {
+        if (extra_tokens == 0) { return; }
+        tokens_.reserve(tokens_.size() + extra_tokens);
+        nodes_.reserve(nodes_.size() + 2 * extra_tokens);
+        edges_.reserve(edges_.size() + extra_tokens);
+    }
+
     void ingest(std::span<const Token> tokens) {
+        reserve_additional(tokens.size() + 2);
         boundary();
         for (const auto t : tokens) {
             append(t);
@@ -208,8 +216,10 @@ public:
 
         const auto live = static_cast<int32_t>(live_begin());
 
-        while (state != 0 && (nodes_[state].pos + 1 >= static_cast<int32_t>(tokens_.size()) ||
-                              nodes_[state].pos - nodes_[state].len + 1 < live)) {
+        while (state != 0 && (nodes_[state].pos < 0 ||
+                              nodes_[state].pos + 1 >= static_cast<int32_t>(tokens_.size()) ||
+                              nodes_[state].pos - matched + 1 < live ||
+                              is_boundary(tokens_[nodes_[state].pos + 1]))) {
             state = nodes_[state].link;
             if (state != 0) { matched = std::min(matched, nodes_[state].len); }
         }

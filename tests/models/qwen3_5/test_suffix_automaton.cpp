@@ -98,6 +98,15 @@ int main() {
             require(m.tokens == std::vector<int>(src.begin() + n, src.begin() + n + 15), "exact span continuation");
         }
 
+        // 9. Boundary-adjacent state must walk suffix links to find a valid continuation
+        SuffixAutomaton link_sa;
+        link_sa.ingest(std::vector<int>{2, 3, 4, 5, 99, 100});
+        link_sa.ingest(std::vector<int>{1, 2, 3, 4, 5});
+        const auto link_match = link_sa.propose(std::vector<int>{1, 2, 3, 4, 5}, 5, 4);
+        require(link_match.matched == 4, "boundary-adjacent state walks suffix link to len 4");
+        require(link_match.tokens == std::vector<int>({99, 100}),
+                "boundary-adjacent state returns continuation from suffix link");
+
         std::cout << "All Suffix Automaton unit tests passed successfully!\n";
         return 0;
     } catch (const std::exception& e) {

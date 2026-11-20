@@ -32,7 +32,8 @@
 #
 # Environment overrides:
 #   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / KV_DTYPE (default: k8v4)
-#   SPEC_BACKEND (default: dflash2 if present else mtp), NGRAM_DRAFT_TOKENS (default: 31)
+#   SPEC_BACKEND (default: dflash2 if present else mtp), NGRAM_DRAFT_TOKENS (default: 31),
+#   NGRAM_MIN_MATCH (default: 8), INFERNIX_NGRAM_WIDTH_COST (default: 0.12)
 #   THINKING_FLAG (default: empty), REASONING_EFFORT (default: medium)
 #   EXPERT_A4_ACTIVATIONS (default: 1 for FP4-Local)
 #   SKIP_BUILD=1 to skip rebuilding infernix-serve
@@ -48,6 +49,7 @@ DRAFT_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFl
 
 KV_DTYPE="${KV_DTYPE:-int8}"
 NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-31}"
+NGRAM_MIN_MATCH="${NGRAM_MIN_MATCH:-8}"
 THINKING_FLAG="${THINKING_FLAG:-}"
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 RESTORE_TOOL_REASONING="${RESTORE_TOOL_REASONING:-1}"
@@ -196,12 +198,12 @@ echo " N-gram Volume   : ${NGRAM_PATH} (${NGRAM_RESIDENCY})"
 echo " Listen Endpoint : http://${HOST}:${PORT}/v1"
 echo " Max Context     : ${MAX_CONTEXT} tokens"
 echo " Max Concurrency : ${MAX_CONCURRENCY}"
-echo " Speculative     : ${SPEC_BACKEND} (auto) + N-gram (${NGRAM_DRAFT_TOKENS} drafts, min-match 4)"
+echo " Speculative     : ${SPEC_BACKEND} (auto) + N-gram (${NGRAM_DRAFT_TOKENS} drafts, min-match ${NGRAM_MIN_MATCH})"
 echo "========================================================================================"
 echo
 
 export INFERNIX_EXPERTS_ON_GPU=1
-export INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.08}"
+export INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.12}"
 
 EXPERT_A4_ARGS=()
 if [[ "${EXPERT_A4_ACTIVATIONS:-${EXPERT_A4_DEFAULT}}" == "1" ]]; then
@@ -242,7 +244,7 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --ngram-cache-mib 4096 \
     --kv-dtype "${KV_DTYPE}" \
     --ngram-draft-tokens "${NGRAM_DRAFT_TOKENS}" \
-    --ngram-min-match 4 \
+    --ngram-min-match "${NGRAM_MIN_MATCH}" \
     --temperature 1.0 \
     --top-p 0.9 \
     --min-p 0.1 \

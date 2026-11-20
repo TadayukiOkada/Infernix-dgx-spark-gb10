@@ -63,6 +63,7 @@ public:
     // never spans a boundary, so the input holds exactly the tokens the ring then holds, and the
     // index is the one token-by-token append() builds.
     void ingest(std::span<const Token> tokens) {
+        sa_.reserve_additional(tokens.size() + 2);
         boundary();
         constexpr std::size_t kLookahead = 8;
         std::array<std::array<std::uint64_t, widths_.size()>, kLookahead> ahead{};
@@ -116,8 +117,13 @@ public:
 
     [[nodiscard]] Match propose(std::span<const Token> history, std::uint32_t maximum,
                                 std::uint32_t minimum_match = 12) const {
+        if (maximum == 0) { return {}; }
+        // Suffix Automaton runs first; original hash-table N-gram is fallback only.
+        if (auto sa_match = sa_.propose(history, maximum, minimum_match);
+            !sa_match.tokens.empty()) {
+            return sa_match;
+        }
         Match best;
-        if (maximum == 0) { return best; }
         const std::uint64_t live = live_begin();
         std::array<std::uint64_t, widths_.size() * 4> seen_ends{};
         std::size_t seen_count = 0;
@@ -174,11 +180,6 @@ public:
                     if (maximal(best, history.size(), maximum)) { return best; }
                 }
             }
-        }
-        const auto sa_match = sa_.propose(history, maximum, minimum_match);
-        if (sa_match.matched > best.matched ||
-            (sa_match.matched == best.matched && sa_match.tokens.size() > best.tokens.size())) {
-            best = sa_match;
         }
         return best;
     }
