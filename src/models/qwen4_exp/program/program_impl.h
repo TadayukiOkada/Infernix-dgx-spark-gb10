@@ -4420,8 +4420,14 @@ private:
             tier_losses_at_span_ = tier_losses();
         }
         const WideWork wide(*this, batch * width);
+        const auto* staged_slots = reinterpret_cast<const std::uint32_t*>(host_io() + io_layout_.slots);
+        const bool screened =
+            logit_columns > 0 &&
+            screened_round(std::span<const std::uint32_t>(staged_slots, static_cast<std::size_t>(batch)),
+                           logit_columns);
         try {
-            forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
+            forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed,
+                         /*decode_round=*/false, screened);
             if (dflash2_) { dflash2_call_context(batch, width); }
         } catch (...) {
             // A failed call (an unreadable record, say) still returns the stream's slots: left

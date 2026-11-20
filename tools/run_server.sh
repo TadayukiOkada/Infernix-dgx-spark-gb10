@@ -47,9 +47,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODELS_DIR="/opt/etc/models"
 DRAFT_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFlash2-Infernix.infernix"
 
-KV_DTYPE="${KV_DTYPE:-int8}"
+KV_DTYPE="${KV_DTYPE:-k8v4}"
 NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-31}"
 NGRAM_MIN_MATCH="${NGRAM_MIN_MATCH:-8}"
+PREFILL_CHUNK="${PREFILL_CHUNK:-12288}"
+KV_CAPACITY="${KV_CAPACITY:-524288}"
+HOST_CONTEXT_MIB="${HOST_CONTEXT_MIB:-4096}"
 THINKING_FLAG="${THINKING_FLAG:-}"
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 RESTORE_TOOL_REASONING="${RESTORE_TOOL_REASONING:-1}"
@@ -58,7 +61,7 @@ CHAT_TEMPLATE_PATH="${CHAT_TEMPLATE_PATH:-${REPO_ROOT}/tools/chat_templates/qwen
 HOST="0.0.0.0"
 PORT="8000"
 MAX_CONTEXT="262144"
-MAX_CONCURRENCY="8"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-8}"
 EXPLICIT_MODEL_ID=""
 MODEL_ALIAS="${MODEL_ALIAS:-}"
 EXPERT_A4_DEFAULT=0
@@ -144,7 +147,7 @@ case "${MODEL_ALIAS}" in
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense"
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense.infernix"
         NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
-        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
         SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
         EXPERT_A4_DEFAULT=1
         VISION_DEFAULT=1
@@ -246,18 +249,19 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     --ngram-draft-tokens "${NGRAM_DRAFT_TOKENS}" \
     --ngram-min-match "${NGRAM_MIN_MATCH}" \
     --temperature 1.0 \
-    --top-p 0.9 \
+    --top-p 0.8 \
     --min-p 0.1 \
     --top-k 20 \
     --lm-head-draft \
-    --kv-capacity 798432 \
+    --prefill-chunk "${PREFILL_CHUNK}" \
+    --kv-capacity "${KV_CAPACITY}" \
     --default-max-tokens 32768 \
     --preserve-thinking \
     --chat-template "${CHAT_TEMPLATE_PATH}" \
     "${RESTORE_ARGS[@]}" \
     "${THINKING_ARGS[@]}" \
     "${REASONING_ARGS[@]}" \
-    --host-context-mib 4096 \
+    --host-context-mib "${HOST_CONTEXT_MIB}" \
     --tolerant-tool-calls \
     --max-context "${MAX_CONTEXT}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
