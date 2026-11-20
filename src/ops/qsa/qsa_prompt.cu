@@ -1735,6 +1735,9 @@ void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, con
             if (forced == 0) { return 2; }
             if (forced == 1) { return 1; }
         }
+        if constexpr (Storage == KvCacheStorage::Int8Group64 || Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            return 2;
+        }
         return (blocks_1 > blocks_2 && q.ne[2] * g.kv_heads > blocks_2 * sms) ? 1 : 2;
     };
     if constexpr (PromptShape<Storage>::Vq == 0) {
