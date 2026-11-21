@@ -122,8 +122,8 @@ struct ServeOptions {
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for thinking requests without a
-    // token constraint (off by default).
-    infernix::ReasoningLoopAction reasoning_loop = infernix::ReasoningLoopAction::Off;
+    // token constraint (conclude by default to prevent runaway circular thinking).
+    infernix::ReasoningLoopAction reasoning_loop = infernix::ReasoningLoopAction::Conclude;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     bool log_colours       = false; // --log-colours on|off: colour the console stats lines

@@ -464,7 +464,7 @@ post-close model token, preparation is rejected with HTTP 400 code
 `thinking_budget_capacity_insufficient` rather than partially inserting control. The server does
 not promise that the model will emit nonempty content or a tool call after the marker.
 
-`--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests without a token
+`--reasoning-loop off|stop|conclude` (default `conclude`) guards thinking-enabled requests without a token
 constraint against a model that keeps rewriting the same passages in its thinking, which token
 penalties do not catch because every pass varies a little.
 - **Check.** Every 512 model-origin thinking tokens, at the end of a decode round, the thinking is
@@ -1282,7 +1282,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--no-thinking-answer-room` | without a budget, thinking may use all of `max_tokens` (by default, from `max_tokens` 1,024, it closes early enough to leave a quarter for the answer) | answer room on |
 | `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it | Qwen guidance |
-| `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
+| `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `conclude` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for Qwen3.8-Flash-Next (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |

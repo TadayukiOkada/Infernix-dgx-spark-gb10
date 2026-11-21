@@ -239,12 +239,16 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
                        backend_kv_addresses->bound_row(*state.kv->backend));
     }
     grammar_dead_positions[0] = 0;
+    const runtime::ForbiddenToken ft =
+        (!execution_schedule.lossless && masks) ? masks->forbidden_token(0) : runtime::ForbiddenToken{};
     if (requests[lane].prefill && permit.main_frontier >= requests[lane].prefill->prompt_tokens &&
-        masks && masks->constrained(0)) {
-        auto& config       = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
-        config             = requests[lane].sampling_host;
-        config.mask        = fill_grammar_mask(masks, 0, {});
-        Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+        ((masks && masks->constrained(0)) || ft.token >= 0)) {
+        auto& config                 = static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampling;
+        config                       = requests[lane].sampling_host;
+        config.mask                  = fill_grammar_mask(masks, 0, {});
+        config.forbidden_token       = ft.token;
+        config.forbidden_until_token = ft.until_token;
+        Tensor config_lane           = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
         CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &config, sizeof(config),
                                    cudaMemcpyHostToDevice, device.stream));
     }

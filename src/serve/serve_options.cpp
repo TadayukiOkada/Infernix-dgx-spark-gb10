@@ -356,7 +356,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             --thinking-budget-message \"Time to stop thinking. I must "
            "act\n"
            "                             now:\")\n"
-           "  --reasoning-loop MODE      off (default), stop or conclude: every 512 thinking\n"
+           "  --reasoning-loop MODE      off, stop or conclude (default): every 512 thinking\n"
            "                             tokens, check whether 25% of the last 2,000 words\n"
            "                             repeat 12-word passages seen 3 times; stop ends the\n"
            "                             reply as length, conclude closes the thinking with\n"

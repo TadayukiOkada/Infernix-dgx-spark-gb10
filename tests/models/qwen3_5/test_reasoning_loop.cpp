@@ -160,6 +160,17 @@ int main() {
         expect(periodic_tail(tail), "bounded tail is periodic");
         expect(tail.size() <= 8U * kLoopTailChars, "tail stays bounded");
     }
+    // Circular-thinking regression (repeated commitment sentence inside thinking).
+    {
+        const std::string commitment =
+            "OK I'm going to commit to a specific, defensible mechanism. "
+            "Let me think about what has the best shot at beating 0.3748.\n\n";
+        std::string circular = varied(150);
+        for (int i = 0; i < 40; ++i) { circular += commitment; }
+        const double circular_cov = repeated_passage_coverage(words_of(circular));
+        expect(circular_cov >= kLoopCoverage,
+               "circular thinking regression coverage " + std::to_string(circular_cov));
+    }
     if (failures != 0) { return 1; }
     std::cout << "OK reasoning loop (varied " << novel << ", looping " << loop << ", recap " << recap << ")\n";
     return 0;

@@ -164,7 +164,7 @@ __launch_bounds__(S::kSamplerBlock) __global__
         float bv             = -CUDART_INF_F;
         int bi               = INT_MAX;
         const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-        if (!penalties && cfg.mask.words == nullptr) {
+        if (!penalties && cfg.mask.words == nullptr && cfg.forbidden_token < 0) {
             if constexpr (std::is_same_v<Logit, float>) {
                 if ((reinterpret_cast<std::uintptr_t>(logits + base) % 16 == 0) && (token_domain >= 32)) {
                     const auto* row4 = reinterpret_cast<const float4*>(logits + base);
@@ -350,7 +350,7 @@ __launch_bounds__(S::kSamplerBlock) __global__
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tile_start    = partial * S::kSamplerPartialTileItems;
     if constexpr (WarpTiles && std::is_same_v<Logit, __nv_bfloat16>) {
-        if (!greedy && !penalties) {
+        if (!greedy && !penalties && cfg.forbidden_token < 0) {
             unsigned int raw_keys[S::kSamplerItemsPerThread];
 #pragma unroll
             for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
@@ -372,8 +372,9 @@ __launch_bounds__(S::kSamplerBlock) __global__
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float raw = sampling_logit(logits[base + v]);
-            const float x =
-                (penalties || cfg.mask.words) ? sampling_adjusted_logit(raw, v, cfg) : raw;
+            const float x = (penalties || cfg.mask.words || cfg.forbidden_token >= 0)
+                                ? sampling_adjusted_logit(raw, v, cfg)
+                                : raw;
             keys[item]      = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;

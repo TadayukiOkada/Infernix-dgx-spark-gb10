@@ -83,6 +83,10 @@ public:
             return outputs[row] && outputs[row]->constrained();
         }
 
+        ForbiddenToken forbidden_token(std::size_t row) const noexcept override {
+            return outputs[row] ? outputs[row]->forbidden_token() : ForbiddenToken{};
+        }
+
         std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,
                            std::span<std::uint32_t> words) override {
             return outputs[row]->grammar_masks(drafts, words);

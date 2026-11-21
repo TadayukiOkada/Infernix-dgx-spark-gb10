@@ -57,11 +57,21 @@ inline void set_nonfinite_fault(std::uint32_t rows) noexcept { nonfinite_fault_r
 }
 } // namespace testing
 
+// Single-token exclusion for unconstrained reasoning (e.g. forbidding `<tool_call>` while inside
+// `<think>` until `</think>` is emitted). Negative ids disable it.
+struct ForbiddenToken {
+    TokenId token       = -1;
+    TokenId until_token = -1;
+};
+
 // Borrowed for one synchronous Program call. Engine maps compact rows to request-owned matchers.
 class TokenMaskProvider {
 public:
     virtual ~TokenMaskProvider()                                           = default;
     [[nodiscard]] virtual bool constrained(std::size_t row) const noexcept = 0;
+    [[nodiscard]] virtual ForbiddenToken forbidden_token(std::size_t /*row*/) const noexcept {
+        return {};
+    }
     // Returns dead-end position bits. Even dead/unreachable positions receive a safe nonempty
     // device mask. A dead end fails a row only if verification reaches that position.
     [[nodiscard]] virtual std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,

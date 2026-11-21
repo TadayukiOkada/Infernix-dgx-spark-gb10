@@ -418,6 +418,8 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
+          has_tool_contract(!output.raw && tool_call_output_ != nullptr &&
+                            !tool_call_output_->tools.empty()),
           collect_open_reasoning(split_reasoning && output.tolerant_tool_calls &&
                                  tool_call_output_ != nullptr &&
                                  !tool_call_output_->constrained && grammar_ == nullptr),
@@ -511,8 +513,9 @@ public:
     fi::OutputMarkerTokens markers;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool preserve_special = false;
-    bool split_reasoning  = false;
+    bool preserve_special  = false;
+    bool split_reasoning   = false;
+    bool has_tool_contract = false;
     // Tolerant tool output keeps the open thinking so a turn that ends inside it can still return
     // the calls stranded there; the text is dropped once the thinking closes.
     bool collect_open_reasoning = false;
@@ -601,6 +604,15 @@ OutputSession::OutputSession(
                                    std::move(grammar), continuation, combined)) {}
 
 bool OutputSession::constrained() const noexcept { return impl_ && impl_->grammar != nullptr; }
+
+runtime::ForbiddenToken OutputSession::forbidden_token() const noexcept {
+    if (impl_ == nullptr || !impl_->split_reasoning || !impl_->state.in_reasoning ||
+        !impl_->has_tool_contract || impl_->grammar != nullptr) {
+        return {};
+    }
+    return runtime::ForbiddenToken{.token       = impl_->markers.tool_call,
+                                   .until_token = impl_->markers.reasoning_close};
+}
 
 void OutputSession::observe_constraint(bool timings, double prepare_seconds) noexcept {
     if (constrained()) impl_->grammar->observe(timings, prepare_seconds);

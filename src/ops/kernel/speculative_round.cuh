@@ -433,7 +433,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
-    if (!(cfg.temperature > 0.0f) && !penalties && cfg.mask.words == nullptr) {
+    if (!(cfg.temperature > 0.0f) && !penalties && cfg.mask.words == nullptr &&
+        cfg.forbidden_token < 0) {
         if (tid == 0) {
             int a = 0;
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
@@ -599,7 +600,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if (greedy && !penalties && cfg.mask.words == nullptr) {
+    if (greedy && !penalties && cfg.mask.words == nullptr && cfg.forbidden_token < 0) {
         return;
     }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
@@ -618,7 +619,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     // BF16 logits without penalties: 32-bit tile keys (16 value bits, 16 tile-index bits). FP32
     // logits take the 64-bit keys below, which also carry the mask (masked rows rank below all).
     if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
-        if (!greedy && !penalties) {
+        if (!greedy && !penalties && cfg.forbidden_token < 0) {
             unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
             for (int item = 0; item < kSamplerItemsPerThread; ++item) {
@@ -694,7 +695,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const bool greedy    = !(cfg.temperature > 0.0f);
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
-    if (greedy && !penalties && cfg.mask.words == nullptr) {
+    if (greedy && !penalties && cfg.mask.words == nullptr && cfg.forbidden_token < 0) {
         const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
         if constexpr (SparseProposal) {
             if (tid < 32 && col == 0 && group == 0)
@@ -1386,7 +1387,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if (greedy && !penalties && cfg.mask.words == nullptr) {
+    if (greedy && !penalties && cfg.mask.words == nullptr && cfg.forbidden_token < 0) {
         return;
     }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
@@ -1406,7 +1407,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
     // BF16 logits without penalties: 32-bit tile keys (16 value bits, 16 tile-index bits). FP32
     // logits take the 64-bit keys below (raw values without penalties, as the BF16 route).
     if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
-        if (!greedy && !penalties) {
+        if (!greedy && !penalties && cfg.forbidden_token < 0) {
             unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
             for (int item = 0; item < kSamplerItemsPerThread; ++item) {
@@ -1425,7 +1426,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
         }
     }
 
-    if (penalties) {
+    const bool need_overlay = penalties || (cfg.forbidden_token >= 0 && cfg.forbidden_until_token >= 0);
+    if (need_overlay) {
         if (threadIdx.x == 0) overlay_len = speculative_tree_overlay(tree, drafts + row * k, col, overlay);
         __syncthreads();
     }
@@ -1436,8 +1438,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_tree_sampling_parti
         if (v < token_domain) {
             const float raw = sampling_logit(logits[base + v]);
             keys[item]      = sampling_sort_key(
-                (penalties || cfg.mask.words)
-                    ? sampling_adjusted_logit(raw, v, cfg, penalties ? overlay : nullptr, penalties ? overlay_len : 0)
+                (penalties || cfg.mask.words || cfg.forbidden_token >= 0)
+                    ? sampling_adjusted_logit(raw, v, cfg, need_overlay ? overlay : nullptr,
+                                              need_overlay ? overlay_len : 0)
                     : raw,
                 v);
         } else {
@@ -1489,7 +1492,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__
     const bool greedy    = !(cfg.temperature > 0.0f);
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
-    if (greedy && !penalties && cfg.mask.words == nullptr) {
+    if (greedy && !penalties && cfg.mask.words == nullptr && cfg.forbidden_token < 0) {
         if (tid < 32 && col == 0 && group == 0) {
             const Logit* row_logits = logits + static_cast<std::int64_t>(row) * cols * physical_rows;
             if (tree_row) {

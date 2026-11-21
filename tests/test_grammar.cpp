@@ -412,6 +412,20 @@ int main() {
         thinking->confirm();
         require(allows(mask(*thinking), 256), "thinking framing did not reach content completion");
 
+        // An excluded token (e.g. `<tool_call>`) is forbidden inside reasoning, and allowed again
+        // once the close token and its separator have been emitted.
+        const infernix::text::ReasoningFraming guarded_framing{
+            .close_token = 259, .separator = "\n\n", .excluded_token = 258};
+        auto guarded = compile(compiler, "root ::= Token(258) | \" answer\"", guarded_framing, {});
+        require(!allows(mask(*guarded), 258), "excluded token was admitted inside reasoning");
+        require(allows(mask(*guarded), 259), "close token was not admitted with excluded token");
+        consume(*guarded, "reason");
+        require(!allows(mask(*guarded), 258), "excluded token was admitted mid-reasoning");
+        guarded->accept(259);
+        guarded->confirm();
+        consume(*guarded, "\n\n");
+        require(allows(mask(*guarded), 258), "excluded token was not admitted after reasoning close");
+
         for (const auto& source :
              {"bad grammar", "root ::= missing", "root ::= Token(256)", "root ::= Regex(\".*\")",
               "root ::= ByteFSM(1, 0, 1, 0)", "root[temperature=0.5] ::= \"a\""}) {

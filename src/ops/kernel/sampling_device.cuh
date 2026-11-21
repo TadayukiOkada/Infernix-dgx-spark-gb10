@@ -244,12 +244,25 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // the penalty at each column sees the same prefix a per-token sampler would.
 // Non-speculative callers pass no overlay. The scan is bounded by k and
 // only runs when penalties are active, so it is free on the no-penalty path.
+__device__ __forceinline__ bool sampling_token_forbidden(int v, const SamplingConfig& c,
+                                                         const std::int32_t* overlay = nullptr,
+                                                         int overlay_len             = 0) {
+    if (c.forbidden_token < 0 || v != c.forbidden_token) { return false; }
+    if (c.forbidden_until_token >= 0) {
+        for (int j = 0; j < overlay_len; ++j) {
+            if (overlay[j] == c.forbidden_until_token) { return false; }
+        }
+    }
+    return true;
+}
+
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
     if (c.mask.words && !(c.mask.words[overlay_len * c.mask.stride + (v >> 5)] & (1u << (v & 31)))) {
         return -CUDART_INF_F;
     }
+    if (sampling_token_forbidden(v, c, overlay, overlay_len)) { return -CUDART_INF_F; }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;

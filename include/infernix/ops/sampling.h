@@ -54,6 +54,11 @@ struct SamplingConfig {
     // produced token's position, v). Speculative verification then compares each draft with that
     // token as greedy verification does, so speculation returns plain sampling's text.
     bool gumbel_max = false;
+    // Optional single token excluded from selection (e.g. `<tool_call>` while inside `<think>`),
+    // lifted within a speculative round once an earlier draft emits `forbidden_until_token`
+    // (e.g. `</think>`). Negative values disable it.
+    std::int32_t forbidden_token       = -1;
+    std::int32_t forbidden_until_token = -1;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive

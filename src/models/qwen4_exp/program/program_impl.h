@@ -5289,8 +5289,11 @@ private:
         bool need_target       = constrained;
         for (std::int32_t b = 0; b < batch && !need_target; ++b) {
             const ops::SamplingConfig& s_cfg = lanes_[lanes[b]].sampling;
+            const bool has_forbidden =
+                !c_.lossless && grammar_ != nullptr &&
+                grammar_->forbidden_token(static_cast<std::size_t>(b)).token >= 0;
             need_target = !(s_cfg.temperature > 0.0F) && s_cfg.presence_penalty == 0.0F &&
-                          s_cfg.frequency_penalty == 0.0F;
+                          s_cfg.frequency_penalty == 0.0F && !has_forbidden;
         }
         if (need_target) { ops::argmax(logits, target, token_domain_, s); }
         if (constrained) { constrain(logits, &target); }
@@ -5298,6 +5301,11 @@ private:
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]      = lanes_[lanes[b]].sampling;
             configs[b].mask = grammar_mask(static_cast<std::size_t>(b), drafts_[b]);
+            if (!c_.lossless && grammar_ != nullptr) {
+                const auto ft                    = grammar_->forbidden_token(static_cast<std::size_t>(b));
+                configs[b].forbidden_token       = ft.token;
+                configs[b].forbidden_until_token = ft.until_token;
+            }
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         Tensor drafts(spec_device(spec_layout_.drafts), DType::I32, {K, batch});
@@ -6187,6 +6195,11 @@ private:
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]          = lanes_[lanes[b]].sampling;
             configs[b].mask     = grammar_mask(static_cast<std::size_t>(b), {});
+            if (!c_.lossless && grammar_ != nullptr) {
+                const auto ft                    = grammar_->forbidden_token(static_cast<std::size_t>(b));
+                configs[b].forbidden_token       = ft.token;
+                configs[b].forbidden_until_token = ft.until_token;
+            }
             sample_positions[b] = positions[b];
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);

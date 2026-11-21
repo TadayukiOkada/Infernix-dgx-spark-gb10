@@ -3092,6 +3092,47 @@ int test_open_reasoning_tool_recovery() {
     failures += rejected(run(planning + call, true, false), "strict tool output");
     failures += rejected(run(planning + call, true, true, true),
                          "a call spelled with ordinary tokens");
+
+    // Unconstrained thinking with active tools forbids `<tool_call>` until `</think>`, then lifts it.
+    {
+        auto session = frontend.make_output_session(
+            prompt, {}, infernix::OutputOptions{.tool_name_max_length = 64, .tolerant_tool_calls = true},
+            {}, {}, free_calls);
+        const auto ft = session.forbidden_token();
+        failures += check(ft.token == 248058 && ft.until_token == 248069,
+                          "unconstrained reasoning with tools did not forbid <tool_call> until </think>");
+        const std::vector<infernix::TokenId> close = fixture_tokenizer().encode("thought\n</think>\n\n");
+        (void)session.preview_model(close, 64, infernix::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        const auto after = session.forbidden_token();
+        failures += check(after.token < 0 && after.until_token < 0,
+                          "unconstrained forbidden_token did not clear after </think>");
+    }
+    // Constrained tool grammar excludes `<tool_call>` inside `<think>` and admits it after `</think>\n\n`.
+    {
+        infernix::ToolChoice required_calls;
+        required_calls.mode = infernix::ToolChoiceMode::Required;
+        auto session = frontend.make_output_session(
+            prompt, {}, infernix::OutputOptions{.tool_name_max_length = 64}, {}, {}, required_calls);
+        failures += check(session.constrained() && session.forbidden_token().token < 0,
+                          "constrained tool session should use grammar exclusion, not single-token forbid");
+        const std::size_t vocab = fixture_tokenizer().vocab_size();
+        const std::size_t words = (vocab + 31U) / 32U;
+        std::vector<std::uint32_t> mask(words, 0);
+        (void)session.grammar_masks({}, mask);
+        const auto bit_set = [&](infernix::TokenId id) {
+            return (mask[static_cast<std::size_t>(id) / 32U] & (1U << (static_cast<std::size_t>(id) % 32U))) != 0;
+        };
+        failures += check(!bit_set(248058) && bit_set(248069),
+                          "constrained tool grammar admitted <tool_call> inside <think>");
+        const std::vector<infernix::TokenId> close = fixture_tokenizer().encode("plan\n</think>\n\n");
+        (void)session.preview_model(close, 64, infernix::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        std::fill(mask.begin(), mask.end(), 0);
+        (void)session.grammar_masks({}, mask);
+        failures += check(bit_set(248058),
+                          "constrained tool grammar did not admit <tool_call> after </think>\\n\\n");
+    }
     return failures;
 }
 

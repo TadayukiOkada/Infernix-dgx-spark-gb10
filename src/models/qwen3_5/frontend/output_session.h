@@ -1,5 +1,6 @@
 #pragma once
 #include "infernix/types.h"
+#include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
 #include <array>
 #include <cstddef>
@@ -92,6 +93,7 @@ public:
     [[nodiscard]] PublishedOutput commit_preview();
     void discard_preview();
     [[nodiscard]] bool constrained() const noexcept;
+    [[nodiscard]] runtime::ForbiddenToken forbidden_token() const noexcept;
     void observe_constraint(bool timings, double prepare_seconds) noexcept;
     void constraint_uploaded(std::size_t bytes) noexcept;
     [[nodiscard]] std::optional<ConstraintObservation> constraint_observation() const;

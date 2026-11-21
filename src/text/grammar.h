@@ -27,6 +27,9 @@ namespace infernix::text {
 struct ReasoningFraming {
     std::optional<std::int32_t> close_token;
     std::string_view separator;
+    // Optional token forbidden inside the reasoning phase (e.g. `<tool_call>` when tool grammar
+    // is active), so the model must emit `close_token` before opening a tool call.
+    std::optional<std::int32_t> excluded_token;
 };
 
 // A request's companion to its grammar for a rule the context-free grammar cannot express (Qwen
