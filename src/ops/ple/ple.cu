@@ -1,10 +1,12 @@
 #include "infernix/ops/ple.h"
 
+#include "core/device.h"
 #include "core/pdl.cuh"
 #include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/speculative_tree.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #include <cmath>
@@ -202,6 +204,7 @@ __device__ __forceinline__ std::uint64_t load_packed_codes(const std::uint8_t* p
     return words;
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 1000
 // E2M1 is a four-bit float: sign, a two-bit exponent with bias one, and one mantissa bit, whose
 // subnormal is 0.5 — so the eight magnitudes are {0, 1/2, 1, 3/2, 2, 3, 4, 6}. Decoding it with
 // integer arithmetic (rather than a sixteen-entry table indexed by the code nibble) keeps the
@@ -211,6 +214,26 @@ __device__ __forceinline__ float e2m1_value(unsigned code) {
     const unsigned exponent = (code >> 1) & 3U, mantissa = code & 1U;
     const unsigned bits = exponent == 0U ? mantissa * 0x3F000000U : ((exponent + 126U) << 23) | (mantissa << 22);
     return __uint_as_float(bits | sign);
+}
+#endif
+
+__device__ __forceinline__ float2 decode_e2m1_pair_f32(std::uint8_t pair) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    union {
+        unsigned bits;
+        __half2 h2;
+    } out;
+    asm("{\n"
+        ".reg .b8 packed;\n"
+        "mov.b32 {packed, _, _, _}, %1;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, packed;\n"
+        "}\n"
+        : "=r"(out.bits)
+        : "r"(static_cast<unsigned>(pair)));
+    return __half22float2(out.h2);
+#else
+    return make_float2(e2m1_value(pair & 15U), e2m1_value(pair >> 4U));
+#endif
 }
 
 // One CTA per (task group, column); each task decodes one 16-element block of one head's row.
@@ -240,9 +263,10 @@ __global__ void __launch_bounds__(kThreads)
         std::uint32_t words[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const std::uint8_t pair = static_cast<std::uint8_t>(codes >> (8 * i));
-            const std::uint32_t low  = bf16_rn_product(e2m1_value(pair & 15U) * s, m); // E2M1 times E4M3: exact in FP32
-            const std::uint32_t high = bf16_rn_product(e2m1_value(pair >> 4U) * s, m);
+            const std::uint8_t pair  = static_cast<std::uint8_t>(codes >> (8 * i));
+            const float2 vals        = decode_e2m1_pair_f32(pair);
+            const std::uint32_t low  = bf16_rn_product(vals.x * s, m); // E2M1 times E4M3: exact in FP32
+            const std::uint32_t high = bf16_rn_product(vals.y * s, m);
             words[i]                 = low | (high << 16);
         }
         std::uint16_t* o =
@@ -307,8 +331,9 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const std::uint8_t pair  = static_cast<std::uint8_t>(codes >> (8 * i));
-            const std::uint32_t low  = bf16_rn_product(e2m1_value(pair & 15U) * s, m);
-            const std::uint32_t high = bf16_rn_product(e2m1_value(pair >> 4U) * s, m);
+            const float2 vals        = decode_e2m1_pair_f32(pair);
+            const std::uint32_t low  = bf16_rn_product(vals.x * s, m);
+            const std::uint32_t high = bf16_rn_product(vals.y * s, m);
             words[i]                 = low | (high << 16);
         }
         std::uint16_t* o =
@@ -1046,6 +1071,165 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+template <bool VectorStore>
+__global__ void __launch_bounds__(kThreads)
+    gather_embed_nvfp4_kernel(const std::uint8_t* __restrict__ cache_base,
+                              const std::uint8_t* __restrict__ fallback_rows,
+                              const std::uint32_t* __restrict__ slots, const float* __restrict__ multiplier,
+                              std::uint32_t cache_slots, int heads, int width, int row_bytes, int columns,
+                              int tasks_per_cta, std::uint16_t* __restrict__ out) {
+    pdl::enter();
+    __shared__ std::uint32_t sh_slots[kMaxPleHashHeads];
+    const int t = blockIdx.y;
+    for (int h = threadIdx.x; h < heads; h += blockDim.x) {
+        sh_slots[h] = slots[static_cast<std::size_t>(t) * heads + h];
+    }
+    __syncthreads();
+
+    const int blocks = width / 16;
+    const int tasks  = heads * blocks;
+    const float m    = multiplier[0];
+    const int begin  = blockIdx.x * tasks_per_cta;
+    const int end    = begin + tasks_per_cta < tasks ? begin + tasks_per_cta : tasks;
+    for (int task = begin + threadIdx.x; task < end; task += blockDim.x) {
+        const int h                  = task / blocks;
+        const int b                  = task % blocks;
+        const std::uint32_t slot_raw = sh_slots[h];
+        const std::uint8_t* row;
+        const std::uint8_t* first;
+        const std::uint8_t* last;
+        if ((slot_raw & kPleCacheStagingBit) != 0U) {
+            if (fallback_rows == nullptr) { continue; }
+            first = fallback_rows;
+            last  = fallback_rows + static_cast<std::size_t>(columns) * heads * row_bytes;
+            row   = fallback_rows + (static_cast<std::size_t>(t) * heads + h) * row_bytes;
+        } else {
+            if (slot_raw >= cache_slots) { continue; }
+            first = cache_base;
+            last  = cache_base + static_cast<std::size_t>(cache_slots) * row_bytes;
+            row   = cache_base + static_cast<std::size_t>(slot_raw) * row_bytes;
+        }
+        __nv_fp8_e4m3 code;
+        code.__x                  = row[width / 2 + b];
+        const float s             = static_cast<float>(code);
+        const std::uint64_t codes = load_packed_codes(row + 8 * b, first, last);
+        std::uint32_t words[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const std::uint8_t pair  = static_cast<std::uint8_t>(codes >> (8 * i));
+            const float2 vals        = decode_e2m1_pair_f32(pair);
+            const std::uint32_t low  = bf16_rn_product(vals.x * s, m);
+            const std::uint32_t high = bf16_rn_product(vals.y * s, m);
+            words[i]                 = low | (high << 16);
+        }
+        std::uint16_t* o =
+            out + static_cast<std::size_t>(t) * heads * width + static_cast<std::size_t>(h) * width + 16 * b;
+        if constexpr (VectorStore) {
+            *reinterpret_cast<uint4*>(o)     = make_uint4(words[0], words[1], words[2], words[3]);
+            *reinterpret_cast<uint4*>(o + 8) = make_uint4(words[4], words[5], words[6], words[7]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                o[2 * i]     = static_cast<std::uint16_t>(words[i] & 0xFFFFU);
+                o[2 * i + 1] = static_cast<std::uint16_t>(words[i] >> 16);
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ uint4 decode_fp8x8_to_bf16x8(std::uint32_t lo, std::uint32_t hi, float s) {
+    union {
+        uint4 bits;
+        __nv_bfloat162 half[4];
+    } raw;
+    __nv_fp8_e4m3 c0, c1, c2, c3, c4, c5, c6, c7;
+    c0.__x      = static_cast<std::uint8_t>(lo & 0xFFU);
+    c1.__x      = static_cast<std::uint8_t>((lo >> 8) & 0xFFU);
+    c2.__x      = static_cast<std::uint8_t>((lo >> 16) & 0xFFU);
+    c3.__x      = static_cast<std::uint8_t>((lo >> 24) & 0xFFU);
+    c4.__x      = static_cast<std::uint8_t>(hi & 0xFFU);
+    c5.__x      = static_cast<std::uint8_t>((hi >> 8) & 0xFFU);
+    c6.__x      = static_cast<std::uint8_t>((hi >> 16) & 0xFFU);
+    c7.__x      = static_cast<std::uint8_t>((hi >> 24) & 0xFFU);
+    raw.half[0] = __floats2bfloat162_rn(static_cast<float>(c0) * s, static_cast<float>(c1) * s);
+    raw.half[1] = __floats2bfloat162_rn(static_cast<float>(c2) * s, static_cast<float>(c3) * s);
+    raw.half[2] = __floats2bfloat162_rn(static_cast<float>(c4) * s, static_cast<float>(c5) * s);
+    raw.half[3] = __floats2bfloat162_rn(static_cast<float>(c6) * s, static_cast<float>(c7) * s);
+    return raw.bits;
+}
+
+__global__ void __launch_bounds__(kThreads)
+    gather_embed_fp8_vec16_kernel(const std::uint8_t* __restrict__ cache_base,
+                                  const std::uint8_t* __restrict__ fallback_rows,
+                                  const std::uint32_t* __restrict__ slots, const bf16* __restrict__ scale,
+                                  std::uint32_t cache_slots, int heads, int width, int tasks_per_cta,
+                                  bf16* __restrict__ out) {
+    pdl::enter();
+    __shared__ std::uint32_t sh_slots[kMaxPleHashHeads];
+    const int t = blockIdx.y;
+    for (int h = threadIdx.x; h < heads; h += blockDim.x) {
+        sh_slots[h] = slots[static_cast<std::size_t>(t) * heads + h];
+    }
+    __syncthreads();
+
+    const int blocks = width / 16;
+    const int tasks  = heads * blocks;
+    const float s    = __bfloat162float(scale[0]);
+    const int begin  = blockIdx.x * tasks_per_cta;
+    const int end    = begin + tasks_per_cta < tasks ? begin + tasks_per_cta : tasks;
+    for (int task = begin + threadIdx.x; task < end; task += blockDim.x) {
+        const int h                  = task / blocks;
+        const int b                  = task % blocks;
+        const std::uint32_t slot_raw = sh_slots[h];
+        const std::uint8_t* row;
+        if ((slot_raw & kPleCacheStagingBit) != 0U) {
+            if (fallback_rows == nullptr) { continue; }
+            row = fallback_rows + (static_cast<std::size_t>(t) * heads + h) * width;
+        } else {
+            if (slot_raw >= cache_slots) { continue; }
+            row = cache_base + static_cast<std::size_t>(slot_raw) * width;
+        }
+        const uint4 packed = *reinterpret_cast<const uint4*>(row + 16 * b);
+        bf16* o =
+            out + static_cast<std::size_t>(t) * heads * width + static_cast<std::size_t>(h) * width + 16 * b;
+        *reinterpret_cast<uint4*>(o)     = decode_fp8x8_to_bf16x8(packed.x, packed.y, s);
+        *reinterpret_cast<uint4*>(o + 8) = decode_fp8x8_to_bf16x8(packed.z, packed.w, s);
+    }
+}
+
+__global__ void __launch_bounds__(kThreads)
+    gather_embed_fp8_kernel(const std::uint8_t* __restrict__ cache_base,
+                            const std::uint8_t* __restrict__ fallback_rows,
+                            const std::uint32_t* __restrict__ slots, const bf16* __restrict__ scale,
+                            std::uint32_t cache_slots, int heads, int head_width, bf16* __restrict__ out) {
+    pdl::enter();
+    __shared__ std::uint32_t sh_slots[kMaxPleHashHeads];
+    const int t = blockIdx.y;
+    for (int h = threadIdx.x; h < heads; h += blockDim.x) {
+        sh_slots[h] = slots[static_cast<std::size_t>(t) * heads + h];
+    }
+    __syncthreads();
+
+    const int i        = blockIdx.x * blockDim.x + threadIdx.x;
+    const int elements = heads * head_width;
+    if (i >= elements) { return; }
+    const int h                  = i / head_width;
+    const int d                  = i % head_width;
+    const std::uint32_t slot_raw = sh_slots[h];
+    const std::uint8_t* row;
+    if ((slot_raw & kPleCacheStagingBit) != 0U) {
+        if (fallback_rows == nullptr) { return; }
+        row = fallback_rows + (static_cast<std::size_t>(t) * heads + h) * head_width;
+    } else {
+        if (slot_raw >= cache_slots) { return; }
+        row = cache_base + static_cast<std::size_t>(slot_raw) * head_width;
+    }
+    __nv_fp8_e4m3 code;
+    code.__x      = row[d];
+    const float v = static_cast<float>(code) * __bfloat162float(scale[0]);
+    out[static_cast<std::size_t>(t) * elements + i] = __float2bfloat16_rn(v);
+}
+
 void launch_embed_nvfp4(const std::uint8_t* rows, const float* multiplier, int row_bytes, int heads, int width,
                         int columns, std::uint16_t* out, cudaStream_t stream) {
     const int tasks = heads * (width / 16);
@@ -1081,6 +1265,34 @@ void launch_hash_embed_nvfp4(const std::int32_t* windows, const std::uint64_t* m
                                    hash_embed_nvfp4_kernel<false>, windows, multipliers, sizes, offsets,
                                    resident_blocks, multiplier, ngram_size, heads_per_ngram, eos_token_id, heads, width,
                                    row_bytes, rows_per_block, block_bytes, columns, tasks_per_cta, out);
+    }
+}
+
+void launch_gather_embed_nvfp4(const std::uint8_t* cache_base, const std::uint8_t* fallback_rows,
+                               const std::uint32_t* slots, const float* multiplier, std::uint32_t cache_slots,
+                               int heads, int width, int row_bytes, int columns, const std::uint32_t* ready,
+                               const std::uint32_t* expected, std::uint64_t* wait_stats,
+                               const std::int32_t* wait_row, std::uint16_t* out, cudaStream_t stream) {
+    const bool gated = ready != nullptr;
+    if (gated) { wait_pinned_word(ready, expected, wait_stats, wait_row, stream); }
+    const int tasks   = heads * (width / 16);
+    int tasks_per_cta = tasks < kThreads ? tasks : kThreads;
+    if (columns < kEmbedSpreadColumns && tasks > kEmbedCtaTasks) { tasks_per_cta = kEmbedCtaTasks; }
+    const dim3 grid((tasks + tasks_per_cta - 1) / tasks_per_cta, columns);
+    const auto launch = [&](auto kernel) {
+        if (gated) {
+            kernel<<<grid, dim3(tasks_per_cta), 0, stream>>>(cache_base, fallback_rows, slots, multiplier, cache_slots,
+                                                             heads, width, row_bytes, columns, tasks_per_cta, out);
+        } else {
+            (void)pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(tasks_per_cta), 0, stream}, kernel, cache_base,
+                                       fallback_rows, slots, multiplier, cache_slots, heads, width, row_bytes, columns,
+                                       tasks_per_cta, out);
+        }
+    };
+    if (aligned<16>(out)) {
+        launch(gather_embed_nvfp4_kernel<true>);
+    } else {
+        launch(gather_embed_nvfp4_kernel<false>);
     }
 }
 
@@ -1163,6 +1375,91 @@ void ple_hash_embed_nvfp4(const Tensor& windows, const PleNgramHashTable& table,
                             table.eos_token_id, heads, table.head_width, table.row_bytes, table.rows_per_block,
                             table.block_bytes, columns, static_cast<std::uint16_t*>(out.data), stream);
     check_launch("hash embed");
+}
+
+void ple_gather_embed_nvfp4(const PleCacheGather& gather, Tensor& out, cudaStream_t stream) {
+    require(gather.cache_base != nullptr && gather.slots != nullptr && gather.scale != nullptr,
+            "gather embed nvfp4 requires mapped cache, slots and scale");
+    require(gather.cache_slots > 0 && gather.heads > 0 && gather.heads <= kMaxPleHashHeads,
+            "gather embed nvfp4 cache slots or head count out of range");
+    require((gather.ready == nullptr) == (gather.expected == nullptr),
+            "gather embed nvfp4 gate requires both ready and expected pointers");
+    require(contiguous(out, DType::BF16) && contiguous(*gather.scale, DType::FP32) &&
+                gather.scale->numel() == 1,
+            "gather embed nvfp4 requires contiguous FP32 scale and BF16 output");
+    const int width   = gather.head_width;
+    const int columns = out.ne[1];
+    require(columns > 0 && width > 0 && width % 16 == 0 &&
+                gather.row_bytes == width / 2 + width / 16 &&
+                out.ne[0] == gather.heads * width && out.ne[2] == 1 && out.ne[3] == 1,
+            "gather embed nvfp4 shapes disagree");
+    launch_gather_embed_nvfp4(
+        static_cast<const std::uint8_t*>(gather.cache_base),
+        static_cast<const std::uint8_t*>(gather.fallback_rows), gather.slots,
+        static_cast<const float*>(gather.scale->data), gather.cache_slots, gather.heads, width,
+        gather.row_bytes, columns, gather.ready, gather.expected, gather.wait_stats, gather.wait_row,
+        static_cast<std::uint16_t*>(out.data), stream);
+    check_launch("gather embed nvfp4");
+}
+
+void ple_gather_embed_fp8(const PleCacheGather& gather, Tensor& out, cudaStream_t stream) {
+    require(gather.cache_base != nullptr && gather.slots != nullptr && gather.scale != nullptr,
+            "gather embed fp8 requires mapped cache, slots and scale");
+    require(gather.cache_slots > 0 && gather.heads > 0 && gather.heads <= kMaxPleHashHeads,
+            "gather embed fp8 cache slots or head count out of range");
+    require((gather.ready == nullptr) == (gather.expected == nullptr),
+            "gather embed fp8 gate requires both ready and expected pointers");
+    require(contiguous(out, DType::BF16) && contiguous(*gather.scale, DType::BF16) &&
+                gather.scale->numel() == 1,
+            "gather embed fp8 requires contiguous BF16 scale and BF16 output");
+    const int width    = gather.head_width;
+    const int columns  = out.ne[1];
+    const int elements = gather.heads * width;
+    require(columns > 0 && width > 0 && gather.row_bytes == width &&
+                out.ne[0] == elements && out.ne[2] == 1 && out.ne[3] == 1,
+            "gather embed fp8 shapes disagree");
+    const bool gated = gather.ready != nullptr;
+    if (gated) { wait_pinned_word(gather.ready, gather.expected, gather.wait_stats, gather.wait_row, stream); }
+    const bool vec16 = (width % 16 == 0) && aligned<16>(gather.cache_base) &&
+                       (gather.fallback_rows == nullptr || aligned<16>(gather.fallback_rows)) &&
+                       aligned<16>(out.data);
+    if (vec16) {
+        const int tasks   = gather.heads * (width / 16);
+        int tasks_per_cta = tasks < kThreads ? tasks : kThreads;
+        if (columns < kEmbedSpreadColumns && tasks > kEmbedCtaTasks) { tasks_per_cta = kEmbedCtaTasks; }
+        const dim3 grid((tasks + tasks_per_cta - 1) / tasks_per_cta, columns);
+        if (gated) {
+            gather_embed_fp8_vec16_kernel<<<grid, dim3(tasks_per_cta), 0, stream>>>(
+                static_cast<const std::uint8_t*>(gather.cache_base),
+                static_cast<const std::uint8_t*>(gather.fallback_rows), gather.slots,
+                static_cast<const bf16*>(gather.scale->data), gather.cache_slots, gather.heads, width, tasks_per_cta,
+                static_cast<bf16*>(out.data));
+        } else {
+            (void)pdl::launch_consumer(
+                pdl::LaunchConfig{grid, dim3(tasks_per_cta), 0, stream}, gather_embed_fp8_vec16_kernel,
+                static_cast<const std::uint8_t*>(gather.cache_base),
+                static_cast<const std::uint8_t*>(gather.fallback_rows), gather.slots,
+                static_cast<const bf16*>(gather.scale->data), gather.cache_slots, gather.heads, width, tasks_per_cta,
+                static_cast<bf16*>(out.data));
+        }
+    } else {
+        const dim3 grid((elements + kThreads - 1) / kThreads, columns);
+        if (gated) {
+            gather_embed_fp8_kernel<<<grid, dim3(kThreads), 0, stream>>>(
+                static_cast<const std::uint8_t*>(gather.cache_base),
+                static_cast<const std::uint8_t*>(gather.fallback_rows), gather.slots,
+                static_cast<const bf16*>(gather.scale->data), gather.cache_slots, gather.heads, width,
+                static_cast<bf16*>(out.data));
+        } else {
+            (void)pdl::launch_consumer(
+                pdl::LaunchConfig{grid, dim3(kThreads), 0, stream}, gather_embed_fp8_kernel,
+                static_cast<const std::uint8_t*>(gather.cache_base),
+                static_cast<const std::uint8_t*>(gather.fallback_rows), gather.slots,
+                static_cast<const bf16*>(gather.scale->data), gather.cache_slots, gather.heads, width,
+                static_cast<bf16*>(out.data));
+        }
+    }
+    check_launch("gather embed fp8");
 }
 
 void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,

@@ -902,6 +902,24 @@ bool narrow_ring_device() {
     return cached == 1;
 }
 
+struct ScreenL2PolicyProps {
+    std::size_t max_window_bytes = 0;
+};
+
+ScreenL2PolicyProps screen_l2_policy_props() {
+    thread_local int cached_device = -1;
+    thread_local ScreenL2PolicyProps cached{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device != cached_device) {
+        int max_win = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&max_win, cudaDevAttrMaxAccessPolicyWindowSize, device));
+        cached.max_window_bytes = max_win > 0 ? static_cast<std::size_t>(max_win) : 0;
+        cached_device           = device;
+    }
+    return cached;
+}
+
 // The screen grid for one (Tiles, NarrowRing) shape: the co-resident CTAs per SM the occupancy
 // admits times the SM count, at most kMaxGrid, then down to the item count. The occupancy is judged
 // on a representative instantiation (the forms share the shared memory and register footprint), so
@@ -928,8 +946,73 @@ void launch_screen(const ScreenParams& p, int grid, cudaStream_t stream) {
     static const cudaError_t configured =
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     CUDA_CHECK(configured);
-    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kScreenThreads), static_cast<std::size_t>(bytes), stream},
-                                    kernel, p));
+
+    cudaLaunchAttribute attrs[2]{};
+    int num_attrs = 0;
+    if (pdl::graph_dependent(stream)) {
+        attrs[num_attrs].id                                           = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[num_attrs].val.programmaticStreamSerializationAllowed   = 1;
+        ++num_attrs;
+    }
+
+    // Isolate the hot input/reduction span in L2 so streaming 94-179 MiB of 2-bit codes and
+    // scales evicts cleanly without trashing hot decode activations/workspace. (CUDA 13.0 ptxas on
+    // sm_121a miscompiles per-instruction createpolicy + extern __shared__ into an invalid odd
+    // LDGSTS desc[UR1], so hardware access-policy windows do the streaming isolation cleanly.)
+    const ScreenL2PolicyProps l2 = screen_l2_policy_props();
+    if (l2.max_window_bytes > 0 && p.x != nullptr && p.columns > 0) {
+        const auto addr     = [](const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); };
+        const auto overlaps = [](std::uintptr_t a0, std::uintptr_t a1, std::uintptr_t b0, std::uintptr_t b1) {
+            return a0 < b1 && b0 < a1;
+        };
+        const std::uintptr_t codes_lo  = addr(p.codes);
+        const std::uintptr_t codes_hi  = codes_lo + static_cast<std::size_t>(p.rows) * kCodeRowBytes;
+        const std::uintptr_t scales_lo = addr(p.scales);
+        const std::uintptr_t scales_hi = scales_lo + static_cast<std::size_t>(p.rows) * kScaleRowBytes;
+        const std::size_t max_pin      = std::min<std::size_t>(l2.max_window_bytes, 8ULL << 20);
+
+        std::uintptr_t win_lo = addr(p.x);
+        std::uintptr_t win_hi = win_lo + static_cast<std::size_t>(p.columns) * kHidden * sizeof(bf16);
+        bool has_win = win_hi > win_lo && (win_hi - win_lo) <= max_pin &&
+                       !overlaps(win_lo, win_hi, codes_lo, codes_hi) &&
+                       !overlaps(win_lo, win_hi, scales_lo, scales_hi);
+        const auto try_merge = [&](const void* ptr, std::size_t span_bytes) {
+            if (!has_win || ptr == nullptr || span_bytes == 0) { return; }
+            const std::uintptr_t lo     = addr(ptr);
+            const std::uintptr_t hi     = lo + span_bytes;
+            const std::uintptr_t new_lo = std::min(win_lo, lo);
+            const std::uintptr_t new_hi = std::max(win_hi, hi);
+            if (new_hi > new_lo && (new_hi - new_lo) <= max_pin && !overlaps(new_lo, new_hi, codes_lo, codes_hi) &&
+                !overlaps(new_lo, new_hi, scales_lo, scales_hi)) {
+                win_lo = new_lo;
+                win_hi = new_hi;
+            }
+        };
+        try_merge(p.lists, static_cast<std::size_t>(p.columns) * grid * kListLength * sizeof(float2));
+        if constexpr (Softmax) {
+            if (p.partials != nullptr) {
+                try_merge(p.partials, static_cast<std::size_t>(p.columns) * grid * sizeof(float2));
+            }
+        }
+        if (has_win && (win_hi - win_lo) <= l2.max_window_bytes) {
+            attrs[num_attrs].id                              = cudaLaunchAttributeAccessPolicyWindow;
+            attrs[num_attrs].val.accessPolicyWindow.base_ptr = reinterpret_cast<void*>(win_lo);
+            attrs[num_attrs].val.accessPolicyWindow.num_bytes = static_cast<std::size_t>(win_hi - win_lo);
+            attrs[num_attrs].val.accessPolicyWindow.hitRatio = 1.0F;
+            attrs[num_attrs].val.accessPolicyWindow.hitProp  = cudaAccessPropertyNormal;
+            attrs[num_attrs].val.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+            ++num_attrs;
+        }
+    }
+
+    cudaLaunchConfig_t config{};
+    config.gridDim          = dim3(grid);
+    config.blockDim         = dim3(kScreenThreads);
+    config.dynamicSmemBytes = static_cast<std::size_t>(bytes);
+    config.stream           = stream;
+    config.attrs            = num_attrs > 0 ? attrs : nullptr;
+    config.numAttrs         = static_cast<unsigned int>(num_attrs);
+    CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, p));
 }
 
 template <bool Logits, bool Softmax>

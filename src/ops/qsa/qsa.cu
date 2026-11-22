@@ -27,6 +27,7 @@
 #include "ops/qsa/qsa_select.h"
 #include "ops/qsa/vq_window.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
@@ -1379,7 +1380,7 @@ __host__ __device__ constexpr std::size_t sparse_gqa_columns_smem_bytes() {
     return static_cast<std::size_t>(Total > Partial ? Total : Partial);
 }
 
-template <KvCacheStorage Storage, int N, int Parts>
+template <KvCacheStorage Storage, int N, int Parts, int ClusterSplits = 1>
 __global__ void __launch_bounds__(Parts * 32)
     sparse_gqa_columns_kernel(const bf16* __restrict__ q, int heads, int kv_heads, PagedKVLayerView kv,
                               QsaPageSpaces spaces, const std::int32_t* __restrict__ tables, int table_stride,
@@ -1390,14 +1391,16 @@ __global__ void __launch_bounds__(Parts * 32)
                               std::int64_t gate_col_stride, float* __restrict__ partial, bf16* __restrict__ out,
                               const SpeculativeTreeRow* __restrict__ trees) {
     static_assert((N == 16 || N == 32) && (Parts == 2 || Parts == 4));
-    using Shape                 = ColumnsShape<Storage>;
-    constexpr bool Quantized    = Storage != KvCacheStorage::BFloat16;
-    constexpr bool RotatedValue = Shape::Value == ColumnsCode::Nvfp4;
-    constexpr int Threads       = Parts * 32;
-    constexpr int GroupHeads    = 12;
-    constexpr int OutCols       = kHeadDim / Parts / 8;
-    constexpr float Log2E       = 1.4426950408889634074f;
-    constexpr unsigned FullMask = 0xffffffffu;
+    static_assert(ClusterSplits == 1 || ClusterSplits == 2 || ClusterSplits == 4);
+    using Shape                           = ColumnsShape<Storage>;
+    constexpr bool Quantized              = Storage != KvCacheStorage::BFloat16;
+    constexpr bool RotatedValue           = Shape::Value == ColumnsCode::Nvfp4;
+    constexpr int Threads                 = Parts * 32;
+    constexpr int GroupHeads              = 12;
+    constexpr int OutCols                 = kHeadDim / Parts / 8;
+    constexpr int kClusterPartialStride   = kHeadDim + 4;
+    constexpr float Log2E                 = 1.4426950408889634074f;
+    constexpr unsigned FullMask           = 0xffffffffu;
 
     pdl::enter();
     const int split   = static_cast<int>(blockIdx.x);
@@ -1417,14 +1420,14 @@ __global__ void __launch_bounds__(Parts * 32)
     const int count     = counts[t];
     const int total     = attended_count(count, ratio, p);
     if (total <= 0) {
-        if (splits == 1) {
+        if (splits == 1 || (ClusterSplits > 1 && split == 0)) {
             for (int i = tid; i < GroupHeads * (kHeadDim / 2); i += Threads) {
                 const int h = i / (kHeadDim / 2), d2 = i % (kHeadDim / 2);
                 reinterpret_cast<__nv_bfloat162*>(
                     out + (static_cast<std::size_t>(t) * heads + kv_head * GroupHeads + h) * kHeadDim)[d2] =
                     __floats2bfloat162_rn(0.0f, 0.0f);
             }
-        } else if (tid < GroupHeads) {
+        } else if (ClusterSplits == 1 && tid < GroupHeads) {
             float* slot =
                 partial + ((static_cast<std::size_t>(t) * splits + split) * heads + kv_head * GroupHeads + tid) *
                               (kHeadDim + 2);
@@ -1437,18 +1440,22 @@ __global__ void __launch_bounds__(Parts * 32)
     const int total_tiles = (total + N - 1) / N;
     const int start       = (split * total_tiles / splits) * N;
     const int end         = min(total, ((split + 1) * total_tiles / splits) * N);
-    if (start >= end) {
-        if (splits > 1 && tid < GroupHeads) {
-            float* slot =
-                partial + ((static_cast<std::size_t>(t) * splits + split) * heads + kv_head * GroupHeads + tid) *
-                              (kHeadDim + 2);
-            slot[kHeadDim]     = -CUDART_INF_F;
-            slot[kHeadDim + 1] = 0.0f;
+    if constexpr (ClusterSplits == 1) {
+        if (start >= end) {
+            if (splits > 1 && tid < GroupHeads) {
+                float* slot =
+                    partial +
+                    ((static_cast<std::size_t>(t) * splits + split) * heads + kv_head * GroupHeads + tid) *
+                        (kHeadDim + 2);
+                slot[kHeadDim]     = -CUDART_INF_F;
+                slot[kHeadDim + 1] = 0.0f;
+            }
+            return;
         }
-        return;
     }
 
     extern __shared__ __align__(16) unsigned char smem[];
+    if (ClusterSplits == 1 || start < end) {
     auto* ks         = reinterpret_cast<std::uint16_t*>(smem);                 // [N][256]
     auto* vs         = ks + N * kHeadDim;                                      // [N][256]
     using KRow       = ColumnsRow<Shape::Key>;
@@ -1765,11 +1772,14 @@ __global__ void __launch_bounds__(Parts * 32)
         const int h = gid + j * 8;
         if (h >= GroupHeads) { continue; }
         const int head_idx = kv_head * GroupHeads + h;
-        const bool direct  = splits == 1;
+        const bool direct  = ClusterSplits == 1 && splits == 1;
         const float inv    = direct ? (state[j].sum > 0.0f ? (1.0f / state[j].sum) : 0.0f) : 1.0f;
-        float* slot        = direct ? nullptr
-                                    : partial + ((static_cast<std::size_t>(t) * splits + split) * heads + head_idx) *
-                                                    (kHeadDim + 2);
+        float* slot        = ClusterSplits > 1
+                                 ? (partial_rows + h * kClusterPartialStride)
+                                 : (direct ? nullptr
+                                           : partial + ((static_cast<std::size_t>(t) * splits + split) * heads +
+                                                        head_idx) *
+                                                           (kHeadDim + 2));
 #pragma unroll
         for (int n = 0; n < OutCols; ++n) {
             const int d   = warp * (kHeadDim / Parts) + n * 8 + lid * 2;
@@ -1794,7 +1804,7 @@ __global__ void __launch_bounds__(Parts * 32)
             slot[kHeadDim + 1] = state[j].sum;
         }
     }
-    if constexpr (RotatedValue) {
+    if constexpr (RotatedValue && ClusterSplits == 1) {
         if (splits == 1) {
             __syncthreads();
             for (int h = warp; h < GroupHeads; h += Parts) {
@@ -1814,6 +1824,80 @@ __global__ void __launch_bounds__(Parts * 32)
                 }
             }
         }
+    }
+    } else if constexpr (ClusterSplits > 1) {
+        if (tid < GroupHeads) {
+            float* slot        = reinterpret_cast<float*>(smem) + tid * kClusterPartialStride;
+            slot[kHeadDim]     = -CUDART_INF_F;
+            slot[kHeadDim + 1] = 0.0f;
+        }
+    }
+    if constexpr (ClusterSplits > 1) {
+        __syncthreads();
+        auto cluster = cooperative_groups::this_cluster();
+        cluster.sync();
+        if (split == 0) {
+            float* partial_rows = reinterpret_cast<float*>(smem);
+            for (int h = warp; h < GroupHeads; h += Parts) {
+                float ms[ClusterSplits];
+                float ls[ClusterSplits];
+                float m = -CUDART_INF_F;
+#pragma unroll
+                for (int s = 0; s < ClusterSplits; ++s) {
+                    const float* rslot = (s == 0) ? (partial_rows + h * kClusterPartialStride)
+                                                  : cluster.map_shared_rank(partial_rows + h * kClusterPartialStride, s);
+                    const float2 ml    = *reinterpret_cast<const float2*>(rslot + kHeadDim);
+                    ms[s]              = ml.x;
+                    ls[s]              = ml.y;
+                    m                  = fmaxf(m, ml.x);
+                }
+                float w[ClusterSplits];
+                float sum = 0.0f;
+#pragma unroll
+                for (int s = 0; s < ClusterSplits; ++s) {
+                    w[s] = (ms[s] == -CUDART_INF_F || ls[s] <= 0.0f) ? 0.0f : exp2_approx(ms[s] - m);
+                    sum += w[s] * ls[s];
+                }
+                float vals[8]{};
+                if (sum > 0.0f) {
+#pragma unroll
+                    for (int s = 0; s < ClusterSplits; ++s) {
+                        if (w[s] == 0.0f) { continue; }
+                        const float* rslot =
+                            (s == 0) ? (partial_rows + h * kClusterPartialStride)
+                                     : cluster.map_shared_rank(partial_rows + h * kClusterPartialStride, s);
+                        const float* src = rslot + lane * 8;
+                        const float2 a   = load_vec<float2>(src);
+                        const float2 b   = load_vec<float2>(src + 2);
+                        const float2 c   = load_vec<float2>(src + 4);
+                        const float2 d   = load_vec<float2>(src + 6);
+                        vals[0] += w[s] * a.x;
+                        vals[1] += w[s] * a.y;
+                        vals[2] += w[s] * b.x;
+                        vals[3] += w[s] * b.y;
+                        vals[4] += w[s] * c.x;
+                        vals[5] += w[s] * c.y;
+                        vals[6] += w[s] * d.x;
+                        vals[7] += w[s] * d.y;
+                    }
+                    const float inv = 1.0f / sum;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { vals[i] *= inv; }
+                    if constexpr (RotatedValue) { normalized_hadamard_d256_contiguous_inplace(vals, lane); }
+                }
+                const int head_idx = kv_head * GroupHeads + h;
+                bf16* dst          = out + (static_cast<std::size_t>(t) * heads + head_idx) * kHeadDim + lane * 8;
+                const std::int64_t g_base =
+                    static_cast<std::int64_t>(t) * gate_col_stride + head_idx * kHeadDim + lane * 8;
+#pragma unroll
+                for (int p_i = 0; p_i < 4; ++p_i) {
+                    const __nv_bfloat162 pair = __floats2bfloat162_rn(vals[2 * p_i], vals[2 * p_i + 1]);
+                    *reinterpret_cast<__nv_bfloat162*>(dst + 2 * p_i) =
+                        apply_qsa_gate_pair(pair, gate, g_base + 2 * p_i);
+                }
+            }
+        }
+        cluster.sync();
     }
 }
 
@@ -2233,15 +2317,49 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         }
         const dim3 mma_grid(static_cast<unsigned>(mma_splits), static_cast<unsigned>(geometry.kv_heads),
                             static_cast<unsigned>(columns));
+        const bool use_cluster_merge = (mma_splits == 2 || mma_splits == 4);
         const auto launch_cols = [&]<KvCacheStorage Storage, int N, int Parts>() {
             constexpr std::size_t smem_bytes = sparse_gqa_columns_smem_bytes<Storage, N>();
             static_assert(smem_bytes <= 48 * 1024, "columns tile fits in default 48 KiB SMEM");
-            const cudaError_t error = pdl::launch_consumer(
-                {mma_grid, dim3(Parts * 32), smem_bytes, stream}, sparse_gqa_columns_kernel<Storage, N, Parts>,
-                static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv, layer.spaces, tables,
-                stride, rows, pos, batch.width, geometry.ratio, static_cast<const std::int32_t*>(ws.selected),
-                static_cast<const std::int32_t*>(ws.counts), top_blocks, mma_splits, scale, gate_ptr, gate_col_stride,
-                ws.partial, static_cast<bf16*>(out.data), trees_p);
+            const auto launch_cluster = [&]<int ClusterSplits>() {
+                cudaLaunchAttribute attributes[2]{};
+                attributes[0].id               = cudaLaunchAttributeClusterDimension;
+                attributes[0].val.clusterDim.x = static_cast<unsigned>(ClusterSplits);
+                attributes[0].val.clusterDim.y = 1;
+                attributes[0].val.clusterDim.z = 1;
+                unsigned count                 = 1;
+                if (pdl::graph_dependent(stream)) {
+                    attributes[1].id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
+                    attributes[1].val.programmaticStreamSerializationAllowed = 1;
+                    count                                                    = 2;
+                }
+                cudaLaunchConfig_t config{};
+                config.gridDim          = mma_grid;
+                config.blockDim         = dim3(Parts * 32);
+                config.dynamicSmemBytes = smem_bytes;
+                config.stream           = stream;
+                config.attrs            = attributes;
+                config.numAttrs         = count;
+                return cudaLaunchKernelEx(
+                    &config, sparse_gqa_columns_kernel<Storage, N, Parts, ClusterSplits>,
+                    static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv, layer.spaces,
+                    tables, stride, rows, pos, batch.width, geometry.ratio,
+                    static_cast<const std::int32_t*>(ws.selected), static_cast<const std::int32_t*>(ws.counts),
+                    top_blocks, mma_splits, scale, gate_ptr, gate_col_stride, ws.partial,
+                    static_cast<bf16*>(out.data), trees_p);
+            };
+            const cudaError_t error =
+                mma_splits == 2
+                    ? launch_cluster.template operator()<2>()
+                    : (mma_splits == 4
+                           ? launch_cluster.template operator()<4>()
+                           : pdl::launch_consumer(
+                                 {mma_grid, dim3(Parts * 32), smem_bytes, stream},
+                                 sparse_gqa_columns_kernel<Storage, N, Parts, 1>, static_cast<const bf16*>(q.data),
+                                 geometry.heads, geometry.kv_heads, layer.kv, layer.spaces, tables, stride, rows, pos,
+                                 batch.width, geometry.ratio, static_cast<const std::int32_t*>(ws.selected),
+                                 static_cast<const std::int32_t*>(ws.counts), top_blocks, mma_splits, scale, gate_ptr,
+                                 gate_col_stride, ws.partial, static_cast<bf16*>(out.data), trees_p));
             if (error != cudaSuccess) {
                 throw std::runtime_error(std::string("qsa mma columns: ") + cudaGetErrorString(error));
             }
@@ -2273,7 +2391,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
             break;
         }
         check_launch("mma columns");
-        if (mma_splits > 1) {
+        if (mma_splits > 1 && !use_cluster_merge) {
             const bool rotate_values = layer.kv.storage == KvCacheStorage::Nvfp4Group16 ||
                                        layer.kv.storage == KvCacheStorage::Fp8KeyNvfp4Value;
             const dim3 merge_grid(static_cast<unsigned>((geometry.heads + 3) / 4), static_cast<unsigned>(columns));

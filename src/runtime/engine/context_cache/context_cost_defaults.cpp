@@ -20,6 +20,17 @@ constexpr ContextPrefillCost kNvfp4Fp8Prefill{
     .vision_item_ns        = 5'860'255,
     .vision_patch_ns_q32   = 23'832'529'381'413,
 };
+// Measured on NVIDIA GB10 (DGX Spark, sm_121a) with Qwen3.8-Flash-Next Local NVFP4-W4Dense
+// (`infernix_context_cost_bench --suite prefill`, 2026-11-22: training p95 rel error 12.76%,
+// held-out validation p95 16.93% on text-b2048-s256, 0/29 ordering failures; kept instead of the
+// ~59%-underpredicting generic fallback).
+constexpr ContextPrefillCost kGb10FlashNextW4DensePrefill{
+    .chunk_ns              = 122'626'757,
+    .token_ns_q32          = 1'328'376'209'951'866,
+    .attention_pair_ns_q32 = 10'861'906'147,
+    .vision_item_ns        = 5'986'585,
+    .vision_patch_ns_q32   = 23'710'212'854'694,
+};
 
 } // namespace
 
@@ -88,13 +99,16 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults() {
                     ContextTransferCost{
                         .batch_ns = 10'441, .operation_ns = 2'539, .ns_per_byte_q32 = 30'671'379},
                 },
-            // No compiled prefill binding: the RTX 5090 signature entries copied here priced
-            // recomputation 3.5..6x below GB10's actual prefill, and no artifact whose prefill is
-            // measurable on this machine reproduces those signatures (measured 2026-10-29; a
-            // Qwen3.8-Flash-Next fit was rejected by the calibration's own error gate). Text
-            // configs on GB10 resolve the generic prefill estimate until
-            // infernix_context_cost_bench --suite prefill --preset-out records a real one.
-            .prefill = {},
+            // Measured Qwen3.8-Flash-Next W4Dense signatures on NVIDIA GB10 (local-f4 with vision
+            // and hc4 without vision). Copied RTX 5090 signatures remain absent so foreign-signature
+            // checks still fall back cleanly to the generic estimator.
+            .prefill =
+                {
+                    {"b99760c8af25d68b35304052663404a0940044322514cc2399921702511dd385",
+                     kGb10FlashNextW4DensePrefill},
+                    {"79428db0b3e90afb0a02fa8eae3cb60fa7b916a4f416176d23dcbdd491dc1213",
+                     kGb10FlashNextW4DensePrefill},
+                },
         },
     };
     return defaults;

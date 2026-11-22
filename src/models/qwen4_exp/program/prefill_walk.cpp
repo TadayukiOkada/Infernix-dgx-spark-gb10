@@ -116,6 +116,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
 }
 
 void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
+    reset_l2_persist_for_prefill();
     const cudaStream_t s = device_.stream;
     walk_                = LayerWalk{};
     walk_.lane           = index;
@@ -190,13 +191,13 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                static_cast<std::uint64_t>(w));
-            stage_sequence(index, b, w, lane.history, !prefetched);
+            stage_sequence(index, b, w, lane.history, !prefetched, /*allow_mapped_cache=*/false);
         }
         std::optional<execution::MtpChunk> chunk = stage_mtp_chunk(lane, index, b, w);
         const execution::VisionInput* vision     = stage_vision(lane, static_cast<std::uint32_t>(b), w);
         std::byte* host_slot = host_area + c * walk_.io_stride;
         std::byte* slot      = area + walk_.residual_bytes + c * walk_.io_stride;
-        const std::size_t prefix = io_prefix(w);
+        const std::size_t prefix = io_prefix(w, /*allow_mapped_cache=*/false);
         const bool has_tail      = chunk.has_value() || vision != nullptr;
         if (prefetched) {
             std::memcpy(host_slot, io_host_.data(), io_layout_.ngram);

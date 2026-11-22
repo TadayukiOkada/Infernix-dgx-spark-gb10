@@ -5,7 +5,7 @@ namespace infernix::ops::detail {
 template <int Tokens, int Warps, int Stages, int RowTiles = 1>
 inline constexpr int nvfp4_sliced_min_blocks_per_sm() {
     constexpr int kSharedBytes =
-        Nvfp4A16SlicedKMmaSchedule<Warps, Tokens, 1, Cache::ca, Cache::cg,
+        Nvfp4A16SlicedKMmaSchedule<Warps, Tokens, 1, Cache::ca, Cache::cg_evict_first,
                                    Nvfp4ActivationStage::ActiveOnly, Stages, RowTiles>::kSharedBytes;
     if constexpr (RowTiles == 1 && Warps <= 4 && kSharedBytes <= 99 * 1024 / 4) {
         return 4;
@@ -24,6 +24,6 @@ template <int Tokens, int Warps, int Stages, int RowTiles = 1>
 using Nvfp4SlicedInstance =
     Nvfp4A16SlicedKMmaSchedule<Warps, Tokens,
                                nvfp4_sliced_min_blocks_per_sm<Tokens, Warps, Stages, RowTiles>(),
-                               Cache::ca, Cache::cg, Nvfp4ActivationStage::ActiveOnly, Stages,
-                               RowTiles>;
+                               Cache::ca, Cache::cg_evict_first, Nvfp4ActivationStage::ActiveOnly,
+                               Stages, RowTiles>;
 } // namespace infernix::ops::detail

@@ -24,7 +24,10 @@ __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_sliced_k_mma_kernel(
     Nvfp4A16Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_offset) {
-    pdl::enter_streaming();
+    std::uint64_t weight_policy = 0ULL;
+    if constexpr (Schedule::kWeightCache == Cache::cg_evict_first) {
+        weight_policy = l2_evict_first_policy();
+    }
     const auto* __restrict__ x             = operands.x;
     const auto* __restrict__ weight_codes  = operands.codes;
     const auto* __restrict__ weight_scales = operands.scales;
@@ -78,22 +81,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     __shared__ std::uint32_t
         row_prefetch[kPrefetchWords == 0 ? 1 : kBlockRows * kPrefetchWords];
 
-    if constexpr (kPrefetchWords != 0) {
-        // One thread fills one row's whole line before the copies go out; the mainloop's first
-        // barrier publishes them, so the fill costs no extra synchronization here. Measured (GB10,
-        // 2026-11-01, T3): issuing it after the prologue instead - so the async copies are already in
-        // flight when the fill stalls on its read - is 1.3 .. 2.4 us slower at every B = 3..8 the route
-        // serves, because the fill then delays the mainloop's first group while the copies it was
-        // supposed to overlap were already covered by the pipeline. The line covers the CTA's
-        // contraction columns by their absolute index, which is what the row consumer below names when
-        // it reads a column's window back.
-        for (int local = tid; local < kBlockRows; local += Schedule::kThreads) {
-            output.prefetch_row(row_prefetch + local * kPrefetchWords,
-                                row_policy.weight_row(row0, local, operands.rows),
-                                token_begin + live_columns);
-        }
-    }
-
     const auto stage_activation = [&](int stage, int group_k0) {
         constexpr auto kActivationCache = Schedule::kActivationCache;
         constexpr bool kPadded          = Schedule::kActivationStage == Nvfp4ActivationStage::PaddedZero;
@@ -127,10 +114,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             const int row    = warp * Schedule::kRowsPerLoaderWarp + ri;
             const int parent = row_policy.weight_row(row0, row, operands.rows);
             for (int chunk = lane; chunk < kCodeChunks; chunk += 32) {
-                cp_async<16, Schedule::kWeightCache>(
+                cp_async_hinted<16, Schedule::kWeightCache>(
                     &code_shared[stage][row][(chunk ^ (row & kCodeSwizzle)) * 16],
                     weight_codes + static_cast<std::int64_t>(parent) * (kHidden / 2) +
-                        group_k0 / 2 + chunk * 16);
+                        group_k0 / 2 + chunk * 16,
+                    weight_policy);
             }
         }
     };
@@ -152,8 +140,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             weight_scales + nvfp4_scale_byte_offset(parent_bot, warp_k0 / 16, kHidden));
     }
 
+    // Hoist immutable stage-0 weight prefetch ahead of the programmatic dependency wait so DRAM
+    // fetches overlap with the producer kernel's tail before activation/prefetch loads run.
+    if (0 < kGroups) { stage_codes(0, 0); }
+    pdl::enter_streaming();
+
+    if constexpr (kPrefetchWords != 0) {
+        // One thread fills one row's whole line before the activation copies go out; the mainloop's
+        // first barrier publishes them, so the fill costs no extra synchronization here.
+        for (int local = tid; local < kBlockRows; local += Schedule::kThreads) {
+            output.prefetch_row(row_prefetch + local * kPrefetchWords,
+                                row_policy.weight_row(row0, local, operands.rows),
+                                token_begin + live_columns);
+        }
+    }
+
+    if (0 < kGroups) {
+        stage_activation(0, 0);
+        cp_commit();
+    }
 #pragma unroll
-    for (int stage = 0; stage < Schedule::kStages; ++stage) {
+    for (int stage = 1; stage < Schedule::kStages; ++stage) {
         if (stage < kGroups) {
             stage_codes(stage, stage * kBlockK);
             stage_activation(stage, stage * kBlockK);

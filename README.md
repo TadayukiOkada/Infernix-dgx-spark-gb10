@@ -9,7 +9,7 @@
 ## Key Architectural Highlights on NVIDIA DGX Spark (`GB10`)
 
 ### 1. Full-Model Unified Memory Residency for `Qwen3.8-Flash-Next` (`HC4-W4Dense`)
-On **DGX Spark's 128 GB unified LPDDR5X**, Infernix pins all 48 layers of routed experts directly in device-accessible unified memory (`INFERNIX_EXPERTS_ON_GPU=1`, zero PCIe miss transfers) and streams the PLE n-gram volume with a 4 GiB cache and 20-thread ARMv9.2 prefill workers.
+On **DGX Spark's 128 GB unified LPDDR5X**, Infernix pins all 48 layers of routed experts directly in device-accessible unified memory (`INFERNIX_EXPERTS_ON_GPU=1`, zero PCIe miss transfers) and streams the PLE n-gram volume with a 16 GiB GPU-direct UMA cache and 20-thread ARMv9.2 prefill workers.
 
 ### 2. Microarchitectural Retuning for Blackwell `sm_121a` (48 SMs, 24 MiB L2)
 - **Native 2-Term Row-Scaled `NVFP4 A4` TMA (`OMMA.16864.F32.E2M1`, `501.6 TFLOP/s` pipe)**: Trunk and MoE projections dynamically quantize BF16 activations into two per-token row-scaled NVFP4 terms (`FastPath::Nvfp4A4Pair`) using 1-pass register-cached reciprocals and 2-CTA/SM `128×64` TMA tiles with `CU_TENSOR_MAP_L2_PROMOTION_L2_128B`.
@@ -63,33 +63,35 @@ Use [`tools/run_server.sh`](tools/run_server.sh) (which builds `infernix-serve` 
 Or launch `build-native/apps/infernix-serve` directly with the default `HC4-W4Dense` command:
 
 ```bash
-INFERNIX_EXPERTS_ON_GPU=1 INFERNIX_NGRAM_WIDTH_COST=0.08 \
+INFERNIX_EXPERTS_ON_GPU=1 \
 ./build-native/apps/infernix-serve \
   /opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense.infernix \
   --expert-a4-activations \
   --vision \
   --spec mtp --draft-tokens auto \
   --ngram-volume /opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram \
-  --ngram-residency auto \
-  --ngram-cache-mib 4096 \
-  --kv-dtype k8v4 \
+  --ngram-residency volume \
+  --ngram-cache-mib 16384 \
+  --kv-dtype int8 \
   --ngram-draft-tokens 31 \
-  --ngram-min-match 4 \
+  --ngram-min-match 8 \
   --temperature 1.0 \
   --top-p 0.9 \
   --min-p 0.1 \
   --top-k 20 \
   --lm-head-draft \
+  --prefill-chunk 12288 \
   --kv-capacity 524288 \
   --default-max-tokens 32768 \
   --preserve-thinking \
   --chat-template tools/chat_templates/qwen3_8.jinja \
   --restore-tool-reasoning \
   --reasoning-effort medium \
-  --host-context-mib 1024 \
+  --reasoning-loop conclude \
+  --host-context-mib 4096 \
   --tolerant-tool-calls \
   --max-context 262144 \
-  --max-concurrency 4 \
+  --max-concurrency 8 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -119,15 +121,15 @@ Model loading takes **8s**; full engine startup and graph initialization takes *
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
 ┃ Test                        ┃   c    ┃        pp t/s ┃        tg t/s ┃     TTFT (ms) ┃    Total (ms) ┃        Tokens ┃
 ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
-│ pp2048 tg128 @ d0           │   c1   │        3,089* │          93.7 │           663 │         2,019 │      2048+128 │
-│ pp2048 tg128 @ d0           │   c2   │         3,131 │         117.1 │         1,315 │         3,445 │      2048+128 │
-│ pp2048 tg128 @ d0           │   c4   │         3,203 │         177.4 │         2,570 │         5,362 │      2048+128 │
-│ pp2048 tg128 @ d4096        │   c1   │        3,755* │          81.8 │         1,636 │         3,190 │      2048+128 │
-│ pp2048 tg128 @ d4096        │   c2   │         3,787 │         117.7 │         3,252 │         5,344 │      2048+128 │
-│ pp2048 tg128 @ d4096        │   c4   │         3,825 │         180.6 │         6,440 │         9,151 │      2048+128 │
-│ pp2048 tg128 @ d8192        │   c1   │        4,078* │          86.6 │         2,511 │         3,977 │      2048+128 │
-│ pp2048 tg128 @ d8192        │   c2   │         4,077 │         117.9 │         5,032 │         7,126 │      2048+128 │
-│ pp2048 tg128 @ d8192        │   c4   │         4,130 │         176.2 │         9,931 │        12,721 │      2048+128 │
+│ pp2048 tg128 @ d0           │   c1   │        3,270* │         102.0 │           626 │         1,871 │      2048+128 │
+│ pp2048 tg128 @ d0           │   c2   │         2,867 │         133.2 │         1,309 │         3,057 │      2048+128 │
+│ pp2048 tg128 @ d0           │   c4   │         3,133 │         157.7 │         2,442 │         5,477 │      2048+128 │
+│ pp2048 tg128 @ d4096        │   c1   │        4,148* │          97.2 │         1,481 │         2,788 │      2048+128 │
+│ pp2048 tg128 @ d4096        │   c2   │         3,887 │         126.2 │         2,858 │         4,789 │      2048+128 │
+│ pp2048 tg128 @ d4096        │   c4   │         3,830 │         164.9 │         5,850 │         8,797 │      2048+128 │
+│ pp2048 tg128 @ d8192        │   c1   │        4,480* │          94.8 │         2,286 │         3,625 │      2048+128 │
+│ pp2048 tg128 @ d8192        │   c2   │         4,063 │         128.4 │         4,568 │         6,474 │      2048+128 │
+│ pp2048 tg128 @ d8192        │   c4   │         4,089 │         162.6 │         9,090 │        12,112 │      2048+128 │
 └─────────────────────────────┴────────┴───────────────┴───────────────┴───────────────┴───────────────┴───────────────┘
 ```
 

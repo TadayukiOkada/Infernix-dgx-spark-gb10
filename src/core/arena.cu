@@ -287,37 +287,54 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
     void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, cudaHostAllocMapped);
     if (err != cudaSuccess) {
         (void)cudaGetLastError(); // reported by this exception only (see DeviceBuffer)
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        throw std::runtime_error(cuda_error_message("cudaHostAlloc failed", err));
+    }
+
+    void* dev_ptr            = nullptr;
+    const cudaError_t map_err = cudaHostGetDevicePointer(&dev_ptr, ptr, 0);
+    if (map_err == cudaSuccess) {
+        device_data_ = dev_ptr;
+    } else {
+        (void)cudaGetLastError();
+        device_data_ = nullptr;
     }
 
     data_ = ptr;
     size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
+PinnedHostBuffer::~PinnedHostBuffer() {
+    free_pinned(data_);
+    device_data_ = nullptr;
+}
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
-    other.data_ = nullptr;
-    other.size_ = 0;
+    : data_(other.data_), device_data_(other.device_data_), size_(other.size_) {
+    other.data_        = nullptr;
+    other.device_data_ = nullptr;
+    other.size_        = 0;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
     free_pinned(data_);
-    data_ = other.data_;
-    size_ = other.size_;
+    data_        = other.data_;
+    device_data_ = other.device_data_;
+    size_        = other.size_;
 
-    other.data_ = nullptr;
-    other.size_ = 0;
+    other.data_        = nullptr;
+    other.device_data_ = nullptr;
+    other.size_        = 0;
     return *this;
 }
 
 void* PinnedHostBuffer::data() const noexcept { return data_; }
+
+void* PinnedHostBuffer::device_data() const noexcept { return device_data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 

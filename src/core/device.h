@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -29,6 +30,8 @@ struct DeviceContext {
     cudaStream_t stream          = nullptr;
     cudaStream_t transfer_stream = nullptr;
     cudaDeviceProp props{};
+    std::size_t persisting_l2_bytes = 0;
+    mutable std::size_t active_persisting_l2_bytes = 0;
 
     explicit DeviceContext(int device_id = 0);
     ~DeviceContext();
@@ -42,7 +45,11 @@ struct DeviceContext {
     void bind_to_current_thread_noexcept() const noexcept;
     int compute_capability() const noexcept;
     int multiprocessor_count() const noexcept;
+    [[nodiscard]] bool integrated_uma() const noexcept;
     DeviceExecutionView execution_view() const noexcept;
+    [[nodiscard]] std::size_t persisting_l2_cache_bytes() const noexcept;
+    [[nodiscard]] std::size_t persisting_l2_cache_max_bytes() const noexcept;
+    [[nodiscard]] std::size_t access_policy_max_window_bytes() const noexcept;
     std::size_t total_vram() const noexcept;
     // Device memory currently free on this device (cudaMemGetInfo).
     std::size_t free_bytes() const;
@@ -54,6 +61,37 @@ struct DeviceContext {
     // otherwise sit in the command buffer until the next blocking call or launch.
     void flush() const;
 };
+
+// Temporarily configures a stream's L2 access-policy window and restores the prior window on scope
+// exit. Stream attributes captured under cudaStreamBeginCapture attach directly to every captured
+// kernel node, so callers must enter this scope before starting graph capture.
+class ScopedL2AccessPolicyWindow {
+public:
+    ScopedL2AccessPolicyWindow() noexcept = default;
+    ScopedL2AccessPolicyWindow(cudaStream_t stream, const void* base_ptr, std::size_t num_bytes,
+                               std::size_t max_window_bytes, float hit_ratio = 1.0F,
+                               cudaAccessProperty hit_prop  = cudaAccessPropertyPersisting,
+                               cudaAccessProperty miss_prop = cudaAccessPropertyNormal);
+    ~ScopedL2AccessPolicyWindow() noexcept;
+
+    ScopedL2AccessPolicyWindow(const ScopedL2AccessPolicyWindow&)            = delete;
+    ScopedL2AccessPolicyWindow& operator=(const ScopedL2AccessPolicyWindow&) = delete;
+    ScopedL2AccessPolicyWindow(ScopedL2AccessPolicyWindow&& other) noexcept;
+    ScopedL2AccessPolicyWindow& operator=(ScopedL2AccessPolicyWindow&& other) noexcept;
+
+    [[nodiscard]] bool active() const noexcept { return active_; }
+
+private:
+    void restore() noexcept;
+
+    cudaStream_t stream_ = nullptr;
+    cudaStreamAttrValue previous_{};
+    bool active_ = false;
+};
+
+void reset_persisting_l2_cache(const DeviceContext& ctx) noexcept;
+void enable_persisting_l2_cache(const DeviceContext& ctx) noexcept;
+void disable_persisting_l2_cache(const DeviceContext& ctx) noexcept;
 
 // Copies `bytes` from pinned host memory to device memory in stream order, read by the SMs
 // through the host mapping (pinned allocations are device-accessible under UVA) rather than by a
@@ -73,10 +111,17 @@ inline constexpr std::uint64_t kPinnedGateTimeoutNs = 120ULL * 1000 * 1000 * 100
 void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t bytes,
                         const std::uint32_t* pinned_ready, const std::uint32_t* device_expected,
                         std::uint64_t* wait_stats, const std::int32_t* wait_row, cudaStream_t stream);
+void wait_pinned_word(const std::uint32_t* pinned_ready, const std::uint32_t* device_expected,
+                      std::uint64_t* wait_stats, const std::int32_t* wait_row, cudaStream_t stream);
 
 // Releases the gates waiting for `value`: orders every earlier store to pinned memory (including
 // non-temporal ones) before the word's store.
 void publish_pinned_word(std::uint32_t* pinned_ready, std::uint32_t value) noexcept;
+
+// Orders preceding host stores to mapped pinned memory before the next CUDA launch or graph replay.
+inline void publish_pinned_memory() noexcept {
+    std::atomic_thread_fence(std::memory_order_release);
+}
 
 class CudaEventTimer {
 public:

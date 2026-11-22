@@ -47,6 +47,15 @@ public:
     [[nodiscard]] const void* resident_device_ptr() const noexcept {
         return resident_ ? resident_->device_pointer() : nullptr;
     }
+    // Sentinel bit in slot indices emitted by resolve_slots(), selecting fallback_out rather than cache_device_ptr().
+    static constexpr std::uint32_t kStagingSlotBit = 0x80000000U;
+    // Device-accessible pointer for the host row cache on integrated UMA (nullptr when resident or unmapped).
+    [[nodiscard]] const void* cache_device_ptr() const noexcept {
+        return cache_ ? cache_->device_data() : nullptr;
+    }
+    [[nodiscard]] std::uint32_t cache_slot_count() const noexcept {
+        return resident_ ? 0U : static_cast<std::uint32_t>(std::size_t{1} << cache_bits_);
+    }
     // Empty when a resident table is locked in RAM; otherwise the OS's reason (it still serves rows, but
     // Windows may page it out under memory pressure).
     [[nodiscard]] std::string resident_lock_failure() const {
@@ -57,6 +66,15 @@ public:
 
     // Copies each row's codes to out[i * row_bytes, (i + 1) * row_bytes).
     void read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out);
+
+    // Resolves each row's cache slot index into out_slots[i] without copying cache hits to fallback_out.
+    // Any entry set to kStagingSlotBit (true 5-way same-call set conflict) has its row bytes copied to
+    // fallback_out[i * row_bytes, (i + 1) * row_bytes). When keep_pinned is true (draft/verify split
+    // staging), resolved slots keep ref_bits_ pin bit (0x02U) until the finishing resolve_slots(..., false)
+    // or unpin_slots().
+    void resolve_slots(std::span<const std::uint32_t> rows, std::span<std::uint32_t> out_slots,
+                       std::span<std::byte> fallback_out, bool keep_pinned = false);
+    void unpin_slots() noexcept;
 
     // Whether every row is in the host cache, so read_rows would read nothing from the volume.
     [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) noexcept;
@@ -119,8 +137,10 @@ private:
     [[nodiscard]] std::size_t set_of(std::uint32_t row) const noexcept {
         return static_cast<std::size_t>((row * 2654435761U) >> cache_set_shift_);
     }
-    [[nodiscard]] std::size_t find_slot(std::uint32_t row) noexcept;
+    [[nodiscard]] std::size_t find_slot(std::uint32_t row, std::uint8_t set_bits = 1U) noexcept;
     void insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) noexcept;
+    [[nodiscard]] std::uint32_t insert_cache_slot(std::uint32_t row, const std::byte* data, std::size_t row_bytes,
+                                                  bool pin) noexcept;
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
@@ -131,9 +151,10 @@ private:
     std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks
     std::byte* parallel_ring_ = nullptr;
     std::vector<std::uint32_t> tags_; // row id per cache slot, UINT32_MAX when empty
-    std::vector<std::uint8_t> ref_bits_; // Clock reference bit per cache slot
+    std::vector<std::uint8_t> ref_bits_; // Clock ref (0x01) + active-round pin (0x02) per cache slot
     std::vector<std::uint8_t> hand_;  // next way to inspect per cache set
-    std::vector<std::byte> cache_;    // row codes per slot
+    std::unique_ptr<RegisteredHostBuffer> cache_; // row codes per slot (mapped for device when integrated UMA)
+    std::vector<std::uint32_t> pinned_slots_;     // cache slots pinned across draft/verify split staging
     // One call's misses as (block << 32 | output index), sorted so each block's rows are adjacent;
     // the distinct blocks' offsets and where each block's misses begin.
     std::vector<std::uint64_t> misses_;

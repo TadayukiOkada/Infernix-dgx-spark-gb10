@@ -181,7 +181,7 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
         tags_.assign(std::size_t{1} << cache_bits_, 0xFFFFFFFFU);
         ref_bits_.assign(std::size_t{1} << cache_bits_, 0);
         hand_.assign(std::size_t{1} << set_bits, 0);
-        cache_.assign((std::size_t{1} << cache_bits_) * table.row_bytes, std::byte{0});
+        cache_ = std::make_unique<RegisteredHostBuffer>((std::size_t{1} << cache_bits_) * table.row_bytes);
     }
     if (table.block_bytes < 4096 || table.block_bytes % 4096 != 0 || table.header_bytes % 4096 != 0) {
         throw std::runtime_error(path.string() + ": n-gram blocks and header must be whole 4 KiB pages");
@@ -191,6 +191,14 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     ring_           = ring_storage_.data() + ((4096 - base % 4096) % 4096);
     pool_           = std::make_unique<ReaderPool>(kReadThreads);
     if (!resident) {
+        const std::size_t total_bytes = cache_->size();
+        const std::size_t pages       = (total_bytes + 4095) / 4096;
+        pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+            const std::size_t lo = std::min(total_bytes, (pages * t / n_threads) * 4096);
+            const std::size_t hi = std::min(total_bytes, (pages * (t + 1) / n_threads) * 4096);
+            if (lo < hi) { cache_->prefault(lo, hi); }
+        });
+        (void)cache_->try_pin_if_integrated_uma();
         const std::size_t ring_bytes = kParallelInFlight * table.block_bytes;
         parallel_storage_.assign(kReadThreads * ring_bytes + 4096, std::byte{0});
         const auto pbase = reinterpret_cast<std::uintptr_t>(parallel_storage_.data());
@@ -260,36 +268,71 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
     }
 }
 
-std::size_t NgramVolume::find_slot(std::uint32_t row) noexcept {
+std::size_t NgramVolume::find_slot(std::uint32_t row, std::uint8_t set_bits) noexcept {
     const std::size_t base = set_of(row) * kCacheWays;
     for (std::size_t w = 0; w < kCacheWays; ++w) {
         if (tags_[base + w] == row) {
-            __atomic_store_n(&ref_bits_[base + w], std::uint8_t{1}, __ATOMIC_RELAXED);
+            if ((__atomic_load_n(&ref_bits_[base + w], __ATOMIC_RELAXED) & set_bits) != set_bits) {
+                __atomic_fetch_or(&ref_bits_[base + w], set_bits, __ATOMIC_RELAXED);
+            }
             return base + w;
         }
     }
     return std::numeric_limits<std::size_t>::max();
 }
 
-void NgramVolume::insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) noexcept {
-    const std::size_t set  = set_of(row);
-    const std::size_t base = set * kCacheWays;
+std::uint32_t NgramVolume::insert_cache_slot(std::uint32_t row, const std::byte* data, std::size_t row_bytes,
+                                             bool pin) noexcept {
+    constexpr std::uint8_t kRefBit = 0x01U;
+    constexpr std::uint8_t kPinBit = 0x02U;
+    const std::size_t set          = set_of(row);
+    const std::size_t base         = set * kCacheWays;
+    const std::uint8_t mark        = pin ? static_cast<std::uint8_t>(kRefBit | kPinBit) : kRefBit;
     for (std::size_t w = 0; w < kCacheWays; ++w) {
         if (tags_[base + w] == row) {
-            ref_bits_[base + w] = 1;
-            return;
+            ref_bits_[base + w] |= mark;
+            return static_cast<std::uint32_t>(base + w);
         }
     }
-    std::size_t way = hand_[set] & (kCacheWays - 1);
+    std::size_t victim = std::numeric_limits<std::size_t>::max();
+    std::size_t way    = hand_[set] & (kCacheWays - 1);
     for (std::size_t step = 0; step < kCacheWays; ++step) {
-        if (tags_[base + way] == 0xFFFFFFFFU || ref_bits_[base + way] == 0) { break; }
-        ref_bits_[base + way] = 0;
-        way                   = (way + 1) & (kCacheWays - 1);
+        if ((ref_bits_[base + way] & kPinBit) == 0U) {
+            if (tags_[base + way] == 0xFFFFFFFFU || (ref_bits_[base + way] & kRefBit) == 0U) {
+                victim = way;
+                break;
+            }
+            ref_bits_[base + way] &= static_cast<std::uint8_t>(~kRefBit);
+        }
+        way = (way + 1) & (kCacheWays - 1);
     }
-    hand_[set]            = static_cast<std::uint8_t>((way + 1) & (kCacheWays - 1));
-    tags_[base + way]     = row;
-    ref_bits_[base + way] = 1;
-    std::memcpy(cache_.data() + (base + way) * row_bytes, data, row_bytes);
+    if (victim == std::numeric_limits<std::size_t>::max()) {
+        for (std::size_t step = 0; step < kCacheWays; ++step) {
+            if ((ref_bits_[base + way] & kPinBit) == 0U) {
+                victim = way;
+                break;
+            }
+            way = (way + 1) & (kCacheWays - 1);
+        }
+    }
+    if (victim == std::numeric_limits<std::size_t>::max()) { return kStagingSlotBit; }
+    hand_[set]               = static_cast<std::uint8_t>((victim + 1) & (kCacheWays - 1));
+    tags_[base + victim]     = row;
+    ref_bits_[base + victim] = mark;
+    std::memcpy(cache_->data() + (base + victim) * row_bytes, data, row_bytes);
+    return static_cast<std::uint32_t>(base + victim);
+}
+
+void NgramVolume::insert_cache(std::uint32_t row, const std::byte* data, std::size_t row_bytes) noexcept {
+    (void)insert_cache_slot(row, data, row_bytes, /*pin=*/false);
+}
+
+void NgramVolume::unpin_slots() noexcept {
+    constexpr std::uint8_t kUnpinMask = static_cast<std::uint8_t>(~0x02U);
+    for (const std::uint32_t slot : pinned_slots_) {
+        if (slot < ref_bits_.size()) { ref_bits_[slot] &= kUnpinMask; }
+    }
+    pinned_slots_.clear();
 }
 
 void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) {
@@ -345,7 +388,7 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
                 if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
                 const std::size_t slot = find_slot(rows[i]);
                 if (slot != std::numeric_limits<std::size_t>::max()) {
-                    std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
+                    std::memcpy(out.data() + i * row_bytes, cache_->data() + slot * row_bytes, row_bytes);
                     ++hits;
                 } else {
                     my_misses.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
@@ -370,7 +413,7 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
             if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
             const std::size_t slot = find_slot(rows[i]);
             if (slot != std::numeric_limits<std::size_t>::max()) {
-                std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
+                std::memcpy(out.data() + i * row_bytes, cache_->data() + slot * row_bytes, row_bytes);
                 ++counters_.hits;
             } else {
                 misses_.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
@@ -460,6 +503,232 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
     counters_.reads += offsets_.size();
     counters_.read_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+void NgramVolume::resolve_slots(std::span<const std::uint32_t> rows, std::span<std::uint32_t> out_slots,
+                                std::span<std::byte> fallback_out, bool keep_pinned) {
+    if (resident_) {
+        throw std::logic_error("n-gram slots: resident volume uses direct table hashing");
+    }
+    if (out_slots.size() != rows.size()) {
+        throw std::invalid_argument("n-gram slots: slot span differs from the row count");
+    }
+    const std::size_t row_bytes = table_.row_bytes;
+    if (fallback_out.size() != rows.size() * row_bytes) {
+        throw std::invalid_argument("n-gram slots: fallback buffer size differs from the row count");
+    }
+    if (rows.empty()) {
+        if (!keep_pinned && !pinned_slots_.empty()) { unpin_slots(); }
+        return;
+    }
+
+    constexpr std::uint8_t kRefBit      = 0x01U;
+    constexpr std::uint8_t kPinBit      = 0x02U;
+    constexpr std::size_t kPrefetchDist = 8;
+
+    misses_.clear();
+    if (parallel_gather_ && rows.size() >= kParallelGatherRows) {
+        std::array<std::vector<std::uint64_t>, kReadThreads> local_misses;
+        std::array<std::uint64_t, kReadThreads> local_hits{};
+        pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+            const std::size_t lo = rows.size() * t / n_threads;
+            const std::size_t hi = rows.size() * (t + 1) / n_threads;
+            auto& my_misses      = local_misses[t];
+            std::uint64_t hits   = 0;
+            for (std::size_t i = lo; i < hi; ++i) {
+                if (i + kPrefetchDist < hi && rows[i + kPrefetchDist] < table_.rows) {
+                    __builtin_prefetch(tags_.data() + set_of(rows[i + kPrefetchDist]) * kCacheWays, 0, 1);
+                }
+                if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
+                const std::size_t slot = find_slot(rows[i], kRefBit);
+                if (slot != std::numeric_limits<std::size_t>::max()) {
+                    out_slots[i] = static_cast<std::uint32_t>(slot);
+                    ++hits;
+                } else {
+                    out_slots[i] = kStagingSlotBit;
+                    my_misses.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
+                }
+            }
+            local_hits[t] = hits;
+        });
+        std::size_t total_misses = 0;
+        for (std::size_t t = 0; t < kReadThreads; ++t) {
+            counters_.hits += local_hits[t];
+            total_misses += local_misses[t].size();
+        }
+        misses_.reserve(total_misses);
+        for (std::size_t t = 0; t < kReadThreads; ++t) {
+            misses_.insert(misses_.end(), local_misses[t].begin(), local_misses[t].end());
+        }
+    } else {
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (i + kPrefetchDist < rows.size() && rows[i + kPrefetchDist] < table_.rows) {
+                __builtin_prefetch(tags_.data() + set_of(rows[i + kPrefetchDist]) * kCacheWays, 0, 1);
+            }
+            if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
+            const std::size_t slot = find_slot(rows[i], kRefBit);
+            if (slot != std::numeric_limits<std::size_t>::max()) {
+                out_slots[i] = static_cast<std::uint32_t>(slot);
+                ++counters_.hits;
+            } else {
+                out_slots[i] = kStagingSlotBit;
+                misses_.push_back((static_cast<std::uint64_t>(rows[i] / table_.rows_per_block) << 32U) | i);
+            }
+        }
+    }
+    counters_.rows += rows.size();
+
+    if (misses_.empty()) {
+        if (keep_pinned) {
+            for (const std::uint32_t s : out_slots) {
+                if (s < kStagingSlotBit) {
+                    ref_bits_[s] |= kPinBit;
+                    pinned_slots_.push_back(s);
+                }
+            }
+        } else if (!pinned_slots_.empty()) {
+            unpin_slots();
+        }
+        return;
+    }
+
+    const auto pin_hit_range = [&](std::size_t lo, std::size_t hi, bool atomic) {
+        for (std::size_t i = lo; i < hi; ++i) {
+            if (i + kPrefetchDist < hi && out_slots[i + kPrefetchDist] < kStagingSlotBit) {
+                __builtin_prefetch(ref_bits_.data() + out_slots[i + kPrefetchDist], 1, 1);
+            }
+            const std::uint32_t s = out_slots[i];
+            if (s < kStagingSlotBit) {
+                if (atomic) {
+                    if ((__atomic_load_n(&ref_bits_[s], __ATOMIC_RELAXED) & kPinBit) == 0U) {
+                        __atomic_fetch_or(&ref_bits_[s], kPinBit, __ATOMIC_RELAXED);
+                    }
+                } else {
+                    ref_bits_[s] |= kPinBit;
+                }
+            }
+        }
+    };
+    if (parallel_gather_ && out_slots.size() >= kParallelGatherRows) {
+        pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+            pin_hit_range(out_slots.size() * t / n_threads, out_slots.size() * (t + 1) / n_threads, /*atomic=*/true);
+        });
+    } else {
+        pin_hit_range(0, out_slots.size(), /*atomic=*/false);
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    std::sort(misses_.begin(), misses_.end());
+    offsets_.clear();
+    first_miss_.clear();
+    for (std::size_t m = 0; m < misses_.size(); ++m) {
+        const std::uint64_t block = misses_[m] >> 32U;
+        if (m == 0 || block != (misses_[m - 1] >> 32U)) {
+            offsets_.push_back(table_.header_bytes + block * table_.block_bytes);
+            first_miss_.push_back(m);
+        }
+    }
+    first_miss_.push_back(misses_.size());
+    const std::size_t blocks = offsets_.size();
+    if (blocks >= kParallelBlocks) {
+        const std::size_t ring_bytes      = kParallelInFlight * table_.block_bytes;
+        const std::uint64_t* read_offsets = offsets_.data();
+        if (scatter_) {
+            std::size_t stride = 97;
+            while (std::gcd(stride, blocks) != 1) { stride += 2; }
+            scattered_offsets_.resize(blocks);
+            scattered_blocks_.resize(blocks);
+            for (std::size_t k = 0; k < blocks; ++k) {
+                const std::size_t b   = (k * stride) % blocks;
+                scattered_offsets_[k] = offsets_[b];
+                scattered_blocks_[k]  = b;
+            }
+            read_offsets = scattered_offsets_.data();
+        }
+        const std::size_t active_threads = std::min<std::size_t>(kReadThreads, std::max<std::size_t>(2, blocks / 2));
+        pool_->run(active_threads, [&](std::size_t t, std::size_t n_threads) {
+            const std::size_t lo = blocks * t / n_threads, hi = blocks * (t + 1) / n_threads;
+            file_.read_direct_blocks(
+                std::span<const std::uint64_t>(read_offsets + lo, hi - lo), table_.block_bytes,
+                std::span<std::byte>(parallel_ring_ + t * ring_bytes, ring_bytes),
+                [&](std::size_t b, std::span<const std::byte> block) {
+                    const std::size_t idx = scatter_ ? scattered_blocks_[lo + b] : lo + b;
+                    for (std::size_t m = first_miss_[idx]; m < first_miss_[idx + 1]; ++m) {
+                        const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
+                        std::memcpy(fallback_out.data() + i * row_bytes,
+                                    block.data() + (rows[i] % table_.rows_per_block) * row_bytes, row_bytes);
+                    }
+                });
+        });
+        if (parallel_gather_ && misses_.size() >= kParallelGatherRows) {
+            pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+                for (const std::uint64_t miss : misses_) {
+                    const auto i          = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
+                    const std::uint32_t r = rows[i];
+                    if (((set_of(r) >> 6U) % n_threads) == t) {
+                        out_slots[i] =
+                            insert_cache_slot(r, fallback_out.data() + i * row_bytes, row_bytes, /*pin=*/true);
+                    }
+                }
+            });
+        } else {
+            for (const std::uint64_t miss : misses_) {
+                const auto i = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
+                out_slots[i] =
+                    insert_cache_slot(rows[i], fallback_out.data() + i * row_bytes, row_bytes, /*pin=*/true);
+            }
+        }
+        counters_.reads += blocks;
+    } else {
+        file_.read_direct_blocks(
+            offsets_, table_.block_bytes, std::span<std::byte>(ring_, kInFlight * table_.block_bytes),
+            [&](std::size_t b, std::span<const std::byte> block) {
+                for (std::size_t m = first_miss_[b]; m < first_miss_[b + 1]; ++m) {
+                    const auto i             = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
+                    const std::byte* row     = block.data() + (rows[i] % table_.rows_per_block) * row_bytes;
+                    const std::uint32_t slot = insert_cache_slot(rows[i], row, row_bytes, /*pin=*/true);
+                    out_slots[i]             = slot;
+                    if (slot == kStagingSlotBit) { std::memcpy(fallback_out.data() + i * row_bytes, row, row_bytes); }
+                }
+            });
+        counters_.reads += offsets_.size();
+    }
+    counters_.read_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+
+    if (keep_pinned) {
+        for (const std::uint32_t s : out_slots) {
+            if (s < kStagingSlotBit) { pinned_slots_.push_back(s); }
+        }
+    } else {
+        constexpr std::uint8_t kUnpinMask = static_cast<std::uint8_t>(~kPinBit);
+        const auto unpin_out_range        = [&](std::size_t lo, std::size_t hi, bool atomic) {
+            for (std::size_t i = lo; i < hi; ++i) {
+                if (i + kPrefetchDist < hi && out_slots[i + kPrefetchDist] < kStagingSlotBit) {
+                    __builtin_prefetch(ref_bits_.data() + out_slots[i + kPrefetchDist], 1, 1);
+                }
+                const std::uint32_t s = out_slots[i];
+                if (s < kStagingSlotBit) {
+                    if (atomic) {
+                        if ((__atomic_load_n(&ref_bits_[s], __ATOMIC_RELAXED) & kPinBit) != 0U) {
+                            __atomic_fetch_and(&ref_bits_[s], kUnpinMask, __ATOMIC_RELAXED);
+                        }
+                    } else {
+                        ref_bits_[s] &= kUnpinMask;
+                    }
+                }
+            }
+        };
+        if (parallel_gather_ && out_slots.size() >= kParallelGatherRows) {
+            pool_->run(kReadThreads, [&](std::size_t t, std::size_t n_threads) {
+                unpin_out_range(out_slots.size() * t / n_threads, out_slots.size() * (t + 1) / n_threads,
+                                /*atomic=*/true);
+            });
+        } else {
+            unpin_out_range(0, out_slots.size(), /*atomic=*/false);
+        }
+        if (!pinned_slots_.empty()) { unpin_slots(); }
+    }
 }
 
 bool NgramVolume::cached(std::span<const std::uint32_t> rows) noexcept {

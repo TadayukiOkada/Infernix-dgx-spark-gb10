@@ -15,12 +15,15 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -355,6 +358,250 @@ void hash_embed_exact() {
     }
 }
 
+void gather_embed_nvfp4_exact() {
+    constexpr int kWidth     = 160;
+    constexpr int kHeads     = 16;
+    constexpr int kRowBytes  = kWidth / 2 + kWidth / 16;
+    constexpr int kCacheSlots = 128;
+
+    struct MappedHost {
+        void* p = nullptr;
+        explicit MappedHost(std::size_t bytes) {
+            t::cuda_check(cudaHostAlloc(&p, bytes, cudaHostAllocMapped), "cudaHostAlloc");
+        }
+        ~MappedHost() {
+            if (p != nullptr) { cudaFreeHost(p); }
+        }
+        MappedHost(const MappedHost&)            = delete;
+        MappedHost& operator=(const MappedHost&) = delete;
+    };
+
+    std::uint32_t state = 4242U;
+    const auto fill_nvfp4_bytes = [&](std::uint8_t* dst, std::size_t n_rows) {
+        for (std::size_t r = 0; r < n_rows; ++r) {
+            std::uint8_t* row = dst + r * kRowBytes;
+            for (int b = 0; b < kRowBytes; ++b) {
+                auto byte = static_cast<std::uint8_t>(next(state) >> 24);
+                if (b >= kWidth / 2) { byte &= 0x7FU; }
+                if (b >= kWidth / 2 && byte == 0x7FU) { byte = 0x7EU; }
+                row[b] = byte;
+            }
+        }
+    };
+
+    const auto check_output = [&](const std::vector<std::uint16_t>& got, const std::uint8_t* cache_p,
+                                  const std::uint8_t* fallback_p, const std::uint32_t* slots_p, int columns,
+                                  float multiplier, const std::string& label) {
+        std::size_t bad = 0;
+        for (int c = 0; c < columns; ++c) {
+            for (int h = 0; h < kHeads; ++h) {
+                const std::uint32_t slot_raw = slots_p[static_cast<std::size_t>(c) * kHeads + h];
+                const std::uint8_t* row =
+                    (slot_raw & infernix::ops::kPleCacheStagingBit) != 0U
+                        ? (fallback_p + (static_cast<std::size_t>(c) * kHeads + h) * kRowBytes)
+                        : (cache_p + static_cast<std::size_t>(slot_raw) * kRowBytes);
+                for (int j = 0; j < kWidth; ++j) {
+                    const unsigned code = (row[j / 2] >> (4 * (j % 2))) & 15U;
+                    const double exact =
+                        e2m1(code) * e4m3fn(row[kWidth / 2 + j / 16]) * static_cast<double>(multiplier);
+                    bad += got[(static_cast<std::size_t>(c) * kHeads + h) * kWidth + j] != bf16_rne(exact);
+                }
+            }
+        }
+        check(bad == 0, label + ": " + std::to_string(bad) + " differ");
+    };
+
+    MappedHost cache(static_cast<std::size_t>(kCacheSlots) * kRowBytes);
+    auto* cache_p = static_cast<std::uint8_t*>(cache.p);
+    fill_nvfp4_bytes(cache_p, kCacheSlots);
+
+    for (const int columns : {1, 8, 16, 64, 256}) {
+        MappedHost fallback(static_cast<std::size_t>(columns) * kHeads * kRowBytes);
+        MappedHost slots(static_cast<std::size_t>(columns) * kHeads * sizeof(std::uint32_t));
+        auto* fallback_p = static_cast<std::uint8_t*>(fallback.p);
+        auto* slots_p    = static_cast<std::uint32_t*>(slots.p);
+        fill_nvfp4_bytes(fallback_p, static_cast<std::size_t>(columns) * kHeads);
+        for (int i = 0; i < columns * kHeads; ++i) {
+            slots_p[i] = (i % 13 == 0) ? infernix::ops::kPleCacheStagingBit : static_cast<std::uint32_t>(next(state) % kCacheSlots);
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+
+        Device md(sizeof(float)), od(static_cast<std::size_t>(kHeads) * kWidth * columns * sizeof(std::uint16_t));
+        const Tensor t_scale(md.p, DType::FP32, {1});
+        Tensor t_out(od.p, DType::BF16, {kHeads * kWidth, columns});
+
+        for (const float multiplier : {3.324236240587197e-05F, 1.0F + 0x1p-7F}) {
+            t::cuda_check(cudaMemcpy(md.p, &multiplier, sizeof(float), cudaMemcpyHostToDevice), "multiplier");
+            infernix::ops::PleCacheGather gather{};
+            gather.cache_base    = cache_p;
+            gather.fallback_rows = fallback_p;
+            gather.slots         = slots_p;
+            gather.scale         = &t_scale;
+            gather.cache_slots   = kCacheSlots;
+            gather.heads         = kHeads;
+            gather.head_width    = kWidth;
+            gather.row_bytes     = kRowBytes;
+            infernix::ops::ple_gather_embed_nvfp4(gather, t_out, nullptr);
+            t::cuda_check(cudaDeviceSynchronize(), "gather embed nvfp4");
+            std::vector<std::uint16_t> got(static_cast<std::size_t>(kHeads) * kWidth * columns);
+            t::cuda_check(cudaMemcpy(got.data(), od.p, got.size() * 2, cudaMemcpyDeviceToHost), "read");
+            check_output(got, cache_p, fallback_p, slots_p, columns, multiplier,
+                         "ple_gather_embed_nvfp4 ungated T=" + std::to_string(columns) + " mult=" +
+                             std::to_string(multiplier));
+        }
+    }
+
+    // Gated launch + CUDA Graph capture/replay with host-side slot/cache mutation between replays (.cv coherency).
+    constexpr int kGraphCols    = 16;
+    constexpr float kMultiplier = 1.0F + 0x1p-7F;
+    MappedHost fallback(static_cast<std::size_t>(kGraphCols) * kHeads * kRowBytes);
+    MappedHost slots(static_cast<std::size_t>(kGraphCols) * kHeads * sizeof(std::uint32_t));
+    MappedHost ready_host(sizeof(std::uint32_t));
+    auto* fallback_p = static_cast<std::uint8_t*>(fallback.p);
+    auto* slots_p    = static_cast<std::uint32_t*>(slots.p);
+    auto* ready_p    = static_cast<volatile std::uint32_t*>(ready_host.p);
+    *ready_p         = 0U;
+
+    Device md(sizeof(float)), d_expected(sizeof(std::uint32_t)), d_wait_stats(2 * sizeof(std::uint64_t)),
+        od(static_cast<std::size_t>(kHeads) * kWidth * kGraphCols * sizeof(std::uint16_t));
+    t::cuda_check(cudaMemcpy(md.p, &kMultiplier, sizeof(float), cudaMemcpyHostToDevice), "multiplier");
+    t::cuda_check(cudaMemset(d_wait_stats.p, 0, 2 * sizeof(std::uint64_t)), "wait stats");
+    const Tensor t_scale(md.p, DType::FP32, {1});
+    Tensor t_out(od.p, DType::BF16, {kHeads * kWidth, kGraphCols});
+
+    cudaStream_t stream = nullptr;
+    t::cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream create");
+
+    infernix::ops::PleCacheGather gather{};
+    gather.cache_base    = cache_p;
+    gather.fallback_rows = fallback_p;
+    gather.slots         = slots_p;
+    gather.scale         = &t_scale;
+    gather.cache_slots   = kCacheSlots;
+    gather.heads         = kHeads;
+    gather.head_width    = kWidth;
+    gather.row_bytes     = kRowBytes;
+    gather.ready         = static_cast<const std::uint32_t*>(ready_host.p);
+    gather.expected      = static_cast<const std::uint32_t*>(d_expected.p);
+    gather.wait_stats    = static_cast<std::uint64_t*>(d_wait_stats.p);
+
+    cudaGraph_t graph         = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    t::cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "begin capture");
+    infernix::ops::ple_gather_embed_nvfp4(gather, t_out, stream);
+    t::cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+    t::cuda_check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "instantiate");
+
+    const auto run_replay = [&](std::uint32_t word, bool delayed_host) {
+        t::cuda_check(cudaMemcpyAsync(d_expected.p, &word, sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream),
+                      "expected");
+        const auto stage_data = [&] {
+            fill_nvfp4_bytes(cache_p, kCacheSlots);
+            fill_nvfp4_bytes(fallback_p, static_cast<std::size_t>(kGraphCols) * kHeads);
+            for (int i = 0; i < kGraphCols * kHeads; ++i) {
+                slots_p[i] =
+                    (i % 7 == 0) ? infernix::ops::kPleCacheStagingBit : static_cast<std::uint32_t>(next(state) % kCacheSlots);
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            *ready_p = word;
+        };
+        std::thread host_writer;
+        if (delayed_host) {
+            t::cuda_check(cudaGraphLaunch(graph_exec, stream), "graph launch gated");
+            host_writer = std::thread([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                stage_data();
+            });
+        } else {
+            stage_data();
+            t::cuda_check(cudaGraphLaunch(graph_exec, stream), "graph launch ungated");
+        }
+        t::cuda_check(cudaStreamSynchronize(stream), "stream sync");
+        if (host_writer.joinable()) { host_writer.join(); }
+
+        std::vector<std::uint16_t> got(static_cast<std::size_t>(kHeads) * kWidth * kGraphCols);
+        t::cuda_check(cudaMemcpy(got.data(), od.p, got.size() * 2, cudaMemcpyDeviceToHost), "read");
+        check_output(got, cache_p, fallback_p, slots_p, kGraphCols, kMultiplier,
+                     "ple_gather_embed_nvfp4 graph replay word=" + std::to_string(word));
+    };
+
+    run_replay(1U, false);
+    run_replay(2U, true);
+    std::uint64_t wait_stats[2]{};
+    t::cuda_check(cudaMemcpy(wait_stats, d_wait_stats.p, sizeof(wait_stats), cudaMemcpyDeviceToHost), "read wait_stats");
+    check(wait_stats[0] > 0 && wait_stats[1] == 1ULL,
+          "ple_gather_embed_nvfp4 gate wait stats expected >0 ns and 1 wait, got ns=" +
+              std::to_string(wait_stats[0]) + " waits=" + std::to_string(wait_stats[1]));
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+
+    // 256-iteration CUDA Graph host-mutation coherency stress test on slot 0 and slots[].
+    for (const int stress_cols : {1, 64}) {
+        MappedHost s_fallback(static_cast<std::size_t>(stress_cols) * kHeads * kRowBytes);
+        MappedHost s_slots(static_cast<std::size_t>(stress_cols) * kHeads * sizeof(std::uint32_t));
+        MappedHost s_ready_host(sizeof(std::uint32_t));
+        auto* s_fallback_p = static_cast<std::uint8_t*>(s_fallback.p);
+        auto* s_slots_p    = static_cast<std::uint32_t*>(s_slots.p);
+        auto* s_ready_p    = static_cast<volatile std::uint32_t*>(s_ready_host.p);
+        *s_ready_p         = 0U;
+
+        Device d_s_expected(sizeof(std::uint32_t)),
+            d_s_out(static_cast<std::size_t>(kHeads) * kWidth * stress_cols * sizeof(std::uint16_t));
+        Tensor t_s_out(d_s_out.p, DType::BF16, {kHeads * kWidth, stress_cols});
+
+        infernix::ops::PleCacheGather s_gather{};
+        s_gather.cache_base    = cache_p;
+        s_gather.fallback_rows = s_fallback_p;
+        s_gather.slots         = s_slots_p;
+        s_gather.scale         = &t_scale;
+        s_gather.cache_slots   = kCacheSlots;
+        s_gather.heads         = kHeads;
+        s_gather.head_width    = kWidth;
+        s_gather.row_bytes     = kRowBytes;
+        s_gather.ready         = static_cast<const std::uint32_t*>(s_ready_host.p);
+        s_gather.expected      = static_cast<const std::uint32_t*>(d_s_expected.p);
+
+        cudaGraph_t s_graph         = nullptr;
+        cudaGraphExec_t s_graph_exec = nullptr;
+        t::cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "stress begin capture");
+        infernix::ops::ple_gather_embed_nvfp4(s_gather, t_s_out, stream);
+        t::cuda_check(cudaStreamEndCapture(stream, &s_graph), "stress end capture");
+        t::cuda_check(cudaGraphInstantiate(&s_graph_exec, s_graph, nullptr, nullptr, 0), "stress instantiate");
+
+        std::vector<std::uint16_t> got(static_cast<std::size_t>(kHeads) * kWidth * stress_cols);
+        for (std::uint32_t iter = 1; iter <= 256U; ++iter) {
+            t::cuda_check(cudaMemcpyAsync(d_s_expected.p, &iter, sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream),
+                          "stress expected");
+            t::cuda_check(cudaGraphLaunch(s_graph_exec, stream), "stress graph launch");
+            std::thread host_writer([&] {
+                if (iter % 16U == 0U) { std::this_thread::sleep_for(std::chrono::microseconds(150)); }
+                // Mutate slot 0 of mapped cache and fallback row 0 on every iteration.
+                fill_nvfp4_bytes(cache_p, 1);
+                fill_nvfp4_bytes(s_fallback_p, static_cast<std::size_t>(stress_cols) * kHeads);
+                s_slots_p[0] = 0U;
+                for (int i = 1; i < stress_cols * kHeads; ++i) {
+                    s_slots_p[i] =
+                        (i % 7 == 0) ? infernix::ops::kPleCacheStagingBit : ((iter + static_cast<std::uint32_t>(i)) % 3U == 0U ? 0U : static_cast<std::uint32_t>(next(state) % kCacheSlots));
+                }
+                std::atomic_thread_fence(std::memory_order_release);
+                *s_ready_p = iter;
+            });
+            t::cuda_check(cudaStreamSynchronize(stream), "stress stream sync");
+            host_writer.join();
+            t::cuda_check(cudaMemcpy(got.data(), d_s_out.p, got.size() * 2, cudaMemcpyDeviceToHost), "stress read");
+            check_output(got, cache_p, s_fallback_p, s_slots_p, stress_cols, kMultiplier,
+                         "ple_gather_embed_nvfp4 coherency stress T=" + std::to_string(stress_cols) +
+                             " iter=" + std::to_string(iter));
+        }
+
+        cudaGraphExecDestroy(s_graph_exec);
+        cudaGraphDestroy(s_graph);
+    }
+
+    cudaStreamDestroy(stream);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(ple_nvfp4) {
@@ -365,6 +612,7 @@ INFERNIX_OP_TEST(ple_nvfp4) {
         }
         embed_exact();
         hash_embed_exact();
+        gather_embed_nvfp4_exact();
         gate_fp32_norms();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

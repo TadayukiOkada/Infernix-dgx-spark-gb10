@@ -31,9 +31,11 @@
 #   -h, --help          Show this help message and exit
 #
 # Environment overrides:
-#   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / KV_DTYPE (default: k8v4)
-#   SPEC_BACKEND (default: dflash2 if present else mtp), NGRAM_DRAFT_TOKENS (default: 31),
-#   NGRAM_MIN_MATCH (default: 8), INFERNIX_NGRAM_WIDTH_COST (default: 0.12)
+#   MODEL_PATH / NGRAM_PATH / NGRAM_RESIDENCY / NGRAM_CACHE_MIB (default: 16384)
+#   KV_DTYPE (default: int8; set k8v4 for >512K KV or RAM-resident N-gram)
+#   VISION (default: 0 for hc4, 1 for local-f4)
+#   SPEC_BACKEND (default: mtp; set dflash2 to use draft model), NGRAM_DRAFT_TOKENS (default: 31),
+#   NGRAM_MIN_MATCH (default: 8), INFERNIX_NGRAM_WIDTH_COST (optional override)
 #   THINKING_FLAG (default: empty), REASONING_EFFORT (default: medium)
 #   EXPERT_A4_ACTIVATIONS (default: 1 for FP4-Local)
 #   SKIP_BUILD=1 to skip rebuilding infernix-serve
@@ -50,6 +52,7 @@ DRAFT_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFl
 KV_DTYPE="${KV_DTYPE:-int8}"
 NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-31}"
 NGRAM_MIN_MATCH="${NGRAM_MIN_MATCH:-8}"
+NGRAM_CACHE_MIB="${NGRAM_CACHE_MIB:-16384}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-12288}"
 KV_CAPACITY="${KV_CAPACITY:-524288}"
 HOST_CONTEXT_MIB="${HOST_CONTEXT_MIB:-4096}"
@@ -189,7 +192,12 @@ else
     MODEL_ID="infernix-model"
 fi
 
-SPEC_BACKEND="${SPEC_BACKEND:-$([[ -f "${DRAFT_PATH}" ]] && echo dflash2 || echo mtp)}"
+SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
+
+NGRAM_DETAIL="${NGRAM_RESIDENCY}"
+if [[ "${NGRAM_RESIDENCY}" == "volume" ]]; then
+    NGRAM_DETAIL="${NGRAM_RESIDENCY}, ${NGRAM_CACHE_MIB} MiB cache"
+fi
 
 echo "========================================================================================"
 echo " INFERNIX SERVER LAUNCHER (GB10 sm_121a)"
@@ -198,7 +206,8 @@ echo " Binary          : ${BINARY_PATH}"
 echo " Model Alias     : ${MODEL_ALIAS}"
 echo " Model ID        : ${MODEL_ID}"
 echo " Model Weights   : ${MODEL_PATH}"
-echo " N-gram Volume   : ${NGRAM_PATH} (${NGRAM_RESIDENCY})"
+echo " N-gram Volume   : ${NGRAM_PATH} (${NGRAM_DETAIL})"
+echo " KV Dtype        : ${KV_DTYPE}"
 echo " Listen Endpoint : http://${HOST}:${PORT}/v1"
 echo " Max Context     : ${MAX_CONTEXT} tokens"
 echo " Max Concurrency : ${MAX_CONCURRENCY}"
@@ -207,7 +216,9 @@ echo "==========================================================================
 echo
 
 export INFERNIX_EXPERTS_ON_GPU=1
-export INFERNIX_NGRAM_WIDTH_COST="${INFERNIX_NGRAM_WIDTH_COST:-0.12}"
+if [[ -n "${INFERNIX_NGRAM_WIDTH_COST:-}" ]]; then
+    export INFERNIX_NGRAM_WIDTH_COST
+fi
 
 EXPERT_A4_ARGS=()
 if [[ "${EXPERT_A4_ACTIVATIONS:-${EXPERT_A4_DEFAULT}}" == "1" ]]; then
@@ -245,7 +256,7 @@ exec "${BINARY_PATH}" "${MODEL_PATH}" \
     "${SPEC_ARGS[@]}" \
     --ngram-volume "${NGRAM_PATH}" \
     --ngram-residency "${NGRAM_RESIDENCY}" \
-    --ngram-cache-mib 4096 \
+    --ngram-cache-mib "${NGRAM_CACHE_MIB}" \
     --kv-dtype "${KV_DTYPE}" \
     --ngram-draft-tokens "${NGRAM_DRAFT_TOKENS}" \
     --ngram-min-match "${NGRAM_MIN_MATCH}" \

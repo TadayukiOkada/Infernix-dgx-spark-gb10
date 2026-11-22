@@ -1,3 +1,4 @@
+#include "core/arena.h"
 #include "core/device.h"
 
 #include <cuda_runtime.h>
@@ -182,6 +183,184 @@ int check_pinned_gate(const infernix::DeviceContext& ctx) {
     return failures;
 }
 
+int check_l2_persisting_policy(const infernix::DeviceContext& ctx) {
+    int failures = 0;
+    const std::size_t expected_persist =
+        ctx.props.persistingL2CacheMaxSize > 0 ? static_cast<std::size_t>(ctx.props.persistingL2CacheMaxSize) : 0;
+    const std::size_t expected_window =
+        ctx.props.accessPolicyMaxWindowSize > 0 ? static_cast<std::size_t>(ctx.props.accessPolicyMaxWindowSize) : 0;
+    if (ctx.persisting_l2_cache_max_bytes() != expected_persist ||
+        ctx.access_policy_max_window_bytes() != expected_window) {
+        ++failures;
+        std::cerr << "DeviceContext L2 capacity accessors mismatch props\n";
+    }
+    if (expected_persist == 0 || expected_window == 0) { return failures; }
+
+    if (ctx.persisting_l2_cache_bytes() == 0 || ctx.persisting_l2_cache_bytes() > expected_persist) {
+        ++failures;
+        std::cerr << "persisting_l2_cache_bytes (" << ctx.persisting_l2_cache_bytes()
+                  << ") out of range (0, " << expected_persist << "]\n";
+    }
+
+    std::size_t actual_limit = 0;
+    CUDA_CHECK(cudaDeviceGetLimit(&actual_limit, cudaLimitPersistingL2CacheSize));
+    if (actual_limit != ctx.persisting_l2_cache_bytes()) {
+        ++failures;
+        std::cerr << "cudaLimitPersistingL2CacheSize expected " << ctx.persisting_l2_cache_bytes() << ", got "
+                  << actual_limit << '\n';
+    }
+
+    const std::size_t buf_bytes = 65536;
+    void* buf                   = nullptr;
+    CUDA_CHECK(cudaMalloc(&buf, buf_bytes));
+    {
+        infernix::ScopedL2AccessPolicyWindow outer(ctx.stream, buf, buf_bytes, expected_window, 1.0F,
+                                                   cudaAccessPropertyPersisting, cudaAccessPropertyNormal);
+        if (!outer.active()) {
+            ++failures;
+            std::cerr << "outer ScopedL2AccessPolicyWindow failed to activate\n";
+        }
+        cudaStreamAttrValue attr{};
+        CUDA_CHECK(cudaStreamGetAttribute(ctx.stream, cudaStreamAttributeAccessPolicyWindow, &attr));
+        if (attr.accessPolicyWindow.base_ptr != buf || attr.accessPolicyWindow.num_bytes != buf_bytes ||
+            attr.accessPolicyWindow.hitProp != cudaAccessPropertyPersisting ||
+            attr.accessPolicyWindow.missProp != cudaAccessPropertyNormal) {
+            ++failures;
+            std::cerr << "outer stream L2 access policy window attributes mismatch\n";
+        }
+        {
+            infernix::ScopedL2AccessPolicyWindow inner(ctx.stream, buf, 4096, expected_window, 1.0F,
+                                                       cudaAccessPropertyNormal, cudaAccessPropertyStreaming);
+            if (!inner.active()) {
+                ++failures;
+                std::cerr << "inner ScopedL2AccessPolicyWindow failed to activate\n";
+            }
+            CUDA_CHECK(cudaStreamGetAttribute(ctx.stream, cudaStreamAttributeAccessPolicyWindow, &attr));
+            if (attr.accessPolicyWindow.num_bytes != 4096 ||
+                attr.accessPolicyWindow.hitProp != cudaAccessPropertyNormal ||
+                attr.accessPolicyWindow.missProp != cudaAccessPropertyStreaming) {
+                ++failures;
+                std::cerr << "inner stream L2 access policy window attributes mismatch\n";
+            }
+        }
+        CUDA_CHECK(cudaStreamGetAttribute(ctx.stream, cudaStreamAttributeAccessPolicyWindow, &attr));
+        if (attr.accessPolicyWindow.base_ptr != buf || attr.accessPolicyWindow.num_bytes != buf_bytes ||
+            attr.accessPolicyWindow.hitProp != cudaAccessPropertyPersisting ||
+            attr.accessPolicyWindow.missProp != cudaAccessPropertyNormal) {
+            ++failures;
+            std::cerr << "outer stream L2 access policy window was not restored after inner scope\n";
+        }
+    }
+    cudaStreamAttrValue cleared{};
+    CUDA_CHECK(cudaStreamGetAttribute(ctx.stream, cudaStreamAttributeAccessPolicyWindow, &cleared));
+    if (cleared.accessPolicyWindow.num_bytes != 0) {
+        ++failures;
+        std::cerr << "stream L2 access policy window was not restored to empty\n";
+    }
+    infernix::reset_persisting_l2_cache(ctx);
+
+    // Phase-switching helpers toggle hardware persisting carveout idempotently (0 during prefill,
+    // persisting_l2_cache_bytes() during decode).
+    infernix::disable_persisting_l2_cache(ctx);
+    infernix::disable_persisting_l2_cache(ctx);
+    CUDA_CHECK(cudaDeviceGetLimit(&actual_limit, cudaLimitPersistingL2CacheSize));
+    if (actual_limit != 0 || ctx.active_persisting_l2_bytes != 0) {
+        ++failures;
+        std::cerr << "disable_persisting_l2_cache failed: limit=" << actual_limit
+                  << ", active=" << ctx.active_persisting_l2_bytes << '\n';
+    }
+    infernix::enable_persisting_l2_cache(ctx);
+    infernix::enable_persisting_l2_cache(ctx);
+    CUDA_CHECK(cudaDeviceGetLimit(&actual_limit, cudaLimitPersistingL2CacheSize));
+    if (actual_limit != ctx.persisting_l2_cache_bytes() ||
+        ctx.active_persisting_l2_bytes != ctx.persisting_l2_cache_bytes()) {
+        ++failures;
+        std::cerr << "enable_persisting_l2_cache failed: expected " << ctx.persisting_l2_cache_bytes()
+                  << ", limit=" << actual_limit << ", active=" << ctx.active_persisting_l2_bytes << '\n';
+    }
+
+    CUDA_CHECK(cudaFree(buf));
+    return failures;
+}
+
+int check_mapped_pinned_zerocopy(const infernix::DeviceContext& ctx) {
+    int failures = 0;
+    const bool expected_uma =
+        ctx.props.integrated != 0 && ctx.props.canMapHostMemory != 0 && ctx.props.unifiedAddressing != 0;
+    if (ctx.integrated_uma() != expected_uma) {
+        ++failures;
+        std::cerr << "integrated_uma() did not match device properties\n";
+    }
+    if (!expected_uma) { return failures; }
+
+    constexpr std::size_t kBytes = 4096;
+    infernix::PinnedHostBuffer in_buf(kBytes);
+    infernix::PinnedHostBuffer out_buf(kBytes);
+    if (in_buf.device_data() == nullptr || out_buf.device_data() == nullptr) {
+        ++failures;
+        std::cerr << "PinnedHostBuffer::device_data() returned null on integrated UMA\n";
+        return failures;
+    }
+
+    // Verify move construction / assignment preserve device_data() and clear moved-from state.
+    {
+        void* const orig_host = in_buf.data();
+        void* const orig_dev  = in_buf.device_data();
+        infernix::PinnedHostBuffer moved_ctor(std::move(in_buf));
+        if (in_buf.data() != nullptr || in_buf.device_data() != nullptr ||
+            moved_ctor.data() != orig_host || moved_ctor.device_data() != orig_dev) {
+            ++failures;
+            std::cerr << "PinnedHostBuffer move constructor did not preserve/clear device_data()\n";
+        }
+        in_buf = std::move(moved_ctor);
+        if (moved_ctor.data() != nullptr || moved_ctor.device_data() != nullptr ||
+            in_buf.data() != orig_host || in_buf.device_data() != orig_dev) {
+            ++failures;
+            std::cerr << "PinnedHostBuffer move assignment did not preserve/clear device_data()\n";
+        }
+    }
+
+    // Repeated CUDA Graph reads/writes directly to mapped pinned host memory with release barrier.
+    cudaGraph_t graph    = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(ctx.stream, cudaStreamCaptureModeThreadLocal));
+    infernix::upload_pinned(out_buf.device_data(), in_buf.device_data(), kBytes, ctx.stream);
+    CUDA_CHECK(cudaStreamEndCapture(ctx.stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+
+    auto* const in_bytes  = static_cast<std::byte*>(in_buf.data());
+    auto* const out_bytes = static_cast<std::byte*>(out_buf.data());
+    for (int iter = 0; iter < 256; ++iter) {
+        for (std::size_t i = 0; i < kBytes; ++i) {
+            in_bytes[i] = static_cast<std::byte>((i * 73U + static_cast<std::size_t>(iter) * 19U + 5U) & 0xffU);
+        }
+        std::memset(out_bytes, 0, kBytes);
+        infernix::publish_pinned_memory();
+        CUDA_CHECK(cudaGraphLaunch(exec, ctx.stream));
+        ctx.synchronize();
+        if (std::memcmp(out_bytes, in_bytes, kBytes) != 0) {
+            ++failures;
+            std::cerr << "mapped zero-copy CUDA Graph round " << iter << " observed stale or torn data\n";
+            break;
+        }
+    }
+    CUDA_CHECK(cudaGraphExecDestroy(exec));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+
+    // In-place upload_pinned_when (device_dst == pinned_src) degrades cleanly to gate wait.
+    auto* const ready      = static_cast<std::uint32_t*>(out_buf.data());
+    std::uint32_t* exp_dev = nullptr;
+    CUDA_CHECK(cudaMalloc(&exp_dev, sizeof(std::uint32_t)));
+    constexpr std::uint32_t kGateWord = 42U;
+    CUDA_CHECK(cudaMemcpyAsync(exp_dev, &kGateWord, sizeof(kGateWord), cudaMemcpyHostToDevice, ctx.stream));
+    infernix::publish_pinned_word(ready, kGateWord);
+    infernix::upload_pinned_when(in_buf.device_data(), in_buf.device_data(), kBytes, ready, exp_dev, nullptr, nullptr,
+                                 ctx.stream);
+    ctx.synchronize();
+    CUDA_CHECK(cudaFree(exp_dev));
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -226,6 +405,8 @@ int main(int argc, char** argv) {
     }
     failures += check_context(ctx, "ctx");
     failures += check_pinned_gate(ctx);
+    failures += check_l2_persisting_policy(ctx);
+    failures += check_mapped_pinned_zerocopy(ctx);
     int* device_value = nullptr;
     int* host_value   = nullptr;
     CUDA_CHECK(cudaMalloc(&device_value, sizeof(int)));

@@ -141,29 +141,43 @@ __device__ __forceinline__ void omma_quantize_x_chunk_split(const bf16* x, int t
     }
 }
 
+__device__ __forceinline__ void omma_bulk_load_hinted(void* destination, const void* source, std::uint32_t bytes,
+                                                      std::uint64_t* barrier, std::uint64_t cache_policy) {
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+        :
+        : "r"(smem_addr(destination)), "l"(source), "r"(bytes), "r"(smem_addr(barrier)), "l"(cache_policy)
+        : "memory");
+}
+
 template <class G>
-union GateUpOmmaShared {
-    struct {
-        alignas(16) std::uint8_t w[2][2][16 * moe::kUnitBytes]; // 9,216 B
-        OmmaXChunk x[2];                                         // 2,304 B
-    } pipe;
-    struct {
-        float partial[2][16][8]; // 1,024 B
-        std::uint16_t h[8][16];  //   256 B
-    } epi;
+struct GateUpOmmaShared {
+    union {
+        struct {
+            alignas(16) std::uint8_t w[2][2][16 * moe::kUnitBytes]; // 9,216 B
+            OmmaXChunk x[2];                                         // 2,304 B
+        } pipe;
+        struct {
+            float partial[2][16][8]; // 1,024 B
+            std::uint16_t h[8][16];  //   256 B
+        } epi;
+    };
+    alignas(8) std::uint64_t mbar[2];
 };
 
 template <class G>
 struct DownOmmaShared {
     alignas(16) std::uint8_t w[2][OmmaShape<G>::kWarps][OmmaShape<G>::kDownWarpStageB]; // 9,216 B
     alignas(16) std::uint8_t h[8][OmmaShape<G>::kHRowBytes];                              // 2,944 B
+    alignas(8) std::uint64_t mbar[2];
 };
 
 template <class G>
 __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, const bf16* x,
                                                      const MoeDispatch& dispatch, int top_k,
                                                      const std::uint8_t* record, const moe::ExpertScales& scales,
-                                                     int first, int count, int slice, std::uint8_t* h_base) {
+                                                     int first, int count, int slice, std::uint8_t* h_base,
+                                                     std::uint32_t& phase_bits) {
     using S              = OmmaShape<G>;
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;
@@ -177,15 +191,15 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
         record + static_cast<std::size_t>(2 * slice) * G::kGateUpBlocks * moe::kUnitBytes;
 
     const auto issue_w = [&](int chunk, int buf) {
-        const std::size_t k_off = static_cast<std::size_t>(chunk) * 16 * moe::kUnitBytes;
-        constexpr int kRgBytes  = 16 * static_cast<int>(moe::kUnitBytes);
-        constexpr int kVecs     = kRgBytes / 16; // 144
-        for (int i = tid; i < 2 * kVecs; i += S::kThreads) {
-            const int rg = i / kVecs;
-            const int k  = i % kVecs;
-            const std::uint8_t* src =
-                units_base + static_cast<std::size_t>(rg) * G::kGateUpBlocks * moe::kUnitBytes + k_off + 16 * k;
-            ggml::tile::cp_async16(sm.pipe.w[buf][rg] + 16 * k, src, 16);
+        if (tid == 0) {
+            constexpr int kRgBytes            = 16 * static_cast<int>(moe::kUnitBytes); // 2,304 B
+            const std::size_t k_off           = static_cast<std::size_t>(chunk) * kRgBytes;
+            const std::uint64_t weight_policy = l2_evict_first_policy();
+            cta_mbarrier_arrive_expect_tx(&sm.mbar[buf], static_cast<std::uint32_t>(2 * kRgBytes));
+            omma_bulk_load_hinted(sm.pipe.w[buf][0], units_base + k_off, kRgBytes, &sm.mbar[buf], weight_policy);
+            omma_bulk_load_hinted(sm.pipe.w[buf][1],
+                                  units_base + static_cast<std::size_t>(G::kGateUpBlocks) * moe::kUnitBytes + k_off,
+                                  kRgBytes, &sm.mbar[buf], weight_policy);
         }
     };
 
@@ -197,16 +211,18 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
             live_col ? moe::wide::entry_column(dispatch.entries[first + c_base + col], top_k, dispatch.shared_first)
                      : 0;
 
-        float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        float acc[4];
         if (!split_in) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { acc[i] = 0.0F; }
             issue_w(0, 0);
-            ggml::tile::cp_async_commit();
             omma_quantize_x_chunk<G>(x, tok, live_col, 0, scales.input_gate, sm.pipe.x[0]);
             issue_w(1, 1);
-            ggml::tile::cp_async_commit();
-            ggml::tile::cp_async_wait<1>();
+            cta_mbarrier_wait(&sm.mbar[0], phase_bits & 1U);
+            phase_bits ^= 1U;
             __syncthreads();
 
+#pragma unroll 2
             for (int ch = 0; ch < S::kGateUpChunks; ++ch) {
                 const OmmaXChunk& xc = sm.pipe.x[ch & 1];
                 const int b_col      = min(group, n_cols - 1);
@@ -224,32 +240,27 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
                 if (ch + 1 < S::kGateUpChunks) {
                     omma_quantize_x_chunk<G>(x, tok, live_col, ch + 1, scales.input_gate, sm.pipe.x[(ch + 1) & 1]);
                 }
+                fence_reads_before_async_refill();
                 __syncthreads();
-                if (ch + 2 < S::kGateUpChunks) {
-                    issue_w(ch + 2, ch & 1);
-                    ggml::tile::cp_async_commit();
-                }
+                if (ch + 2 < S::kGateUpChunks) { issue_w(ch + 2, ch & 1); }
                 if (ch + 1 < S::kGateUpChunks) {
-                    if (ch + 2 < S::kGateUpChunks) {
-                        ggml::tile::cp_async_wait<1>();
-                    } else {
-                        ggml::tile::cp_async_wait<0>();
-                    }
-                    __syncthreads();
+                    const int nxt = (ch + 1) & 1;
+                    cta_mbarrier_wait(&sm.mbar[nxt], (phase_bits >> nxt) & 1U);
+                    phase_bits ^= (1U << nxt);
                 }
             }
         } else {
             float acc_g[4] = {0.0F, 0.0F, 0.0F, 0.0F};
             float acc_u[4] = {0.0F, 0.0F, 0.0F, 0.0F};
             issue_w(0, 0);
-            ggml::tile::cp_async_commit();
             omma_quantize_x_chunk_split<G>(x, tok, live_col, 0, scales.input_gate, scales.input_up, sm.pipe.x[0],
                                            sm.pipe.x[1]);
             issue_w(1, 1);
-            ggml::tile::cp_async_commit();
-            ggml::tile::cp_async_wait<1>();
+            cta_mbarrier_wait(&sm.mbar[0], phase_bits & 1U);
+            phase_bits ^= 1U;
             __syncthreads();
 
+#pragma unroll 2
             for (int ch = 0; ch < S::kGateUpChunks; ++ch) {
                 const int b_col      = min(group, n_cols - 1);
                 const std::uint8_t* wu = sm.pipe.w[ch & 1][rg_local];
@@ -267,19 +278,15 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
                     const std::uint32_t su  = sm.pipe.x[1].scales4[w_idx][b_col];
                     mma_nvfp4_e4m3(acc_u[0], acc_u[1], acc_u[2], acc_u[3], a0, a1, a2, a3, bu0, bu1, sfa, su);
                 }
+                fence_reads_before_async_refill();
                 __syncthreads();
-                if (ch + 2 < S::kGateUpChunks) {
-                    issue_w(ch + 2, ch & 1);
-                    ggml::tile::cp_async_commit();
-                }
+                if (ch + 2 < S::kGateUpChunks) { issue_w(ch + 2, ch & 1); }
                 if (ch + 1 < S::kGateUpChunks) {
                     omma_quantize_x_chunk_split<G>(x, tok, live_col, ch + 1, scales.input_gate, scales.input_up,
                                                    sm.pipe.x[0], sm.pipe.x[1]);
-                    if (ch + 2 < S::kGateUpChunks) {
-                        ggml::tile::cp_async_wait<1>();
-                    } else {
-                        ggml::tile::cp_async_wait<0>();
-                    }
+                    const int nxt = (ch + 1) & 1;
+                    cta_mbarrier_wait(&sm.mbar[nxt], (phase_bits >> nxt) & 1U);
+                    phase_bits ^= (1U << nxt);
                     __syncthreads();
                 }
             }
@@ -343,7 +350,10 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
             *reinterpret_cast<uint2*>(h_row + 8 * pos) = make_uint2(low, high);
             h_row[moe::wide::kHCodeBytes + pos]        = sw;
         }
-        if (c_base + 8 < count) { __syncthreads(); }
+        if (c_base + 8 < count) {
+            fence_reads_before_async_refill();
+            __syncthreads();
+        }
     }
 }
 
@@ -351,7 +361,8 @@ template <class G>
 __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, const MoeDispatch& dispatch,
                                                        const std::uint8_t* record, const moe::ExpertScales& scales,
                                                        int first, int count, int tile, const std::uint8_t* h_base,
-                                                       bf16* outputs, bool preloaded_stage0) {
+                                                       bf16* outputs, bool preloaded_stage0,
+                                                       std::uint32_t& phase_bits) {
     using S        = OmmaShape<G>;
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -363,18 +374,21 @@ __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, co
         record + G::kGateUpBytes + static_cast<std::size_t>(4 * tile) * S::kDownRgBytes;
 
     const auto stage_w = [&](int st, int buf) {
-        constexpr int kVecs = S::kDownWarpStageB / 16; // 72
-        const std::uint8_t* src =
-            rg_base + static_cast<std::size_t>(warp) * S::kDownRgBytes + static_cast<std::size_t>(st) * S::kDownWarpStageB;
-        for (int i = lane; i < kVecs; i += 32) { ggml::tile::cp_async16(sm.w[buf][warp] + 16 * i, src + 16 * i, 16); }
+        if (tid == 0) {
+            cta_mbarrier_arrive_expect_tx(&sm.mbar[buf], static_cast<std::uint32_t>(4 * S::kDownWarpStageB));
+            const std::size_t k_off           = static_cast<std::size_t>(st) * S::kDownWarpStageB;
+            const std::uint64_t weight_policy = l2_evict_first_policy();
+#pragma unroll
+            for (int w = 0; w < S::kWarps; ++w) {
+                const std::uint8_t* src = rg_base + static_cast<std::size_t>(w) * S::kDownRgBytes + k_off;
+                omma_bulk_load_hinted(sm.w[buf][w], src, S::kDownWarpStageB, &sm.mbar[buf], weight_policy);
+            }
+        }
     };
 
     for (int c_base = 0; c_base < count; c_base += 8) {
         const int n_cols = min(8, count - c_base);
-        if (!preloaded_stage0 || c_base > 0) {
-            stage_w(0, 0);
-            ggml::tile::cp_async_commit();
-        }
+        if (!preloaded_stage0 || c_base > 0) { stage_w(0, 0); }
         constexpr int kHVecs = S::kHRowBytes / 16; // 23
         for (int i = tid; i < n_cols * kHVecs; i += S::kThreads) {
             const int c = i / kHVecs;
@@ -385,8 +399,9 @@ __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, co
         }
         ggml::tile::cp_async_commit();
         stage_w(1, 1);
-        ggml::tile::cp_async_commit();
-        ggml::tile::cp_async_wait<1>();
+        ggml::tile::cp_async_wait<0>();
+        cta_mbarrier_wait(&sm.mbar[0], phase_bits & 1U);
+        phase_bits ^= 1U;
         __syncthreads();
 
         float acc[4]              = {0.0F, 0.0F, 0.0F, 0.0F};
@@ -403,18 +418,13 @@ __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, co
                 const std::uint32_t sfb = omma_lds32(h_row + moe::wide::kHCodeBytes + 4 * k64);
                 mma_nvfp4_e4m3(acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, sfa, sfb);
             }
+            fence_reads_before_async_refill();
             __syncthreads();
-            if (st + 2 < S::kDownChunks) {
-                stage_w(st + 2, st & 1);
-                ggml::tile::cp_async_commit();
-            }
+            if (st + 2 < S::kDownChunks) { stage_w(st + 2, st & 1); }
             if (st + 1 < S::kDownChunks) {
-                if (st + 2 < S::kDownChunks) {
-                    ggml::tile::cp_async_wait<1>();
-                } else {
-                    ggml::tile::cp_async_wait<0>();
-                }
-                __syncthreads();
+                const int nxt = (st + 1) & 1;
+                cta_mbarrier_wait(&sm.mbar[nxt], (phase_bits >> nxt) & 1U);
+                phase_bits ^= (1U << nxt);
             }
         }
 
@@ -437,11 +447,18 @@ __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, co
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
     gate_up_omma_kernel(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
                         const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ flags,
                         int base, std::uint8_t* __restrict__ h_base, PassPhase phase) {
     __shared__ GateUpOmmaShared<G> sm;
+    if (threadIdx.x == 0) {
+        cta_mbarrier_init(&sm.mbar[0], 1);
+        cta_mbarrier_init(&sm.mbar[1], 1);
+    }
+    cta_mbarrier_fence_init();
+    __syncthreads();
+    std::uint32_t mbar_phase = 0U;
     pdl::wait_for_dependencies();
     const int job   = base + static_cast<int>(blockIdx.y);
     const int slice = static_cast<int>(blockIdx.x);
@@ -452,7 +469,7 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
             const moe::ExpertScales scales = source.scales[expert];
             const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
             if (count > 0 && !moe::wide_route(count, scales)) {
-                gate_up_omma_slice<G>(sm, x, dispatch, top_k, record, scales, first, count, slice, h_base);
+                gate_up_omma_slice<G>(sm, x, dispatch, top_k, record, scales, first, count, slice, h_base, mbar_phase);
             }
         }
     }
@@ -460,16 +477,23 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
     down_omma_kernel(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
                      const std::int32_t* __restrict__ flags, int base, const std::uint8_t* __restrict__ h_base,
                      bf16* __restrict__ outputs, PassPhase phase) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
+    if (threadIdx.x == 0) {
+        cta_mbarrier_init(&sm.mbar[0], 1);
+        cta_mbarrier_init(&sm.mbar[1], 1);
+    }
+    cta_mbarrier_fence_init();
+    __syncthreads();
+    std::uint32_t mbar_phase = 0U;
+
     const int job  = base + static_cast<int>(blockIdx.y);
     const int tile = static_cast<int>(blockIdx.x);
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int tid  = static_cast<int>(threadIdx.x);
 
     int expert = 0, first = 0, count = 0;
     const std::uint8_t* record = nullptr;
@@ -487,24 +511,28 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
             if (count <= 0 || moe::wide_route(count, scales)) {
                 record = nullptr;
             } else {
-                const std::uint8_t* rg_base =
-                    record + G::kGateUpBytes + static_cast<std::size_t>(4 * tile) * S::kDownRgBytes;
-                const std::uint8_t* src = rg_base + static_cast<std::size_t>(warp) * S::kDownRgBytes;
-                for (int i = lane; i < S::kDownWarpStageB / 16; i += 32) {
-                    ggml::tile::cp_async16(sm.w[0][warp] + 16 * i, src + 16 * i, 16);
+                if (tid == 0) {
+                    const std::uint8_t* rg_base =
+                        record + G::kGateUpBytes + static_cast<std::size_t>(4 * tile) * S::kDownRgBytes;
+                    const std::uint64_t weight_policy = l2_evict_first_policy();
+                    cta_mbarrier_arrive_expect_tx(&sm.mbar[0], static_cast<std::uint32_t>(4 * S::kDownWarpStageB));
+#pragma unroll
+                    for (int w = 0; w < S::kWarps; ++w) {
+                        const std::uint8_t* src = rg_base + static_cast<std::size_t>(w) * S::kDownRgBytes;
+                        omma_bulk_load_hinted(sm.w[0][w], src, S::kDownWarpStageB, &sm.mbar[0], weight_policy);
+                    }
                 }
-                ggml::tile::cp_async_commit();
                 preloaded = true;
             }
         }
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
-    down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_base, outputs, preloaded);
+    down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_base, outputs, preloaded, mbar_phase);
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
     gate_up_omma_persistent_kernel(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
                                    const std::uint8_t* const* __restrict__ job_records,
                                    const std::int32_t* __restrict__ narrow_jobs,
@@ -512,6 +540,13 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
                                    std::uint8_t* __restrict__ h_base) {
     using S = OmmaShape<G>;
     __shared__ GateUpOmmaShared<G> sm;
+    if (threadIdx.x == 0) {
+        cta_mbarrier_init(&sm.mbar[0], 1);
+        cta_mbarrier_init(&sm.mbar[1], 1);
+    }
+    cta_mbarrier_fence_init();
+    __syncthreads();
+    std::uint32_t mbar_phase = 0U;
     pdl::wait_for_dependencies();
     const int n_begin     = pass_narrow[pass_index];
     const int n_count     = pass_narrow[pass_index + 1] - n_begin;
@@ -525,14 +560,15 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
         const moe::ExpertScales scales = source.scales[expert];
         const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
         if (count <= 0 || moe::wide_route(count, scales)) { continue; }
-        gate_up_omma_slice<G>(sm, x, dispatch, top_k, record, scales, first, count, slice, h_base);
+        gate_up_omma_slice<G>(sm, x, dispatch, top_k, record, scales, first, count, slice, h_base, mbar_phase);
+        fence_reads_before_async_refill();
         __syncthreads();
     }
     pdl::trigger_dependents();
 }
 
 template <class G>
-__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
+__global__ void __launch_bounds__(OmmaShape<G>::kThreads, 5)
     down_omma_persistent_kernel(MoeDispatch dispatch, MoeExpertSource source,
                                 const std::uint8_t* const* __restrict__ job_records,
                                 const std::int32_t* __restrict__ narrow_jobs,
@@ -540,8 +576,15 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
                                 const std::uint8_t* __restrict__ h_base, bf16* __restrict__ outputs) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
-    const int warp        = static_cast<int>(threadIdx.x) >> 5;
-    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    if (threadIdx.x == 0) {
+        cta_mbarrier_init(&sm.mbar[0], 1);
+        cta_mbarrier_init(&sm.mbar[1], 1);
+    }
+    cta_mbarrier_fence_init();
+    __syncthreads();
+    std::uint32_t mbar_phase = 0U;
+
+    const int tid         = static_cast<int>(threadIdx.x);
     const int n_begin     = pass_narrow[pass_index];
     const int n_count     = pass_narrow[pass_index + 1] - n_begin;
     const int total_tasks = n_count * S::kDownTiles;
@@ -563,20 +606,26 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
             if (count0 <= 0 || moe::wide_route(count0, scales0)) {
                 rec0 = nullptr;
             } else {
-                const std::uint8_t* rg_base =
-                    rec0 + G::kGateUpBytes + static_cast<std::size_t>(4 * tile0) * S::kDownRgBytes;
-                const std::uint8_t* src = rg_base + static_cast<std::size_t>(warp) * S::kDownRgBytes;
-                for (int i = lane; i < S::kDownWarpStageB / 16; i += 32) {
-                    ggml::tile::cp_async16(sm.w[0][warp] + 16 * i, src + 16 * i, 16);
+                if (tid == 0) {
+                    const std::uint8_t* rg_base =
+                        rec0 + G::kGateUpBytes + static_cast<std::size_t>(4 * tile0) * S::kDownRgBytes;
+                    const std::uint64_t weight_policy = l2_evict_first_policy();
+                    cta_mbarrier_arrive_expect_tx(&sm.mbar[0], static_cast<std::uint32_t>(4 * S::kDownWarpStageB));
+#pragma unroll
+                    for (int w = 0; w < S::kWarps; ++w) {
+                        const std::uint8_t* src = rg_base + static_cast<std::size_t>(w) * S::kDownRgBytes;
+                        omma_bulk_load_hinted(sm.w[0][w], src, S::kDownWarpStageB, &sm.mbar[0], weight_policy);
+                    }
                 }
-                ggml::tile::cp_async_commit();
                 preloaded0 = true;
             }
         }
     }
     pdl::wait_for_dependencies();
     if (task0 < total_tasks && rec0 != nullptr) {
-        down_omma_tile_compute<G>(sm, dispatch, rec0, scales0, first0, count0, tile0, h_base, outputs, preloaded0);
+        down_omma_tile_compute<G>(sm, dispatch, rec0, scales0, first0, count0, tile0, h_base, outputs, preloaded0,
+                                  mbar_phase);
+        fence_reads_before_async_refill();
         __syncthreads();
     }
     for (int task = task0 + static_cast<int>(gridDim.x); task < total_tasks; task += static_cast<int>(gridDim.x)) {
@@ -588,9 +637,20 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 3)
         const moe::ExpertScales scales = source.scales[expert];
         const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
         if (count <= 0 || moe::wide_route(count, scales)) { continue; }
-        down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_base, outputs, false);
+        down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_base, outputs, false, mbar_phase);
+        fence_reads_before_async_refill();
         __syncthreads();
     }
+}
+
+int persistent_omma_ctas() {
+    static const int ctas = [] {
+        int dev = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        return sms * 5;
+    }();
+    return ctas;
 }
 
 void launch_expert_pass_a4_omma(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
@@ -602,7 +662,7 @@ void launch_expert_pass_a4_omma(const bf16* x, const MoeDispatch& dispatch, cons
     auto* h_base               = reinterpret_cast<std::uint8_t*>(h_blocks);
     const bool unstaged_direct = source.staging_slots == 0 && source.fetch.request == nullptr && phase == PassPhase::All;
     if (use_xplane) {
-        const int persistent = persistent_narrow_ctas();
+        const int persistent = persistent_omma_ctas();
         if (part != PassPart::Down) {
             CUDA_CHECK(pdl::launch_with(unstaged_direct ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized,
                                         {dim3(persistent), dim3(S::kThreads), 0, stream},

@@ -62,6 +62,73 @@ int check_external_event(infernix::DeviceContext& device) {
     return failures;
 }
 
+int check_l2_policy_graph_capture(infernix::DeviceContext& device) {
+    const std::size_t max_persist = device.persisting_l2_cache_max_bytes();
+    const std::size_t max_window  = device.access_policy_max_window_bytes();
+    if (max_persist == 0 || max_window == 0) { return 0; }
+
+    int failures                     = 0;
+    constexpr std::size_t kBytes     = 4096;
+    infernix::DeviceBuffer dst(kBytes);
+    infernix::PinnedHostBuffer src(kBytes);
+    auto* words = static_cast<std::uint32_t*>(src.data());
+    for (std::size_t i = 0; i < kBytes / sizeof(std::uint32_t); ++i) { words[i] = 0x11111111U; }
+
+    // 1. Direct CUDA Graph node inspection: kernel nodes captured inside ScopedL2AccessPolicyWindow
+    // inherit cudaKernelNodeAttributeAccessPolicyWindow.
+    cudaGraph_t raw_graph = nullptr;
+    {
+        infernix::ScopedL2AccessPolicyWindow l2_window(device.stream, dst.p, kBytes, max_window, 1.0F,
+                                                       cudaAccessPropertyPersisting, cudaAccessPropertyNormal);
+        CUDA_CHECK(cudaStreamBeginCapture(device.stream, cudaStreamCaptureModeThreadLocal));
+        infernix::upload_pinned(dst.p, src.data(), kBytes, device.stream);
+        CUDA_CHECK(cudaStreamEndCapture(device.stream, &raw_graph));
+    }
+    std::size_t node_count  = 0;
+    cudaGraphNode_t node[4] = {};
+    CUDA_CHECK(cudaGraphGetNodes(raw_graph, nullptr, &node_count));
+    if (node_count != 1) {
+        ++failures;
+        std::cerr << "expected 1 captured kernel node for L2 policy test, got " << node_count << '\n';
+    } else {
+        CUDA_CHECK(cudaGraphGetNodes(raw_graph, node, &node_count));
+        cudaKernelNodeAttrValue node_attr{};
+        CUDA_CHECK(cudaGraphKernelNodeGetAttribute(node[0], cudaKernelNodeAttributeAccessPolicyWindow, &node_attr));
+        if (node_attr.accessPolicyWindow.base_ptr != dst.p ||
+            node_attr.accessPolicyWindow.num_bytes != kBytes ||
+            node_attr.accessPolicyWindow.hitProp != cudaAccessPropertyPersisting ||
+            node_attr.accessPolicyWindow.missProp != cudaAccessPropertyNormal) {
+            ++failures;
+            std::cerr << "captured kernel node did not inherit persisting L2 access policy window\n";
+        }
+    }
+    CUDA_CHECK(cudaGraphDestroy(raw_graph));
+
+    // 2. DecodeGraphDefinition + DecodeGraphExecutable update/launch compatibility.
+    infernix::DecodeGraphDefinition def_a;
+    infernix::DecodeGraphDefinition def_b;
+    {
+        infernix::ScopedL2AccessPolicyWindow l2_window(device.stream, dst.p, kBytes, max_window, 1.0F,
+                                                       cudaAccessPropertyPersisting, cudaAccessPropertyNormal);
+        def_a.capture(device.stream, [&] { infernix::upload_pinned(dst.p, src.data(), kBytes, device.stream); });
+        def_b.capture(device.stream, [&] { infernix::upload_pinned(dst.p, src.data(), kBytes, device.stream); });
+    }
+    infernix::DecodeGraphExecutable exec;
+    exec.instantiate(def_a);
+    exec.launch(device.stream);
+    device.synchronize();
+    failures += expect_value(dst.p, 0x11111111U, "L2 policy graph launch");
+
+    for (std::size_t i = 0; i < kBytes / sizeof(std::uint32_t); ++i) { words[i] = 0x22222222U; }
+    exec.update(def_b);
+    exec.launch(device.stream);
+    device.synchronize();
+    failures += expect_value(dst.p, 0x22222222U, "L2 policy graph update+launch");
+
+    infernix::reset_persisting_l2_cache(device);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -111,6 +178,7 @@ int main() {
         device.synchronize();
         failures += expect_value(storage.base(), 0x22222222U, "updated graph launch");
         failures += check_external_event(device);
+        failures += check_l2_policy_graph_capture(device);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "decode graph test failed: " << error.what() << '\n';

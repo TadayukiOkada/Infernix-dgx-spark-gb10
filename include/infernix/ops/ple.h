@@ -68,6 +68,34 @@ struct PleNgramHashTable {
 void ple_hash_embed_nvfp4(const Tensor& windows, const PleNgramHashTable& table, Tensor& out,
                           cudaStream_t stream);
 
+/// Flag bit in slot indices passed to ple_gather_embed_* selecting fallback_rows rather than cache_base.
+inline constexpr std::uint32_t kPleCacheStagingBit = 0x80000000U;
+
+/// Descriptor for GPU-direct zero-copy gather from a host-mapped NgramVolume row cache.
+struct PleCacheGather {
+    const void* cache_base         = nullptr; // device-mapped NgramVolume::cache_
+    const void* fallback_rows      = nullptr; // optional fallback [row_bytes, heads, T] for kPleCacheStagingBit
+    const std::uint32_t* slots     = nullptr; // [heads, T] slot index (bit 31 selects fallback_rows)
+    const Tensor* scale            = nullptr; // FP32 [1] (NVFP4) or BF16 [1] (FP8)
+    std::uint32_t cache_slots      = 0;       // number of slots in cache_base
+    std::int32_t heads             = 0;
+    std::int32_t head_width        = 0;
+    std::int32_t row_bytes         = 0;
+    // Optional host-ready gate polled before reading slots and fallback/cache rows (NgramRowGate).
+    const std::uint32_t* ready     = nullptr;
+    const std::uint32_t* expected  = nullptr;
+    std::uint64_t* wait_stats      = nullptr;
+    const std::int32_t* wait_row   = nullptr;
+};
+
+/// Gathers cached (or fallback) NVFP4 n-gram rows and decodes them directly to BF16 [heads*W, T].
+/// Produces bit-identical output to ple_embed_nvfp4 over the resolved rows.
+void ple_gather_embed_nvfp4(const PleCacheGather& gather, Tensor& out, cudaStream_t stream);
+
+/// Gathers cached (or fallback) FP8 E4M3FN n-gram rows and decodes them directly to BF16 [heads*W, T].
+/// Produces bit-identical output to ple_embed (BF16 scale) over the resolved rows.
+void ple_gather_embed_fp8(const PleCacheGather& gather, Tensor& out, cudaStream_t stream);
+
 /// key: BF16 [S*H, T]; value: BF16 [H, T]; residual: BF16 [S*H, T]; key_norm, query_norm,
 /// conv_norm: [S*H], all BF16 or all FP32 (NVIDIA FP4-Local's). gated and normalized: BF16 [S*H, T].
 void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,

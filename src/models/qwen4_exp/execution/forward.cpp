@@ -706,13 +706,28 @@ Tensor Forward::ple_embedding(const PleParameters& p, const ForwardBatch& batch)
         ops::ple_hash_embed_nvfp4(batch.ple_windows, table, e, s);
         return e;
     }
+    const NgramRowFormat format = batch.ngram_format.value_or(config_.ple.table.format);
+    if (batch.ple_cache_gather != nullptr) {
+        const Tensor& scale = batch.ngram_scale.data != nullptr ? batch.ngram_scale : p.ngram_scale;
+        if (scale.data == nullptr) {
+            throw std::invalid_argument("Qwen4Exp forward: mapped n-gram cache needs its table's scale");
+        }
+        ops::PleCacheGather gather = *batch.ple_cache_gather;
+        gather.scale               = &scale;
+        Tensor e = work_.alloc(DType::BF16, {dim(config_.ple.embed_dim), T});
+        if (format == NgramRowFormat::Nvfp4) {
+            ops::ple_gather_embed_nvfp4(gather, e, s);
+        } else {
+            ops::ple_gather_embed_fp8(gather, e, s);
+        }
+        return e;
+    }
     if (const NgramRowGate* gate = batch.ngram_gate) {
         // The upload never triggers dependents early, so even where ple_embed is a programmatic
         // dependent it still starts only once the copy has completed.
         upload_pinned_when(batch.ngram_rows.data, gate->pinned_rows, batch.ngram_rows.bytes(), gate->ready,
                            gate->expected, gate->wait_stats, gate->wait_row, s);
     }
-    const NgramRowFormat format = batch.ngram_format.value_or(config_.ple.table.format);
     Tensor e;
     if (format == NgramRowFormat::Bf16) {
         // BF16 rows are the embedding itself: rows [W, heads] of a column are e[h * W + j] (ple_embed's

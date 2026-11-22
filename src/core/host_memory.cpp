@@ -80,6 +80,7 @@ RegisteredHostBuffer::RegisteredHostBuffer(std::size_t bytes) : size_(bytes) {
     if (bytes == 0) { throw std::invalid_argument("RegisteredHostBuffer size must be nonzero"); }
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
+    if (bytes >= (2ULL << 20)) { (void)::madvise(p, bytes, MADV_HUGEPAGE); }
     data_ = static_cast<std::byte*>(p);
 }
 
@@ -108,6 +109,30 @@ void RegisteredHostBuffer::pin() {
         throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") + cudaGetErrorString(status));
     }
     device_ = static_cast<std::byte*>(device);
+}
+
+void* RegisteredHostBuffer::try_pin_if_integrated_uma() noexcept {
+    if (device_ != nullptr) { return device_; }
+    int device = 0, integrated = 0, can_map = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, device) != cudaSuccess ||
+        integrated == 0 || can_map == 0) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    if (cudaHostRegister(data_, size_, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    void* dev_ptr = nullptr;
+    if (cudaHostGetDevicePointer(&dev_ptr, data_, 0) != cudaSuccess) {
+        (void)cudaHostUnregister(data_);
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    device_ = static_cast<std::byte*>(dev_ptr);
+    return device_;
 }
 
 ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {

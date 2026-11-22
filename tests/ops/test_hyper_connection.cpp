@@ -187,6 +187,46 @@ void randomize_q8(infernix::test::quantized_weight::PackedWeight& w, std::uint32
     }
 }
 
+std::vector<float> decode_q4(const infernix::test::quantized_weight::PackedWeight& w) {
+    const int n = w.weight.n, k = w.weight.k, padded = w.weight.padded_shape[1];
+    std::vector<float> out(static_cast<std::size_t>(n) * k);
+    for (int r = 0; r < n; ++r) {
+        for (int c = 0; c < k; ++c) {
+            const std::size_t scale_at =
+                static_cast<std::size_t>(w.scale_plane_offset) + (static_cast<std::size_t>(r) * (padded / 64) + c / 64) * 2;
+            const auto bits = static_cast<std::uint16_t>(w.payload[scale_at] | (w.payload[scale_at + 1] << 8));
+            const auto byte = w.payload[static_cast<std::size_t>(r) * (padded / 2) + (c / 2)];
+            const int nib   = (c & 1) == 0 ? (byte & 0x0F) : (byte >> 4);
+            const int code  = (nib ^ 8) - 8;
+            out[static_cast<std::size_t>(r) * k + c] = static_cast<float>(code) * half_to_float(bits);
+        }
+    }
+    return out;
+}
+
+void randomize_q4(infernix::test::quantized_weight::PackedWeight& w, std::uint32_t seed) {
+    const int n = w.weight.n, k = w.weight.k, padded = w.weight.padded_shape[1];
+    std::uint32_t state = seed;
+    for (int r = 0; r < n; ++r) {
+        for (int c = 0; c < padded; c += 2) {
+            const int q0 = c < k ? static_cast<std::int32_t>(next(state) % 15U) - 7 : 0;
+            const int q1 = c + 1 < k ? static_cast<std::int32_t>(next(state) % 15U) - 7 : 0;
+            const int n0 = (q0 + 8) ^ 8;
+            const int n1 = (q1 + 8) ^ 8;
+            w.payload[static_cast<std::size_t>(r) * (padded / 2) + (c / 2)] =
+                static_cast<std::uint8_t>((n0 & 0x0F) | ((n1 & 0x0F) << 4));
+        }
+        for (int g = 0; g < padded / 64; ++g) {
+            const double gain    = 2.0 + 4.0 * static_cast<double>(next(state) >> 8) / static_cast<double>(1 << 24);
+            const auto bits      = half_bits(gain / (7.0 * std::sqrt(static_cast<double>(k))));
+            const std::size_t at = static_cast<std::size_t>(w.scale_plane_offset) +
+                                   (static_cast<std::size_t>(r) * (padded / 64) + g) * 2;
+            w.payload[at]     = static_cast<std::uint8_t>(bits & 0xFFU);
+            w.payload[at + 1] = static_cast<std::uint8_t>(bits >> 8);
+        }
+    }
+}
+
 // BF16 weights of the same scale as randomize_q8's: per 32-element group a gain g in [2, 6), values
 // uniform in (-1, 1) * g / sqrt(K), rounded to BF16 (the oracle reads the rounded values).
 void randomize_bf16(infernix::test::quantized_weight::PackedWeight& w, std::uint32_t seed) {
@@ -212,7 +252,7 @@ std::vector<float> decode_bf16(const infernix::test::quantized_weight::PackedWei
     return out;
 }
 
-enum class Codec { Q8, Bf16 };
+enum class Codec { Q8, Q4, Bf16 };
 
 struct Problem {
     int down_rows = 0;
@@ -243,6 +283,13 @@ Problem make_problem(bool inject, Codec codec) {
         randomize_q8(p.up, 607U);
         p.down_values = decode_q8(p.down);
         p.up_values   = decode_q8(p.up);
+    } else if (codec == Codec::Q4) {
+        p.down = t::linear::make_q4_g64_fp16_weight(p.down_rows, kW, inject ? 521U : 523U);
+        p.up   = t::linear::make_q4_g64_fp16_weight(kW, kRank, 529U);
+        randomize_q4(p.down, inject ? 621U : 623U);
+        randomize_q4(p.up, 627U);
+        p.down_values = decode_q4(p.down);
+        p.up_values   = decode_q4(p.up);
     } else {
         p.down = t::linear::make_bf16_weight(p.down_rows, kW, inject ? 511U : 513U);
         p.up   = t::linear::make_bf16_weight(kW, kRank, 519U);
@@ -400,7 +447,8 @@ void up_collapse_bit_identity(Codec codec, cudaStream_t stream) {
 // degrades to the same two launches, which this check pins).
 void inject_mix_bit_identity(Codec codec, cudaStream_t stream) {
     Problem p                = make_problem(true, codec);
-    const std::string tag    = codec == Codec::Q8 ? "q8 inject mix" : "bf16 inject mix";
+    const std::string tag =
+        codec == Codec::Q8 ? "q8 inject mix" : (codec == Codec::Q4 ? "q4 inject mix" : "bf16 inject mix");
     constexpr int kMaxTokens = 17;
     const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
         p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, kMaxTokens);
@@ -469,23 +517,24 @@ INFERNIX_OP_TEST(hyper_connection) {
         }
         cudaStream_t stream = nullptr;
         t::cuda_check(cudaStreamCreate(&stream), "stream");
-        // Both codecs, with a BF16 norm weight and with an FP32 one (NVIDIA FP4-Local's).
-        for (const Codec codec : {Codec::Q8, Codec::Bf16})
+        // Q8, Q4, and BF16 codecs, each with a BF16 norm weight and an FP32 one (NVIDIA FP4-Local's).
+        for (const Codec codec : {Codec::Q8, Codec::Q4, Codec::Bf16})
         for (const bool fp32_norm : {false, true})
         for (const bool inject : {true, false}) {
             Problem p = make_problem(inject, codec);
             const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
                 p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 193);
             infernix::WorkspaceArena ws(capacity);
-            const std::string tag = std::string(codec == Codec::Q8 ? "q8 " : "bf16 ") +
-                                    (fp32_norm ? "fp32-norm " : "") + (inject ? "inject" : "no inject");
+            const std::string tag =
+                std::string(codec == Codec::Q8 ? "q8 " : (codec == Codec::Q4 ? "q4 " : "bf16 ")) +
+                (fp32_norm ? "fp32-norm " : "") + (inject ? "inject" : "no inject");
             const std::vector<double> norm = p.norm_values(fp32_norm);
             for (const int T : {1, 4, 5, 8, 9, 16, 17, 64, 96, 97, 129, 193}) {
                 const auto r     = residual(T, 1000U + static_cast<std::uint32_t>(T));
                 const Result got = run(p, r, T, inject, ws, stream, false, fp32_norm);
                 compare(got, oracle(r, norm, p.down_values, p.down_rows, p.up_values, T),
                         T <= (codec == Codec::Q8 ? infernix::ops::detail::kHcMixFusedMaxColumnsQ8
-                                                 : infernix::ops::detail::kHcMixFusedMaxColumnsBf16),
+                                                 : (codec == Codec::Q4 ? 4 : infernix::ops::detail::kHcMixFusedMaxColumnsBf16)),
                         inject, tag + " T=" + std::to_string(T));
                 check(ws.peak_used() <= capacity, tag + ": the workspace capacity covers T=" + std::to_string(T));
             }
@@ -517,6 +566,16 @@ INFERNIX_OP_TEST(hyper_connection) {
                 bool same9 = std::equal(nine.x.begin(), nine.x.end(), all.x.begin()) &&
                              (!inject || std::equal(nine.inject.begin(), nine.inject.end(), all.inject.begin()));
                 check(same9, tag + ": a 9-column call equals the first nine of the 16-column call");
+            }
+            if (codec == Codec::Q4) {
+                const std::vector<std::uint16_t> r5(r16.begin(), r16.begin() + 5 * kW);
+                const Result five = run(p, r5, 5, inject, ws, stream, false, fp32_norm);
+                const bool same5 = std::equal(five.x.begin(), five.x.end(), all.x.begin()) &&
+                                   (!inject || std::equal(five.inject.begin(), five.inject.end(), all.inject.begin()));
+                check(same5, tag + ": a 5-column Q4 MMA call equals the first five of the 16-column call");
+                const Result captured5 = run(p, r5, 5, inject, ws, stream, true, fp32_norm);
+                check(captured5.x == five.x && captured5.inject == five.inject,
+                      tag + ": a graph-captured 5-column call equals the eager call");
             }
             const Result captured = run(p, r9, 9, inject, ws, stream, true, fp32_norm);
             check(captured.x == nine.x && captured.inject == nine.inject, tag + ": a graph-captured call equals the eager call");
@@ -550,6 +609,7 @@ INFERNIX_OP_TEST(hyper_connection) {
                 check(norm_mix_same, tag + ": hyper_connection_norm + mix_normalized bit-equals mix at T=193");
             }
         }
+        inject_mix_bit_identity(Codec::Q4, stream);
         up_collapse_bit_identity(Codec::Q8, stream);
         // Shapes that disagree are refused.
         {

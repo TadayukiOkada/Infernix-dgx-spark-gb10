@@ -1155,6 +1155,12 @@ public:
             diagnostic("PLE GPU-direct UMA unavailable (resident buffer not device-mapped); falling back to CPU hash+copy",
                        DiagnosticLevel::Warning);
         }
+        if (use_mapped_cache_ple()) {
+            ngram_slots_host_ = PinnedHostBuffer(
+                static_cast<std::size_t>(columns_) * hash_.heads() * sizeof(std::uint32_t));
+            diagnostic("PLE GPU-direct UMA cache: fused gather+embed active on mapped n-gram host cache",
+                       DiagnosticLevel::Debug);
+        }
         allocate(constraint_, constraint_bytes(lanes, max_width_), allocated);
         constraint_pinned_ = PinnedHostBuffer(constraint_bytes(lanes, max_width_));
         allocate(grammar_masks_, grammar_mask_bytes(token_domain_, lanes, max_width_), allocated);
@@ -2464,6 +2470,7 @@ public:
         const bool streamed = !walk_.active && stream_chunk(width);
         score_column_       = begin;
         const execution::VisionInput* vision = stage_vision(lane, static_cast<std::uint32_t>(begin), width);
+        reset_l2_persist_for_prefill();
         bool prefill_compact = false;
         if (rows_behind && (streamed || options_.device_experts)) {
             prefill_compact = run_rows_behind(lane, begin, width, chunk ? &*chunk : nullptr, vision, streamed);
@@ -2923,6 +2930,7 @@ public:
         const bool screened   = screened_round(round_lanes, batch);
         DecodeGraph& graph    = decode_graph(batch, screened);
         const bool direct_ple = use_direct_ple();
+        if (use_mapped_cache_ple()) { volume_.unpin_slots(); }
         if (!direct_ple) { prepare_decode_ngram_rows(round_lanes, round_positions); }
         const bool gated = !direct_ple && graph.executable.ready() && !volume_.cached(row_ids_);
         stage_decode(round_lanes, round_positions);
@@ -2933,7 +2941,7 @@ public:
         }
         run_decode(batch, round_positions[0], graph, screened);
         if (gated) {
-            read_behind_gate(round_lanes, word, io_prefix(batch) - io_layout_.ngram,
+            read_behind_gate(round_lanes, word, ngram_rows_bytes(batch),
                              [&] { read_prepared_decode_ngram_rows(round_lanes); });
         }
         // The route download stays in run_decode (GB10 placement, guarded by track_routes()).
@@ -3969,6 +3977,12 @@ private:
         GateRelease& operator=(const GateRelease&) = delete;
         ~GateRelease() {
             if (owner == nullptr) { return; }
+            if (owner->use_mapped_cache_ple()) {
+                const std::size_t n_slots = bytes / owner->ngram_table().row_bytes;
+                std::fill_n(static_cast<std::uint32_t*>(owner->ngram_slots_host_.data()), n_slots,
+                            NgramVolume::kStagingSlotBit);
+                owner->volume_.unpin_slots();
+            }
             std::memset(owner->host_io() + owner->io_layout_.ngram, 0, bytes);
             publish_pinned_word(owner->gate_ready(), word);
         }
@@ -4027,15 +4041,29 @@ private:
     // Prefill and forced-token calls copy the whole layout (their MTP cells follow the rows).
     [[nodiscard]] bool use_direct_ple() const noexcept { return ple_hash_table_.resident_blocks != nullptr; }
 
+    [[nodiscard]] bool use_mapped_cache_ple() const noexcept {
+        if (c_.lossless || use_direct_ple() || volume_.cache_device_ptr() == nullptr) { return false; }
+        const auto fmt = ngram_table().format;
+        if (fmt != NgramRowFormat::Nvfp4 && fmt != NgramRowFormat::Fp8E4m3) { return false; }
+        return (c_.ple.layer < parameters_.layers.size() && parameters_.layers[c_.ple.layer].ple &&
+                parameters_.layers[c_.ple.layer].ple->ngram_scale.data != nullptr) ||
+               ngram_scale_.p != nullptr;
+    }
+
     std::size_t io_control_bytes(std::int32_t columns) const noexcept {
         return use_direct_ple()
                    ? (io_layout_.ple_windows + 4ULL * static_cast<std::size_t>(c_.ple.ngram.ngram_size) * columns)
                    : io_layout_.ngram;
     }
 
-    std::size_t io_prefix(std::int32_t columns) const {
+    std::size_t ngram_rows_bytes(std::int32_t columns) const {
+        return static_cast<std::size_t>(columns) * hash_.heads() * ngram_table().row_bytes;
+    }
+
+    std::size_t io_prefix(std::int32_t columns, bool allow_mapped_cache = true) const {
         if (use_direct_ple()) { return io_control_bytes(columns); }
-        return io_layout_.ngram + static_cast<std::size_t>(columns) * hash_.heads() * ngram_table().row_bytes;
+        if (allow_mapped_cache && use_mapped_cache_ple()) { return io_layout_.ngram; }
+        return io_layout_.ngram + ngram_rows_bytes(columns);
     }
 
     SequenceHandle handle(std::uint32_t lane) const noexcept {
@@ -4203,9 +4231,9 @@ private:
     // The n-gram rows of `count` positions starting at `begin`, from the tokens before them; the
     // traffic counts toward `lane`'s request.
     void stage_ngram(Lane& lane, const std::vector<std::int32_t>& history, std::int32_t begin, std::int32_t count,
-                     std::size_t column) {
+                     std::size_t column, bool allow_mapped_cache = true) {
         ngram_window(history, begin, count);
-        read_ngram(lane, count, column);
+        read_ngram(lane, count, column, allow_mapped_cache);
     }
 
     // window_ = the tokens of positions [begin - (n - 1), begin + count), EOS before the sequence.
@@ -4291,8 +4319,11 @@ private:
 
     void read_prepared_verify_ngram_batch(std::span<const std::uint32_t> lanes, std::int32_t W,
                                           std::span<const std::int32_t> from, std::span<const std::int32_t> to,
-                                          std::int32_t total_cols, bool contiguous) {
-        if (total_cols == 0) { return; }
+                                          std::int32_t total_cols, bool contiguous, bool keep_pinned = false) {
+        if (total_cols == 0) {
+            if (!keep_pinned && use_mapped_cache_ple()) { volume_.unpin_slots(); }
+            return;
+        }
         const auto batch = static_cast<std::int32_t>(lanes.size());
         const nvtx::ScopedRange rows_range(nvtx::Name::PleRows, nvtx::Category::Control,
                                            static_cast<std::uint64_t>(total_cols));
@@ -4301,7 +4332,42 @@ private:
         const std::size_t col_bytes        = heads * row_bytes;
         std::byte* const base              = host_io() + io_layout_.ngram;
         const NgramVolume::Counters before = volume_.counters();
-        if (contiguous || batch == 1) {
+        if (use_mapped_cache_ple()) {
+            auto* const slots_base = reinterpret_cast<std::uint32_t*>(ngram_slots_host_.data());
+            if (contiguous || batch == 1) {
+                const std::size_t dst_col = batch == 1 ? static_cast<std::size_t>(from[0]) : 0ULL;
+                const std::size_t n_slots = static_cast<std::size_t>(total_cols) * heads;
+                volume_.resolve_slots(
+                    row_ids_, std::span<std::uint32_t>(slots_base + dst_col * heads, n_slots),
+                    std::span<std::byte>(base + dst_col * col_bytes, static_cast<std::size_t>(total_cols) * col_bytes),
+                    keep_pinned);
+            } else {
+                const std::size_t n_slots = static_cast<std::size_t>(total_cols) * heads;
+                ngram_slots_scratch_.resize(n_slots);
+                ngram_stage_scratch_.resize(static_cast<std::size_t>(total_cols) * col_bytes);
+                volume_.resolve_slots(row_ids_, ngram_slots_scratch_,
+                                      std::span<std::byte>(ngram_stage_scratch_.data(), ngram_stage_scratch_.size()),
+                                      keep_pinned);
+                std::size_t src_col = 0;
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    const std::int32_t f = from[b], t = to[b];
+                    if (f >= t) { continue; }
+                    const auto count          = static_cast<std::size_t>(t - f);
+                    const std::size_t dst_col = static_cast<std::size_t>(b * W + f);
+                    const std::size_t n_copy  = count * heads;
+                    std::memcpy(slots_base + dst_col * heads, ngram_slots_scratch_.data() + src_col * heads,
+                                n_copy * sizeof(std::uint32_t));
+                    for (std::size_t k = 0; k < n_copy; ++k) {
+                        if ((ngram_slots_scratch_[src_col * heads + k] & NgramVolume::kStagingSlotBit) != 0U) {
+                            std::memcpy(base + (dst_col * heads + k) * row_bytes,
+                                        ngram_stage_scratch_.data() + (src_col * heads + k) * row_bytes, row_bytes);
+                        }
+                    }
+                    src_col += count;
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+        } else if (contiguous || batch == 1) {
             const std::size_t dst_col = batch == 1 ? static_cast<std::size_t>(from[0]) : 0ULL;
             volume_.read_rows(row_ids_,
                               std::span<std::byte>(base + dst_col * col_bytes,
@@ -4341,14 +4407,39 @@ private:
     void stage_verify_ngram_batch(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
                                   std::int32_t W, std::span<const std::int32_t> from,
                                   std::span<const std::int32_t> to) {
+        if (use_mapped_cache_ple()) { volume_.unpin_slots(); }
         const auto [total_cols, contiguous] = prepare_verify_ngram_batch(lanes, positions, W, from, to);
-        read_prepared_verify_ngram_batch(lanes, W, from, to, total_cols, contiguous);
+        read_prepared_verify_ngram_batch(lanes, W, from, to, total_cols, contiguous, /*keep_pinned=*/true);
     }
 
     // Reads the rows of the `count` positions whose tokens (with their context) are in window_ into
     // io columns from `column`.
-    void read_ngram(Lane& lane, std::int32_t count, std::size_t column) {
+    void read_ngram(Lane& lane, std::int32_t count, std::size_t column, bool allow_mapped_cache = true) {
+        if (allow_mapped_cache && use_mapped_cache_ple()) {
+            resolve_ngram_to(lane, count, column);
+            return;
+        }
         read_ngram_to(lane, count, host_io() + io_layout_.ngram + column * hash_.heads() * ngram_table().row_bytes);
+    }
+
+    void resolve_ngram_to(Lane& lane, std::int32_t count, std::size_t column) {
+        const nvtx::ScopedRange rows_range(nvtx::Name::PleRows, nvtx::Category::Control, static_cast<std::uint64_t>(count));
+        const std::size_t heads = hash_.heads();
+        const std::size_t n     = static_cast<std::size_t>(count) * heads;
+        row_ids_.resize(n);
+        hash_.row_ids(window_, static_cast<std::size_t>(count), row_ids_.data());
+        const std::size_t row_bytes        = ngram_table().row_bytes;
+        auto* const slots                  = reinterpret_cast<std::uint32_t*>(ngram_slots_host_.data()) + column * heads;
+        std::byte* const fallback          = host_io() + io_layout_.ngram + column * heads * row_bytes;
+        const NgramVolume::Counters before = volume_.counters();
+        volume_.resolve_slots(row_ids_, std::span<std::uint32_t>(slots, n),
+                              std::span<std::byte>(fallback, n * row_bytes), /*keep_pinned=*/false);
+        std::atomic_thread_fence(std::memory_order_release);
+        const NgramVolume::Counters& after = volume_.counters();
+        lane.ngram.rows += after.rows - before.rows;
+        lane.ngram.hits += after.hits - before.hits;
+        lane.ngram.reads += after.reads - before.reads;
+        lane.ngram.read_ns += after.read_ns - before.read_ns;
     }
 
     // As read_ngram, into `out` (count * heads rows).
@@ -4429,7 +4520,7 @@ private:
 
     // `rows`: also read the n-gram rows (a walk chunk whose rows were prefetched skips them).
     void stage_sequence(std::uint32_t lane, std::int32_t begin, std::int32_t width,
-                        const std::vector<std::int32_t>& history, bool rows = true) {
+                        const std::vector<std::int32_t>& history, bool rows = true, bool allow_mapped_cache = true) {
         auto* ids       = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
         auto* positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         auto* columns   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.columns);
@@ -4445,7 +4536,7 @@ private:
             if (use_direct_ple()) {
                 stage_ple_windows_seq(history, begin, width);
             } else {
-                stage_ngram(lanes_[lane], history, begin, width, 0);
+                stage_ngram(lanes_[lane], history, begin, width, 0, allow_mapped_cache);
             }
         }
         host_lanes_[0] = static_cast<std::int32_t>(lane);
@@ -4490,8 +4581,17 @@ private:
         const std::size_t heads            = hash_.heads();
         const std::size_t row_bytes        = ngram_table().row_bytes;
         const NgramVolume::Counters before = volume_.counters();
-        volume_.read_rows(row_ids_,
-                          std::span<std::byte>(host_io() + io_layout_.ngram, lanes.size() * heads * row_bytes));
+        if (use_mapped_cache_ple()) {
+            const std::size_t n_slots = lanes.size() * heads;
+            volume_.resolve_slots(
+                row_ids_,
+                std::span<std::uint32_t>(reinterpret_cast<std::uint32_t*>(ngram_slots_host_.data()), n_slots),
+                std::span<std::byte>(host_io() + io_layout_.ngram, n_slots * row_bytes), /*keep_pinned=*/false);
+            std::atomic_thread_fence(std::memory_order_release);
+        } else {
+            volume_.read_rows(row_ids_,
+                              std::span<std::byte>(host_io() + io_layout_.ngram, lanes.size() * heads * row_bytes));
+        }
         const NgramVolume::Counters& after = volume_.counters();
         const std::uint64_t d_rows         = after.rows - before.rows;
         const std::uint64_t d_hits         = after.hits - before.hits;
@@ -4681,7 +4781,13 @@ private:
                 stage_ngram(lane, lane.history, begin, width, 0);
             } catch (...) {
                 failed = std::current_exception();
-                std::memset(host_io() + io_layout_.ngram, 0, io_prefix(width) - io_layout_.ngram);
+                if (use_mapped_cache_ple()) {
+                    const std::size_t n_slots = static_cast<std::size_t>(width) * hash_.heads();
+                    std::fill_n(static_cast<std::uint32_t*>(ngram_slots_host_.data()), n_slots,
+                                NgramVolume::kStagingSlotBit);
+                    volume_.unpin_slots();
+                }
+                std::memset(host_io() + io_layout_.ngram, 0, ngram_rows_bytes(width));
             }
             publish_pinned_word(gate_ready(), word);
         });
@@ -4909,6 +5015,7 @@ private:
     }
 
     void enter_wide(std::int32_t columns) {
+        reset_l2_persist_for_prefill();
         DeviceSpan span{};
         // This call's need, and a lease for the prefilling lanes' remaining calls (one too small for this
         // call is lent again).
@@ -5030,6 +5137,34 @@ private:
     // later rounds replay it.
     // `position`: the first sequence's (a one-column round's context, for the plain divisor). `graph`: the
     // round kind's graph for this batch (graphs_, or screened_graphs_ for a screened round).
+    [[nodiscard]] std::size_t decode_l2_persist_bytes() const noexcept {
+        const std::size_t persist_bytes = device_.persisting_l2_cache_bytes();
+        const std::size_t max_window    = device_.access_policy_max_window_bytes();
+        if (persist_bytes == 0 || max_window == 0 || !work_ || work_->base() == nullptr) { return 0; }
+        return std::min({work_->capacity(), max_window, persist_bytes});
+    }
+
+    struct DecodeL2PersistGuard {
+        std::array<ScopedL2AccessPolicyWindow, 3> windows{};
+        explicit DecodeL2PersistGuard(const ProgramImpl& p) {
+            const std::size_t bytes = p.decode_l2_persist_bytes();
+            if (bytes == 0) { return; }
+            enable_persisting_l2_cache(p.device_);
+            const std::size_t max_window = p.device_.access_policy_max_window_bytes();
+            const void* base             = p.work_->base();
+            windows[0] = ScopedL2AccessPolicyWindow(p.device_.stream, base, bytes, max_window, 1.0F,
+                                                    cudaAccessPropertyPersisting, cudaAccessPropertyNormal);
+            windows[1] = ScopedL2AccessPolicyWindow(p.overlap_.shared_stream, base, bytes, max_window, 1.0F,
+                                                    cudaAccessPropertyPersisting, cudaAccessPropertyNormal);
+            windows[2] = ScopedL2AccessPolicyWindow(p.overlap_.split_stream, base, bytes, max_window, 1.0F,
+                                                    cudaAccessPropertyPersisting, cudaAccessPropertyNormal);
+        }
+    };
+
+    void reset_l2_persist_for_prefill() noexcept {
+        disable_persisting_l2_cache(device_);
+    }
+
     struct DecodeGraph; // below, with the graphs
     void run_decode(std::int32_t batch, std::int32_t position, DecodeGraph& graph, bool screened) {
         const cudaStream_t s = device_.stream;
@@ -5039,6 +5174,7 @@ private:
         if (!options_.device_experts) { residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active); }
         // The lossless route runs eagerly (its experts' pass reads job counts on the host).
         if (c_.lossless) {
+            const DecodeL2PersistGuard l2_guard(*this);
             decode_graph_body(batch, screened);
         } else {
             replay(graph, [&] { decode_graph_body(batch, screened); });
@@ -5167,11 +5303,15 @@ private:
         // With graphs refused (--no-cuda-graph) every round runs eagerly and nothing is ever
         // captured, giving a real eager baseline instead of a label-only switch.
         if (!options_.use_cuda_graph) {
+            const DecodeL2PersistGuard l2_guard(*this);
             body();
             return;
         }
         if (graph.executable.ready()) {
-            if (!graph_set_.capturing) { graph.executable.launch(s); }
+            if (!graph_set_.capturing) {
+                enable_persisting_l2_cache(device_);
+                graph.executable.launch(s);
+            }
             return;
         }
         prepare_graph(graph, [&] { graph.definition.capture(s, body); });
@@ -5185,11 +5325,15 @@ private:
         // The label-only switch was the same bug on this path: with graphs refused every round
         // runs the eager bodies and nothing is captured.
         if (!options_.use_cuda_graph) {
+            const DecodeL2PersistGuard l2_guard(*this);
             for (std::int32_t j = 0; j < steps; ++j) { body(j); }
             return;
         }
         if (graph.executable.ready()) {
-            if (!graph_set_.capturing) { graph.executable.launch(s); }
+            if (!graph_set_.capturing) {
+                enable_persisting_l2_cache(device_);
+                graph.executable.launch(s);
+            }
             return;
         }
         prepare_graph(graph, [&] { graph.definition.capture_gated_chain(s, steps, body, gate); });
@@ -5209,7 +5353,12 @@ private:
             throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
         }
         const std::size_t free_before = trace_ ? trace_free() : 0;
-        capture();
+        if (graph_set_.capturing) {
+            capture();
+        } else {
+            const DecodeL2PersistGuard l2_guard(*this);
+            capture();
+        }
         graph.executable.instantiate(graph.definition);
         if (graph_set_.capturing) {
             graph.executable.upload(s);
@@ -5289,6 +5438,28 @@ private:
         fb.decode_round  = decode_round;
         fb.screened_head = screened_head;
         fb.ngram_gate    = gate;
+        ops::PleCacheGather cache_gather;
+        if (use_mapped_cache_ple()) {
+            cache_gather.cache_base    = volume_.cache_device_ptr();
+            cache_gather.fallback_rows = io_host_.device_data() != nullptr
+                                             ? static_cast<std::byte*>(io_host_.device_data()) + io_layout_.ngram
+                                             : host_io() + io_layout_.ngram;
+            cache_gather.slots         = reinterpret_cast<const std::uint32_t*>(
+                ngram_slots_host_.device_data() != nullptr ? ngram_slots_host_.device_data()
+                                                           : ngram_slots_host_.data());
+            cache_gather.cache_slots   = volume_.cache_slot_count();
+            cache_gather.heads         = dim(hash_.heads());
+            cache_gather.head_width    = dim(c_.ple.head_width());
+            cache_gather.row_bytes     = dim(ngram_table().row_bytes);
+            if (gate != nullptr) {
+                cache_gather.ready      = gate->ready;
+                cache_gather.expected   = gate->expected;
+                cache_gather.wait_stats = gate->wait_stats;
+                cache_gather.wait_row   = gate->wait_row;
+            }
+            fb.ple_cache_gather = &cache_gather;
+            fb.ngram_gate       = nullptr;
+        }
         fb.verify        = verify;
         fb.mtp_chunk     = chunk;
         fb.layer_waits   = next_waits_;
@@ -5604,7 +5775,7 @@ private:
         if (!options_.device_experts) { residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active); }
         replay(graph, [&] { verify_graph_body(batch, W, screened, tree_round); });
         if (gated) {
-            read_behind_gate(lanes, word, io_prefix(batch * W) - io_layout_.ngram, [&] {
+            read_behind_gate(lanes, word, ngram_rows_bytes(batch * W), [&] {
                 read_prepared_verify_ngram_batch(lanes, W, std::span<const std::int32_t>(clamped_staged.data(), batch),
                                                  std::span<const std::int32_t>(to.data(), batch), total_cols, contiguous);
             });
@@ -7913,6 +8084,8 @@ private:
     DeviceBuffer ple_hash_multipliers_, ple_hash_sizes_, ple_hash_offsets_;
     Tensor ple_hash_mult_tensor_, ple_hash_size_tensor_, ple_hash_off_tensor_;
     ops::PleNgramHashTable ple_hash_table_{};
+    PinnedHostBuffer ngram_slots_host_{1};
+    std::vector<std::uint32_t> ngram_slots_scratch_;
     std::vector<PagedKVBatchLayerView> kv_compact_layers_;
     std::array<bool, kMaximumConcurrency> row_is_tree_{};
     std::array<std::int32_t, kMaximumConcurrency> tree_side_token_{};

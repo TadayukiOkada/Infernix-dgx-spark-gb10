@@ -91,6 +91,36 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceProperties failed", err));
     }
 
+    // Reserve 3/8 of L2 (9.0 MiB on GB10's 24 MiB L2) for persisting decode workspace:
+    // hardware sweeps on sm_121a measured a ~2x throughput cliff at 18 MiB (190.6 GB/s DRAM,
+    // 53.38 TF BF16 GEMM vs 242.0 GB/s, 105.00 TF at 9.0 MiB and 107.38 TF at default 4.5 MiB).
+    if (props.persistingL2CacheMaxSize > 0) {
+        const std::size_t max_persist = static_cast<std::size_t>(props.persistingL2CacheMaxSize);
+        const std::size_t l2_bytes =
+            props.l2CacheSize > 0 ? static_cast<std::size_t>(props.l2CacheSize) : max_persist;
+        const std::size_t target = std::min(max_persist, l2_bytes * 3 / 8);
+        if (target > 0) {
+            const cudaError_t l2_err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, target);
+            if (l2_err == cudaErrorNotSupported || l2_err == cudaErrorInvalidValue) {
+                (void)cudaGetLastError();
+            } else if (l2_err != cudaSuccess) {
+                throw std::runtime_error(
+                    cuda_error_message("cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize) failed", l2_err));
+            }
+        }
+        std::size_t applied          = 0;
+        const cudaError_t get_l2_err = cudaDeviceGetLimit(&applied, cudaLimitPersistingL2CacheSize);
+        if (get_l2_err == cudaErrorNotSupported || get_l2_err == cudaErrorInvalidValue) {
+            (void)cudaGetLastError();
+        } else if (get_l2_err != cudaSuccess) {
+            throw std::runtime_error(
+                cuda_error_message("cudaDeviceGetLimit(cudaLimitPersistingL2CacheSize) failed", get_l2_err));
+        } else {
+            persisting_l2_bytes        = applied;
+            active_persisting_l2_bytes = applied;
+        }
+    }
+
     cudaStream_t compute = nullptr;
     cudaStream_t load    = nullptr;
     err                  = cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking);
@@ -118,9 +148,12 @@ DeviceContext::~DeviceContext() {
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
-      props(other.props) {
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
+      props(other.props), persisting_l2_bytes(other.persisting_l2_bytes),
+      active_persisting_l2_bytes(other.active_persisting_l2_bytes) {
+    other.stream                     = nullptr;
+    other.transfer_stream            = nullptr;
+    other.persisting_l2_bytes        = 0;
+    other.active_persisting_l2_bytes = 0;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
@@ -130,13 +163,17 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     destroy_stream(transfer_stream);
     destroy_stream(stream);
 
-    device          = other.device;
-    props           = other.props;
-    stream          = other.stream;
-    transfer_stream = other.transfer_stream;
+    device                     = other.device;
+    props                      = other.props;
+    persisting_l2_bytes        = other.persisting_l2_bytes;
+    active_persisting_l2_bytes = other.active_persisting_l2_bytes;
+    stream                     = other.stream;
+    transfer_stream            = other.transfer_stream;
 
-    other.stream          = nullptr;
-    other.transfer_stream = nullptr;
+    other.stream                     = nullptr;
+    other.transfer_stream            = nullptr;
+    other.persisting_l2_bytes        = 0;
+    other.active_persisting_l2_bytes = 0;
     return *this;
 }
 
@@ -155,8 +192,24 @@ int DeviceContext::compute_capability() const noexcept { return props.major * 10
 
 int DeviceContext::multiprocessor_count() const noexcept { return props.multiProcessorCount; }
 
+bool DeviceContext::integrated_uma() const noexcept {
+    return props.integrated != 0 && props.canMapHostMemory != 0 && props.unifiedAddressing != 0;
+}
+
 DeviceExecutionView DeviceContext::execution_view() const noexcept {
     return {.stream = stream, .multiprocessor_count = multiprocessor_count()};
+}
+
+std::size_t DeviceContext::persisting_l2_cache_bytes() const noexcept {
+    return persisting_l2_bytes;
+}
+
+std::size_t DeviceContext::persisting_l2_cache_max_bytes() const noexcept {
+    return props.persistingL2CacheMaxSize > 0 ? static_cast<std::size_t>(props.persistingL2CacheMaxSize) : 0;
+}
+
+std::size_t DeviceContext::access_policy_max_window_bytes() const noexcept {
+    return props.accessPolicyMaxWindowSize > 0 ? static_cast<std::size_t>(props.accessPolicyMaxWindowSize) : 0;
 }
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
@@ -191,6 +244,122 @@ void DeviceContext::flush() const {
         return;
     }
     CUDA_CHECK(status);
+}
+
+ScopedL2AccessPolicyWindow::ScopedL2AccessPolicyWindow(cudaStream_t stream, const void* base_ptr,
+                                                       std::size_t num_bytes, std::size_t max_window_bytes,
+                                                       float hit_ratio, cudaAccessProperty hit_prop,
+                                                       cudaAccessProperty miss_prop) {
+    if (stream == nullptr || base_ptr == nullptr || num_bytes == 0 || max_window_bytes == 0 || hit_ratio <= 0.0F) {
+        return;
+    }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const cudaError_t cap_err              = cudaStreamIsCapturing(stream, &capture_status);
+    if (cap_err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    if (capture_status != cudaStreamCaptureStatusNone) { return; }
+
+    const cudaError_t get_err = cudaStreamGetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &previous_);
+    if (get_err != cudaSuccess) {
+        if (get_err == cudaErrorNotSupported || get_err == cudaErrorInvalidValue) {
+            (void)cudaGetLastError();
+            return;
+        }
+        throw std::runtime_error(cuda_error_message("cudaStreamGetAttribute(AccessPolicyWindow) failed", get_err));
+    }
+
+    cudaStreamAttrValue next{};
+    next.accessPolicyWindow.base_ptr  = const_cast<void*>(base_ptr);
+    next.accessPolicyWindow.num_bytes = std::min(num_bytes, max_window_bytes);
+    next.accessPolicyWindow.hitRatio  = std::clamp(hit_ratio, 0.0F, 1.0F);
+    next.accessPolicyWindow.hitProp   = hit_prop;
+    next.accessPolicyWindow.missProp  = miss_prop;
+    const cudaError_t set_err         = cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &next);
+    if (set_err != cudaSuccess) {
+        if (set_err == cudaErrorNotSupported || set_err == cudaErrorInvalidValue) {
+            (void)cudaGetLastError();
+            return;
+        }
+        throw std::runtime_error(cuda_error_message("cudaStreamSetAttribute(AccessPolicyWindow) failed", set_err));
+    }
+    stream_ = stream;
+    active_ = true;
+}
+
+ScopedL2AccessPolicyWindow::~ScopedL2AccessPolicyWindow() noexcept { restore(); }
+
+ScopedL2AccessPolicyWindow::ScopedL2AccessPolicyWindow(ScopedL2AccessPolicyWindow&& other) noexcept
+    : stream_(std::exchange(other.stream_, nullptr)), previous_(other.previous_),
+      active_(std::exchange(other.active_, false)) {}
+
+ScopedL2AccessPolicyWindow& ScopedL2AccessPolicyWindow::operator=(ScopedL2AccessPolicyWindow&& other) noexcept {
+    if (this == &other) { return *this; }
+    restore();
+    stream_   = std::exchange(other.stream_, nullptr);
+    previous_ = other.previous_;
+    active_   = std::exchange(other.active_, false);
+    return *this;
+}
+
+void ScopedL2AccessPolicyWindow::restore() noexcept {
+    if (!active_ || stream_ == nullptr) {
+        active_ = false;
+        stream_ = nullptr;
+        return;
+    }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream_, &capture_status) == cudaSuccess &&
+        capture_status == cudaStreamCaptureStatusNone) {
+        log_cuda_error("cudaStreamSetAttribute(AccessPolicyWindow restore)",
+                       cudaStreamSetAttribute(stream_, cudaStreamAttributeAccessPolicyWindow, &previous_));
+    } else {
+        (void)cudaGetLastError();
+    }
+    active_ = false;
+    stream_ = nullptr;
+}
+
+void reset_persisting_l2_cache(const DeviceContext& ctx) noexcept {
+    if (ctx.persisting_l2_cache_bytes() == 0) { return; }
+    log_cuda_error("cudaCtxResetPersistingL2Cache", cudaCtxResetPersistingL2Cache());
+}
+
+void enable_persisting_l2_cache(const DeviceContext& ctx) noexcept {
+    const std::size_t target = ctx.persisting_l2_cache_bytes();
+    if (target == 0 || ctx.active_persisting_l2_bytes == target) { return; }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    if (ctx.stream != nullptr &&
+        cudaStreamIsCapturing(ctx.stream, &capture_status) == cudaSuccess &&
+        capture_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    ctx.bind_to_current_thread_noexcept();
+    const cudaError_t err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, target);
+    if (err == cudaSuccess) {
+        ctx.active_persisting_l2_bytes = target;
+    } else {
+        log_cuda_error("cudaDeviceSetLimit(enable persisting L2)", err);
+    }
+}
+
+void disable_persisting_l2_cache(const DeviceContext& ctx) noexcept {
+    if (ctx.persisting_l2_cache_bytes() == 0 || ctx.active_persisting_l2_bytes == 0) { return; }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    if (ctx.stream != nullptr &&
+        cudaStreamIsCapturing(ctx.stream, &capture_status) == cudaSuccess &&
+        capture_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    ctx.bind_to_current_thread_noexcept();
+    log_cuda_error("cudaCtxResetPersistingL2Cache", cudaCtxResetPersistingL2Cache());
+    const cudaError_t err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+    if (err == cudaSuccess) {
+        ctx.active_persisting_l2_bytes = 0;
+    } else {
+        log_cuda_error("cudaDeviceSetLimit(disable persisting L2)", err);
+    }
 }
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
@@ -387,12 +556,38 @@ __global__ void __launch_bounds__(kGateThreads)
     }
 }
 
+__global__ void __launch_bounds__(1)
+    wait_pinned_word_kernel(const std::uint32_t* ready, const std::uint32_t* expected, std::uint64_t* stats,
+                            const std::int32_t* row) {
+    const std::uint32_t want = *expected;
+    const auto* word         = reinterpret_cast<const volatile std::uint32_t*>(ready);
+    if (*word != want) {
+        std::uint64_t start, now;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+        do {
+            __nanosleep(200);
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+            if (now - start > kPinnedGateTimeoutNs) { asm volatile("trap;"); }
+        } while (*word != want);
+        if (stats != nullptr) {
+            std::uint64_t* at = stats + 2 * (row != nullptr ? *row : 0);
+            atomicAdd(reinterpret_cast<unsigned long long*>(at), static_cast<unsigned long long>(now - start));
+            atomicAdd(reinterpret_cast<unsigned long long*>(at + 1), 1ULL);
+        }
+    }
+    __threadfence_system();
+}
+
 } // namespace
 
 void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t bytes, const std::uint32_t* pinned_ready,
                         const std::uint32_t* device_expected, std::uint64_t* wait_stats, const std::int32_t* wait_row,
                         cudaStream_t stream) {
     if (bytes == 0) { return; }
+    if (device_dst == pinned_src) {
+        wait_pinned_word(pinned_ready, device_expected, wait_stats, wait_row, stream);
+        return;
+    }
     if (bytes % 16 != 0 || (reinterpret_cast<std::uintptr_t>(device_dst) | reinterpret_cast<std::uintptr_t>(pinned_src)) % 16 != 0) {
         throw std::invalid_argument("upload_pinned_when: bytes and buffers must be 16-byte multiples");
     }
@@ -401,6 +596,18 @@ void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t by
     upload_pinned_when_kernel<<<ctas, kGateThreads, 0, stream>>>(static_cast<uint4*>(device_dst),
                                                                  static_cast<const uint4*>(pinned_src), bytes / 16,
                                                                  pinned_ready, device_expected, wait_stats, wait_row);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void wait_pinned_word(const std::uint32_t* pinned_ready, const std::uint32_t* device_expected,
+                      std::uint64_t* wait_stats, const std::int32_t* wait_row, cudaStream_t stream) {
+    if (pinned_ready == nullptr || device_expected == nullptr) {
+        if (pinned_ready != device_expected) {
+            throw std::invalid_argument("wait_pinned_word: ready and expected pointers must both be set or null");
+        }
+        return;
+    }
+    wait_pinned_word_kernel<<<1, 1, 0, stream>>>(pinned_ready, device_expected, wait_stats, wait_row);
     CUDA_CHECK(cudaGetLastError());
 }
 

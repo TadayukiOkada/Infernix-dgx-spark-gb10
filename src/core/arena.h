@@ -107,11 +107,13 @@ public:
     PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept;
 
     void* data() const noexcept;
+    void* device_data() const noexcept;
     std::size_t size() const noexcept;
 
 private:
-    void* data_       = nullptr;
-    std::size_t size_ = 0;
+    void* data_        = nullptr;
+    void* device_data_ = nullptr;
+    std::size_t size_  = 0;
 };
 
 using WorkspaceArena = DeviceArena;

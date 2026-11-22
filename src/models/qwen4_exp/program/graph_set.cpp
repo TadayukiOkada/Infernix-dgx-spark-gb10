@@ -122,6 +122,7 @@ void ProgramImpl::capture_graph_set() {
     };
     graph_set_.capturing = true;
     try {
+        const DecodeL2PersistGuard l2_guard(*this);
         // Plain rounds: every batch size (a screened round's columns at most the screened head's), and with a
         // drafter their one-column catch-up (commit(): MTP's, else DFlash2's).
         for (std::int32_t batch = 1; batch <= lanes; ++batch) {

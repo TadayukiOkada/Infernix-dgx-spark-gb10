@@ -66,6 +66,9 @@ public:
     void prefault(std::size_t begin, std::size_t end) const noexcept;
     // Page-locks and maps the block for the device; once.
     void pin();
+    // Attempts to register and map the block for integrated-UMA zero-copy without throwing.
+    // Returns nullptr when integrated UMA is unavailable or registration fails.
+    [[nodiscard]] void* try_pin_if_integrated_uma() noexcept;
     [[nodiscard]] std::byte* device_data() const noexcept { return device_; } // null before pin()
 
 private:

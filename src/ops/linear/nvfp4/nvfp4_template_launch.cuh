@@ -72,7 +72,7 @@ void launch_nvfp4_a16_mma(const Nvfp4A16Operands& p, Output output, Epilogue epi
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
                                    cudaStream_t stream, Rows rows = {},
-                                   pdl::Dependency dependency = pdl::Dependency::Serialized) {
+                                   pdl::Dependency dependency = pdl::Dependency::Programmatic) {
     validate_nvfp4_operands<Schedule>(p);
     constexpr int capacity =
         Schedule::kTokenCapacity ? Schedule::kTokenCapacity : Schedule::kBlockTokens;

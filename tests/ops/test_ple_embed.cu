@@ -12,12 +12,15 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using infernix::DType;
@@ -174,6 +177,231 @@ void test_nvfp4_spot(std::int32_t head_width) {
     check(dout.download() == expected, "nvfp4 spot: hand-computed cells differ");
 }
 
+void test_gather_embed_fp8(int width, std::initializer_list<int> cols_list, bool run_stress) {
+    constexpr int kHeads      = 16;
+    constexpr int kCacheSlots = 96;
+
+    struct MappedHost {
+        void* p = nullptr;
+        explicit MappedHost(std::size_t bytes) {
+            cuda_check(cudaHostAlloc(&p, bytes, cudaHostAllocMapped), "cudaHostAlloc");
+        }
+        ~MappedHost() {
+            if (p != nullptr) { cudaFreeHost(p); }
+        }
+        MappedHost(const MappedHost&)            = delete;
+        MappedHost& operator=(const MappedHost&) = delete;
+    };
+
+    std::mt19937 rng(7331U + static_cast<std::uint32_t>(width));
+    std::uniform_int_distribution<int> byte_dist(0, 0x7E);
+    std::uniform_int_distribution<int> slot_dist(0, kCacheSlots - 1);
+    const std::uint16_t scale_bf16 = bf16_rn(1.75F);
+    __nv_bfloat16 sb;
+    std::memcpy(&sb, &scale_bf16, 2);
+    const float scale_f = __bfloat162float(sb);
+    Buffer<std::uint16_t> dscale(std::vector<std::uint16_t>{scale_bf16});
+    Tensor ts(dscale.p, DType::BF16, {1});
+
+    MappedHost cache(static_cast<std::size_t>(kCacheSlots) * width);
+    auto* cache_p = static_cast<std::uint8_t*>(cache.p);
+    for (int i = 0; i < kCacheSlots * width; ++i) { cache_p[i] = static_cast<std::uint8_t>(byte_dist(rng)); }
+
+    const auto compute_oracle = [&](const std::uint8_t* fallback_p, const std::uint32_t* slots_p, int columns) {
+        std::vector<std::uint16_t> expected(static_cast<std::size_t>(kHeads) * width * columns);
+        for (int t = 0; t < columns; ++t) {
+            for (int h = 0; h < kHeads; ++h) {
+                const std::uint32_t slot_raw = slots_p[static_cast<std::size_t>(t) * kHeads + h];
+                const std::uint8_t* row =
+                    (slot_raw & infernix::ops::kPleCacheStagingBit) != 0U
+                        ? (fallback_p + (static_cast<std::size_t>(t) * kHeads + h) * width)
+                        : (cache_p + static_cast<std::size_t>(slot_raw) * width);
+                for (int d = 0; d < width; ++d) {
+                    expected[static_cast<std::size_t>(t) * (kHeads * width) + h * width + d] =
+                        bf16_rn(e4m3_byte(row[d]) * scale_f);
+                }
+            }
+        }
+        return expected;
+    };
+
+    for (const int columns : cols_list) {
+        MappedHost fallback(static_cast<std::size_t>(columns) * kHeads * width);
+        MappedHost slots(static_cast<std::size_t>(columns) * kHeads * sizeof(std::uint32_t));
+        auto* fallback_p = static_cast<std::uint8_t*>(fallback.p);
+        auto* slots_p    = static_cast<std::uint32_t*>(slots.p);
+        for (int i = 0; i < columns * kHeads * width; ++i) {
+            fallback_p[i] = static_cast<std::uint8_t>(byte_dist(rng));
+        }
+        for (int i = 0; i < columns * kHeads; ++i) {
+            slots_p[i] = (i % 11 == 0) ? infernix::ops::kPleCacheStagingBit : static_cast<std::uint32_t>(slot_dist(rng));
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+
+        Buffer<std::uint16_t> dout(static_cast<std::size_t>(kHeads) * width * columns);
+        Tensor to(dout.p, DType::BF16, {kHeads * width, columns});
+        infernix::ops::PleCacheGather gather{};
+        gather.cache_base    = cache_p;
+        gather.fallback_rows = fallback_p;
+        gather.slots         = slots_p;
+        gather.scale         = &ts;
+        gather.cache_slots   = kCacheSlots;
+        gather.heads         = kHeads;
+        gather.head_width    = width;
+        gather.row_bytes     = width;
+        infernix::ops::ple_gather_embed_fp8(gather, to, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "fp8 gather embed");
+        check(dout.download() == compute_oracle(fallback_p, slots_p, columns),
+              "fp8 gather ungated width=" + std::to_string(width) + " cols=" + std::to_string(columns) +
+                  ": differs from host oracle");
+    }
+
+    // Gated CUDA Graph capture/replay with host cache mutation between replays.
+    constexpr int kGraphCols = 16;
+    MappedHost fallback(static_cast<std::size_t>(kGraphCols) * kHeads * width);
+    MappedHost slots(static_cast<std::size_t>(kGraphCols) * kHeads * sizeof(std::uint32_t));
+    MappedHost ready_host(sizeof(std::uint32_t));
+    auto* fallback_p = static_cast<std::uint8_t*>(fallback.p);
+    auto* slots_p    = static_cast<std::uint32_t*>(slots.p);
+    auto* ready_p    = static_cast<volatile std::uint32_t*>(ready_host.p);
+    *ready_p         = 0U;
+
+    Buffer<std::uint32_t> d_expected(1);
+    Buffer<std::uint64_t> d_wait_stats(std::vector<std::uint64_t>{0ULL, 0ULL});
+    Buffer<std::uint16_t> dout(static_cast<std::size_t>(kHeads) * width * kGraphCols);
+    Tensor to(dout.p, DType::BF16, {kHeads * width, kGraphCols});
+
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream create");
+
+    infernix::ops::PleCacheGather gather{};
+    gather.cache_base    = cache_p;
+    gather.fallback_rows = fallback_p;
+    gather.slots         = slots_p;
+    gather.scale         = &ts;
+    gather.cache_slots   = kCacheSlots;
+    gather.heads         = kHeads;
+    gather.head_width    = width;
+    gather.row_bytes     = width;
+    gather.ready         = static_cast<const std::uint32_t*>(ready_host.p);
+    gather.expected      = d_expected.p;
+    gather.wait_stats    = d_wait_stats.p;
+
+    cudaGraph_t graph          = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "begin capture");
+    infernix::ops::ple_gather_embed_fp8(gather, to, stream);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
+    cuda_check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "instantiate");
+
+    for (const std::uint32_t word : {1U, 2U}) {
+        cuda_check(cudaMemcpyAsync(d_expected.p, &word, sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream),
+                   "expected");
+        const auto stage = [&] {
+            for (int i = 0; i < kCacheSlots * width; ++i) { cache_p[i] = static_cast<std::uint8_t>(byte_dist(rng)); }
+            for (int i = 0; i < kGraphCols * kHeads * width; ++i) {
+                fallback_p[i] = static_cast<std::uint8_t>(byte_dist(rng));
+            }
+            for (int i = 0; i < kGraphCols * kHeads; ++i) {
+                slots_p[i] =
+                    (i % 9 == 0) ? infernix::ops::kPleCacheStagingBit : static_cast<std::uint32_t>(slot_dist(rng));
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            *ready_p = word;
+        };
+        std::thread writer;
+        if (word == 2U) {
+            cuda_check(cudaGraphLaunch(graph_exec, stream), "graph launch gated");
+            writer = std::thread([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                stage();
+            });
+        } else {
+            stage();
+            cuda_check(cudaGraphLaunch(graph_exec, stream), "graph launch ungated");
+        }
+        cuda_check(cudaStreamSynchronize(stream), "stream sync");
+        if (writer.joinable()) { writer.join(); }
+        check(dout.download() == compute_oracle(fallback_p, slots_p, kGraphCols),
+              "fp8 gather graph replay width=" + std::to_string(width) + " word=" + std::to_string(word) +
+                  ": differs from oracle");
+    }
+    const auto stats = d_wait_stats.download();
+    check(stats[0] > 0 && stats[1] == 1ULL, "fp8 gather gate wait_stats mismatch");
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+
+    if (run_stress) {
+        for (const int stress_cols : {1, 64}) {
+            MappedHost s_fallback(static_cast<std::size_t>(stress_cols) * kHeads * width);
+            MappedHost s_slots(static_cast<std::size_t>(stress_cols) * kHeads * sizeof(std::uint32_t));
+            MappedHost s_ready_host(sizeof(std::uint32_t));
+            auto* s_fallback_p = static_cast<std::uint8_t*>(s_fallback.p);
+            auto* s_slots_p    = static_cast<std::uint32_t*>(s_slots.p);
+            auto* s_ready_p    = static_cast<volatile std::uint32_t*>(s_ready_host.p);
+            *s_ready_p         = 0U;
+
+            Buffer<std::uint32_t> d_s_expected(1);
+            Buffer<std::uint16_t> d_s_out(static_cast<std::size_t>(kHeads) * width * stress_cols);
+            Tensor t_s_out(d_s_out.p, DType::BF16, {kHeads * width, stress_cols});
+
+            infernix::ops::PleCacheGather s_gather{};
+            s_gather.cache_base    = cache_p;
+            s_gather.fallback_rows = s_fallback_p;
+            s_gather.slots         = s_slots_p;
+            s_gather.scale         = &ts;
+            s_gather.cache_slots   = kCacheSlots;
+            s_gather.heads         = kHeads;
+            s_gather.head_width    = width;
+            s_gather.row_bytes     = width;
+            s_gather.ready         = static_cast<const std::uint32_t*>(s_ready_host.p);
+            s_gather.expected      = d_s_expected.p;
+
+            cudaGraph_t s_graph          = nullptr;
+            cudaGraphExec_t s_graph_exec = nullptr;
+            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "stress begin capture");
+            infernix::ops::ple_gather_embed_fp8(s_gather, t_s_out, stream);
+            cuda_check(cudaStreamEndCapture(stream, &s_graph), "stress end capture");
+            cuda_check(cudaGraphInstantiate(&s_graph_exec, s_graph, nullptr, nullptr, 0), "stress instantiate");
+
+            for (std::uint32_t iter = 1; iter <= 256U; ++iter) {
+                cuda_check(cudaMemcpyAsync(d_s_expected.p, &iter, sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream),
+                           "stress expected");
+                cuda_check(cudaGraphLaunch(s_graph_exec, stream), "stress launch");
+                std::thread writer([&] {
+                    if (iter % 16U == 0U) { std::this_thread::sleep_for(std::chrono::microseconds(150)); }
+                    for (int d = 0; d < width; ++d) { cache_p[d] = static_cast<std::uint8_t>(byte_dist(rng)); }
+                    for (int i = 0; i < stress_cols * kHeads * width; ++i) {
+                        s_fallback_p[i] = static_cast<std::uint8_t>(byte_dist(rng));
+                    }
+                    s_slots_p[0] = 0U;
+                    for (int i = 1; i < stress_cols * kHeads; ++i) {
+                        s_slots_p[i] =
+                            (i % 9 == 0) ? infernix::ops::kPleCacheStagingBit
+                                         : (((iter + static_cast<std::uint32_t>(i)) % 3U == 0U)
+                                                ? 0U
+                                                : static_cast<std::uint32_t>(slot_dist(rng)));
+                    }
+                    std::atomic_thread_fence(std::memory_order_release);
+                    *s_ready_p = iter;
+                });
+                cuda_check(cudaStreamSynchronize(stream), "stress stream sync");
+                writer.join();
+                check(d_s_out.download() == compute_oracle(s_fallback_p, s_slots_p, stress_cols),
+                      "fp8 gather coherency stress width=" + std::to_string(width) +
+                          " cols=" + std::to_string(stress_cols) + " iter=" + std::to_string(iter) +
+                          ": differs from oracle");
+            }
+
+            cudaGraphExecDestroy(s_graph_exec);
+            cudaGraphDestroy(s_graph);
+        }
+    }
+
+    cudaStreamDestroy(stream);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(ple_embed) {
@@ -188,6 +416,8 @@ INFERNIX_OP_TEST(ple_embed) {
             test_fp8(heads, width, cols);
         }
         test_nvfp4_spot(160);
+        test_gather_embed_fp8(160, {1, 4, 32, 64, 256}, true);
+        test_gather_embed_fp8(24, {1, 4, 32}, false);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

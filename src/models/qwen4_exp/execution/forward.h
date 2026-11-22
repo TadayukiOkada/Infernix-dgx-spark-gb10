@@ -187,6 +187,7 @@ struct ForwardBatch {
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
     Tensor ple_windows;                       // optional I32 [ngram_size, T] for GPU-direct UMA NVFP4 PLE
     const ops::PleNgramHashTable* ple_hash = nullptr;
+    const ops::PleCacheGather* ple_cache_gather = nullptr;
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
     Tensor logit_columns; // I32 [n]: the columns whose logits are produced (each sequence's last
