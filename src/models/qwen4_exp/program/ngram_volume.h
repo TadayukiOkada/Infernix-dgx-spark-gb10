@@ -42,6 +42,11 @@ public:
         return table.blocks * table.block_bytes;
     }
     [[nodiscard]] bool resident() const noexcept { return resident_ != nullptr; }
+    // Device-accessible pointer for resident tables mapped onto unified memory (nullptr when
+    // non-resident, unmapped, or if host registration fails).
+    [[nodiscard]] const void* resident_device_ptr() const noexcept {
+        return resident_ ? resident_->device_pointer() : nullptr;
+    }
     // Empty when a resident table is locked in RAM; otherwise the OS's reason (it still serves rows, but
     // Windows may page it out under memory pressure).
     [[nodiscard]] std::string resident_lock_failure() const {
@@ -126,7 +131,8 @@ private:
     std::vector<std::byte> parallel_storage_; // kReadThreads rings of kParallelInFlight blocks
     std::byte* parallel_ring_ = nullptr;
     std::vector<std::uint32_t> tags_; // row id per cache slot, UINT32_MAX when empty
-    std::vector<std::uint8_t> hand_;  // next way to replace per cache set
+    std::vector<std::uint8_t> ref_bits_; // Clock reference bit per cache slot
+    std::vector<std::uint8_t> hand_;  // next way to inspect per cache set
     std::vector<std::byte> cache_;    // row codes per slot
     // One call's misses as (block << 32 | output index), sorted so each block's rows are adjacent;
     // the distinct blocks' offsets and where each block's misses begin.

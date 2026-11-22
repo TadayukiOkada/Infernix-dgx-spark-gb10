@@ -22,11 +22,31 @@ __global__ void graph_gate_product_kernel(const float* __restrict__ values, std:
     cudaGraphSetConditional(handle, graph_gate_product(values, stride, step, bins) < *threshold ? 0U : 1U);
 }
 
+__global__ void graph_gate_batch_product_kernel(const float* __restrict__ values, std::int32_t batch, std::int32_t step,
+                                                GraphGateBins bins, const float* __restrict__ thresholds,
+                                                cudaGraphConditionalHandle handle) {
+    unsigned keep = 0U;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        if (!(graph_gate_product(values + b, batch, step, bins) < thresholds[b])) {
+            keep = 1U;
+            break;
+        }
+    }
+    cudaGraphSetConditional(handle, keep);
+}
+
 } // namespace
 
 void launch_graph_gate_product(const float* values, std::int32_t stride, std::int32_t step, const GraphGateBins& bins,
                                const float* threshold, cudaGraphConditionalHandle handle, cudaStream_t stream) {
     graph_gate_product_kernel<<<1, 1, 0, stream>>>(values, stride, step, bins, threshold, handle);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_graph_gate_batch_product(const float* values, std::int32_t batch, std::int32_t step,
+                                     const GraphGateBins& bins, const float* thresholds,
+                                     cudaGraphConditionalHandle handle, cudaStream_t stream) {
+    graph_gate_batch_product_kernel<<<1, 1, 0, stream>>>(values, batch, step, bins, thresholds, handle);
     CUDA_CHECK(cudaGetLastError());
 }
 

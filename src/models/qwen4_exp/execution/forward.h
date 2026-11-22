@@ -15,6 +15,7 @@
 #include "models/qwen4_exp/execution/activation_scan.h"
 #include "models/qwen4_exp/execution/fast_path_flags.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/ple.h"
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
 #include "infernix/ops/sampling.h"
@@ -130,6 +131,7 @@ struct ForwardVerify {
     Tensor ple_inputs;    // BF16 [S*H, W, B]: the PLE convolution inputs
     Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
     const std::int32_t* valid_columns = nullptr; // optional device I32 [B]: live columns (1 + extent) per row
+    Tensor tree_rows;     // optional I32 [kSpeculativeTreeRowWords, B]: 2-branch root-fork speculative trees
 };
 
 // Visual embeddings of a call's image columns (design §19.3.2): they replace those columns' token
@@ -183,6 +185,8 @@ struct ForwardBatch {
     std::optional<NgramRowFormat> ngram_format;
     Tensor ngram_scale;
     const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
+    Tensor ple_windows;                       // optional I32 [ngram_size, T] for GPU-direct UMA NVFP4 PLE
+    const ops::PleNgramHashTable* ple_hash = nullptr;
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
     Tensor logit_columns; // I32 [n]: the columns whose logits are produced (each sequence's last
@@ -198,6 +202,13 @@ struct ForwardBatch {
     // The screened-lm-head fast path's round (Parameters::output_head_screen bound, at most 16 logit
     // columns): the head's logits come from ops::screened_head_logits.
     bool screened_head = false;
+    // Compact screened top-64 candidates (decode & verify): avoids allocating/reading full-vocab logits.
+    struct ScreenedCompactOut {
+        Tensor ids;    // I32 [cap, T]
+        Tensor logits; // FP32 [cap, T]
+        Tensor counts; // I32 [T]
+    };
+    const ScreenedCompactOut* screened_compact = nullptr;
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
     // DFlash2 target features (docs/maintainer/dflash.md): when set, BF16 [taps * H, n] receives,
     // for the call's last n columns, the stream mean of each tapped layer's completed residual
@@ -415,6 +426,7 @@ private:
         const Tensor& slots;
         const Tensor& table_rows;
         std::int32_t batch = 0, width = 0;
+        const Tensor* tree_rows = nullptr;
     };
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
     // `route_columns` >= 0: a layer walk's grouped call, whose route log keeps its last that many

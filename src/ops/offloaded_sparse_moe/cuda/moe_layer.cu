@@ -19,6 +19,7 @@
 #include "ops/common/canonical_math.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/mma.cuh"
 #include "ops/ggml/ggml_a8.h"
 #include "ops/ggml/ggml_a8_tile.cuh"
 #include "ops/ggml/ggml_dp4a.cuh"
@@ -2583,11 +2584,19 @@ int persistent_narrow_ctas() {
     return ctas;
 }
 
+#include "ops/offloaded_sparse_moe/cuda/narrow_a4_omma.cuh"
+
 void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                         const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                         canon::A4Block* h_blocks, int columns, const moe::wide::ExpertsWorkspace& layout,
                         int pass_index, bool use_xplane, bf16* outputs, cudaStream_t stream,
                         PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
+    if (source.omma_narrow && columns >= 2 && source.activation == moe::ExpertActivation::kA4 && !ggml_bank(source) &&
+        source.shape == moe::kFlashNextShape) {
+        launch_expert_pass_a4_omma(x, dispatch, source, top_k, job_records, flags, base, jobs, h_blocks, layout,
+                                   pass_index, use_xplane, outputs, stream, phase, part);
+        return;
+    }
     static const bool configured = [] {
         cudaFuncSetAttribute(gate_up_kernel_one, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(sizeof(GateUpOneShared)));

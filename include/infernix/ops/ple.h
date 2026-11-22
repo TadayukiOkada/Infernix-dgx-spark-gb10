@@ -41,6 +41,33 @@ void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_
 /// to nearest even (W a multiple of 16).
 void ple_embed_nvfp4(const Tensor& rows, const Tensor& multiplier, Tensor& out, cudaStream_t stream);
 
+/// Hash table and device-mapped resident NVFP4 volume for fused GPU-side PLE hashing and
+/// decoding (GPU-direct UMA / unified-memory resident table).
+struct PleNgramHashTable {
+    const void* resident_blocks   = nullptr; // device pointer to resident [blocks, block_bytes]
+    const Tensor* multipliers     = nullptr; // I64 [ngram_size] (bitwise U64)
+    const Tensor* sizes           = nullptr; // I64 [heads] (bitwise U64 primes)
+    const Tensor* offsets         = nullptr; // I64 [heads] (bitwise U64 row offsets)
+    const Tensor* multiplier      = nullptr; // FP32 [1] global NVFP4 table multiplier
+    std::int32_t ngram_size       = 0;
+    std::int32_t heads_per_ngram  = 0;
+    std::int32_t eos_token_id     = 0;
+    std::int32_t vocab_size       = 0;
+    std::int32_t head_width       = 0;
+    std::int32_t row_bytes        = 0;
+    std::int32_t rows_per_block   = 0;
+    std::int32_t block_bytes      = 0;
+    std::uint64_t total_rows      = 0;
+};
+
+/// Fused GPU hash + resident NVFP4 lookup + BF16 embed. windows: I32 [ngram_size, T] where
+/// windows[s, t] is the context token s steps before column t (s = 0 is the current column's
+/// token; earlier positions before sequence start hold eos_token_id). out: BF16 [heads*W, T].
+/// Produces bit-identical output to host NgramHash::row_ids + NgramVolume::read_rows +
+/// ple_embed_nvfp4.
+void ple_hash_embed_nvfp4(const Tensor& windows, const PleNgramHashTable& table, Tensor& out,
+                          cudaStream_t stream);
+
 /// key: BF16 [S*H, T]; value: BF16 [H, T]; residual: BF16 [S*H, T]; key_norm, query_norm,
 /// conv_norm: [S*H], all BF16 or all FP32 (NVIDIA FP4-Local's). gated and normalized: BF16 [S*H, T].
 void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
@@ -52,15 +79,18 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
 /// convolution history from state slot source_slots[i] and writes the updated history to slot
 /// destination_slots[i] (both I32 [sequences]; equal slots update in place). An empty
 /// destination_slots leaves every state unchanged (speculative verification, committed later by
-/// ple_conv_commit). weight: BF16 [C, K] (tap j of channel c at j*C + c); states: BF16
-/// [C, span, slots] with span = (K-1) * dilation, oldest column first. residual is updated in
-/// place. When next_norm_weight and next_norm_out are supplied, also writes the per-stream
-/// unit-offset RMSNorm of the updated residual (matching hyper_connection_norm over `streams`).
+/// ple_conv_commit). When tree_rows is supplied (I32 [kSpeculativeTreeRowWords, sequences]), each
+/// sequence whose tree != 0 walks parent[col] per tap lag instead of col - lag. weight: BF16 [C, K]
+/// (tap j of channel c at j*C + c); states: BF16 [C, span, slots] with span = (K-1) * dilation,
+/// oldest column first. residual is updated in place. When next_norm_weight and next_norm_out
+/// are supplied, also writes the per-stream unit-offset RMSNorm of the updated residual (matching
+/// hyper_connection_norm over `streams`).
 void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor& weight,
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream,
                      const Tensor* next_norm_weight = nullptr, Tensor* next_norm_out = nullptr,
-                     float next_norm_eps = 0.0F, std::int32_t streams = 4);
+                     float next_norm_eps = 0.0F, std::int32_t streams = 4,
+                     const Tensor* tree_rows = nullptr);
 
 /// ple_gate immediately followed by ple_conv_inject, fused into one kernel when the geometry is a
 /// decode column per sequence (one column each, so width == 1) with a state update, an aligned
@@ -77,7 +107,7 @@ void ple_gate_conv_inject(const Tensor& key, const Tensor& value, Tensor& residu
                           Tensor& states, const Tensor& source_slots, const Tensor& destination_slots,
                           Tensor& gated, Tensor& normalized, cudaStream_t stream,
                           const Tensor* next_norm_weight = nullptr, Tensor* next_norm_out = nullptr,
-                          float next_norm_eps = 0.0F);
+                          float next_norm_eps = 0.0F, const Tensor* tree_rows = nullptr);
 
 /// Commits the first commit_columns[b] (I32 [B], each in [0, W]) of row b's verified columns to
 /// slot slots[b] (I32 [B]): the history becomes the trailing span columns of the old history

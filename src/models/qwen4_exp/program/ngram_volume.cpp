@@ -179,6 +179,7 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
         const unsigned set_bits      = cache_bits_ - kCacheWayBits;
         cache_set_shift_             = 32U - set_bits;
         tags_.assign(std::size_t{1} << cache_bits_, 0xFFFFFFFFU);
+        ref_bits_.assign(std::size_t{1} << cache_bits_, 0);
         hand_.assign(std::size_t{1} << set_bits, 0);
         cache_.assign((std::size_t{1} << cache_bits_) * table.row_bytes, std::byte{0});
     }
@@ -255,13 +256,17 @@ NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConf
         counters_.reads   = table.blocks;
         counters_.read_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        if (table.format == NgramRowFormat::Nvfp4) { (void)resident_->map_for_device(); }
     }
 }
 
 std::size_t NgramVolume::find_slot(std::uint32_t row) noexcept {
     const std::size_t base = set_of(row) * kCacheWays;
     for (std::size_t w = 0; w < kCacheWays; ++w) {
-        if (tags_[base + w] == row) { return base + w; }
+        if (tags_[base + w] == row) {
+            __atomic_store_n(&ref_bits_[base + w], std::uint8_t{1}, __ATOMIC_RELAXED);
+            return base + w;
+        }
     }
     return std::numeric_limits<std::size_t>::max();
 }
@@ -270,11 +275,20 @@ void NgramVolume::insert_cache(std::uint32_t row, const std::byte* data, std::si
     const std::size_t set  = set_of(row);
     const std::size_t base = set * kCacheWays;
     for (std::size_t w = 0; w < kCacheWays; ++w) {
-        if (tags_[base + w] == row) { return; }
+        if (tags_[base + w] == row) {
+            ref_bits_[base + w] = 1;
+            return;
+        }
     }
-    const std::size_t way = hand_[set] & (kCacheWays - 1);
-    hand_[set]            = static_cast<std::uint8_t>(way + 1);
+    std::size_t way = hand_[set] & (kCacheWays - 1);
+    for (std::size_t step = 0; step < kCacheWays; ++step) {
+        if (tags_[base + way] == 0xFFFFFFFFU || ref_bits_[base + way] == 0) { break; }
+        ref_bits_[base + way] = 0;
+        way                   = (way + 1) & (kCacheWays - 1);
+    }
+    hand_[set]            = static_cast<std::uint8_t>((way + 1) & (kCacheWays - 1));
     tags_[base + way]     = row;
+    ref_bits_[base + way] = 1;
     std::memcpy(cache_.data() + (base + way) * row_bytes, data, row_bytes);
 }
 

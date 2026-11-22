@@ -22,4 +22,8 @@ void bf16_rescore(const Tensor& x, const void* head_rows, std::int32_t vocab_row
                   const std::int32_t* entries, const std::int32_t* counts, std::int32_t cap, float* logits,
                   cudaStream_t stream);
 
+void bf16_rescore_compact(const Tensor& x, const void* head_rows, std::int32_t columns,
+                          const std::int32_t* entries, const std::int32_t* counts, std::int32_t cap,
+                          float* compact_logits, cudaStream_t stream);
+
 } // namespace infernix::ops::detail::screened_head

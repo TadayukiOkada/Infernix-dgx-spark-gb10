@@ -445,7 +445,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3: return configuration.offloaded_experts;
     // The narrow form is Flash-Next's geometry only (its CPU engine and narrow A4 kernels).
-    case FastPath::ExpertA4ResidualDecode: return false;
+    case FastPath::ExpertA4ResidualDecode:
+    case FastPath::ExpertA4OmmaNarrow: return false;
     // Qwen3.8-Flash-Next's two-row DFlash2 rounds; Qwen3.5's several-row DFlash2 rounds are
     // adaptive-speculation's.
     case FastPath::DFlash2Pairs: return false;

@@ -13,11 +13,11 @@
 
 namespace infernix::models::qwen3_5::detail {
 
-// Suffix Automaton (SAM) speculative draft proposer.
-// Represents all substrings of the prompt and generated history in linear space O(N) with at most
-// 2N states and 3N transitions. Provides exact longest proper suffix lookup in O(1) amortized
-// time by traversing suffix link pointers, replacing fixed-window multi-hash tables with zero
-// hash collisions and arbitrary match length discovery.
+// Recency-, frequency-, and continuation-aware Suffix Automaton (SAM) speculative draft proposer.
+// Represents all substrings of the live window (bounded to token_capacity_ via tail compaction at
+// 2 * token_capacity_) in linear space O(N) with at most 2N states and 3N transitions. Each state
+// tracks its most recent occurrences (last_pos/prev_pos) and most recent occurrences with valid
+// non-boundary continuations (valid_pos/prev_valid_pos) plus occurrence count (occ_count).
 class SuffixAutomaton {
 public:
     using Token = TokenId;
@@ -53,6 +53,7 @@ public:
     void boundary() {
         tokens_.push_back(-1);
         last_ = 0;
+        compact_if_needed();
     }
 
     void set_boundaries(std::vector<Token> tokens) {
@@ -70,58 +71,18 @@ public:
             boundary();
             return;
         }
-        tokens_.push_back(token);
-        const auto cur = static_cast<int32_t>(nodes_.size());
-        nodes_.push_back(Node{
-            .len        = nodes_[last_].len + 1,
-            .link       = 0,
-            .pos        = static_cast<int32_t>(tokens_.size() - 1),
-            .first_key  = -1,
-            .first_to   = -1,
-            .next_edge  = -1
-        });
-
-        int32_t p = last_;
-        while (p != -1 && get_transition(p, token) == -1) {
-            set_transition(p, token, cur);
-            p = nodes_[p].link;
-        }
-
-        if (p == -1) {
-            nodes_[cur].link = 0;
-        } else {
-            const int32_t q = get_transition(p, token);
-            if (nodes_[p].len + 1 == nodes_[q].len) {
-                nodes_[cur].link = q;
-            } else {
-                const auto clone = static_cast<int32_t>(nodes_.size());
-                nodes_.push_back(Node{
-                    .len        = nodes_[p].len + 1,
-                    .link       = nodes_[q].link,
-                    .pos        = nodes_[q].pos,
-                    .first_key  = -1,
-                    .first_to   = -1,
-                    .next_edge  = -1
-                });
-                copy_transitions(clone, q);
-
-                int32_t p_curr = p;
-                while (p_curr != -1 && get_transition(p_curr, token) == q) {
-                    set_transition(p_curr, token, clone);
-                    p_curr = nodes_[p_curr].link;
-                }
-                nodes_[q].link   = clone;
-                nodes_[cur].link = clone;
-            }
-        }
-        last_ = cur;
+        append_non_boundary(token);
+        compact_if_needed();
     }
 
     void reserve_additional(std::size_t extra_tokens) {
         if (extra_tokens == 0) { return; }
-        tokens_.reserve(tokens_.size() + extra_tokens);
-        nodes_.reserve(nodes_.size() + 2 * extra_tokens);
-        edges_.reserve(edges_.size() + extra_tokens);
+        const std::size_t cap_tokens = std::min(tokens_.size() + extra_tokens, 2 * token_capacity_);
+        if (cap_tokens > tokens_.capacity()) { tokens_.reserve(cap_tokens); }
+        const std::size_t cap_nodes = std::min(nodes_.size() + 2 * extra_tokens, 4 * token_capacity_);
+        if (cap_nodes > nodes_.capacity()) { nodes_.reserve(cap_nodes); }
+        const std::size_t cap_edges = std::min(edges_.size() + extra_tokens, 4 * token_capacity_);
+        if (cap_edges > edges_.capacity()) { edges_.reserve(cap_edges); }
     }
 
     void ingest(std::span<const Token> tokens) {
@@ -134,31 +95,31 @@ public:
     }
 
     // O(1) online lookup from the generation tip (last_): walks suffix links to find the longest
-    // suffix that appeared earlier in the corpus.
+    // suffix that appeared earlier in the live window with a valid non-boundary continuation.
     [[nodiscard]] std::optional<LookupResult> lookup() const noexcept {
         if (nodes_.empty() || last_ == 0) { return std::nullopt; }
 
-        int32_t state = last_;
+        int32_t state      = last_;
         int32_t best_state = 0;
+        int32_t best_pos   = -1;
+        const auto n_tokens = static_cast<int32_t>(tokens_.size());
+        const auto live     = static_cast<int32_t>(live_begin());
 
         while (state != 0) {
-            const auto& nd = nodes_[state];
-            const bool is_last = (nd.pos >= 0 && nd.pos + 1 >= static_cast<int32_t>(tokens_.size()));
-            if (!is_last) {
+            const int32_t cand = best_lookup_candidate(state, nodes_[state].len, live, n_tokens);
+            if (cand >= 0) {
                 best_state = state;
+                best_pos   = cand;
                 break;
             }
-            if (nd.link == -1) { break; }
-            state = nd.link;
+            if (nodes_[state].link == -1) { break; }
+            state = nodes_[state].link;
         }
 
-        if (best_state == 0) { return std::nullopt; }
-        const auto& best_node = nodes_[best_state];
-        if (best_node.pos < 0) { return std::nullopt; }
-
+        if (best_state == 0 || best_pos < 0) { return std::nullopt; }
         return LookupResult{
-            .pos = best_node.pos + 1,
-            .len = best_node.len
+            .pos = best_pos + 1,
+            .len = nodes_[best_state].len
         };
     }
 
@@ -168,8 +129,8 @@ public:
         if (maximum == 0 || history.empty()) { return match; }
 
         // Fast path: if history matches the active tail ending at last_ (with no boundary tokens),
-        // last_ is already the SAM state for history, avoiding root-to-tip linked-list traversal.
-        int32_t state = 0;
+        // last_ is already the SAM state for history, avoiding root-to-tip transition lookup.
+        int32_t state   = 0;
         int32_t matched = 0;
         bool tail_match = (last_ != 0 && history.size() <= tokens_.size());
         if (tail_match) {
@@ -214,30 +175,33 @@ public:
             return match;
         }
 
-        const auto live = static_cast<int32_t>(live_begin());
+        const auto n_tokens = static_cast<int32_t>(tokens_.size());
+        const auto live     = static_cast<int32_t>(live_begin());
+        int32_t best_pos    = -1;
 
-        while (state != 0 && (nodes_[state].pos < 0 ||
-                              nodes_[state].pos + 1 >= static_cast<int32_t>(tokens_.size()) ||
-                              nodes_[state].pos - matched + 1 < live ||
-                              is_boundary(tokens_[nodes_[state].pos + 1]))) {
+        while (state != 0 && matched >= static_cast<int32_t>(minimum_match)) {
+            best_pos = best_lookup_candidate(state, matched, live, n_tokens);
+            if (best_pos >= 0) { break; }
             state = nodes_[state].link;
-            if (state != 0) { matched = std::min(matched, nodes_[state].len); }
+            if (state > 0) { matched = std::min(matched, nodes_[state].len); }
         }
 
-        if (state == 0 || matched < static_cast<int32_t>(minimum_match) || nodes_[state].pos < 0) {
+        if (state <= 0 || matched < static_cast<int32_t>(minimum_match) || best_pos < 0) {
             return match;
         }
 
-        const int32_t match_end = nodes_[state].pos + 1;
-        uint32_t avail = 0;
-        while (avail < maximum && match_end + avail < static_cast<int32_t>(tokens_.size()) &&
-               !is_boundary(tokens_[match_end + avail])) {
+        const int32_t match_end = best_pos + 1;
+        uint32_t avail          = 0;
+        while (avail < maximum && match_end + static_cast<int32_t>(avail) < n_tokens &&
+               !is_boundary(tokens_[match_end + static_cast<int32_t>(avail)])) {
             avail++;
         }
 
         if (avail == 0) { return match; }
 
-        match.matched = static_cast<uint32_t>(matched);
+        match.matched     = static_cast<uint32_t>(matched);
+        match.occurrences = nodes_[state].occ_count;
+        match.distance    = static_cast<uint32_t>(n_tokens - 1 - best_pos);
         match.tokens.resize(avail);
         for (uint32_t i = 0; i < avail; ++i) {
             match.tokens[i] = tokens_[match_end + i];
@@ -262,7 +226,7 @@ public:
             throw std::invalid_argument("ngram proposal lookahead overflows");
         }
         const auto available = static_cast<std::uint32_t>(match.tokens.size());
-        const auto drafts = std::min(maximum, available > 2U ? available - 2U : 0U);
+        const auto drafts    = std::min(maximum, available > 2U ? available - 2U : 0U);
         if (available < maximum + 2U && drafts <= neural_drafts) { return {}; }
         match.tokens.resize(drafts);
         return match;
@@ -274,6 +238,8 @@ public:
     }
 
 private:
+    static constexpr int32_t kMaxPropagateHops = 256;
+
     struct Edge {
         Token key;
         int32_t to;
@@ -281,12 +247,16 @@ private:
     };
 
     struct Node {
-        int32_t len = 0;
-        int32_t link = -1;
-        int32_t pos = -1;
-        Token first_key = -1;
-        int32_t first_to = -1;
-        int32_t next_edge = -1;
+        int32_t len            = 0;
+        int32_t link           = -1;
+        int32_t last_pos       = -1;
+        int32_t prev_pos       = -1;
+        int32_t valid_pos      = -1;
+        int32_t prev_valid_pos = -1;
+        uint32_t occ_count     = 0;
+        Token first_key        = -1;
+        int32_t first_to       = -1;
+        int32_t next_edge      = -1;
     };
 
     struct EdgeSlot {
@@ -303,6 +273,126 @@ private:
     std::vector<Token> tokens_;
     std::vector<Token> boundaries_;
     int32_t last_ = 0;
+
+    void append_non_boundary(Token token) {
+        // The non-boundary token being appended confirms that the previous tip ended a valid
+        // continuation for `last_` and its suffix ancestors.
+        if (last_ != 0 && !tokens_.empty()) {
+            const int32_t prev_end = static_cast<int32_t>(tokens_.size()) - 1;
+            int32_t u              = last_;
+            for (int32_t hops = 0; u > 0 && hops < kMaxPropagateHops; ++hops) {
+                if (nodes_[u].valid_pos != prev_end) {
+                    nodes_[u].prev_valid_pos = nodes_[u].valid_pos;
+                    nodes_[u].valid_pos      = prev_end;
+                }
+                u = nodes_[u].link;
+            }
+        }
+
+        tokens_.push_back(token);
+        const auto cur_pos = static_cast<int32_t>(tokens_.size()) - 1;
+        const auto cur     = static_cast<int32_t>(nodes_.size());
+        nodes_.push_back(Node{
+            .len            = nodes_[last_].len + 1,
+            .link           = 0,
+            .last_pos       = cur_pos,
+            .prev_pos       = -1,
+            .valid_pos      = -1,
+            .prev_valid_pos = -1,
+            .occ_count      = 1,
+            .first_key      = -1,
+            .first_to       = -1,
+            .next_edge      = -1
+        });
+
+        int32_t p = last_;
+        while (p != -1 && get_transition(p, token) == -1) {
+            set_transition(p, token, cur);
+            p = nodes_[p].link;
+        }
+
+        if (p == -1) {
+            nodes_[cur].link = 0;
+        } else {
+            const int32_t q = get_transition(p, token);
+            if (nodes_[p].len + 1 == nodes_[q].len) {
+                nodes_[cur].link = q;
+            } else {
+                const auto clone = static_cast<int32_t>(nodes_.size());
+                nodes_.push_back(Node{
+                    .len            = nodes_[p].len + 1,
+                    .link           = nodes_[q].link,
+                    .last_pos       = nodes_[q].last_pos,
+                    .prev_pos       = nodes_[q].prev_pos,
+                    .valid_pos      = nodes_[q].valid_pos,
+                    .prev_valid_pos = nodes_[q].prev_valid_pos,
+                    .occ_count      = nodes_[q].occ_count,
+                    .first_key      = -1,
+                    .first_to       = -1,
+                    .next_edge      = -1
+                });
+                copy_transitions(clone, q);
+
+                int32_t p_curr = p;
+                while (p_curr != -1 && get_transition(p_curr, token) == q) {
+                    set_transition(p_curr, token, clone);
+                    p_curr = nodes_[p_curr].link;
+                }
+                nodes_[q].link   = clone;
+                nodes_[cur].link = clone;
+            }
+        }
+
+        // Propagate the new end position and occurrence count up the suffix-link chain so lookup
+        // and propose see the most recent occurrence at every matching state.
+        int32_t u = nodes_[cur].link;
+        for (int32_t hops = 0; u > 0 && hops < kMaxPropagateHops; ++hops) {
+            if (nodes_[u].last_pos != cur_pos) {
+                nodes_[u].prev_pos = nodes_[u].last_pos;
+                nodes_[u].last_pos = cur_pos;
+            }
+            if (nodes_[u].occ_count < std::numeric_limits<uint32_t>::max()) {
+                ++nodes_[u].occ_count;
+            }
+            u = nodes_[u].link;
+        }
+
+        last_ = cur;
+    }
+
+    void compact_if_needed() {
+        const std::size_t trigger = std::max<std::size_t>(2U * token_capacity_, 1024U);
+        if (tokens_.size() < trigger) { return; }
+        const std::size_t keep = std::min(token_capacity_, tokens_.size());
+        std::vector<Token> tail(tokens_.end() - static_cast<std::ptrdiff_t>(keep), tokens_.end());
+        clear();
+        reserve_additional(tail.size());
+        for (const Token t : tail) {
+            if (is_boundary(t)) {
+                tokens_.push_back(-1);
+                last_ = 0;
+            } else {
+                append_non_boundary(t);
+            }
+        }
+    }
+
+    [[nodiscard]] int32_t best_lookup_candidate(int32_t state, int32_t matched, int32_t live,
+                                                int32_t n_tokens) const noexcept {
+        const Node& nd    = nodes_[state];
+        int32_t best      = -1;
+        const auto check  = [&](int32_t p) noexcept {
+            if (p >= 0 && p + 1 < n_tokens && p - matched + 1 >= live &&
+                !is_boundary(tokens_[p + 1]) && p > best) {
+                best = p;
+            }
+        };
+        check(nd.valid_pos);
+        check(nd.prev_valid_pos);
+        check(nd.last_pos);
+        check(nd.prev_pos);
+        return best;
+    }
 
     [[nodiscard]] static std::size_t hash_edge(int32_t u, Token key) noexcept {
         std::uint64_t x = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(u)) << 32) |

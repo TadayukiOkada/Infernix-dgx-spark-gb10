@@ -37,6 +37,7 @@
 // between calls, so it captures into CUDA Graphs and replays with new positions.
 
 #include "infernix/ops/qsa.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
@@ -63,7 +64,8 @@ struct QsaSelectOutput {
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
                 std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,
-                const QsaPageSpaces& spaces = {}, bool allow_mma_score = false);
+                const QsaPageSpaces& spaces = {}, bool allow_mma_score = false,
+                const SpeculativeTreeRow* tree_rows = nullptr);
 
 /// After qsa_select, the FP32 scores of its last group: column c of the group (c counted from
 /// the group's first column) holds block b at scores[c * stride + b] for b < its block count.

@@ -522,4 +522,70 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
+__device__ inline unsigned long long sampling_compact_max_key(unsigned long long key,
+                                                                unsigned long long* warp_keys) {
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned long long other = __shfl_xor_sync(0xffffffffu, key, offset);
+        if (other > key) { key = other; }
+    }
+    if (lane == 0) { warp_keys[warp] = key; }
+    __syncthreads();
+    const unsigned long long a = warp_keys[0];
+    const unsigned long long b = warp_keys[1];
+    return a > b ? a : b;
+}
+
+__device__ inline void sampling_sort_keys64_desc(unsigned long long* keys) {
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int size = 2; size <= 64; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const int other = tid ^ stride;
+            __syncthreads();
+            if (other > tid) {
+                const unsigned long long ov = keys[other];
+                const unsigned long long tv = keys[tid];
+                const bool descending       = ((tid & size) == 0);
+                const bool swap             = descending ? (ov > tv) : (tv > ov);
+                if (swap) {
+                    keys[tid]   = ov;
+                    keys[other] = tv;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// 64-thread CTA helper: loads n <= 64 compact candidates, applies adjusted logits + overlay,
+// sorts descending via score_id_order_key, and normalizes top-k / min-p / top-p support.
+__device__ inline void sampling_compact_build_support(
+    const std::int32_t* compact_ids, const float* compact_logits, std::int32_t n,
+    std::int32_t token_domain, const SamplingConfig& cfg, unsigned long long* sort_keys,
+    float* cand_val, int* cand_idx, float* prob, int* n_support,
+    const std::int32_t* overlay = nullptr, int overlay_len = 0) {
+    const int tid          = static_cast<int>(threadIdx.x);
+    unsigned long long key = 0ull;
+    if (tid < n) {
+        const int id = compact_ids[tid];
+        if (id >= 0 && id < token_domain) {
+            const float x = sampling_adjusted_logit(compact_logits[tid], id, cfg, overlay, overlay_len);
+            key           = sampling_sort_key(x, id);
+        }
+    }
+    sort_keys[tid] = key;
+    sampling_sort_keys64_desc(sort_keys);
+    const int k_cap = min(sampling_candidate_cap(cfg, token_domain), n);
+    if (tid < k_cap) {
+        const unsigned long long k = sort_keys[tid];
+        cand_val[tid]              = sampling_key_float(k);
+        cand_idx[tid]              = sampling_key_index(k);
+    }
+    __syncthreads();
+    sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, k_cap);
+}
+
 } // namespace infernix::ops

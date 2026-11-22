@@ -47,11 +47,13 @@ void causal_conv1d_snapshot_split_launch(const Tensor& x, const Tensor& weight, 
                                          CausalConvSplitGeometry geometry, cudaStream_t stream);
 void causal_conv1d_from_states_launch(const Tensor& x, const Tensor& weight,
                                       const Tensor& conv_states, const Tensor& initial_state_slots,
-                                      Tensor& out, cudaStream_t stream);
+                                      Tensor& out, cudaStream_t stream,
+                                      const Tensor* tree_rows = nullptr);
 void causal_conv1d_from_states_split_launch(const Tensor& x, const Tensor& weight,
                                             const Tensor& conv_states,
                                             const Tensor& initial_state_slots, Tensor& out0,
                                             Tensor& out1, Tensor& out2,
-                                            CausalConvSplitGeometry geometry, cudaStream_t stream);
+                                            CausalConvSplitGeometry geometry, cudaStream_t stream,
+                                            const Tensor* tree_rows = nullptr);
 
 } // namespace infernix::ops::detail

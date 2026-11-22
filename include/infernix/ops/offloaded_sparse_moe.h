@@ -355,6 +355,8 @@ struct MoeExpertSource {
     // renormalisation). It changes the output; the routing and route log are unchanged, so the
     // expert is still credited as routed.
     std::int32_t tail_skip_rank = 0;
+    // Use native sm_121a NVFP4 OMMA kernels for narrow/medium (1..8 column) W4A4 jobs instead of DP4A.
+    bool omma_narrow = false;
 };
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries

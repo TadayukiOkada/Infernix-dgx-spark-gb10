@@ -193,6 +193,10 @@ void hc_up_collapse(const Tensor& m, const Weight& up, const Tensor& normalized,
     }
     const int hidden = x.ne[0];
     if (up.qtype == QType::Q4_G64_FP16) {
+        using MmaR32T16K64Wr16Wt8S3A3B2 =
+            Q4A16MmaSchedule<32, 16, 64, 16, 8, 3, 2, Q4MmaFragmentPipeline::Serial,
+                             Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 3>;
+        if (T <= 16) return launch_q4<MmaR32T16K64Wr16Wt8S3A3B2>(m, up, normalized, x, stream);
         if (T <= 32) return launch_q4<q4_instances::MmaR32T32K64Wr16Wt16S3A3B2>(m, up, normalized, x, stream);
         if (T <= 64) return launch_q4<q4_instances::MmaR32T64K64Wr16Wt32S2A2B2>(m, up, normalized, x, stream);
         if (hidden % 32 == 0) {

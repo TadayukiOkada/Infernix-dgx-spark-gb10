@@ -119,7 +119,27 @@ ResidentHostBuffer::ResidentHostBuffer(std::size_t bytes) : size_(bytes) {
 }
 
 ResidentHostBuffer::~ResidentHostBuffer() {
+    if (device_ != nullptr) { (void)cudaHostUnregister(data_); }
     (void)::munmap(data_, size_);
+}
+
+void* ResidentHostBuffer::map_for_device() {
+    if (device_ != nullptr) { return device_; }
+    int device = 0, unified = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&unified, cudaDevAttrUnifiedAddressing, device) != cudaSuccess || unified == 0) {
+        return nullptr;
+    }
+    if (cudaHostRegister(data_, size_, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        return nullptr;
+    }
+    void* dev_ptr = nullptr;
+    if (cudaHostGetDevicePointer(&dev_ptr, data_, 0) != cudaSuccess) {
+        (void)cudaHostUnregister(data_);
+        return nullptr;
+    }
+    device_ = dev_ptr;
+    return device_;
 }
 
 } // namespace infernix

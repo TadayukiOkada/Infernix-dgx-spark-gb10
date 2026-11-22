@@ -28,6 +28,8 @@ struct ForwardFastPaths {
     // GPU and in the CPU expert engine, take two NVFP4 terms per x and h row with exact sums
     // (ops::offloaded_moe::NarrowA16::kA4Residual); false keeps them exact. No effect on W4A4 experts.
     bool expert_a4_narrow = false;
+    // expert-a4-omma-narrow: native sm_121a NVFP4 OMMA kernels for narrow/medium W4A4 expert jobs.
+    bool expert_a4_omma_narrow = false;
     // gdn-f16-accumulate: the chunked GDN calls' arithmetic.
     ops::GdnChunkArithmetic gdn_arithmetic = ops::GdnChunkArithmetic::Exact;
     // router-mma: prefill calls of at least kRouterMmaMinColumns take the tensor-core router.

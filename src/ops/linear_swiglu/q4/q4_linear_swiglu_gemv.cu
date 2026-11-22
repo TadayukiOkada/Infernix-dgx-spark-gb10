@@ -41,17 +41,17 @@ static_assert(kVecsPerWarpTile == 32);
 // Each m16 row tile of a CTA holds eight gate rows and the matching eight up rows, so a fragment's
 // top and bottom halves meet in the SwiGLU epilogue. The release kernel runs one tile (16 block
 // rows); the pipelined one-wave route may take two (Rebind<32>).
-template <int BlockRows = 16>
+template <int Intermediate = kIntermediate, int BlockRows = 16>
 struct Q4SwiGluSmallTRows {
     static_assert(BlockRows % 16 == 0);
     static constexpr int kOutputRowsPerCta = BlockRows / 2;
     template <int Rows>
-    using Rebind = Q4SwiGluSmallTRows<Rows>;
+    using Rebind = Q4SwiGluSmallTRows<Intermediate, Rows>;
 
     __host__ __device__ int output_rows(int rows) const { return rows / 2; }
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
-        return output_row(output_row0, local_row) + ((local_row & 8) != 0 ? kIntermediate : 0);
+        return output_row(output_row0, local_row) + ((local_row & 8) != 0 ? Intermediate : 0);
     }
 
     __device__ __forceinline__ int output_row(int output_row0, int local_row) const {
@@ -72,7 +72,7 @@ struct Q4SwiGluSmallTEpilogue {
 
 using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <int ActiveCols>
+template <int ActiveCols, int StaticK = kK>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     // Wider tiles are shared-memory limited before six CTAs can be resident.
     // Match launch bounds to that limit instead of forcing register spills.
@@ -80,22 +80,24 @@ void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaSt
                                : ActiveCols <= 16 ? 4
                                : ActiveCols <= 24 ? 3
                                                   : 2;
+    constexpr int kIntermediateForK = StaticK == 2560 ? 640 : kIntermediate;
     using Schedule =
         Q4A16SlicedKMmaSchedule<16, (ActiveCols + 7) / 8 * 8, 8, 1, Cache::cg, Cache::ca,
-                                kMinBlocks, kK, ActiveCols, Q4SlicedKReduction::Pairwise>;
+                                kMinBlocks, StaticK, ActiveCols, Q4SlicedKReduction::Pairwise>;
     launch_q4_a16_sliced_k_mma<Schedule>(
         q4_linear_operands(x, w),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
-        Q4SwiGluSmallTEpilogue{}, stream, Q4SwiGluSmallTRows<>{});
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediateForK},
+        Q4SwiGluSmallTEpilogue{}, stream, Q4SwiGluSmallTRows<kIntermediateForK>{});
 }
 
-template <std::size_t... Offsets>
+template <int StaticK, std::size_t... Offsets>
 constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
     return std::array<SmallTLauncher, sizeof...(Offsets)>{
-        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets))>...};
+        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets)), StaticK>...};
 }
 
-constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<4>{});
+constexpr auto kSmallTLaunchers     = make_small_t_launchers<kK>(std::make_index_sequence<4>{});
+constexpr auto kSmallTLaunchersK2560 = make_small_t_launchers<2560>(std::make_index_sequence<4>{});
 
 __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[kVecsPerWarpTile],
                                                    uint4 (*__restrict__ s_scale)[2],
@@ -223,10 +225,11 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
 
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {
-    if (x.ne[1] < 2 || x.ne[1] > 32) {
-        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    if (x.ne[1] < 1 || x.ne[1] > 32) {
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=1..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
+    const auto& launchers = w.k == 2560 ? kSmallTLaunchersK2560 : kSmallTLaunchers;
+    launchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
 }
 
 // Every instance is the same sliced-K schedule but for its token capacity (8 K-warps, pairwise
@@ -235,8 +238,9 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
 void q4_linear_swiglu_small_t_invariant_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                cudaStream_t stream) {
     if (x.ne[1] < 1) { throw std::invalid_argument("Q4 LinearSwiGLU column-invariant route requires T >= 1"); }
-    const std::size_t instance = std::min<std::size_t>(kSmallTLaunchers.size() - 1, static_cast<std::size_t>((x.ne[1] - 1) / 8));
-    kSmallTLaunchers[instance](x, w, out, stream);
+    const auto& launchers    = w.k == 2560 ? kSmallTLaunchersK2560 : kSmallTLaunchers;
+    const std::size_t instance = std::min<std::size_t>(launchers.size() - 1, static_cast<std::size_t>((x.ne[1] - 1) / 8));
+    launchers[instance](x, w, out, stream);
 }
 
 } // namespace infernix::ops::detail

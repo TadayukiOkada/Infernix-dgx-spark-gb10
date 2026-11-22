@@ -374,6 +374,21 @@ int main() {
             failures += check(q::fast_path_applies(FastPath::RouterMma, w4dense, options) &&
                                   q::fast_path_qualified(FastPath::RouterMma, w4dense),
                               "router-mma applies and is registered on W4Dense");
+            if (a4) {
+                failures += check(q::fast_path_applies(FastPath::ExpertA4OmmaNarrow, w4dense, options) &&
+                                      q::fast_path_qualified(FastPath::ExpertA4OmmaNarrow, w4dense) &&
+                                      infernix::parse_fast_path("expert-a4-omma-narrow") ==
+                                          FastPath::ExpertA4OmmaNarrow,
+                                  "expert-a4-omma-narrow applies and is registered on W4Dense (A4 only)");
+                const q::FastPathSelection omma_sel{
+                    .configuration = w4dense, .paths = {FastPath::ExpertA4OmmaNarrow}};
+                failures += check(omma_sel.forward().expert_a4_omma_narrow && !omma_sel.request_invariant(),
+                                  "expert-a4-omma-narrow sets forward flag and stays outside reproducible");
+            } else {
+                failures += check(!q::fast_path_applies(FastPath::ExpertA4OmmaNarrow, w4dense, options) &&
+                                      !q::fast_path_qualified(FastPath::ExpertA4OmmaNarrow, w4dense),
+                                  "expert-a4-omma-narrow stays off W4Dense with A16 experts");
+            }
         }
     }
     {
@@ -562,6 +577,42 @@ int main() {
         failures += check(fp4_local_a4.describe().find("decode and verification: none") != std::string::npos &&
                               recipe_c_a8.describe().find("prefill: the routed experts") != std::string::npos,
                           "the startup line names what takes 8-bit activations in decode and in prefill");
+    }
+
+    // univer-trees: applies to generation with MTP or DFlash2 and scalar KV storage (excluding VQ
+    // storages and None), qualified on W4Dense (Nvfp4, a4=true, scalar KV), request-invariant.
+    {
+        infernix::EngineOptions mtp_opt = options;
+        mtp_opt.speculative.backend     = infernix::SpeculativeBackend::Mtp;
+        infernix::EngineOptions df_opt  = options;
+        df_opt.speculative.backend      = infernix::SpeculativeBackend::DFlash2;
+        infernix::EngineOptions none_opt = options;
+        none_opt.speculative.backend     = infernix::SpeculativeBackend::None;
+        infernix::EngineOptions score_opt = mtp_opt;
+        score_opt.purpose                 = infernix::EnginePurpose::CausalScoring;
+
+        const FastPathConfiguration w4_int8{DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64};
+        const FastPathConfiguration w4_k8v4{DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value};
+        const FastPathConfiguration w4_vq2{DenseKernels::Nvfp4, true, KvCacheStorage::Vq2};
+        const FastPathConfiguration w4_k4v2{DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value};
+        const FastPathConfiguration a4_false{DenseKernels::Mxfp8, false, KvCacheStorage::Int8Group64};
+
+        failures += check(q::fast_path_applies(FastPath::UniverTrees, w4_int8, mtp_opt) &&
+                              q::fast_path_applies(FastPath::UniverTrees, w4_k8v4, df_opt) &&
+                              !q::fast_path_applies(FastPath::UniverTrees, w4_int8, none_opt) &&
+                              !q::fast_path_applies(FastPath::UniverTrees, w4_int8, score_opt) &&
+                              !q::fast_path_applies(FastPath::UniverTrees, w4_vq2, mtp_opt) &&
+                              !q::fast_path_applies(FastPath::UniverTrees, w4_k4v2, df_opt),
+                          "univer-trees applies only to scalar-KV generation with MTP or DFlash2");
+        failures += check(q::fast_path_qualified(FastPath::UniverTrees, w4_int8) &&
+                              q::fast_path_qualified(FastPath::UniverTrees, w4_k8v4) &&
+                              !q::fast_path_qualified(FastPath::UniverTrees, w4_vq2) &&
+                              !q::fast_path_qualified(FastPath::UniverTrees, a4_false),
+                          "univer-trees is qualified on W4Dense with scalar KV formats only");
+        selection.configuration = w4_int8;
+        selection.paths         = {FastPath::UniverTrees};
+        failures += check(selection.request_invariant(), "univer-trees stays request-invariant");
+        failures += check(infernix::parse_fast_path("univer-trees") == FastPath::UniverTrees, "univer-trees parses");
     }
 
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Qwen3.8-Flash-Next fast-path selection\n";

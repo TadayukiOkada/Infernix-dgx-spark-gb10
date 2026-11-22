@@ -19,9 +19,13 @@
 // the step it lands on, as before; the executed count below still reports what the round paid for.
 
 #include "core/decode_graph.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 namespace infernix::models::qwen4_exp {
@@ -183,6 +187,343 @@ struct MtpDraftCut {
     const double chain_score =
         expected_chain_tokens(chain_accept, chain_drafts) / (1.0 + chain_cost * static_cast<double>(chain_drafts));
     return copy_score > chain_score;
+}
+
+// Expected distinct routed experts across `columns` tokens when each token routes uniformly to
+// `top_k` of `experts` (coupon-collector model): E * (1 - (1 - K / E)^columns).
+[[nodiscard]] inline double moe_expected_unique_experts(std::int32_t experts, std::int32_t top_k,
+                                                        std::int32_t columns) noexcept {
+    if (columns <= 0 || experts <= 0 || top_k <= 0) { return 0.0; }
+    if (top_k >= experts) { return static_cast<double>(experts); }
+    const double e = static_cast<double>(experts);
+    const double k = static_cast<double>(top_k);
+    return e * (1.0 - std::pow(1.0 - k / e, static_cast<double>(columns)));
+}
+
+// Relative round time of a speculative round verifying `drafts` per sequence across `batch`
+// sequences compared to a plain round (drafts = 0) of the same `batch`, modeling dense layers as
+// `dense_equiv_experts` expert-equivalents plus the expected distinct routed experts plus `drafts`
+// serial draft steps normalized from B=1 plain rounds by (dense + U(1)) / (dense + U(batch)).
+[[nodiscard]] inline double moe_round_cost(std::int32_t batch, std::int32_t drafts, std::int32_t experts,
+                                           std::int32_t top_k, double dense_equiv_experts,
+                                           double draft_step_cost = 0.0) noexcept {
+    if (drafts <= 0) { return 1.0; }
+    const double u_b1         = moe_expected_unique_experts(experts, top_k, 1);
+    const double u0           = moe_expected_unique_experts(experts, top_k, std::max(batch, 1));
+    const double u1           = moe_expected_unique_experts(experts, top_k, std::max(batch, 1) * (1 + drafts));
+    const double denom        = std::max(dense_equiv_experts + u0, 1e-6);
+    const double verify_ratio = (dense_equiv_experts + u1) / denom;
+    const double step_scale   = (dense_equiv_experts + u_b1) / denom;
+    return verify_ratio + draft_step_cost * step_scale * static_cast<double>(drafts);
+}
+
+// Online Ridge-regularized EWM linear regression of single-row decode round duration:
+//   t = a + b_v * x_v + b_d * x_d
+// where x_v = (U(1 + verified_drafts) - U(1)) / U(1) is normalized extra unique routed experts
+// verified across all B=1 round kinds (plain, complete MTP, gated MTP, N-gram), and x_d is the
+// executed draft step count (0 for plain / pure N-gram, executed steps for MTP).
+struct RoundCostModel {
+    static constexpr double kDecay       = 0.98;
+    static constexpr double kGapRatio    = 3.0;
+    static constexpr double kMinRounds   = 16.0;
+    static constexpr double kRidgeLambda = 4.0;
+
+    double n     = 0.0;
+    double t_sum = 0.0;
+    double m[3][3]{};
+    double rhs[3]{};
+
+    [[nodiscard]] static double extra_expert_feature(std::int32_t verified_drafts, std::int32_t experts,
+                                                     std::int32_t top_k) noexcept {
+        if (verified_drafts <= 0) { return 0.0; }
+        const double u1 = moe_expected_unique_experts(experts, top_k, 1);
+        const double uk = moe_expected_unique_experts(experts, top_k, 1 + verified_drafts);
+        return (uk - u1) / std::max(u1, 1e-6);
+    }
+
+    [[nodiscard]] bool solve_ridge(std::int32_t experts, std::int32_t top_k, double prior_dense_equiv,
+                                   double prior_step_cost, double& a, double& bv, double& bd) const noexcept {
+        if (n < 1.0 || t_sum <= 0.0) { return false; }
+        const double u1       = std::max(moe_expected_unique_experts(experts, top_k, 1), 1.0);
+        const double ratio_v0 = u1 / std::max(prior_dense_equiv + u1, 1.0);
+        // Scale-invariant penalty kRidgeLambda * ((bv - ratio_v0 * a)^2 + (bd - prior_step_cost * a)^2)
+        // keeps the intercept `a` unbiased while shrinking normalized cost ratios toward priors.
+        const std::array<double, 3> v1{-ratio_v0, 1.0, 0.0};
+        const std::array<double, 3> v2{-prior_step_cost, 0.0, 1.0};
+
+        double aug[3][4]{};
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                aug[r][c] = m[r][c] +
+                            kRidgeLambda * (v1[static_cast<std::size_t>(r)] * v1[static_cast<std::size_t>(c)] +
+                                            v2[static_cast<std::size_t>(r)] * v2[static_cast<std::size_t>(c)]);
+            }
+            aug[r][3] = rhs[r];
+        }
+        for (int col = 0; col < 3; ++col) {
+            int piv = col;
+            double best = std::abs(aug[col][col]);
+            for (int r = col + 1; r < 3; ++r) {
+                if (std::abs(aug[r][col]) > best) {
+                    best = std::abs(aug[r][col]);
+                    piv  = r;
+                }
+            }
+            if (best < 1e-18) { return false; }
+            if (piv != col) {
+                for (int c = col; c < 4; ++c) { std::swap(aug[col][c], aug[piv][c]); }
+            }
+            const double inv = 1.0 / aug[col][col];
+            for (int r = col + 1; r < 3; ++r) {
+                const double factor = aug[r][col] * inv;
+                for (int c = col; c < 4; ++c) { aug[r][c] -= factor * aug[col][c]; }
+            }
+        }
+        double x[3]{};
+        for (int r = 2; r >= 0; --r) {
+            double s = aug[r][3];
+            for (int c = r + 1; c < 3; ++c) { s -= aug[r][c] * x[c]; }
+            x[r] = s / aug[r][r];
+        }
+        a  = x[0];
+        bv = x[1];
+        bd = x[2];
+        return std::isfinite(a) && std::isfinite(bv) && std::isfinite(bd) && a > 0.0;
+    }
+
+    void observe(std::int32_t verified_drafts, std::int32_t executed_draft_steps, double seconds,
+                 std::int32_t experts, std::int32_t top_k, double prior_dense_equiv,
+                 double prior_step_cost) noexcept {
+        if (!(seconds > 0.0) || !std::isfinite(seconds) || verified_drafts < 0 || executed_draft_steps < 0) {
+            return;
+        }
+        const double xv = extra_expert_feature(verified_drafts, experts, top_k);
+        const double xd = static_cast<double>(executed_draft_steps);
+        double a = 0.0, bv = 0.0, bd = 0.0;
+        if (n >= 4.0) {
+            const double u1 = std::max(moe_expected_unique_experts(experts, top_k, 1), 1.0);
+            const double predict = solve_ridge(experts, top_k, prior_dense_equiv, prior_step_cost, a, bv, bd)
+                                       ? (a + std::max(0.0, bv) * xv + std::max(0.0, bd) * xd)
+                                       : (t_sum / n) * moe_round_cost(1, verified_drafts, experts, top_k,
+                                                                      prior_dense_equiv, prior_step_cost) /
+                                             std::max(moe_round_cost(1, 0, experts, top_k, prior_dense_equiv, 0.0), 1.0);
+            if (predict > 0.0 && seconds > kGapRatio * predict) { return; }
+        }
+        const double f[3] = {1.0, xv, xd};
+        n                 = kDecay * n + 1.0;
+        t_sum             = kDecay * t_sum + seconds;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) { m[r][c] = kDecay * m[r][c] + f[r] * f[c]; }
+            rhs[r] = kDecay * rhs[r] + f[r] * seconds;
+        }
+    }
+
+    [[nodiscard]] bool fit(std::int32_t experts, std::int32_t top_k, double prior_dense_equiv,
+                           double prior_step_cost, double& out_dense_equiv,
+                           double& out_step_cost) const noexcept {
+        if (n < kMinRounds) { return false; }
+        double a = 0.0, bv = 0.0, bd = 0.0;
+        if (!solve_ridge(experts, top_k, prior_dense_equiv, prior_step_cost, a, bv, bd)) { return false; }
+        const double u1 = std::max(moe_expected_unique_experts(experts, top_k, 1), 1.0);
+        out_dense_equiv =
+            bv > 0.0 ? std::clamp(u1 * std::max(a / bv - 1.0, 0.25), 35.0, 300.0) : prior_dense_equiv;
+        out_step_cost = std::clamp(bd / a, 0.02, 0.12);
+        return true;
+    }
+};
+
+// Prefix length in [0, copies] maximizing expected tokens / moe_round_cost while preserving the
+// minimum expected per-draft acceptance rate `min_accept`.
+[[nodiscard]] inline std::int32_t best_copy_length_moe(std::int32_t copies, double copy_accept, std::int32_t batch,
+                                                       std::int32_t experts, std::int32_t top_k, double dense_equiv,
+                                                       double min_accept = 0.0) noexcept {
+    std::int32_t best = 0;
+    double best_score = 1.0;
+    double reach = 1.0, accepted = 0.0;
+    for (std::int32_t k = 1; k <= copies; ++k) {
+        reach *= copy_accept;
+        accepted += reach;
+        if (min_accept > 0.0 && accepted < min_accept * static_cast<double>(k)) { break; }
+        const double cost  = moe_round_cost(batch, k, experts, top_k, dense_equiv, 0.0);
+        const double score = (1.0 + accepted) / cost;
+        if (score > best_score) {
+            best_score = score;
+            best       = k;
+        }
+    }
+    return best;
+}
+
+[[nodiscard]] inline bool copy_beats_chain_moe(std::int32_t copies, double copy_accept,
+                                               std::span<const double> chain_accept, std::int32_t chain_drafts,
+                                               std::int32_t batch, std::int32_t experts, std::int32_t top_k,
+                                               double dense_equiv, double draft_step_cost) noexcept {
+    const double copy_score =
+        expected_copy_tokens(copies, copy_accept) / moe_round_cost(batch, copies, experts, top_k, dense_equiv, 0.0);
+    const double chain_score =
+        expected_chain_tokens(chain_accept, chain_drafts) /
+        moe_round_cost(batch, chain_drafts, experts, top_k, dense_equiv, draft_step_cost);
+    return copy_score > chain_score;
+}
+
+[[nodiscard]] inline constexpr std::int32_t bucket_verify_width(std::int32_t width,
+                                                                std::int32_t max_width) noexcept {
+    if (width <= 8 || width >= max_width) { return std::min(width, max_width); }
+    constexpr std::int32_t kBuckets[] = {10, 12, 16, 20, 24, 28, 32};
+    for (const std::int32_t b : kBuckets) {
+        if (b >= width) { return std::min(b, max_width); }
+    }
+    return max_width;
+}
+
+[[nodiscard]] inline constexpr std::int32_t floor_verify_width(std::int32_t width,
+                                                               std::int32_t max_width) noexcept {
+    if (width <= 8) { return width; }
+    const std::int32_t clamped = std::min(width, max_width);
+    if (clamped == max_width) { return max_width; }
+    constexpr std::int32_t kBuckets[] = {32, 28, 24, 20, 16, 12, 10, 8};
+    for (const std::int32_t b : kBuckets) {
+        if (b <= clamped) { return b; }
+    }
+    return 8;
+}
+
+[[nodiscard]] inline std::uint32_t count_bucketed_verify_widths(std::int32_t max_width) noexcept {
+    std::uint32_t n = 0;
+    for (std::int32_t w = 2; w <= max_width; ++w) {
+        if (w == bucket_verify_width(w, max_width)) { ++n; }
+    }
+    return n;
+}
+
+// Eight-bucket confidence classifier combining SAM match length, occurrence multiplicity, recency,
+// and neural confirmation / post-neural stitching:
+//   0: short (<8)
+//   1: 8..11 single stale       2: 8..11 repeated (>=2 occ) or recent (<=2048 tok)
+//   3: 12..15 single stale      4: 12..15 repeated or recent
+//   5: 16+ single stale         6: 16+ repeated or recent
+//   7: neural-confirmed or post-neural stitched SAM suffix
+[[nodiscard]] inline int ngram_confidence_bucket(std::uint32_t matched, std::uint32_t occurrences,
+                                                 std::uint32_t distance, bool mtp_confirmed = false) noexcept {
+    if (mtp_confirmed) { return 7; }
+    if (matched < 8U) { return 0; }
+    const bool strong = (occurrences >= 2U) || (distance <= 2048U);
+    if (matched < 12U) { return strong ? 2 : 1; }
+    if (matched < 16U) { return strong ? 4 : 3; }
+    return strong ? 6 : 5;
+}
+
+// Optimal stitched SAM suffix length in [0, copies] appended after an already-drafted neural prefix
+// of length `prefix_len` with expected round tokens `prefix_expected_tokens` and survival
+// probability `prefix_reach` at its tip (draft step cost already sunk).
+[[nodiscard]] inline std::int32_t best_stitch_length(std::int32_t prefix_len, double prefix_expected_tokens,
+                                                     double prefix_reach, std::int32_t copies, double copy_accept,
+                                                     std::int32_t batch, std::int32_t current_batch_drafts,
+                                                     std::int32_t experts, std::int32_t top_k, double dense_equiv,
+                                                     double min_accept = 0.0) noexcept {
+    if (copies <= 0 || prefix_reach <= 0.0) { return 0; }
+    std::int32_t best = 0;
+    double best_score =
+        prefix_expected_tokens / moe_round_cost(batch, current_batch_drafts, experts, top_k, dense_equiv, 0.0);
+    double reach = 1.0, accepted = 0.0;
+    for (std::int32_t s = 1; s <= copies; ++s) {
+        reach *= copy_accept;
+        accepted += reach;
+        if (min_accept > 0.0 && accepted < min_accept * static_cast<double>(s)) { break; }
+        const std::int32_t width_drafts = std::max(current_batch_drafts, prefix_len + s);
+        const double total_tokens       = prefix_expected_tokens + prefix_reach * accepted;
+        const double score =
+            total_tokens / moe_round_cost(batch, width_drafts, experts, top_k, dense_equiv, 0.0);
+        if (score > best_score) {
+            best_score = score;
+            best       = s;
+        }
+    }
+    return best;
+}
+
+struct RootForkDecision {
+    bool fork                = false;
+    std::int32_t side_token  = 0;
+};
+
+// Decides independently of the realized draw `main_token` whether step-0 proposal uncertainty
+// warrants a depth-1 root-fork branch, then samples an alternative token without replacement from
+// q restricted to candidates != main_token using a deterministic hash of (seed, position).
+// Gates out `(position % ratio) == (ratio - 2)` where QSA pooled-block completion would see both
+// the main token and side token at physical position `position + 1`.
+[[nodiscard]] inline RootForkDecision choose_root_fork_side(std::int32_t main_token,
+                                                            std::span<const std::int32_t> candidates,
+                                                            std::span<const float> q, std::int32_t position,
+                                                            std::int32_t ratio, std::uint64_t seed,
+                                                            float max_p_threshold = 0.90F) noexcept {
+    if (ratio > 1 && (position % ratio) == (ratio - 2)) { return {}; }
+    if (candidates.empty() || candidates.size() != q.size()) { return {}; }
+    float max_p = 0.0F;
+    for (const float p : q) {
+        if (std::isfinite(p) && p > max_p) { max_p = p; }
+    }
+    if (max_p >= max_p_threshold) { return {}; }
+    double residual = 0.0;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (candidates[i] != main_token && std::isfinite(q[i]) && q[i] > 0.0F) { residual += q[i]; }
+    }
+    if (residual <= 1e-6) { return {}; }
+    std::uint64_t x = seed ^ (static_cast<std::uint64_t>(position) * 0x9E3779B97F4A7C15ULL);
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x ^= (x >> 31);
+    const double u       = static_cast<double>(x >> 11) * (1.0 / static_cast<double>(std::uint64_t{1} << 53));
+    const double target  = u * residual;
+    double accum         = 0.0;
+    std::int32_t picked  = -1;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (candidates[i] == main_token || !std::isfinite(q[i]) || q[i] <= 0.0F) { continue; }
+        picked = candidates[i];
+        accum += q[i];
+        if (accum >= target) { return {.fork = true, .side_token = picked}; }
+    }
+    return picked >= 0 ? RootForkDecision{.fork = true, .side_token = picked} : RootForkDecision{};
+}
+
+// Builds a depth-1 root-fork SpeculativeTreeRow (transport = 0, without-replacement):
+// path 0 is the main chain `0..main_depth`; when `has_side`, column `main_depth + 1` forks off
+// root column 0 at depth 1 and path 1 is `{0, main_depth + 1}`.
+inline void build_root_fork_tree_row(ops::SpeculativeTreeRow& row, std::int32_t main_depth, bool has_side) noexcept {
+    std::memset(&row, 0, sizeof(row));
+    std::fill(std::begin(row.parent), std::end(row.parent), static_cast<std::int8_t>(-1));
+    std::fill(std::begin(row.first_child), std::end(row.first_child), static_cast<std::int8_t>(-1));
+    std::fill(std::begin(row.next_sibling), std::end(row.next_sibling), static_cast<std::int8_t>(-1));
+    row.main_depth = main_depth;
+    row.tree       = has_side ? 1 : 0;
+    row.transport  = 0;
+    row.sampled    = 0;
+    for (std::int32_t c = 1; c <= main_depth; ++c) {
+        row.parent[c]          = static_cast<std::int8_t>(c - 1);
+        row.depth[c]           = static_cast<std::int8_t>(c);
+        row.first_child[c - 1] = static_cast<std::int8_t>(c);
+        row.sibling_index[c]   = 0;
+        row.path_columns[0][c] = static_cast<std::int8_t>(c);
+    }
+    row.path_length[0] = static_cast<std::int8_t>(main_depth + 1);
+    row.owned_from[0]  = 0;
+    if (has_side) {
+        const std::int32_t s = main_depth + 1;
+        row.nodes            = main_depth + 2;
+        row.paths            = 2;
+        row.parent[s]        = 0;
+        row.depth[s]         = 1;
+        row.next_sibling[1]  = static_cast<std::int8_t>(s);
+        row.sibling_index[s] = 1;
+        row.path_length[1]   = 2;
+        row.owned_from[1]    = 1;
+        row.path_columns[1][0] = 0;
+        row.path_columns[1][1] = static_cast<std::int8_t>(s);
+    } else {
+        row.nodes = main_depth + 1;
+        row.paths = 1;
+    }
 }
 
 } // namespace infernix::models::qwen4_exp

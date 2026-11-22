@@ -83,10 +83,19 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
     upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
     const execution::DFlash2ProposalCall call = dflash2_proposal_call(batch);
     replay(dflash_propose_graphs_[static_cast<std::size_t>(batch - 1)], [&] { drafter_->propose(call); });
-    // The drafts and their probabilities (adjacent regions) in one copy.
+    // The drafts and their probabilities (adjacent regions) in one copy, plus candidates & q when
+    // sampled root-fork trees are enabled.
     CUDA_CHECK(cudaMemcpyAsync(dflash_host(dflash_io_.drafts), dflash_device(dflash_io_.drafts),
                                4ULL * (dflash_io_.confidence - dflash_io_.drafts + static_cast<std::size_t>(K) * batch),
                                cudaMemcpyDeviceToHost, s));
+    if (sampled_dflash_drafts_ && options_.univer_trees) {
+        constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
+        const std::size_t law_bytes = 4ULL * C * static_cast<std::size_t>(K) * static_cast<std::size_t>(batch);
+        CUDA_CHECK(cudaMemcpyAsync(dflash_host(dflash_io_.candidates), dflash_device(dflash_io_.candidates), law_bytes,
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(dflash_host(dflash_io_.q), dflash_device(dflash_io_.q), law_bytes,
+                                   cudaMemcpyDeviceToHost, s));
+    }
     if (while_drafting) {
         device_.flush();
         while_drafting();
@@ -105,14 +114,21 @@ void ProgramImpl::dflash2_propose(std::span<const std::uint32_t> lanes, const st
     }
 }
 
-std::pair<std::size_t, std::size_t> ProgramImpl::dflash2_verify_planes(std::int32_t batch, std::int32_t K) {
+std::pair<std::size_t, std::size_t> ProgramImpl::dflash2_verify_planes(std::int32_t batch, std::int32_t K,
+                                                                        bool tree_round) {
     const cudaStream_t s     = device_.stream;
     constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
     bool copies              = false;
-    for (std::int32_t b = 0; b < batch; ++b) { copies = copies || (from_ngram_[b] && !drafts_[b].empty()); }
+    bool stitched            = false;
+    for (std::int32_t b = 0; b < batch; ++b) {
+        copies   = copies || (from_ngram_[b] && !drafts_[b].empty());
+        stitched = stitched || (!from_ngram_[b] && stitched_ngram_[b] && !drafts_[b].empty());
+    }
     // Row b's plane j stands at (b * K + j) * C in both layouts when batch == 1 or K is the proposal's.
-    if (!copies && (batch == 1 || K == dflash_k_)) { return {dflash_io_.candidates, dflash_io_.q}; }
-    if (!copies) {
+    if (!tree_round && !copies && !stitched && (batch == 1 || K == dflash_k_)) {
+        return {dflash_io_.candidates, dflash_io_.q};
+    }
+    if (!tree_round && !copies && !stitched) {
         for (const auto [from, to] : {std::pair{dflash_io_.candidates, dflash_io_.verify_candidates},
                                       std::pair{dflash_io_.q, dflash_io_.verify_q}}) {
             CUDA_CHECK(cudaMemcpy2DAsync(dflash_device(to), 4ULL * C * K, dflash_device(from), 4ULL * C * dflash_k_,
@@ -126,23 +142,38 @@ std::pair<std::size_t, std::size_t> ProgramImpl::dflash2_verify_planes(std::int3
         const auto n = static_cast<std::int32_t>(drafts_[b].size());
         if (n == 0) { continue; }
         const std::size_t row = static_cast<std::size_t>(b) * K * C;
-        if (from_ngram_[b]) {
-            for (std::int32_t j = 0; j < n; ++j) {
+        const std::int32_t neural_n =
+            from_ngram_[b] ? 0 : (stitched_ngram_[b] ? neural_draft_count_[b] : n);
+        if (neural_n > 0) {
+            const std::size_t from = static_cast<std::size_t>(b) * dflash_k_ * C;
+            CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_candidates + row),
+                                       dflash_device(dflash_io_.candidates + from), 4ULL * C * neural_n,
+                                       cudaMemcpyDeviceToDevice, s));
+            CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_q + row),
+                                       dflash_device(dflash_io_.q + from), 4ULL * C * neural_n,
+                                       cudaMemcpyDeviceToDevice, s));
+            if (tree_round && row_is_tree_[b] && n < K) {
+                CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_candidates + row + static_cast<std::size_t>(n) * C),
+                                           dflash_device(dflash_io_.candidates + from), 4ULL * C,
+                                           cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_q + row + static_cast<std::size_t>(n) * C),
+                                           dflash_device(dflash_io_.q + from), 4ULL * C,
+                                           cudaMemcpyDeviceToDevice, s));
+            }
+        }
+        if (neural_n < n) {
+            for (std::int32_t j = neural_n; j < n; ++j) {
                 const std::int32_t token = drafts_[b][static_cast<std::size_t>(j)];
                 for (std::int32_t c = 0; c < C; ++c) {
                     host_candidates[row + j * C + c] = (token + c) % token_domain_;
                     host_q[row + j * C + c]          = c == 0 ? 1.0F : 0.0F;
                 }
             }
-            upload_pinned(dflash_device(dflash_io_.verify_candidates + row), host_candidates + row, 4ULL * C * n, s);
-            upload_pinned(dflash_device(dflash_io_.verify_q + row), host_q + row, 4ULL * C * n, s);
-            continue;
+            const std::size_t offset = row + static_cast<std::size_t>(neural_n) * C;
+            const std::size_t bytes  = 4ULL * C * static_cast<std::size_t>(n - neural_n);
+            upload_pinned(dflash_device(dflash_io_.verify_candidates + offset), host_candidates + offset, bytes, s);
+            upload_pinned(dflash_device(dflash_io_.verify_q + offset), host_q + offset, bytes, s);
         }
-        const std::size_t from = static_cast<std::size_t>(b) * dflash_k_ * C;
-        CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_candidates + row), dflash_device(dflash_io_.candidates + from),
-                                   4ULL * C * n, cudaMemcpyDeviceToDevice, s));
-        CUDA_CHECK(cudaMemcpyAsync(dflash_device(dflash_io_.verify_q + row), dflash_device(dflash_io_.q + from),
-                                   4ULL * C * n, cudaMemcpyDeviceToDevice, s));
     }
     return {dflash_io_.verify_candidates, dflash_io_.verify_q};
 }

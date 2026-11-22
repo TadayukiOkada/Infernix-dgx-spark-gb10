@@ -78,12 +78,16 @@ void causal_conv1d_silu_snapshot_split(const Tensor& x, const Tensor& weight, Te
  */
 void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
                                     const Tensor& conv_states, const Tensor& initial_state_slots,
-                                    Tensor& out, cudaStream_t stream);
+                                    Tensor& out, cudaStream_t stream,
+                                    const Tensor* tree_rows = nullptr);
 
-// Split-output read-only form, with the destinations of causal_conv1d_silu_snapshot_split.
+// Split-output read-only form, with the destinations of causal_conv1d_silu_snapshot_split. When
+// tree_rows (I32 [kSpeculativeTreeRowWords, B]) is supplied, columns of tree != 0 sequences walk
+// ancestor parents instead of sequential columns, and columns >= nodes write zero.
 void causal_conv1d_silu_from_states_split(const Tensor& x, const Tensor& weight,
                                           const Tensor& conv_states,
                                           const Tensor& initial_state_slots, Tensor& out0,
-                                          Tensor& out1, Tensor& out2, cudaStream_t stream);
+                                          Tensor& out1, Tensor& out2, cudaStream_t stream,
+                                          const Tensor* tree_rows = nullptr);
 
 } // namespace infernix::ops

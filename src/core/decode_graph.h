@@ -48,6 +48,12 @@ __host__ __device__ inline float graph_gate_product(const float* values, std::in
 void launch_graph_gate_product(const float* values, std::int32_t stride, std::int32_t step, const GraphGateBins& bins,
                                const float* threshold, cudaGraphConditionalHandle handle, cudaStream_t stream);
 
+// `handle` is 1 when ANY row b in [0, batch) has graph_gate_product(values + b, batch, step, bins) not
+// below thresholds[b] (step-major values [steps, batch]), 0 otherwise.
+void launch_graph_gate_batch_product(const float* values, std::int32_t batch, std::int32_t step,
+                                     const GraphGateBins& bins, const float* thresholds,
+                                     cudaGraphConditionalHandle handle, cudaStream_t stream);
+
 // A CUDA Graph executable found no device memory to instantiate or upload into. The device stays
 // usable (the error is not sticky), so a caller may free memory and retry; every other CUDA error
 // of these calls aborts as CUDA_CHECK does.

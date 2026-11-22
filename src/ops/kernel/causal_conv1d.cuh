@@ -4,6 +4,7 @@
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
 #include "core/pdl.cuh"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/common/math.cuh"
 
 #include <cuda_bf16.h>
@@ -503,6 +504,7 @@ __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict
                                                  const __nv_bfloat16* __restrict__ weight,
                                                  const __nv_bfloat16* __restrict__ conv_states,
                                                  const std::int32_t* __restrict__ initial_state_slots,
+                                                 const SpeculativeTreeRow* __restrict__ trees,
                                                  Output out, std::int32_t C,
                                                  std::int32_t width, std::int64_t slot_stride) {
     pdl::enter(); // launched as a programmatic dependent
@@ -521,6 +523,63 @@ __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict
     const float w3              = __bfloat162float(weight[3 * C64 + c64]);
     const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
     const auto destination      = out.column(c64);
+    if (trees != nullptr) {
+        const SpeculativeTreeRow& tree = trees[batch];
+        const std::int32_t live        = tree.nodes < width ? tree.nodes : width;
+        if (tree.tree != 0) {
+            const __nv_bfloat16 zero = __float2bfloat16_rn(0.0f);
+            for (std::int32_t column = 0; column < width; ++column) {
+                if (column >= live) {
+                    *destination.at(batch * width + column) = zero;
+                    continue;
+                }
+                const __nv_bfloat16 x3 = x[row_base + static_cast<std::int64_t>(column) * C64 + c64];
+                const int p1           = column == 0 ? -1 : static_cast<int>(tree.parent[column]);
+                __nv_bfloat16 x0, x1, x2;
+                if (p1 < 0) {
+                    x0 = s0;
+                    x1 = s1;
+                    x2 = s2;
+                } else {
+                    x2           = x[row_base + static_cast<std::int64_t>(p1) * C64 + c64];
+                    const int p2 = p1 == 0 ? -1 : static_cast<int>(tree.parent[p1]);
+                    if (p2 < 0) {
+                        x0 = s1;
+                        x1 = s2;
+                    } else {
+                        x1           = x[row_base + static_cast<std::int64_t>(p2) * C64 + c64];
+                        const int p3 = p2 == 0 ? -1 : static_cast<int>(tree.parent[p2]);
+                        x0 = p3 >= 0 ? x[row_base + static_cast<std::int64_t>(p3) * C64 + c64] : s2;
+                    }
+                }
+                float acc = 0.0f;
+                acc += w0 * __bfloat162float(x0);
+                acc += w1 * __bfloat162float(x1);
+                acc += w2 * __bfloat162float(x2);
+                acc += w3 * __bfloat162float(x3);
+                *destination.at(batch * width + column) = __float2bfloat16_rn(silu(acc));
+            }
+            return;
+        }
+        for (std::int32_t column = 0; column < width; ++column) {
+            if (column >= live) {
+                *destination.at(batch * width + column) = __float2bfloat16_rn(0.0f);
+                continue;
+            }
+            const std::int64_t idx = row_base + static_cast<std::int64_t>(column) * C64 + c64;
+            const __nv_bfloat16 x0 = x[idx];
+            float acc              = 0.0f;
+            acc += w0 * __bfloat162float(s0);
+            acc += w1 * __bfloat162float(s1);
+            acc += w2 * __bfloat162float(s2);
+            acc += w3 * __bfloat162float(x0);
+            *destination.at(batch * width + column) = __float2bfloat16_rn(silu(acc));
+            s0                                      = s1;
+            s1                                      = s2;
+            s2                                      = x0;
+        }
+        return;
+    }
     for (std::int32_t column = 0; column < width; ++column) {
         const std::int64_t idx = row_base + static_cast<std::int64_t>(column) * C64 + c64;
         const __nv_bfloat16 x0 = x[idx];

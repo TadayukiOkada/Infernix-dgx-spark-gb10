@@ -39,6 +39,24 @@ struct ListedRowsOutput {
     }
 };
 
+struct ListedCompactOutput {
+    float* compact_logits;
+    const std::int32_t* entries;
+    const std::int32_t* counts;
+    std::int32_t cap;
+
+    __device__ __forceinline__ std::int64_t weight_row(int row) const {
+        return static_cast<std::int64_t>(__ldcg(entries + row));
+    }
+    __device__ __forceinline__ bool skip_tile(int row0) const {
+        return row0 % cap >= __ldcg(counts + row0 / cap);
+    }
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        const int column = row / cap;
+        if (token == column && row % cap < __ldcg(counts + column)) { compact_logits[row] = value; }
+    }
+};
+
 // projection_fp32_mma.cu's schedule.
 using HeadSchedule = Bf16A16SlicedR32T16W4;
 static_assert(HeadSchedule::kBlockRows == 32 && HeadSchedule::kBlockTokens == 16,
@@ -52,6 +70,15 @@ void bf16_rescore(const Tensor& x, const void* head_rows, std::int32_t vocab_row
     const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(head_rows),
                             columns * cap, kHidden, columns};
     launch_bf16_a16_sliced_k_mma<HeadSchedule>(p, ListedRowsOutput{logits, vocab_rows, entries, counts, cap},
+                                               LinearIdentityEpilogue{}, stream, pdl::Dependency::Programmatic);
+}
+
+void bf16_rescore_compact(const Tensor& x, const void* head_rows, std::int32_t columns,
+                          const std::int32_t* entries, const std::int32_t* counts, std::int32_t cap,
+                          float* compact_logits, cudaStream_t stream) {
+    const Bf16A16Operands p{static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(head_rows),
+                            columns * cap, kHidden, columns};
+    launch_bf16_a16_sliced_k_mma<HeadSchedule>(p, ListedCompactOutput{compact_logits, entries, counts, cap},
                                                LinearIdentityEpilogue{}, stream, pdl::Dependency::Programmatic);
 }
 

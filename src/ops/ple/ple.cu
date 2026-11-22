@@ -2,6 +2,7 @@
 
 #include "core/pdl.cuh"
 #include "infernix/ops/hyper_connection.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -28,6 +29,7 @@ constexpr int kFusedConvMaxSpan = 16;
 // occupies several SMs instead of one.
 constexpr int kEmbedSpreadColumns = 48;
 constexpr int kEmbedCtaTasks      = 32;
+constexpr int kMaxPleHashHeads    = 64;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("ple: ") + message); }
@@ -240,6 +242,72 @@ __global__ void __launch_bounds__(kThreads)
         for (int i = 0; i < 8; ++i) {
             const std::uint8_t pair = static_cast<std::uint8_t>(codes >> (8 * i));
             const std::uint32_t low  = bf16_rn_product(e2m1_value(pair & 15U) * s, m); // E2M1 times E4M3: exact in FP32
+            const std::uint32_t high = bf16_rn_product(e2m1_value(pair >> 4U) * s, m);
+            words[i]                 = low | (high << 16);
+        }
+        std::uint16_t* o =
+            out + static_cast<std::size_t>(t) * heads * width + static_cast<std::size_t>(h) * width + 16 * b;
+        if constexpr (VectorStore) {
+            *reinterpret_cast<uint4*>(o)     = make_uint4(words[0], words[1], words[2], words[3]);
+            *reinterpret_cast<uint4*>(o + 8) = make_uint4(words[4], words[5], words[6], words[7]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                o[2 * i]     = static_cast<std::uint16_t>(words[i] & 0xFFFFU);
+                o[2 * i + 1] = static_cast<std::uint16_t>(words[i] >> 16);
+            }
+        }
+    }
+}
+
+template <bool VectorStore>
+__global__ void __launch_bounds__(kThreads)
+    hash_embed_nvfp4_kernel(const std::int32_t* __restrict__ windows, const std::uint64_t* __restrict__ multipliers,
+                            const std::uint64_t* __restrict__ sizes, const std::uint64_t* __restrict__ offsets,
+                            const std::uint8_t* __restrict__ resident_blocks, const float* __restrict__ multiplier,
+                            int ngram_size, int heads_per_ngram, int eos_token_id, int heads, int width, int row_bytes,
+                            int rows_per_block, int block_bytes, int columns, int tasks_per_cta,
+                            std::uint16_t* __restrict__ out) {
+    pdl::enter();
+    __shared__ std::uint32_t sh_rows[kMaxPleHashHeads];
+    const int t = blockIdx.y;
+    for (int h = threadIdx.x; h < heads; h += blockDim.x) {
+        const int n_idx             = h / heads_per_ngram + 2;
+        const std::int32_t* col_win = windows + static_cast<std::size_t>(t) * ngram_size;
+        bool closed                 = false;
+        std::uint64_t mixed         = static_cast<std::uint64_t>(col_win[0]) * multipliers[0];
+        for (int s = 1; s < n_idx; ++s) {
+            const std::int32_t w = col_win[s];
+            if (w == eos_token_id) { closed = true; }
+            const std::uint64_t tok = static_cast<std::uint64_t>(closed ? eos_token_id : w);
+            mixed ^= tok * multipliers[s];
+        }
+        sh_rows[h] = static_cast<std::uint32_t>(mixed % sizes[h] + offsets[h]);
+    }
+    __syncthreads();
+
+    const int blocks = width / 16;
+    const int tasks  = heads * blocks;
+    const float m    = multiplier[0];
+    const int begin  = blockIdx.x * tasks_per_cta;
+    const int end    = begin + tasks_per_cta < tasks ? begin + tasks_per_cta : tasks;
+    for (int task = begin + threadIdx.x; task < end; task += blockDim.x) {
+        const int h                  = task / blocks;
+        const int b                  = task % blocks;
+        const std::uint32_t row_id   = sh_rows[h];
+        const std::size_t block      = static_cast<std::size_t>(row_id) / static_cast<std::size_t>(rows_per_block);
+        const std::size_t in_block   = static_cast<std::size_t>(row_id) % static_cast<std::size_t>(rows_per_block);
+        const std::uint8_t* blk_base = resident_blocks + block * static_cast<std::size_t>(block_bytes);
+        const std::uint8_t* row      = blk_base + in_block * static_cast<std::size_t>(row_bytes);
+        __nv_fp8_e4m3 code;
+        code.__x                  = row[width / 2 + b];
+        const float s             = static_cast<float>(code);
+        const std::uint64_t codes = load_packed_codes(row + 8 * b, blk_base, blk_base + block_bytes);
+        std::uint32_t words[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const std::uint8_t pair  = static_cast<std::uint8_t>(codes >> (8 * i));
+            const std::uint32_t low  = bf16_rn_product(e2m1_value(pair & 15U) * s, m);
             const std::uint32_t high = bf16_rn_product(e2m1_value(pair >> 4U) * s, m);
             words[i]                 = low | (high << 16);
         }
@@ -597,12 +665,28 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+__device__ __forceinline__ int ple_conv_source(const SpeculativeTreeRow* __restrict__ trees, int sequence, int local,
+                                               int lag) {
+    if (lag == 0) { return local; }
+    if (trees == nullptr || trees[sequence].tree == 0) { return local - lag; }
+    const SpeculativeTreeRow& tree = trees[sequence];
+    if (local >= tree.nodes) { return local - lag; }
+    int col   = local;
+    int steps = 0;
+    while (steps < lag && col > 0) {
+        col = static_cast<int>(tree.parent[col]);
+        ++steps;
+    }
+    if (col < 0) { return col - (lag - steps); }
+    return steps == lag ? col : -(lag - steps);
+}
+
 // One thread per (channel, column): reads the pre-update history.
 __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
                             const bf16* __restrict__ weight, int taps, int dilation, int span,
                             int channels, int width, const bf16* __restrict__ states,
-                            const std::int32_t* __restrict__ source_slots, int columns,
-                            bf16* __restrict__ residual) {
+                            const std::int32_t* __restrict__ source_slots, const SpeculativeTreeRow* __restrict__ trees,
+                            int columns, bf16* __restrict__ residual) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (c >= channels || t >= columns) { return; }
@@ -610,7 +694,7 @@ __global__ void conv_kernel(const bf16* __restrict__ gated, const bf16* __restri
     const int slot     = source_slots[sequence];
     float acc          = 0.0F;
     for (int j = 0; j < taps; ++j) {
-        const int source = local - (taps - 1 - j) * dilation;
+        const int source = ple_conv_source(trees, sequence, local, (taps - 1 - j) * dilation);
         float x;
         if (source >= 0) {
             x = __bfloat162float(normalized[static_cast<std::size_t>(sequence * width + source) * channels + c]);
@@ -628,8 +712,8 @@ __global__ void __launch_bounds__(kThreads)
     conv_vec8_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
                      const bf16* __restrict__ weight, int taps, int dilation, int span, int channels,
                      int width, const bf16* __restrict__ states,
-                     const std::int32_t* __restrict__ source_slots, int columns,
-                     bf16* __restrict__ residual) {
+                     const std::int32_t* __restrict__ source_slots, const SpeculativeTreeRow* __restrict__ trees,
+                     int columns, bf16* __restrict__ residual) {
     pdl::enter();
     const int c = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int t = blockIdx.y;
@@ -638,7 +722,7 @@ __global__ void __launch_bounds__(kThreads)
     const int slot     = source_slots[sequence];
     float acc[8]       = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     for (int j = 0; j < taps; ++j) {
-        const int source = local - (taps - 1 - j) * dilation;
+        const int source = ple_conv_source(trees, sequence, local, (taps - 1 - j) * dilation);
         float x[8], w[8];
         if (source >= 0) {
             load_bf16x<8>(normalized + static_cast<std::size_t>(sequence * width + source) * channels + c, x);
@@ -727,7 +811,8 @@ __global__ void __launch_bounds__(kGateMaxThreads)
     conv_norm_vec8_kernel(const bf16* __restrict__ gated, const bf16* __restrict__ normalized,
                           const bf16* __restrict__ weight, int taps, int dilation, int span,
                           int hidden, int channels, int width, const bf16* __restrict__ states,
-                          const std::int32_t* __restrict__ source_slots, bf16* __restrict__ residual,
+                          const std::int32_t* __restrict__ source_slots,
+                          const SpeculativeTreeRow* __restrict__ trees, bf16* __restrict__ residual,
                           const void* __restrict__ next_norm_weight,
                           bf16* __restrict__ next_norm_out, float next_norm_eps) {
     pdl::enter();
@@ -744,7 +829,7 @@ __global__ void __launch_bounds__(kGateMaxThreads)
         const int slot     = source_slots[sequence];
         float acc[8]       = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
         for (int j = 0; j < taps; ++j) {
-            const int source = local - (taps - 1 - j) * dilation;
+            const int source = ple_conv_source(trees, sequence, local, (taps - 1 - j) * dilation);
             float x[8], w[8];
             if (source >= 0) {
                 load_bf16x<8>(
@@ -976,6 +1061,29 @@ void launch_embed_nvfp4(const std::uint8_t* rows, const float* multiplier, int r
     }
 }
 
+void launch_hash_embed_nvfp4(const std::int32_t* windows, const std::uint64_t* multipliers,
+                             const std::uint64_t* sizes, const std::uint64_t* offsets,
+                             const std::uint8_t* resident_blocks, const float* multiplier, int ngram_size,
+                             int heads_per_ngram, int eos_token_id, int heads, int width, int row_bytes,
+                             int rows_per_block, int block_bytes, int columns, std::uint16_t* out,
+                             cudaStream_t stream) {
+    const int tasks   = heads * (width / 16);
+    int tasks_per_cta = tasks < kThreads ? tasks : kThreads;
+    if (columns < kEmbedSpreadColumns && tasks > kEmbedCtaTasks) { tasks_per_cta = kEmbedCtaTasks; }
+    const dim3 grid((tasks + tasks_per_cta - 1) / tasks_per_cta, columns);
+    if (aligned<16>(out)) {
+        (void)pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(tasks_per_cta), 0, stream},
+                                   hash_embed_nvfp4_kernel<true>, windows, multipliers, sizes, offsets,
+                                   resident_blocks, multiplier, ngram_size, heads_per_ngram, eos_token_id, heads, width,
+                                   row_bytes, rows_per_block, block_bytes, columns, tasks_per_cta, out);
+    } else {
+        (void)pdl::launch_consumer(pdl::LaunchConfig{grid, dim3(tasks_per_cta), 0, stream},
+                                   hash_embed_nvfp4_kernel<false>, windows, multipliers, sizes, offsets,
+                                   resident_blocks, multiplier, ngram_size, heads_per_ngram, eos_token_id, heads, width,
+                                   row_bytes, rows_per_block, block_bytes, columns, tasks_per_cta, out);
+    }
+}
+
 } // namespace
 
 void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_t stream) {
@@ -1020,6 +1128,41 @@ void ple_embed_nvfp4(const Tensor& rows, const Tensor& multiplier, Tensor& out, 
     launch_embed_nvfp4(static_cast<const std::uint8_t*>(rows.data), static_cast<const float*>(multiplier.data),
                        row_bytes, heads, width, columns, static_cast<std::uint16_t*>(out.data), stream);
     check_launch("embed nvfp4");
+}
+
+void ple_hash_embed_nvfp4(const Tensor& windows, const PleNgramHashTable& table, Tensor& out, cudaStream_t stream) {
+    require(table.resident_blocks != nullptr && table.multipliers != nullptr && table.sizes != nullptr &&
+                table.offsets != nullptr && table.multiplier != nullptr,
+            "hash embed requires a resident NVFP4 table and hash descriptors");
+    require(contiguous(windows, DType::I32) && contiguous(out, DType::BF16) &&
+                contiguous(*table.multipliers, DType::I64) && contiguous(*table.sizes, DType::I64) &&
+                contiguous(*table.offsets, DType::I64) && contiguous(*table.multiplier, DType::FP32),
+            "hash embed requires contiguous tensors");
+    require(table.ngram_size >= 2 && table.ngram_size <= 32 && table.heads_per_ngram > 0,
+            "hash embed n-gram geometry out of range");
+    const int heads = (table.ngram_size - 1) * table.heads_per_ngram;
+    require(heads > 0 && heads <= kMaxPleHashHeads, "hash embed head count exceeds kernel limit");
+    const int columns = windows.ne[1];
+    require(columns > 0 && windows.ne[0] == table.ngram_size && windows.ne[2] == 1 && windows.ne[3] == 1,
+            "hash embed windows shape disagrees");
+    require(table.multipliers->numel() == table.ngram_size && table.sizes->numel() == heads &&
+                table.offsets->numel() == heads && table.multiplier->numel() == 1,
+            "hash embed table tensor sizes disagree");
+    require(table.head_width > 0 && table.head_width % 16 == 0 &&
+                table.row_bytes == table.head_width / 2 + table.head_width / 16 && table.rows_per_block > 0 &&
+                table.block_bytes >= table.rows_per_block * table.row_bytes,
+            "hash embed NVFP4 block geometry disagrees");
+    require(out.ne[0] == heads * table.head_width && out.ne[1] == columns && out.ne[2] == 1 && out.ne[3] == 1,
+            "hash embed output shape disagrees");
+    launch_hash_embed_nvfp4(static_cast<const std::int32_t*>(windows.data),
+                            reinterpret_cast<const std::uint64_t*>(table.multipliers->data),
+                            reinterpret_cast<const std::uint64_t*>(table.sizes->data),
+                            reinterpret_cast<const std::uint64_t*>(table.offsets->data),
+                            static_cast<const std::uint8_t*>(table.resident_blocks),
+                            static_cast<const float*>(table.multiplier->data), table.ngram_size, table.heads_per_ngram,
+                            table.eos_token_id, heads, table.head_width, table.row_bytes, table.rows_per_block,
+                            table.block_bytes, columns, static_cast<std::uint16_t*>(out.data), stream);
+    check_launch("hash embed");
 }
 
 void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
@@ -1099,7 +1242,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream,
                      const Tensor* next_norm_weight, Tensor* next_norm_out, float next_norm_eps,
-                     std::int32_t streams) {
+                     std::int32_t streams, const Tensor* tree_rows) {
     require(contiguous(gated, DType::BF16) && contiguous(normalized, DType::BF16) &&
                 contiguous(weight, DType::BF16) && contiguous(states, DType::BF16) &&
                 contiguous(residual, DType::BF16) && contiguous(source_slots, DType::I32) &&
@@ -1108,6 +1251,12 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
     const int channels = gated.ne[0], columns = gated.ne[1], taps = weight.ne[1];
     const int sequences = source_slots.ne[0];
     const bool update   = destination_slots.data != nullptr;
+    const SpeculativeTreeRow* trees_p = nullptr;
+    if (tree_rows != nullptr && tree_rows->data != nullptr) {
+        validate_speculative_tree_rows(*tree_rows, sequences, "ple_conv_inject");
+        require(!update, "conv tree_rows cannot update states in place");
+        trees_p = reinterpret_cast<const SpeculativeTreeRow*>(tree_rows->data);
+    }
     require(dilation > 0 && taps > 1 && weight.ne[0] == channels && normalized.ne[0] == channels &&
                 normalized.ne[1] == columns && residual.ne[0] == channels && residual.ne[1] == columns &&
                 sequences > 0 && (!update || destination_slots.ne[0] == sequences) && columns % sequences == 0,
@@ -1191,12 +1340,12 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
             if (next_norm_weight->dtype == DType::FP32) {
                 (void)pdl::launch_consumer(cfg, conv_norm_vec8_kernel<PleNextNorm::kFp32>, gated_p, normalized_p,
                                            weight_p, taps, static_cast<int>(dilation), span, hidden, channels, width,
-                                           states_p, source_p, residual_p, next_norm_weight->data, nn_out,
+                                           states_p, source_p, trees_p, residual_p, next_norm_weight->data, nn_out,
                                            next_norm_eps);
             } else {
                 (void)pdl::launch_consumer(cfg, conv_norm_vec8_kernel<PleNextNorm::kBf16>, gated_p, normalized_p,
                                            weight_p, taps, static_cast<int>(dilation), span, hidden, channels, width,
-                                           states_p, source_p, residual_p, next_norm_weight->data, nn_out,
+                                           states_p, source_p, trees_p, residual_p, next_norm_weight->data, nn_out,
                                            next_norm_eps);
             }
             check_launch("conv norm");
@@ -1207,7 +1356,7 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
         constexpr int kTiledBlock = 128;
         constexpr int kTileSteps  = 8;
         const int time_tiles      = (width + kTileSteps - 1) / kTileSteps;
-        if (pair2 && taps == 4 && dilation == 3 && width >= kTileSteps &&
+        if (trees_p == nullptr && pair2 && taps == 4 && dilation == 3 && width >= kTileSteps &&
             time_tiles <= 65535 && sequences <= 65535) {
             const int pairs = channels / 2;
             const dim3 grid((pairs + kTiledBlock - 1) / kTiledBlock, time_tiles, sequences);
@@ -1223,11 +1372,11 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
             (void)pdl::launch_consumer(pdl::LaunchConfig{dim3((channels / 8 + kThreads - 1) / kThreads, columns),
                                                          dim3(kThreads), 0, stream},
                                        conv_vec8_kernel, gated_p, normalized_p, weight_p, taps, dilation, span,
-                                       channels, width, states_p, source_p, columns, residual_p);
+                                       channels, width, states_p, source_p, trees_p, columns, residual_p);
         } else {
             conv_kernel<<<dim3((channels + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-                gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, columns,
-                residual_p);
+                gated_p, normalized_p, weight_p, taps, dilation, span, channels, width, states_p, source_p, trees_p,
+                columns, residual_p);
         }
         check_launch("conv");
         if (want_next_norm) {
@@ -1252,7 +1401,8 @@ void ple_gate_conv_inject(const Tensor& key, const Tensor& value, Tensor& residu
                           std::int32_t streams, float eps, const Tensor& weight, std::int32_t dilation,
                           Tensor& states, const Tensor& source_slots, const Tensor& destination_slots,
                           Tensor& gated, Tensor& normalized, cudaStream_t stream,
-                          const Tensor* next_norm_weight, Tensor* next_norm_out, float next_norm_eps) {
+                          const Tensor* next_norm_weight, Tensor* next_norm_out, float next_norm_eps,
+                          const Tensor* tree_rows) {
     const int width   = key.ne[0], columns = key.ne[1];
     const int taps    = weight.ne[1];
     const int span    = (taps - 1) * static_cast<int>(dilation);
@@ -1273,6 +1423,7 @@ void ple_gate_conv_inject(const Tensor& key, const Tensor& value, Tensor& residu
     // scratch it does not use; an unmet condition (or an invalid shape, which throws below or in
     // the composed fallback) leaves the exact composed route.
     const bool fused =
+        (tree_rows == nullptr || tree_rows->data == nullptr) &&
         update && source_slots.data != nullptr && contiguous(source_slots, DType::I32) &&
         contiguous(destination_slots, DType::I32) && source_slots.ne[0] == columns &&
         destination_slots.ne[0] == columns && taps > 1 && span >= 1 && span <= kFusedConvMaxSpan &&
@@ -1355,7 +1506,7 @@ void ple_gate_conv_inject(const Tensor& key, const Tensor& value, Tensor& residu
     }
     ple_gate(key, value, residual, key_norm, query_norm, conv_norm, streams, eps, gated, normalized, stream);
     ple_conv_inject(gated, normalized, weight, dilation, states, source_slots, destination_slots, residual, stream,
-                    next_norm_weight, next_norm_out, next_norm_eps, streams);
+                    next_norm_weight, next_norm_out, next_norm_eps, streams, tree_rows);
 }
 
 void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Tensor& states,

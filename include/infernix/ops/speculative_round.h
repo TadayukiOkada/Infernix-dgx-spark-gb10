@@ -21,6 +21,8 @@ struct SpeculativeAcceptExecutionEnvelope {
     // token. The output distribution is the same and the expected accepted length at least the
     // token rule's; the drawn text differs. Greedy and Gumbel rows are unchanged.
     bool block_verification = false;
+    // Update SamplingConfig::token_counts for accepted + terminal tokens (speculative_accept_compact_drafts).
+    bool update_token_counts = false;
 };
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
@@ -283,5 +285,21 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
  */
 void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
                               std::int32_t count, cudaStream_t stream);
+
+/**
+ * Compact-candidate form of speculative_accept_{greedy,sparse}_drafts: verifies drafts [K,B] against
+ * compact screened-head candidates compact_ids I32 [cap,K+1,B], compact_logits FP32 [cap,K+1,B], and
+ * compact_counts I32 [K+1,B] (<= 64 candidates per column), updating lengths, anchors, licensed_tokens,
+ * licensed_counts, accepted, and optionally SamplingConfig::token_counts with zero workspace. When
+ * candidate_ids / proposal_q are empty, verifies chain rows without sparse proposal laws.
+ */
+void speculative_accept_compact_drafts(const Tensor& compact_ids, const Tensor& compact_logits,
+                                       const Tensor& compact_counts, const Tensor& drafts,
+                                       const Tensor& current_extents, Tensor& lengths, Tensor& anchors,
+                                       Tensor& licensed_tokens, Tensor& licensed_counts,
+                                       Tensor& accepted, std::int32_t token_domain,
+                                       const SamplingConfig* configs, cudaStream_t stream,
+                                       const SpeculativeAcceptExecutionEnvelope& execution = {},
+                                       const Tensor& candidate_ids = {}, const Tensor& proposal_q = {});
 
 } // namespace infernix::ops

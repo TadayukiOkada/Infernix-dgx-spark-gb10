@@ -91,10 +91,15 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
     // Empty when every page is locked in RAM; otherwise the OS's reason.
     [[nodiscard]] const std::string& lock_failure() const noexcept { return lock_failure_; }
+    // Attempts to map the buffer into the current CUDA device's UMA address space (zero-copy).
+    // Returns nullptr if unified addressing is unavailable or registration fails.
+    void* map_for_device();
+    [[nodiscard]] void* device_pointer() const noexcept { return device_; }
 
 private:
-    std::byte* data_  = nullptr;
-    std::size_t size_ = 0;
+    std::byte* data_    = nullptr;
+    void* device_       = nullptr;
+    std::size_t size_   = 0;
     std::size_t raised_ = 0; // Windows: what the minimum working set grew by
     std::string lock_failure_;
 };

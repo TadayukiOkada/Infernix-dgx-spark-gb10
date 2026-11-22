@@ -590,6 +590,29 @@ __device__ __forceinline__ float q8_row(const std::int8_t* codes, const __half* 
     return warp_butterfly(sum);
 }
 
+// Same arithmetic as q8_row with x cached in __shared__ (must use normal load, never __ldcg).
+__device__ __forceinline__ float q8_row_smem(const std::int8_t* codes, const __half* scales, std::int64_t row,
+                                             int padded_k, const bf16* x_smem, int lane) {
+    const auto* w      = reinterpret_cast<const uint2*>(codes + row * padded_k);
+    const __half* srow = scales + row * (padded_k / 32);
+    float sum          = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kHidden / 8 / 32; ++i) {
+        const int chunk    = lane + 32 * i;
+        const uint2 packed = __ldg(w + chunk);
+        const float scale  = __half2float(srow[chunk / 4]);
+        const uint4 xp     = *reinterpret_cast<const uint4*>(x_smem + chunk * 8);
+        const bf16* xv     = reinterpret_cast<const bf16*>(&xp);
+        const auto* wv     = reinterpret_cast<const std::int8_t*>(&packed);
+        float wf[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { wf[j] = static_cast<float>(wv[j]) * scale; }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sum = fmaf(wf[j], __bfloat162float(xv[j]), sum); }
+    }
+    return warp_butterfly(sum);
+}
+
 // ---- The top form's selection, rescore and ranks (one CTA per column)
 
 struct TopParams {
@@ -748,6 +771,7 @@ struct ListParams {
     const float2* lists;
     std::int32_t grid;
     float margin;
+    std::int32_t ranks;
     std::int32_t cap;
     std::int32_t* entries; // [T][cap]
     std::int32_t* counts;  // [T]
@@ -757,12 +781,56 @@ __global__ void __launch_bounds__(kSelectThreads) screened_list_kernel(ListParam
     __shared__ SelectShared s;
     const int tid = static_cast<int>(threadIdx.x), column = static_cast<int>(blockIdx.x);
     pdl::enter();
-    const int n = select_rows(p.lists + static_cast<std::size_t>(column) * p.grid * kListLength, p.grid, p.margin, 1,
-                              p.cap, s);
+    const int n = select_rows(p.lists + static_cast<std::size_t>(column) * p.grid * kListLength, p.grid, p.margin,
+                              p.ranks, p.cap, s);
     __syncthreads();
     // Every slot holds a row (the tail repeats the first), so a gathered tile reads only valid rows.
     for (int i = tid; i < p.cap; i += kSelectThreads) {
         p.entries[static_cast<std::size_t>(column) * p.cap + i] = s.rows[i < n ? i : 0];
+    }
+    if (tid == 0) { p.counts[column] = n; }
+}
+
+struct CompactQ8Params {
+    const bf16* x;
+    const std::int8_t* codes;
+    const __half* scales;
+    std::int32_t padded_k;
+    const float2* lists;
+    std::int32_t grid;
+    float margin;
+    std::int32_t ranks;
+    std::int32_t cap;
+    std::int32_t* compact_ids; // [T][cap]
+    float* compact_logits;     // [T][cap]
+    std::int32_t* counts;      // [T]
+};
+
+struct CompactQ8Shared {
+    SelectShared select;
+    __align__(16) bf16 x[kHidden];
+};
+
+__global__ void __launch_bounds__(kSelectThreads) screened_compact_q8_kernel(CompactQ8Params p) {
+    __shared__ CompactQ8Shared s;
+    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+    const int column = static_cast<int>(blockIdx.x);
+    pdl::enter();
+    for (int i = tid; i < kHidden / 8; i += kSelectThreads) {
+        reinterpret_cast<uint4*>(s.x)[i] =
+            __ldcg(reinterpret_cast<const uint4*>(p.x + static_cast<std::size_t>(column) * kHidden) + i);
+    }
+    const int n = select_rows(p.lists + static_cast<std::size_t>(column) * p.grid * kListLength, p.grid, p.margin,
+                              p.ranks, p.cap, s.select);
+    __syncthreads();
+    const std::size_t base = static_cast<std::size_t>(column) * p.cap;
+    for (int e = warp; e < n; e += kSelectWarps) {
+        const int row = s.select.rows[e];
+        const float v = q8_row_smem(p.codes, p.scales, row, p.padded_k, s.x, lane);
+        if (lane == 0) {
+            p.compact_ids[base + e]    = row;
+            p.compact_logits[base + e] = v;
+        }
     }
     if (tid == 0) { p.counts[column] = n; }
 }
@@ -922,6 +990,27 @@ ScreenParams screen_params(const Tensor& x, const Weight& screen, std::int32_t v
             .partials   = static_cast<float2*>(scratch.partials.data)};
 }
 
+bool validate_rescore_head(const Tensor& x, const Tensor& bf16_head, const Weight& head, const Weight& screen,
+                           std::int32_t valid_rows, const ScreenedHeadPolicy& policy) {
+    validate_policy(policy);
+    validate_x(x);
+    validate_screen(screen);
+    const std::int32_t R = screen.n;
+    const bool rows_bf16 = bf16_head.data != nullptr;
+    if (rows_bf16) {
+        require(head.qdata == nullptr && bf16_head.dtype == DType::BF16 && bf16_head.is_contiguous() &&
+                    bf16_head.ne[0] == kHidden && bf16_head.ne[1] == R && bf16_head.ne[2] == 1 && aligned16(bf16_head.data),
+                "a BF16 head must be contiguous, aligned rows [R, 2560] (a BF16 tensor [2560, R]) matching the screen");
+    } else {
+        require(head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit && head.n == R &&
+                    head.k == kHidden && head.padded_shape[1] % 32 == 0 && head.padded_shape[1] >= kHidden &&
+                    head.qhigh == nullptr && head.qdata != nullptr && head.scales != nullptr && aligned16(head.qdata),
+                "the head must be BF16 rows or a row-split q8_g32_fp16 [R, 2560] matching the screen");
+    }
+    require(valid_rows >= 1 && valid_rows <= R, "valid_rows must be in [1, R]");
+    return rows_bf16;
+}
+
 } // namespace
 
 std::size_t screened_head_workspace_bytes(std::int32_t head_rows, std::int32_t max_columns,
@@ -992,22 +1081,8 @@ void screened_head_top(const Tensor& x, const Weight& head, const Weight& screen
 void screened_head_logits(const Tensor& x, const Tensor& bf16_head, const Weight& head, const Weight& screen,
                           std::int32_t valid_rows, const ScreenedHeadPolicy& policy, Tensor& logits,
                           WorkspaceArena& workspace, cudaStream_t stream) {
-    validate_policy(policy);
-    validate_x(x);
-    validate_screen(screen);
+    const bool rows_bf16 = validate_rescore_head(x, bf16_head, head, screen, valid_rows, policy);
     const std::int32_t T = x.ne[1], R = screen.n;
-    const bool rows_bf16 = bf16_head.data != nullptr;
-    if (rows_bf16) {
-        require(head.qdata == nullptr && bf16_head.dtype == DType::BF16 && bf16_head.is_contiguous() &&
-                    bf16_head.ne[0] == kHidden && bf16_head.ne[1] == R && bf16_head.ne[2] == 1 && aligned16(bf16_head.data),
-                "a BF16 head must be contiguous, aligned rows [R, 2560] (a BF16 tensor [2560, R]) matching the screen");
-    } else {
-        require(head.qtype == QType::Q8_G32_FP16 && head.layout == QuantLayout::RowSplit && head.n == R &&
-                    head.k == kHidden && head.padded_shape[1] % 32 == 0 && head.padded_shape[1] >= kHidden &&
-                    head.qhigh == nullptr && head.qdata != nullptr && head.scales != nullptr && aligned16(head.qdata),
-                "the head must be BF16 rows or a row-split q8_g32_fp16 [R, 2560] matching the screen");
-    }
-    require(valid_rows >= 1 && valid_rows <= R, "valid_rows must be in [1, R]");
     require(logits.data != nullptr && logits.dtype == DType::FP32 && logits.is_contiguous() && logits.ne[0] == R &&
                 logits.ne[1] == T && logits.ne[2] == 1 && logits.ne[3] == 1,
             "logits must be contiguous FP32 [R, T]");
@@ -1020,6 +1095,7 @@ void screened_head_logits(const Tensor& x, const Tensor& bf16_head, const Weight
     const ListParams list{.lists   = static_cast<const float2*>(scratch.lists.data),
                           .grid    = grid,
                           .margin  = policy.margin,
+                          .ranks   = 1,
                           .cap     = policy.rescored,
                           .entries = static_cast<std::int32_t*>(scratch.entries.data),
                           .counts  = static_cast<std::int32_t*>(scratch.counts.data)};
@@ -1041,6 +1117,59 @@ void screened_head_logits(const Tensor& x, const Tensor& bf16_head, const Weight
         const int warps = T * policy.rescored;
         CUDA_CHECK(pdl::launch_consumer({dim3((warps + kSelectWarps - 1) / kSelectWarps), dim3(kSelectThreads), 0, stream},
                                         q8_rescore_kernel, q8));
+    }
+}
+
+void screened_head_compact(const Tensor& x, const Tensor& bf16_head, const Weight& head, const Weight& screen,
+                           std::int32_t valid_rows, const ScreenedHeadPolicy& policy, Tensor& compact_ids,
+                           Tensor& compact_logits, Tensor& compact_counts, WorkspaceArena& workspace,
+                           cudaStream_t stream) {
+    const bool rows_bf16 = validate_rescore_head(x, bf16_head, head, screen, valid_rows, policy);
+    const std::int32_t T = x.ne[1];
+    require(compact_ids.data != nullptr && compact_ids.dtype == DType::I32 && compact_ids.is_contiguous() &&
+                compact_ids.ne[0] == policy.rescored && compact_ids.ne[1] == T && compact_ids.ne[2] == 1 &&
+                compact_ids.ne[3] == 1,
+            "compact_ids must be contiguous I32 [rescored, T]");
+    require(compact_logits.data != nullptr && compact_logits.dtype == DType::FP32 && compact_logits.is_contiguous() &&
+                compact_logits.ne[0] == policy.rescored && compact_logits.ne[1] == T && compact_logits.ne[2] == 1 &&
+                compact_logits.ne[3] == 1,
+            "compact_logits must be contiguous FP32 [rescored, T]");
+    require(compact_counts.data != nullptr && compact_counts.dtype == DType::I32 && compact_counts.is_contiguous() &&
+                compact_counts.ne[0] == T && compact_counts.ne[1] == 1 && compact_counts.ne[2] == 1 &&
+                compact_counts.ne[3] == 1,
+            "compact_counts must be contiguous I32 [T]");
+    auto scope                   = workspace.scope();
+    const Scratch scratch        = allocate_scratch(workspace, T, policy.rescored);
+    ScreenParams params          = screen_params(x, screen, valid_rows, scratch);
+    params.logits                = nullptr;
+    params.partials              = nullptr;
+    const int grid               = run_screen<false, false>(params, stream);
+    const std::int32_t min_ranks = std::min<std::int32_t>(2, valid_rows);
+    if (rows_bf16) {
+        const ListParams list{.lists   = static_cast<const float2*>(scratch.lists.data),
+                              .grid    = grid,
+                              .margin  = policy.margin,
+                              .ranks   = min_ranks,
+                              .cap     = policy.rescored,
+                              .entries = static_cast<std::int32_t*>(compact_ids.data),
+                              .counts  = static_cast<std::int32_t*>(compact_counts.data)};
+        CUDA_CHECK(pdl::launch_consumer({dim3(T), dim3(kSelectThreads), 0, stream}, screened_list_kernel, list));
+        detail::screened_head::bf16_rescore_compact(x, bf16_head.data, T, list.entries, list.counts, policy.rescored,
+                                                    static_cast<float*>(compact_logits.data), stream);
+    } else {
+        const CompactQ8Params q8{.x              = static_cast<const bf16*>(x.data),
+                                 .codes          = static_cast<const std::int8_t*>(head.qdata),
+                                 .scales         = static_cast<const __half*>(head.scales),
+                                 .padded_k       = head.padded_shape[1],
+                                 .lists          = static_cast<const float2*>(scratch.lists.data),
+                                 .grid           = grid,
+                                 .margin         = policy.margin,
+                                 .ranks          = min_ranks,
+                                 .cap            = policy.rescored,
+                                 .compact_ids    = static_cast<std::int32_t*>(compact_ids.data),
+                                 .compact_logits = static_cast<float*>(compact_logits.data),
+                                 .counts         = static_cast<std::int32_t*>(compact_counts.data)};
+        CUDA_CHECK(pdl::launch_consumer({dim3(T), dim3(kSelectThreads), 0, stream}, screened_compact_q8_kernel, q8));
     }
 }
 

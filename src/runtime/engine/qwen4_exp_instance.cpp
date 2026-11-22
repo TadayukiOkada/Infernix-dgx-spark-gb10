@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
 
 #include "core/vram_budget.h"
 #include "models/load_options.h"
@@ -605,6 +606,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.screened_lm_head   = fast.selected(FastPath::ScreenedLmHead);
     program_options.fp16_gdn_state     = fast.selected(FastPath::Fp16GdnState);
     program_options.block_verification = fast.selected(FastPath::BlockVerification);
+    program_options.univer_trees =
+        fast.selected(FastPath::UniverTrees) && !temporary_switches::flag("INFERNIX_TMP_NO_UNIVER_TREES");
     program_options.gumbel_sampling    = !options.fast_paths;
     program_options.bf16_logits        = options.logits_dtype == LogitsDtype::BF16;
     // --a8-activations (LOSSY, opt-in; design §19.3.31): the 8-bit activation routes of this artifact

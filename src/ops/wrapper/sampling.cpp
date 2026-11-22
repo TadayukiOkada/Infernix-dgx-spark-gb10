@@ -61,6 +61,42 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                                 scratch, stream);
 }
 
+void sample_compact(const Tensor& compact_ids, const Tensor& compact_logits,
+                    const Tensor& compact_counts, Tensor& out, std::int32_t token_domain,
+                    const SamplingConfig* configs, const Tensor& logical_positions,
+                    std::int32_t purpose, cudaStream_t stream) {
+    const std::int32_t cap   = compact_ids.ne[0];
+    const std::int32_t batch = compact_ids.ne[1];
+    if (cap < 1 || cap > 64 || batch < 1 || compact_ids.dtype != DType::I32 || compact_ids.ne[2] != 1 ||
+        compact_ids.ne[3] != 1 || !compact_ids.is_contiguous() || compact_ids.data == nullptr) {
+        throw std::invalid_argument("sample_compact: compact_ids must be contiguous I32 [cap, B] with cap in [1,64]");
+    }
+    if (compact_logits.dtype != DType::FP32 || compact_logits.ne[0] != cap || compact_logits.ne[1] != batch ||
+        compact_logits.ne[2] != 1 || compact_logits.ne[3] != 1 || !compact_logits.is_contiguous() ||
+        compact_logits.data == nullptr) {
+        throw std::invalid_argument("sample_compact: compact_logits must be contiguous FP32 [cap, B]");
+    }
+    if (compact_counts.dtype != DType::I32 || compact_counts.ne[0] != batch || compact_counts.ne[1] != 1 ||
+        compact_counts.ne[2] != 1 || compact_counts.ne[3] != 1 || !compact_counts.is_contiguous() ||
+        compact_counts.data == nullptr) {
+        throw std::invalid_argument("sample_compact: compact_counts must be contiguous I32 [B]");
+    }
+    if (out.dtype != DType::I32 || out.ne[0] != batch || out.ne[1] != 1 || out.ne[2] != 1 || out.ne[3] != 1 ||
+        !out.is_contiguous() || out.data == nullptr) {
+        throw std::invalid_argument("sample_compact: out must be contiguous I32 [B]");
+    }
+    if (logical_positions.dtype != DType::I32 || logical_positions.ne[0] != batch || logical_positions.ne[1] != 1 ||
+        logical_positions.ne[2] != 1 || logical_positions.ne[3] != 1 || !logical_positions.is_contiguous() ||
+        logical_positions.data == nullptr) {
+        throw std::invalid_argument("sample_compact: logical_positions must be contiguous I32 [B]");
+    }
+    if (token_domain <= 0 || configs == nullptr) {
+        throw std::invalid_argument("sample_compact: token_domain must be positive and configs non-null");
+    }
+    detail::sample_compact_launch(compact_ids, compact_logits, compact_counts, out, token_domain, configs,
+                                  logical_positions, purpose, stream);
+}
+
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream) {
     if (token_ids.dtype != DType::I32 || token_ids.ne[0] <= 0 || token_ids.ne[1] != 1 ||
         token_ids.ne[2] != 1 || token_ids.ne[3] != 1 || !token_ids.is_contiguous() ||

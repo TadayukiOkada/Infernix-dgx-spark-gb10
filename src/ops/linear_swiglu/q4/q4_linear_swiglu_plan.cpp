@@ -38,6 +38,13 @@ struct RouteSpec {
 };
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
+constexpr Q4LinearSwiGluProblem kSharedShape{1280, 640, 2560, 2560, 1};
+
+bool is_shared_shape(std::int32_t gate_up_rows, std::int32_t output_rows, std::int32_t k,
+                     std::int32_t padded_k) noexcept {
+    return gate_up_rows == kSharedShape.gate_up_rows && output_rows == kSharedShape.output_rows &&
+           k == kSharedShape.k && padded_k == kSharedShape.padded_k;
+}
 
 // GB10 (48 SM) retune. Cold-cache candidate sweeps show the split-half-pair MMA tiles dominate the
 // whole prefill range: the materialized [gate_up_rows,cols] scratch route loses 5-19% to them almost
@@ -75,9 +82,11 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q4LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == kShape.gate_up_rows &&
-           problem.output_rows == kShape.output_rows && problem.k == kShape.k &&
-           problem.padded_k == kShape.padded_k;
+    const bool large = problem.gate_up_rows == kShape.gate_up_rows &&
+                       problem.output_rows == kShape.output_rows && problem.k == kShape.k &&
+                       problem.padded_k == kShape.padded_k;
+    return large ||
+           is_shared_shape(problem.gate_up_rows, problem.output_rows, problem.k, problem.padded_k);
 }
 
 template <class Allocator>
@@ -137,6 +146,11 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         throw std::invalid_argument("q4 linear_swiglu: invalid route flags");
     }
     if (column_invariant) { return {Q4LinearSwiGluScheduleId::SmallTTiledColumnInvariant, 0, routes}; }
+    if (is_shared_shape(problem.gate_up_rows, problem.output_rows, problem.k, problem.padded_k)) {
+        return {problem.cols <= 32 ? Q4LinearSwiGluScheduleId::SmallTTiled
+                                  : Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128,
+                0, routes};
+    }
     if (selects_w4a8(routes, problem.cols)) {
         return {Q4LinearSwiGluScheduleId::W4A8, w4a8_workspace_bytes(problem.cols, problem.k),
                 routes};
@@ -176,6 +190,7 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
     }
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, min_cols}, routes);
     (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, max_cols}, routes);
+    if (is_shared_shape(gate_up_rows, output_rows, k, padded_k)) { return 0; }
 
     // Columns below the W4A8 threshold (all of them without the flag) run the exact catalog; the
     // W4A8 workspace grows with the column count, so its largest call is the interval's last.

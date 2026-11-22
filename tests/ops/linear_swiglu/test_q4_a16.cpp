@@ -27,6 +27,13 @@ INFERNIX_OP_TEST(linear_swiglu_q4_a16) {
         failures += run_profile("LinearSwiGLU Q4_A16 column-invariant",
                                 {QType::Q4_G64_FP16, 34816, 5120, 17408, 1407U, ActivationCompute::A16ColumnInvariant},
                                 std::array{1, 2, 8, 9, 16, 17, 24, 25, 32, 33, 40, 64, 65, 129, 512});
+        failures += run_profile("LinearSwiGLU Q4_A16 shared [1280,2560]",
+                                {QType::Q4_G64_FP16, 1280, 2560, 640, 2401U, ActivationCompute::A16},
+                                std::array{1, 2, 4, 5, 8, 16, 32, 33, 64, 128},
+                                std::array<std::int32_t, 3>{1, 17, 64});
+        failures += run_profile("LinearSwiGLU Q4_A16 shared column-invariant",
+                                {QType::Q4_G64_FP16, 1280, 2560, 640, 2407U, ActivationCompute::A16ColumnInvariant},
+                                std::array{1, 2, 4, 5, 8, 16, 32, 33, 64, 128});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU Q4_A16 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

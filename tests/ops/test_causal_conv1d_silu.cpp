@@ -1,4 +1,5 @@
 #include "infernix/ops/causal_conv1d_silu.h"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/op_family.h"
 #include "ops/op_tester.h"
 
@@ -792,6 +793,117 @@ int split_snapshot_case(std::int32_t rows2, std::int32_t width, const std::vecto
     return failures;
 }
 
+int from_states_tree_case() {
+    constexpr std::int32_t kRows0 = 2048, kRows1 = 2048, kRows2 = 6144;
+    constexpr std::int32_t C = kRows0 + kRows1 + kRows2;
+    constexpr std::int32_t W = 7, B = 2, slots = 4;
+    const std::int32_t columns = W * B;
+    const LogicalInput input   = make_input(C, columns, 8801U);
+    std::vector<float> states(static_cast<std::size_t>(C) * 3U * slots);
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        const auto one = make_state(C, 8820U + static_cast<std::uint32_t>(slot));
+        std::copy(one.begin(), one.end(), states.begin() + static_cast<std::size_t>(slot) * C * 3U);
+    }
+    const auto x_bits      = bf16_bits(input.x);
+    const auto weight_bits = bf16_bits(input.weight);
+    const auto state_bits  = bf16_bits(states);
+    const std::vector<std::int32_t> initial_slots{1, 3};
+
+    // Row 0: 2-branch root-fork tree: main 0->1->2->3->4, side 0->5->6 (nodes=7).
+    // Row 1: sequential chain prefix of 4 nodes (tree=0, nodes=4), cols 4..6 must be exact zero.
+    std::vector<ops::SpeculativeTreeRow> trees(B);
+    std::memset(trees.data(), 0, trees.size() * sizeof(ops::SpeculativeTreeRow));
+    std::fill(std::begin(trees[0].parent), std::end(trees[0].parent), std::int8_t{-1});
+    std::fill(std::begin(trees[1].parent), std::end(trees[1].parent), std::int8_t{-1});
+    trees[0].nodes     = 7;
+    trees[0].tree      = 1;
+    trees[0].parent[1] = 0;
+    trees[0].parent[2] = 1;
+    trees[0].parent[3] = 2;
+    trees[0].parent[4] = 3;
+    trees[0].parent[5] = 0;
+    trees[0].parent[6] = 5;
+    trees[1].nodes     = 4;
+    trees[1].tree      = 0;
+
+    DeviceBuffer d_x = to_device(x_bits), d_w = to_device(weight_bits), d_s = to_device(state_bits),
+                 d_init = to_device(initial_slots), d_trees = to_device(trees);
+    GuardedDeviceBuffer out0(static_cast<std::size_t>(kRows0) * columns * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out1(static_cast<std::size_t>(kRows1) * columns * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out2(static_cast<std::size_t>(kRows2) * columns * sizeof(std::uint16_t));
+    out0.fill(kOutputPoison);
+    out1.fill(kOutputPoison);
+    out2.fill(kOutputPoison);
+    Tensor tx(d_x.p, DType::BF16, {C, W, B}), tw(d_w.p, DType::BF16, {C, 4}), tc(d_s.p, DType::BF16, {C, 3, slots}),
+        tinit(d_init.p, DType::I32, {B}), ttrees(d_trees.p, DType::I32, {ops::kSpeculativeTreeRowWords, B}),
+        t0(out0.data(), DType::BF16, {kRows0, columns}), t1(out1.data(), DType::BF16, {kRows1, columns}),
+        t2(out2.data(), DType::BF16, {kRows2, columns});
+    ops::causal_conv1d_silu_from_states_split(tx, tw, tc, tinit, t0, t1, t2, nullptr, &ttrees);
+    cuda_synchronize();
+
+    const auto got0 = from_device<std::uint16_t>(out0.data(), static_cast<std::size_t>(kRows0) * columns);
+    const auto got1 = from_device<std::uint16_t>(out1.data(), static_cast<std::size_t>(kRows1) * columns);
+    const auto got2 = from_device<std::uint16_t>(out2.data(), static_cast<std::size_t>(kRows2) * columns);
+    auto col_bit = [&](int b, int col, int c) -> std::uint16_t {
+        const std::size_t gcol = static_cast<std::size_t>(b) * W + col;
+        if (c < kRows0) { return got0[gcol * kRows0 + c]; }
+        if (c < kRows0 + kRows1) { return got1[gcol * kRows1 + (c - kRows0)]; }
+        return got2[gcol * kRows2 + (c - kRows0 - kRows1)];
+    };
+
+    const auto run_chain = [&](int b, const std::vector<int>& path_cols) {
+        const int pw = static_cast<int>(path_cols.size());
+        std::vector<std::uint16_t> px(static_cast<std::size_t>(C) * pw);
+        for (int i = 0; i < pw; ++i) {
+            const auto* src = x_bits.data() + (static_cast<std::size_t>(b) * W + path_cols[i]) * C;
+            std::copy(src, src + C, px.data() + static_cast<std::size_t>(i) * C);
+        }
+        DeviceBuffer dp = to_device(px), di(4), do0(static_cast<std::size_t>(kRows0) * pw * 2),
+                     do1(static_cast<std::size_t>(kRows1) * pw * 2), do2(static_cast<std::size_t>(kRows2) * pw * 2);
+        cuda_check(cudaMemcpy(di.p, &initial_slots[b], 4, cudaMemcpyHostToDevice), "slot");
+        Tensor tpx(dp.p, DType::BF16, {C, pw, 1}), tpi(di.p, DType::I32, {1}),
+            po0(do0.p, DType::BF16, {kRows0, pw}), po1(do1.p, DType::BF16, {kRows1, pw}),
+            po2(do2.p, DType::BF16, {kRows2, pw});
+        ops::causal_conv1d_silu_from_states_split(tpx, tw, tc, tpi, po0, po1, po2, nullptr);
+        cuda_synchronize();
+        return std::tuple{from_device<std::uint16_t>(do0.p, static_cast<std::size_t>(kRows0) * pw),
+                          from_device<std::uint16_t>(do1.p, static_cast<std::size_t>(kRows1) * pw),
+                          from_device<std::uint16_t>(do2.p, static_cast<std::size_t>(kRows2) * pw)};
+    };
+
+    int failures = 0;
+    const auto check_path = [&](int b, const std::vector<int>& path_cols, const char* tag) {
+        const auto [r0, r1, r2] = run_chain(b, path_cols);
+        std::int64_t bad = 0;
+        for (std::size_t i = 0; i < path_cols.size(); ++i) {
+            const int col = path_cols[i];
+            for (int c = 0; c < C; ++c) {
+                const std::uint16_t ref =
+                    c < kRows0 ? r0[i * kRows0 + c]
+                               : (c < kRows0 + kRows1 ? r1[i * kRows1 + (c - kRows0)] : r2[i * kRows2 + (c - kRows0 - kRows1)]);
+                bad += col_bit(b, col, c) != ref;
+            }
+        }
+        if (bad != 0) {
+            std::cerr << tag << ": " << bad << " mismatches\n";
+            ++failures;
+        }
+    };
+    check_path(0, {0, 1, 2, 3, 4}, "from_states_tree row0 main");
+    check_path(0, {0, 5, 6}, "from_states_tree row0 side");
+    check_path(1, {0, 1, 2, 3}, "from_states_tree row1 chain");
+    std::int64_t nonzero_pad = 0;
+    for (int col = 4; col < W; ++col) {
+        for (int c = 0; c < C; ++c) { nonzero_pad += col_bit(1, col, c) != 0; }
+    }
+    if (nonzero_pad != 0) {
+        std::cerr << "from_states_tree row1 tail: " << nonzero_pad << " non-zero outputs\n";
+        ++failures;
+    }
+    failures += verify_bits("from_states_tree states preserved", d_s.p, state_bits);
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(causal_conv1d_silu) {
@@ -890,6 +1002,7 @@ INFERNIX_OP_TEST(causal_conv1d_silu) {
     failures += split_snapshot_case(8192, 1, {8, 9, 10}, {0, 1, 2}, {}, 11, 8101U);
     failures += split_snapshot_case(8192, 5, {10, 11}, {0, 5}, {5, 2}, 12, 8102U);
     failures += split_snapshot_case(8192, 40, {41}, {0}, {}, 42, 8103U);
+    failures += from_states_tree_case();
 
     // Argument rejection, on both sides of the route bound.
     failures += split_rejection_case(16);

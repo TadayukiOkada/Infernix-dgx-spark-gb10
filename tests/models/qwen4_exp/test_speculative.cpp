@@ -237,6 +237,168 @@ void check_copy_fallback() {
             "near-exact copy reaches the full 31-token window");
 }
 
+void check_moe_round_cost_and_fit() {
+    using infernix::models::qwen4_exp::RoundCostModel;
+    using infernix::models::qwen4_exp::moe_expected_unique_experts;
+    using infernix::models::qwen4_exp::moe_round_cost;
+
+    require(moe_expected_unique_experts(512, 10, 0) == 0.0, "0 columns -> 0 unique experts");
+    require(moe_expected_unique_experts(16, 16, 4) == 16.0, "top_k == experts saturates all experts");
+    const double u1 = moe_expected_unique_experts(512, 10, 1);
+    const double u2 = moe_expected_unique_experts(512, 10, 2);
+    const double u8 = moe_expected_unique_experts(512, 10, 8);
+    require(std::abs(u1 - 10.0) < 1e-9, "1 token activates top_k experts");
+    require(std::abs(u2 - 512.0 * (1.0 - std::pow(502.0 / 512.0, 2.0))) < 1e-9, "2 tokens match coupon formula");
+    require(u2 > u1 && u8 > u2 && (u2 - u1) < u1, "coupon collector is strictly increasing and concave");
+
+    require(moe_round_cost(1, 0, 512, 10, 45.0, 0.05) == 1.0, "plain round relative cost is 1.0");
+    require(moe_round_cost(8, 0, 512, 10, 45.0, 0.05) == 1.0, "batch plain round relative cost is 1.0");
+    const double c_b1_d4 = moe_round_cost(1, 4, 512, 10, 45.0, 0.05);
+    const double c_b4_d4 = moe_round_cost(4, 4, 512, 10, 45.0, 0.05);
+    const double c_b8_d4 = moe_round_cost(8, 4, 512, 10, 45.0, 0.05);
+    require(c_b8_d4 > c_b4_d4 && c_b4_d4 > c_b1_d4,
+            "drafting at higher concurrency increases relative MoE verify expansion cost");
+    for (std::int32_t batch : {1, 4, 8}) {
+        for (std::int32_t k : {1, 2, 4}) {
+            const double ub1 = moe_expected_unique_experts(512, 10, 1);
+            const double u0  = moe_expected_unique_experts(512, 10, batch);
+            const double uk  = moe_expected_unique_experts(512, 10, batch * (1 + k));
+            const double expected = (60.0 + uk) / (60.0 + u0) + 0.06 * ((60.0 + ub1) / (60.0 + u0)) * k;
+            require(std::abs(moe_round_cost(batch, k, 512, 10, 60.0, 0.06) - expected) < 1e-12,
+                    "moe_round_cost matches batch-normalized coupon formula");
+        }
+    }
+
+    RoundCostModel model;
+    double dense_fit = 0.0, step_fit = 0.0;
+    require(!model.fit(512, 10, 45.0, 0.05, dense_fit, step_fit), "fit requires kMinRounds");
+
+    constexpr std::int32_t kExperts   = 512;
+    constexpr std::int32_t kTopK      = 10;
+    constexpr double kTrueDenseEquiv  = 64.0;
+    constexpr double kTrueStepCost    = 0.042;
+    constexpr double kBasePlainMs     = 0.011;
+    for (int round = 0; round < 160; ++round) {
+        std::int32_t verified = 0;
+        std::int32_t exec     = 0;
+        switch (round % 4) {
+        case 0: verified = 0; exec = 0; break;            // plain
+        case 1: verified = 4; exec = 4; break;            // complete MTP
+        case 2: verified = 1 + (round % 3); exec = 3; break; // gated MTP
+        case 3: verified = 8 + (round % 9); exec = 0; break; // N-gram / SAM
+        }
+        const double u_base = moe_expected_unique_experts(kExperts, kTopK, 1);
+        const double u_var  = moe_expected_unique_experts(kExperts, kTopK, 1 + verified);
+        const double dt =
+            kBasePlainMs * ((kTrueDenseEquiv + u_var) / (kTrueDenseEquiv + u_base) + kTrueStepCost * exec);
+        model.observe(verified, exec, dt, kExperts, kTopK, 45.0, 0.05);
+        if (round == 80) {
+            // Inject an OS preemption spike (should be rejected by 3x outlier guard).
+            model.observe(verified, exec, dt * 10.0, kExperts, kTopK, 45.0, 0.05);
+        }
+    }
+    require(model.fit(kExperts, kTopK, 45.0, 0.05, dense_fit, step_fit), "fit succeeds after mixed rounds");
+    require(std::abs(dense_fit - kTrueDenseEquiv) < 4.0,
+            "RoundCostModel recovers dense_equiv across mixed B=1 traces (got " + std::to_string(dense_fit) + ")");
+    require(std::abs(step_fit - kTrueStepCost) < 0.005,
+            "RoundCostModel recovers draft_step_cost across mixed B=1 traces (got " + std::to_string(step_fit) + ")");
+
+    // Rank-1 trace (all plain B=1 rounds): step_fit and dense_fit must stay safely at priors.
+    RoundCostModel plain_only;
+    for (int r = 0; r < 24; ++r) { plain_only.observe(0, 0, kBasePlainMs, kExperts, kTopK, 45.0, 0.05); }
+    require(plain_only.fit(kExperts, kTopK, 45.0, 0.05, dense_fit, step_fit), "rank-1 trace still fits safely");
+    require(std::abs(dense_fit - 45.0) < 1e-6 && std::abs(step_fit - 0.05) < 1e-6,
+            "rank-1 plain trace preserves prior dense_equiv and draft_step_cost");
+}
+
+void check_ngram_buckets_and_moe_copy_stitch() {
+    using infernix::models::qwen4_exp::best_copy_length_moe;
+    using infernix::models::qwen4_exp::best_stitch_length;
+    using infernix::models::qwen4_exp::copy_beats_chain_moe;
+    using infernix::models::qwen4_exp::moe_round_cost;
+    using infernix::models::qwen4_exp::ngram_confidence_bucket;
+
+    require(ngram_confidence_bucket(0, 5, 10, false) == 0, "bucket 0 for matched 0");
+    require(ngram_confidence_bucket(7, 5, 10, false) == 0, "bucket 0 for matched 7");
+    require(ngram_confidence_bucket(8, 1, 4096, false) == 1, "bucket 1 for 8..11 single stale");
+    require(ngram_confidence_bucket(11, 1, 2049, false) == 1, "bucket 1 just outside recency window");
+    require(ngram_confidence_bucket(8, 2, 10000, false) == 2, "bucket 2 for 8..11 repeated");
+    require(ngram_confidence_bucket(10, 1, 2048, false) == 2, "bucket 2 for 8..11 recent");
+    require(ngram_confidence_bucket(12, 1, 5000, false) == 3, "bucket 3 for 12..15 single stale");
+    require(ngram_confidence_bucket(15, 3, 9999, false) == 4, "bucket 4 for 12..15 repeated");
+    require(ngram_confidence_bucket(13, 1, 512, false) == 4, "bucket 4 for 12..15 recent");
+    require(ngram_confidence_bucket(16, 1, 5000, false) == 5, "bucket 5 for 16+ single stale");
+    require(ngram_confidence_bucket(31, 4, 9000, false) == 6, "bucket 6 for 16+ repeated");
+    require(ngram_confidence_bucket(20, 1, 1024, false) == 6, "bucket 6 for 16+ recent");
+    require(ngram_confidence_bucket(3, 1, 90000, true) == 7, "bucket 7 whenever MTP confirmed/stitched");
+
+    constexpr std::int32_t E = 512, K = 10;
+    constexpr double D = 45.0, S = 0.05;
+    require(best_copy_length_moe(31, 0.55, 1, E, K, D, 0.60) == 0, "below min_accept gives 0 copy drafts");
+    const std::int32_t b1_mid = best_copy_length_moe(31, 0.80, 1, E, K, D, 0.60);
+    const std::int32_t b8_mid = best_copy_length_moe(31, 0.80, 8, E, K, D, 0.60);
+    require(b1_mid >= b8_mid, "higher concurrency tightens moderate-confidence copy length");
+    require(best_copy_length_moe(31, 0.995, 1, E, K, D, 0.60) == 31, "high confidence reaches full 31 at B=1");
+
+    // Exhaustive oracle check for best_copy_length_moe and best_stitch_length.
+    Rng rng;
+    for (int trial = 0; trial < 200; ++trial) {
+        const std::int32_t batch  = 1 + (trial % 8);
+        const std::int32_t copies = 1 + (trial % 31);
+        const double copy_p       = 0.50 + 0.50 * rng.next_unit();
+        constexpr double kMinAcc  = 0.60;
+
+        std::int32_t brute_k = 0;
+        double best_sc       = 1.0;
+        double reach = 1.0, acc = 0.0;
+        for (std::int32_t k = 1; k <= copies; ++k) {
+            reach *= copy_p;
+            acc += reach;
+            if (acc < kMinAcc * static_cast<double>(k)) { break; }
+            const double sc = (1.0 + acc) / moe_round_cost(batch, k, E, K, D, 0.0);
+            if (sc > best_sc) {
+                best_sc = sc;
+                brute_k = k;
+            }
+        }
+        require(best_copy_length_moe(copies, copy_p, batch, E, K, D, kMinAcc) == brute_k,
+                "best_copy_length_moe matches brute-force maximization");
+
+        const std::int32_t prefix_len = 1 + (trial % 4);
+        const std::int32_t width_b    = std::max(prefix_len, 1 + (trial % 8));
+        const double prefix_reach     = 0.4 + 0.55 * rng.next_unit();
+        const double prefix_toks      = 1.0 + static_cast<double>(prefix_len) * prefix_reach;
+        std::int32_t brute_s          = 0;
+        double best_stitch_sc         = prefix_toks / moe_round_cost(batch, width_b, E, K, D, 0.0);
+        double s_reach = 1.0, s_acc = 0.0;
+        for (std::int32_t s = 1; s <= copies; ++s) {
+            s_reach *= copy_p;
+            s_acc += s_reach;
+            if (s_acc < kMinAcc * static_cast<double>(s)) { break; }
+            const double sc =
+                (prefix_toks + prefix_reach * s_acc) /
+                moe_round_cost(batch, std::max(width_b, prefix_len + s), E, K, D, 0.0);
+            if (sc > best_stitch_sc) {
+                best_stitch_sc = sc;
+                brute_s        = s;
+            }
+        }
+        require(best_stitch_length(prefix_len, prefix_toks, prefix_reach, copies, copy_p, batch, width_b, E, K, D,
+                                   kMinAcc) == brute_s,
+                "best_stitch_length matches brute-force maximization");
+    }
+
+    const std::array<double, 4> strong_mtp{0.92, 0.90, 0.88, 0.86};
+    require(copy_beats_chain_moe(20, 0.99, strong_mtp, 3, 8, E, K, D, S),
+            "near-exact 20-token copy beats 3-draft MTP chain even at B=8");
+    require(!copy_beats_chain_moe(2, 0.72, strong_mtp, 3, 8, E, K, D, S),
+            "short moderate copy loses to strong 3-draft MTP chain at B=8");
+    // Free-width stitching: if batch width 8 is already paid by another row, stitching onto prefix_len=3
+    // takes at least up to 5 free copy tokens when acceptance clears min_accept.
+    const std::int32_t free_stitch = best_stitch_length(3, 3.2, 0.85, 8, 0.90, 4, 8, E, K, D, 0.60);
+    require(free_stitch >= 5, "stitching exploits free already-paid batch width before capping");
+}
+
 // The two expected-token helpers against a direct evaluation.
 void check_expected_tokens() {
     Rng rng;
@@ -303,6 +465,82 @@ void check_sampled_cumulative_table() {
     }
 }
 
+void check_root_fork_trees() {
+    using infernix::ops::SpeculativeTreeRow;
+    using infernix::models::qwen4_exp::bucket_verify_width;
+    using infernix::models::qwen4_exp::build_root_fork_tree_row;
+    using infernix::models::qwen4_exp::choose_root_fork_side;
+    using infernix::models::qwen4_exp::floor_verify_width;
+    using infernix::ops::kSpeculativeTreeMaxNodes;
+    using infernix::ops::kSpeculativeTreeMaxPathLength;
+
+    // 16 candidates with p[0]=0.55 < 0.90 and residual mass over candidates[1..].
+    std::array<std::int32_t, 16> cands{};
+    std::array<float, 16> q{};
+    for (std::size_t i = 0; i < 16; ++i) {
+        cands[i] = static_cast<std::int32_t>(1000 + i);
+        q[i]     = i == 0 ? 0.55F : 0.03F;
+    }
+
+    // pos % 4 == 2 must suppress root-fork (QSA pooled-block ambiguity).
+    const auto skip_mod = choose_root_fork_side(1000, cands, q, /*position=*/102, /*ratio=*/4, /*seed=*/42);
+    require(!skip_mod.fork, "root-fork gates out pos % r == r - 2");
+
+    // High confidence top-1 (>= 0.90) must suppress root-fork.
+    auto high_q = q;
+    high_q[0]   = 0.92F;
+    for (std::size_t i = 1; i < 16; ++i) { high_q[i] = 0.005F; }
+    const auto skip_conf = choose_root_fork_side(1000, cands, high_q, /*position=*/100, /*ratio=*/4, /*seed=*/42);
+    require(!skip_conf.fork, "root-fork gates out high step-0 top-1 mass >= 0.90");
+
+    // Deterministic without-replacement side draw != main_token on eligible positions.
+    for (const std::int32_t pos : {100, 101, 103}) {
+        const auto d1 = choose_root_fork_side(1000, cands, q, pos, 4, 42);
+        const auto d2 = choose_root_fork_side(1000, cands, q, pos, 4, 42);
+        require(d1.fork && d2.fork, "eligible position activates root-fork");
+        require(d1.side_token == d2.side_token, "root-fork draw is deterministic in (seed, position)");
+        require(d1.side_token != 1000 && d1.side_token >= 1001 && d1.side_token <= 1015,
+                "root-fork draws without replacement from remaining candidates");
+    }
+
+    // Check SpeculativeTreeRow geometry for chain and root-fork rows.
+    SpeculativeTreeRow fork_row{};
+    build_root_fork_tree_row(fork_row, /*main_depth=*/3, /*has_side=*/true);
+    require(fork_row.tree == 1 && fork_row.transport == 0 && fork_row.sampled == 0,
+            "root-fork sets tree=1 transport=0 sampled=0");
+    require(fork_row.nodes == 5 && fork_row.main_depth == 3 && fork_row.paths == 2,
+            "root-fork sets nodes/main_depth/paths");
+    require(fork_row.parent[0] == -1 && fork_row.parent[1] == 0 && fork_row.parent[2] == 1 &&
+                fork_row.parent[3] == 2 && fork_row.parent[4] == 0,
+            "root-fork parent links are exact");
+    require(fork_row.depth[0] == 0 && fork_row.depth[1] == 1 && fork_row.depth[2] == 2 &&
+                fork_row.depth[3] == 3 && fork_row.depth[4] == 1,
+            "root-fork depths are exact");
+    require(fork_row.first_child[0] == 1 && fork_row.next_sibling[1] == 4 && fork_row.sibling_index[4] == 1,
+            "root-fork child/sibling links are exact");
+    require(fork_row.path_length[0] == 4 && fork_row.owned_from[0] == 0 &&
+                fork_row.path_length[1] == 2 && fork_row.owned_from[1] == 1 &&
+                fork_row.path_columns[1][0] == 0 && fork_row.path_columns[1][1] == 4,
+            "root-fork paths/owned_from are exact");
+
+    SpeculativeTreeRow chain_row{};
+    build_root_fork_tree_row(chain_row, /*main_depth=*/3, /*has_side=*/false);
+    require(chain_row.tree == 0 && chain_row.nodes == 4 && chain_row.paths == 1,
+            "non-fork row builds chain tree metadata");
+
+    // floor_verify_width maps all widths in [1, 20] below max_width down to supported buckets.
+    for (std::int32_t w = 1; w <= 20; ++w) {
+        const std::int32_t f = floor_verify_width(w, 20);
+        require(f <= w && (f <= 8 || f == bucket_verify_width(f, 20)),
+                "floor_verify_width returns a valid bucket <= w");
+    }
+    require(floor_verify_width(13, 16) == 12 && floor_verify_width(17, 16) == 16 &&
+                floor_verify_width(9, 16) == 8,
+            "floor_verify_width handles exact boundary buckets");
+    (void)kSpeculativeTreeMaxNodes;
+    (void)kSpeculativeTreeMaxPathLength;
+}
+
 } // namespace
 
 int main() {
@@ -315,6 +553,9 @@ int main() {
         check_copy_fallback();
         check_expected_tokens();
         check_sampled_cumulative_table();
+        check_moe_round_cost_and_fit();
+        check_ngram_buckets_and_moe_copy_stitch();
+        check_root_fork_trees();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

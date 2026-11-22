@@ -146,14 +146,33 @@ void screened_text_head_logits(const Parameters& parameters, const Tensor& x, Te
     }
 }
 
+void screened_text_head_compact(const Parameters& parameters, const Tensor& x,
+                                const ForwardBatch::ScreenedCompactOut& out, WorkspaceArena& work, cudaStream_t s) {
+    if (!parameters.output_head_screen || (parameters.output_head_q8 && parameters.output_head_q8->is_ggml())) {
+        throw std::logic_error("Qwen4Exp forward: a screened head round needs the head's screen and a BF16 or Q8 head");
+    }
+    const std::int32_t valid = dim(parameters.model.resources().public_token_count);
+    Tensor ids               = out.ids;
+    Tensor logits            = out.logits;
+    Tensor counts            = out.counts;
+    if (parameters.output_head_q8) {
+        ops::screened_head_compact(x, Tensor{}, parameters.output_head_q8->weight, *parameters.output_head_screen,
+                                   valid, kScreenedHeadPolicy, ids, logits, counts, work, s);
+    } else {
+        ops::screened_head_compact(x, parameters.output_head, Weight{}, *parameters.output_head_screen, valid,
+                                   kScreenedHeadPolicy, ids, logits, counts, work, s);
+    }
+}
+
 // The shared expert's SiLU(gate) * up: one fused call for Q8 weights (gate and up stay FP32); BF16
 // weights (recipe A) project, split and multiply.
 void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
                    cudaStream_t s, ops::LinearRoutes routes = ops::LinearRoutes::Exact) {
-    // Q8 (Dense8) at every width; BF16 (the bit-exact artifact) on its register-streamed route at decode
+    // Q8 (Dense8) / Q4 (W4Dense) at every width; BF16 (the bit-exact artifact) on its register-streamed route at decode
     // and verification widths, the tuned GEMM then SwiGLU beyond.
-    if (gate_up.weight.qtype == QType::Q8_G32_FP16 || (gate_up.weight.qtype == QType::BF16 && x.ne[1] <= 16)) {
-        ops::linear_swiglu(x, gate_up.weight, out, gate_up.policy, work, s);
+    if (gate_up.weight.qtype == QType::Q8_G32_FP16 || gate_up.weight.qtype == QType::Q4_G64_FP16 ||
+        (gate_up.weight.qtype == QType::BF16 && x.ne[1] <= 16)) {
+        ops::linear_swiglu(x, gate_up.weight, out, gate_up.policy, work, s, routes);
         return;
     }
     auto scope = work.scope();
@@ -476,7 +495,10 @@ Tensor Forward::mixer(std::uint32_t layer, const ForwardBatch& batch, const Tens
                              .slots            = batch.slots,
                              .table_rows       = batch.table_rows,
                              .batch            = batch.batch,
-                             .width            = batch.width};
+                             .width            = batch.width,
+                             .tree_rows        = (batch.verify != nullptr && batch.verify->tree_rows.data != nullptr)
+                                                     ? &batch.verify->tree_rows
+                                                     : nullptr};
     return attention(std::get<AttentionParameters>(block.mixer), xa, call);
 }
 
@@ -615,7 +637,9 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
         last           = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
         ops::gather_columns(final_x, batch.logit_columns, last, s);
     }
-    if (batch.screened_head) {
+    if (batch.screened_compact != nullptr) {
+        screened_text_head_compact(parameters_, last, *batch.screened_compact, work_, s);
+    } else if (batch.screened_head) {
         screened_text_head_logits(parameters_, last, *logits, work_, s);
     } else {
         text_head_logits(parameters_, last, *logits, work_, s);
@@ -671,6 +695,17 @@ Tensor Forward::inject_mix(const HyperConnectionParameters& p, const Tensor& y, 
 Tensor Forward::ple_embedding(const PleParameters& p, const ForwardBatch& batch) {
     const cudaStream_t s = device_.stream;
     const std::int32_t T = batch.ids.ne[0];
+    if (batch.ple_windows.data != nullptr && batch.ple_hash != nullptr) {
+        const Tensor& scale = batch.ngram_scale.data != nullptr ? batch.ngram_scale : p.ngram_scale;
+        if (scale.data == nullptr) {
+            throw std::invalid_argument("Qwen4Exp forward: NVFP4 n-gram hash needs its table's multiplier");
+        }
+        ops::PleNgramHashTable table = *batch.ple_hash;
+        table.multiplier             = &scale;
+        Tensor e = work_.alloc(DType::BF16, {dim(config_.ple.embed_dim), T});
+        ops::ple_hash_embed_nvfp4(batch.ple_windows, table, e, s);
+        return e;
+    }
     if (const NgramRowGate* gate = batch.ngram_gate) {
         // The upload never triggers dependents early, so even where ple_embed is a programmatic
         // dependent it still starts only once the copy has completed.
@@ -734,11 +769,14 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     // A verification call records the convolution inputs for its commit and leaves the history.
     Tensor normalized = batch.verify != nullptr ? batch.verify->ple_inputs.view({W, T})
                                                 : work_.alloc(DType::BF16, {W, T});
+    const Tensor* tree_rows = (batch.verify != nullptr && batch.verify->tree_rows.data != nullptr)
+                                  ? &batch.verify->tree_rows
+                                  : nullptr;
     ops::ple_gate_conv_inject(key, value, residual, p.key_norm, p.query_norm, p.conv_norm,
                               dim(config_.hc.streams), config_.rms_norm_eps, p.convolution,
                               dim(config_.ple.conv_dilation), state_.ple_conv, batch.slots,
                               batch.verify != nullptr ? Tensor{} : batch.slots, gated, normalized, s,
-                              next_norm_weight, next_norm_out, config_.rms_norm_eps);
+                              next_norm_weight, next_norm_out, config_.rms_norm_eps, tree_rows);
 }
 
 Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
@@ -808,8 +846,9 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     }
     // A verification of at most kGdnReplayConvMaxWidth columns evaluates its convolution and gates inside the
     // recurrence (gated_delta_net_replay_record_conv, the same bits as the composed kernels below; design §19.3.38).
-    const bool replay_conv = batch.verify != nullptr && batch.width <= ops::kGdnReplayConvMaxWidth && NK == 16 &&
-                             NV == 48 && DK == 128 && DV == 128;
+    const bool has_tree    = batch.verify != nullptr && batch.verify->tree_rows.data != nullptr;
+    const bool replay_conv = batch.verify != nullptr && !has_tree && batch.width <= ops::kGdnReplayConvMaxWidth &&
+                             NK == 16 && NV == 48 && DK == 128 && DV == 128;
     // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
     // them inside the recurrent update, except a GGUF import's (its third input holds A itself), whose
     // decode takes them from gdn_gating_direct too.
@@ -845,12 +884,25 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         const std::int32_t Wd = batch.width, B = batch.batch;
         auto layer = state_.gdn->layer_view(index);
         ops::causal_conv1d_silu_from_states_split(qkv.view({C, Wd, B}), p.convolution, layer.conv,
-                                                  batch.slots, q, k, v, s);
+                                                  batch.slots, q, k, v, s,
+                                                  has_tree ? &batch.verify->tree_rows : nullptr);
         Tensor o_rows = o.view({DV, NV, Wd, B});
-        ops::gated_delta_net_replay_record(q.view({DK, NK, Wd, B}), k.view({DK, NK, Wd, B}), v.view({DV, NV, Wd, B}),
-                                           gate.view({NV, Wd, B}), beta.view({NV, Wd, B}), scale, layer.recurrent,
-                                           Tensor{}, batch.slots, records.key, records.value, records.gate,
-                                           o_rows, s);
+        if (has_tree) {
+            if (batch.verify->valid_columns == nullptr) {
+                throw std::logic_error("Qwen4Exp GDN: tree verification requires valid_columns");
+            }
+            const Tensor valid_cols(const_cast<std::int32_t*>(batch.verify->valid_columns), DType::I32, {B});
+            ops::gated_delta_net_replay_record(q.view({DK, NK, Wd, B}), k.view({DK, NK, Wd, B}),
+                                               v.view({DV, NV, Wd, B}), gate.view({NV, Wd, B}), beta.view({NV, Wd, B}),
+                                               scale, layer.recurrent, valid_cols, batch.slots, batch.verify->tree_rows,
+                                               records.key, records.value, records.gate, o_rows, s,
+                                               ops::GdnTreeRecordRoute::Walk);
+        } else {
+            ops::gated_delta_net_replay_record(q.view({DK, NK, Wd, B}), k.view({DK, NK, Wd, B}),
+                                               v.view({DV, NV, Wd, B}), gate.view({NV, Wd, B}), beta.view({NV, Wd, B}),
+                                               scale, layer.recurrent, Tensor{}, batch.slots, records.key,
+                                               records.value, records.gate, o_rows, s);
+        }
     } else if (batch.width > 1) {
         // One sequence of several positions (a prefill chunk): chunked recurrence.
         if (batch.batch != 1) { throw std::invalid_argument("Qwen4Exp GDN: multi-position calls hold one sequence"); }
@@ -1046,7 +1098,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                                          .index_key   = p.index_key_norm};
         Tensor q_out  = call.kv_only ? Tensor{} : q;
         Tensor iq_out = call.kv_only ? Tensor{} : iq;
-        ops::qsa_prepare(inputs, norms, call.tails, layer, qsa_batch, geometry, q_out, iq_out, s);
+        ops::qsa_prepare(inputs, norms, call.tails, layer, qsa_batch, geometry, q_out, iq_out, s, call.tree_rows);
         if (call.kv_only) { return Tensor{}; }
     } else {
         Tensor kn      = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
@@ -1080,7 +1132,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
             ops::kv_cache_append_batch(append.k, append.v, call.positions.view({call.width, call.batch}),
                                        call.table_rows, view, s);
         }
-        ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s);
+        ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s, call.tree_rows);
         if (call.kv_only) { return Tensor{}; }
         ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
     }
@@ -1094,7 +1146,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                                 fast_.expert_a4_narrow || fast_.router_mma || fast_.a8_experts || fast_.a8_experts_wide;
     ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s, vq ? &append : nullptr, encode_gate ? nullptr : &gate, qsa_fast);
+                       span.bytes, out, s, vq ? &append : nullptr, encode_gate ? nullptr : &gate, qsa_fast,
+                       call.tree_rows);
     Tensor gated = out.view({QW, T});
     Tensor y     = work_.alloc(DType::BF16, {H, T});
     if (encode_gate) {
@@ -1463,6 +1516,7 @@ ops::MoeExpertSource Forward::expert_source(const MoeParameters& p, std::uint32_
     if (pitch != 0 && pitch != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: the layer's frame pitch differs from its bank's record stride");
     }
+    source.omma_narrow = fast_.expert_a4_omma_narrow;
     return source;
 }
 

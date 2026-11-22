@@ -294,6 +294,8 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
+    const bool q4_flash_next = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 1280 &&
+                               profile.input_rows == 2560 && profile.output_rows == 640;
     const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
                               profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
                               profile.output_rows == 6144;
@@ -313,8 +315,8 @@ void validate_profile(const Profile& profile) {
     // Qwen3.5-122B-A10B's per-row FP8 shared expert (A16 and column-invariant routes only).
     const bool fp8_122b_shared = profile.qtype == QType::FP8_E4M3FN_ROW_F32 && profile.gate_up_rows == 2048 &&
                                  profile.input_rows == 3072 && profile.output_rows == 1024;
-    if ((!q4 && !q8_companion && !q8_dflash2 && !q8_flash_next_dflash2 && !q8_122b_dflash2 && !q8_flash_next &&
-         !nvfp4 && !fp8 && !fp8_122b_shared) ||
+    if ((!q4 && !q4_flash_next && !q8_companion && !q8_dflash2 && !q8_flash_next_dflash2 && !q8_122b_dflash2 &&
+         !q8_flash_next && !nvfp4 && !fp8 && !fp8_122b_shared) ||
         profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
@@ -332,7 +334,7 @@ void validate_profile(const Profile& profile) {
          profile.activation_compute != ActivationCompute::A8Residual && !invariant) ||
         (q4_w4a8 && profile.activation_compute != ActivationCompute::A8Int) ||
         (!nvfp4 && !fp8 && !q4_w4a8 && profile.activation_compute != ActivationCompute::A16 &&
-         !((q4 || fp8_122b_shared) && invariant)) ||
+         !((q4 || q4_flash_next || fp8_122b_shared) && invariant)) ||
         (profile.pattern == ActivationPattern::Int8Representable &&
          profile.activation_compute != ActivationCompute::A8Int)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");

@@ -537,6 +537,11 @@ constexpr std::array kQualified{
     Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::BlockVerification, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
@@ -653,6 +658,13 @@ constexpr std::array kQualified{
     Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Vq2}},
     Qualification{FastPath::ExpertA4ResidualDecode, {DenseKernels::Nvfp4, false, KvCacheStorage::Q4KeyVq2Value}},
+    Qualification{FastPath::ExpertA4OmmaNarrow, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
+    Qualification{FastPath::ExpertA4OmmaNarrow, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::ExpertA4OmmaNarrow, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
+    Qualification{FastPath::ExpertA4OmmaNarrow, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::ExpertA4OmmaNarrow, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::ExpertA4OmmaNarrow, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
+    Qualification{FastPath::ExpertA4OmmaNarrow, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
 };
 
 const char* dense_name(DenseKernels dense) {
@@ -789,6 +801,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
         return !configuration.a4_experts &&
                (configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8 ||
                 configuration.dense == DenseKernels::Nvfp4);
+    case FastPath::ExpertA4OmmaNarrow:
+        return configuration.a4_experts && configuration.dense != DenseKernels::Ggml;
     // Its more precise three-term form stays on the two gated configurations; W4Dense registers the
     // two-term pair, not this one (task T8, 2026-11-07).
     case FastPath::ExpertA4Residual3:
@@ -818,7 +832,13 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::BlockVerification:
         return options.speculative.backend == SpeculativeBackend::DFlash2 ||
                options.speculative.backend == SpeculativeBackend::Mtp;
-    case FastPath::UniverTrees: return false; // Qwen3.5's tree rounds only
+    case FastPath::UniverTrees:
+        return options.purpose == EnginePurpose::Generation &&
+               (options.speculative.backend == SpeculativeBackend::DFlash2 ||
+                options.speculative.backend == SpeculativeBackend::Mtp) &&
+               (configuration.kv == KvCacheStorage::BFloat16 || configuration.kv == KvCacheStorage::Int8Group64 ||
+                configuration.kv == KvCacheStorage::Fp8E4M3Row256 || configuration.kv == KvCacheStorage::Nvfp4Group16 ||
+                configuration.kv == KvCacheStorage::Fp8KeyNvfp4Value);
     case FastPath::GdnTreeClosedForm: return false; // Qwen3.5's tree rounds only
     case FastPath::QsaPrepareFused:
         // ops::qsa_prepare_supports's KV formats (bf16, int8, fp8, nvfp4, k8v4); VQ2 and K4V2 append
@@ -852,7 +872,7 @@ bool FastPathSelection::request_invariant() const noexcept {
         return path == FastPath::AdaptiveSpeculation || path == FastPath::DFlash2Pairs ||
                path == FastPath::FreeCacheResume || path == FastPath::Preemption || path == FastPath::Q8SlicedK ||
                path == FastPath::ExpertA4Residual || path == FastPath::ExpertA4Residual3 ||
-               path == FastPath::ExpertA4ResidualDecode ||
+               path == FastPath::ExpertA4ResidualDecode || path == FastPath::ExpertA4OmmaNarrow ||
                path == FastPath::Fp8A8Pair || path == FastPath::Fp8A8PairBlock32 ||
                path == FastPath::Nvfp4A4Pair ||
                path == FastPath::GgmlBf16Prefill || path == FastPath::F16AccumulatePrefill ||
@@ -871,14 +891,15 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     ops::LinearRoutes prefill = ops::LinearRoutes::Exact;
     if (selected(FastPath::GgmlBf16Prefill)) { prefill = prefill | ops::LinearRoutes::GgmlBf16Wide; }
     if (selected(FastPath::F16AccumulatePrefill)) { prefill = prefill | ops::LinearRoutes::F16Accumulate; }
-    return {.dense_routes       = routes,
-            .prefill_routes     = prefill,
-            .gdn_conv_fused     = selected(FastPath::GdnConvFused),
-            .qsa_prepare_fused  = selected(FastPath::QsaPrepareFused),
-            .expert_a4_terms    = selected(FastPath::ExpertA4Residual3) ? 3
-                                  : selected(FastPath::ExpertA4Residual) ? 2
-                                                                          : 0,
-            .expert_a4_narrow   = selected(FastPath::ExpertA4ResidualDecode),
+    return {.dense_routes          = routes,
+            .prefill_routes        = prefill,
+            .gdn_conv_fused        = selected(FastPath::GdnConvFused),
+            .qsa_prepare_fused     = selected(FastPath::QsaPrepareFused),
+            .expert_a4_terms       = selected(FastPath::ExpertA4Residual3) ? 3
+                                     : selected(FastPath::ExpertA4Residual) ? 2
+                                                                             : 0,
+            .expert_a4_narrow      = selected(FastPath::ExpertA4ResidualDecode),
+            .expert_a4_omma_narrow = selected(FastPath::ExpertA4OmmaNarrow),
             .gdn_arithmetic    = selected(FastPath::GdnF16Accumulate) ? ops::GdnChunkArithmetic::Fp16Accumulate
                                                                        : ops::GdnChunkArithmetic::Exact,
             .router_mma        = selected(FastPath::RouterMma)};

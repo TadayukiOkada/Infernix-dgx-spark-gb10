@@ -16,6 +16,7 @@
 #include "infernix/ops/rmsnorm.h"
 #include "infernix/ops/rmsnorm_pack_tail.h"
 #include "infernix/ops/rmsnorm_rope.h"
+#include "infernix/ops/screened_head.h"
 #include "infernix/ops/sliding_window_attention.h"
 #include "infernix/ops/speculative_round.h"
 #include "infernix/ops/top_logprobs.h"
@@ -33,6 +34,7 @@ std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
 
 // The drafter's top-16 candidates per position (the selector's lattice).
 constexpr std::int32_t kCandidates = 16;
+constexpr ops::ScreenedHeadPolicy kScreenedHeadPolicy{.margin = 5.0F, .rescored = 64};
 
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
     ops::linear(x, p.weight, out, p.policy, work, s);
@@ -74,7 +76,8 @@ DFlash2::DFlash2(const Parameters& parameters, const DFlash2Config& config, Prop
                                  parameters_.draft_head.rows->weight.qtype == QType::Q4_G64_FP16 && rows == 131072
                            : parameters_.output_head_q8 && !parameters_.output_head_q8->is_ggml() &&
                                  parameters_.output_head_q8->weight.qtype == QType::Q8_G32_FP16;
-    if (rows != dim(config_.head_rows) || fused != config_.fused_head) {
+    const bool screened = head_ == ProposalHead::Optimized && parameters_.draft_head.screen.has_value();
+    if (rows != dim(config_.head_rows) || fused != config_.fused_head || screened != config_.screened_head) {
         throw std::logic_error("Qwen4Exp DFlash2: the bound head differs from the planned one");
     }
     require_q8(p_.feature_projection.weight, "the feature projection");
@@ -119,9 +122,24 @@ void DFlash2::materialize(const DFlash2ContextCall& call) {
 }
 
 void DFlash2::head_candidates(const Tensor& hidden, Tensor& ids, Tensor& scores) {
-    const cudaStream_t s = device_.stream;
+    const cudaStream_t s       = device_.stream;
     const std::int32_t columns = hidden.ne[1];
     const auto& head           = parameters_.draft_head;
+    if (config_.screened_head) {
+        const std::int32_t rows = head.rows->weight.n;
+        Tensor unmapped;
+        for (std::int32_t c0 = 0; c0 < columns; c0 += ops::kScreenedHeadMaxColumns) {
+            const std::int32_t chunk = std::min(ops::kScreenedHeadMaxColumns, columns - c0);
+            Tensor h_slice           = hidden.slice(1, c0, chunk);
+            Tensor id_slice          = ids.slice(1, c0, chunk);
+            Tensor sc_slice          = scores.slice(1, c0, chunk);
+            ops::screened_head_top(h_slice, head.rows->weight, *head.screen, rows, kScreenedHeadPolicy, id_slice,
+                                   sc_slice, unmapped, unmapped, work_, s);
+        }
+        Tensor flat = ids.view({kCandidates * columns});
+        ops::proposal_remap_token_ids(flat, static_cast<const std::int32_t*>(head.token_ids.data), rows, s);
+        return;
+    }
     if (config_.fused_head) {
         if (head_ == ProposalHead::Optimized) {
             ops::linear_topk(hidden, head.rows->weight, head.token_ids, ids, scores, work_, s);
@@ -300,7 +318,11 @@ std::size_t DFlash2::workspace_bytes(const TextConfig& text, const DFlash2Config
     // The head: linear_topk's scratch, or the FP32 logits of another head (and a GGUF head's
     // decode scratch). The selector's projection runs Q8 or BF16.
     std::size_t head = 0;
-    if (config.fused_head) {
+    if (config.screened_head) {
+        head = ops::screened_head_workspace_bytes(
+            dim(config.head_rows), std::min<std::int32_t>(dim(masks), ops::kScreenedHeadMaxColumns),
+            kScreenedHeadPolicy);
+    } else if (config.fused_head) {
         head = ops::linear_topk_workspace_capacity_bytes(config.head_rows == 131072U ? QType::Q4_G64_FP16 : kQ8,
                                                          dim(config.head_rows), dim(H), 1, dim(masks));
     } else {

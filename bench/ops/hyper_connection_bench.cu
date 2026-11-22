@@ -7,7 +7,7 @@
 // reports the time per call. The bandwidth figure counts one call's weights once. The FNV-1a hash of
 // the last call's outputs identifies the result bits.
 //
-//   infernix_hyper_connection_bench [--columns 1,2,5] [--codec q8|bf16] [--layers 48] [--warmup 5] [--repeat 50]
+//   infernix_hyper_connection_bench [--columns 1,2,5] [--codec q8|q4|bf16] [--layers 48] [--warmup 5] [--repeat 50]
 //                                   [--seed N]
 
 #include "infernix/ops/hyper_connection.h"
@@ -39,9 +39,20 @@ constexpr int kHidden  = 2560;
 constexpr int kRank    = 320;
 constexpr int kWidth   = kStreams * kHidden;
 
+enum class BenchCodec { Q8, Q4, Bf16 };
+
+const char* codec_name(BenchCodec codec) noexcept {
+    switch (codec) {
+    case BenchCodec::Q8: return "q8";
+    case BenchCodec::Q4: return "q4";
+    case BenchCodec::Bf16: return "bf16";
+    }
+    return "q8";
+}
+
 struct Options {
     std::vector<int> columns{1, 2, 5};
-    bool bf16          = false;
+    BenchCodec codec   = BenchCodec::Q8;
     int layers         = 48;
     int warmup         = 5;
     int repeat         = 50;
@@ -72,8 +83,15 @@ Options parse_options(int argc, char** argv) {
             options.columns = parse_list(value());
         } else if (arg == "--codec") {
             const std::string v = value();
-            if (v != "q8" && v != "bf16") { throw std::invalid_argument("--codec takes q8 or bf16"); }
-            options.bf16 = v == "bf16";
+            if (v == "q8") {
+                options.codec = BenchCodec::Q8;
+            } else if (v == "q4") {
+                options.codec = BenchCodec::Q4;
+            } else if (v == "bf16") {
+                options.codec = BenchCodec::Bf16;
+            } else {
+                throw std::invalid_argument("--codec takes q8, q4, or bf16");
+            }
         } else if (arg == "--layers") {
             options.layers = std::stoi(value());
         } else if (arg == "--warmup") {
@@ -89,23 +107,22 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-// A [rows, k] weight: Q8 row-split (random codes, FP16 group scales 2^-12 .. 2^-8, K padded to 128)
-// or BF16 contiguous (values of the same magnitude).
+// A [rows, k] weight: Q8 row-split (K padded to 128), Q4 row-split (group 64, K padded to 128), or
+// BF16 contiguous (values of the same magnitude).
 struct BenchWeight {
     DeviceBuffer data;
     DeviceBuffer scales;
     Weight weight;
     double bytes = 0;
 
-    BenchWeight(int rows, int k, bool bf16, std::mt19937& rng) {
-        const int padded = (k + 127) / 128 * 128;
+    BenchWeight(int rows, int k, BenchCodec codec, std::mt19937& rng) {
         std::uniform_real_distribution<float> lg(-12.0F, -8.0F);
         weight.n = rows;
         weight.k = k;
         weight.ndim = 2;
         weight.shape[0] = weight.padded_shape[0] = rows;
         weight.shape[1] = k;
-        if (bf16) {
+        if (codec == BenchCodec::Bf16) {
             weight.padded_shape[1] = k;
             data          = bench::make_bf16(static_cast<std::size_t>(rows) * k, rng(), -0.03F, 0.03F);
             weight.qtype  = QType::BF16;
@@ -114,6 +131,26 @@ struct BenchWeight {
             bytes         = static_cast<double>(data.bytes);
             return;
         }
+        if (codec == BenchCodec::Q4) {
+            const int padded = (k + 127) / 128 * 128;
+            weight.padded_shape[1] = padded;
+            data = DeviceBuffer(static_cast<std::size_t>(rows) * (padded / 2));
+            CUDA_CHECK(bench::fixture::fill_bytes(data.p, data.bytes, rng()));
+            std::vector<__half> s(static_cast<std::size_t>(rows) * (padded / 64));
+            for (auto& v : s) { v = __float2half(std::exp2(lg(rng))); }
+            scales = DeviceBuffer(s.size() * sizeof(__half));
+            CUDA_CHECK(cudaMemcpy(scales.p, s.data(), scales.bytes, cudaMemcpyHostToDevice));
+            weight.qtype       = QType::Q4_G64_FP16;
+            weight.layout      = QuantLayout::RowSplit;
+            weight.qdata       = data.p;
+            weight.scales      = scales.p;
+            weight.group       = 64;
+            weight.group_size  = 64;
+            weight.scale_dtype = DType::FP16;
+            bytes              = static_cast<double>(data.bytes + scales.bytes);
+            return;
+        }
+        const int padded = (k + 127) / 128 * 128;
         weight.padded_shape[1] = padded;
         data = DeviceBuffer(static_cast<std::size_t>(rows) * padded);
         CUDA_CHECK(bench::fixture::fill_bytes(data.p, data.bytes, rng()));
@@ -148,8 +185,8 @@ int main(int argc, char** argv) {
         if (options.layers < 1) { throw std::invalid_argument("--layers must be positive"); }
         std::vector<std::unique_ptr<BenchWeight>> downs, ups;
         for (int l = 0; l < options.layers; ++l) {
-            downs.push_back(std::make_unique<BenchWeight>(kRank + kStreams, kWidth, options.bf16, rng));
-            ups.push_back(std::make_unique<BenchWeight>(kWidth, kRank, options.bf16, rng));
+            downs.push_back(std::make_unique<BenchWeight>(kRank + kStreams, kWidth, options.codec, rng));
+            ups.push_back(std::make_unique<BenchWeight>(kWidth, kRank, options.codec, rng));
         }
         const BenchWeight& down = *downs.front();
         const BenchWeight& up   = *ups.front();
@@ -162,7 +199,7 @@ int main(int argc, char** argv) {
             1));
         std::printf("# gpu=%s timed=hyper_connection_mix (graph of %d calls, distinct weights) codec=%s S=%d H=%d "
                     "rank=%d weights=%.2f MB per call\n",
-                    context.props.name, options.layers, options.bf16 ? "bf16" : "q8", kStreams, kHidden, kRank,
+                    context.props.name, options.layers, codec_name(options.codec), kStreams, kHidden, kRank,
                     (down.bytes + up.bytes) / 1e6);
         for (const int columns : options.columns) {
             const DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kWidth) * columns,

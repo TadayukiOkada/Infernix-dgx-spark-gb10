@@ -1669,4 +1669,284 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
+// Warp-0 helper: draws a token from a weighted discrete law across lanes 0..support-1
+// using inclusive warp scan + ballot (exact parity with speculative_sparse_warp_accept).
+__device__ __forceinline__ int speculative_sparse_warp_draw_terminal(
+    int token, float weight, int support, int column, int extent, int old_length, const SamplingConfig& cfg) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    float cdf      = weight;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+        const float earlier = __shfl_up_sync(0xffffffffU, cdf, offset);
+        if (lane >= offset) { cdf += earlier; }
+    }
+    const float mass = __shfl_sync(0xffffffffU, cdf, 31);
+    const int purpose =
+        column < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
+    const float u           = sampling_uniform(cfg.seed, old_length + column + 1, purpose, 0);
+    const float goal        = u * mass;
+    const unsigned positive = __ballot_sync(0xffffffffU, lane < support && weight > 0.0f);
+    const unsigned below    = __ballot_sync(0xffffffffU, lane < support && weight > 0.0f && goal < cdf);
+    const int selected      = !(mass > 0.0f) ? 0
+                              : below        ? __ffs(below) - 1
+                              : positive     ? 31 - __clz(positive)
+                                             : 0;
+    return __shfl_sync(0xffffffffU, token, selected);
+}
+
+template <bool UpdateTokenCounts, bool SparseProposal, bool BlockVerification>
+__launch_bounds__(64) __global__ void speculative_accept_compact_kernel(
+    const std::int32_t* compact_ids, const float* compact_logits, const std::int32_t* compact_counts,
+    const std::int32_t* drafts, const std::int32_t* candidate_ids, const float* proposal_q,
+    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
+    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cap, std::int32_t k) {
+    pdl::enter();
+    const int tid                   = static_cast<int>(threadIdx.x);
+    const int row                   = static_cast<int>(blockIdx.x);
+    const int cols                  = k + 1;
+    int extent                      = current_extents[row];
+    extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
+    const SamplingConfig cfg        = configs[row];
+    const std::int32_t* row_drafts  = drafts + row * k;
+    std::int32_t* row_tokens        = licensed_tokens + row * cols;
+
+    __shared__ unsigned long long sort_keys[64];
+    __shared__ unsigned long long warp_keys[2];
+    __shared__ float cand_val[kSamplerCandidateCap];
+    __shared__ int cand_idx[kSamplerCandidateCap];
+    __shared__ float prob[kSamplerCandidateCap];
+    __shared__ int n_support;
+    __shared__ int a_sh;
+    __shared__ int done_sh;
+    __shared__ int tstar_sh;
+    __shared__ int L_sh;
+    __shared__ int tau_idx[kSamplerCandidateCap];
+    __shared__ float tau_prob[kSamplerCandidateCap];
+    __shared__ int tau_n;
+
+    if (tid == 0) {
+        a_sh     = 0;
+        done_sh  = 0;
+        tstar_sh = 0;
+        L_sh     = lengths[row];
+    }
+    __syncthreads();
+
+    if (!(cfg.temperature > 0.0f)) {
+        for (int i = 0; i <= extent; ++i) {
+            const int col_idx      = row * cols + i;
+            const int n            = min(cap, max(0, compact_counts[col_idx]));
+            unsigned long long key = 0ull;
+            if (tid < n) {
+                const int id = compact_ids[static_cast<std::size_t>(col_idx) * cap + tid];
+                if (id >= 0 && id < token_domain) {
+                    const float val = sampling_adjusted_logit(
+                        compact_logits[static_cast<std::size_t>(col_idx) * cap + tid], id, cfg, row_drafts, i);
+                    key = sampling_sort_key(val, id);
+                }
+            }
+            const unsigned long long best = sampling_compact_max_key(key, warp_keys);
+            if (tid == 0) {
+                const bool finite  = (best != 0ull) && isfinite(sampling_key_float(best));
+                const int selected = finite ? sampling_key_index(best) : sampling_report_nonfinite(cfg);
+                if (finite && i < extent && selected == row_drafts[i]) {
+                    a_sh = i + 1;
+                } else {
+                    tstar_sh = selected;
+                    done_sh  = 1;
+                }
+            }
+            __syncthreads();
+            if (done_sh) { break; }
+        }
+        if (tid == 0) {
+            speculative_store_accept_result<UpdateTokenCounts>(
+                row_drafts, k, row, a_sh, tstar_sh, lengths, anchors, row_tokens, licensed_counts, accepted, &cfg);
+        }
+        return;
+    }
+
+    const auto q_of = [&](int column, int token) {
+        if constexpr (SparseProposal) {
+            const int at = (row * k + column) * kSparseSpeculativeCandidates;
+            return speculative_sparse_probability(candidate_ids + at, proposal_q + at, token);
+        } else {
+            return 0.0f;
+        }
+    };
+
+    if constexpr (SparseProposal && BlockVerification) {
+        if (!cfg.gumbel_max) {
+            const int col0 = row * cols;
+            const int n0   = min(cap, max(0, compact_counts[col0]));
+            sampling_compact_build_support(compact_ids + static_cast<std::size_t>(col0) * cap,
+                                           compact_logits + static_cast<std::size_t>(col0) * cap, n0, token_domain,
+                                           cfg, sort_keys, cand_val, cand_idx, prob, &n_support, row_drafts, 0);
+            if (tid < kSamplerCandidateCap) {
+                tau_idx[tid]  = cand_idx[tid];
+                tau_prob[tid] = prob[tid];
+            }
+            if (tid == 0) { tau_n = n_support; }
+            __syncthreads();
+
+            float p     = 1.0f;
+            float p_tau = 1.0f;
+            int tau     = 0;
+            const int L = L_sh;
+            for (int i = 1; i <= extent; ++i) {
+                const int prev = i - 1;
+                if (tid < 32) {
+                    const int cur_n    = n_support;
+                    const int d        = row_drafts[prev];
+                    const unsigned hit = __ballot_sync(0xffffffffU, tid < cur_n && cand_idx[tid] == d);
+                    const float my_p   = tid < cur_n ? prob[tid] : 0.0f;
+                    const float pd     = hit ? __shfl_sync(0xffffffffU, my_p, __ffs(hit) - 1) : 0.0f;
+                    const float qd     = q_of(prev, d);
+                    p                  = qd > 0.0f ? fminf(p * pd / qd, 1.0f) : 0.0f;
+                }
+                __syncthreads();
+
+                const int col_idx = row * cols + i;
+                const int n       = min(cap, max(0, compact_counts[col_idx]));
+                sampling_compact_build_support(compact_ids + static_cast<std::size_t>(col_idx) * cap,
+                                               compact_logits + static_cast<std::size_t>(col_idx) * cap, n,
+                                               token_domain, cfg, sort_keys, cand_val, cand_idx, prob, &n_support,
+                                               row_drafts, i);
+                if (tid < 32) {
+                    const int cur_n = n_support;
+                    float threshold = p;
+                    if (i < extent) {
+                        const float nw = tid < cur_n ? prob[tid] : 0.0f;
+                        const float excess =
+                            nw > 0.0f ? fmaxf(p * nw - q_of(i, cand_idx[tid]), 0.0f) : 0.0f;
+                        const float s     = warp_sum(excess);
+                        const float denom = s + 1.0f - p;
+                        threshold         = denom > 0.0f ? s / denom : 1.0f;
+                    }
+                    const float eta = sampling_uniform(cfg.seed, L + i, kSamplePurposeSpeculativeBlockAccept,
+                                                       static_cast<unsigned>(i));
+                    if (eta <= threshold) {
+                        tau   = i;
+                        p_tau = p;
+                        if (tid < cur_n) {
+                            tau_idx[tid]  = cand_idx[tid];
+                            tau_prob[tid] = prob[tid];
+                        }
+                        if (tid == 0) { tau_n = cur_n; }
+                    }
+                }
+                __syncthreads();
+            }
+            if (tid < 32) {
+                const int n  = tau_n;
+                int token    = 0;
+                float weight = 0.0f;
+                if (tid < n) {
+                    token  = tau_idx[tid];
+                    weight = tau_prob[tid];
+                }
+                if (tau < extent && weight > 0.0f) {
+                    weight = fmaxf(p_tau * weight - q_of(tau, token), 0.0f);
+                }
+                const int terminal = speculative_sparse_warp_draw_terminal(token, weight, n, tau, extent, L, cfg);
+                if (tid == 0) {
+                    speculative_store_accept_result<UpdateTokenCounts>(
+                        row_drafts, k, row, tau, terminal, lengths, anchors, row_tokens, licensed_counts, accepted,
+                        &cfg);
+                }
+            }
+            return;
+        }
+    }
+
+    for (int i = 0; i <= extent; ++i) {
+        const int col_idx = row * cols + i;
+        const int n       = min(cap, max(0, compact_counts[col_idx]));
+        sampling_compact_build_support(compact_ids + static_cast<std::size_t>(col_idx) * cap,
+                                       compact_logits + static_cast<std::size_t>(col_idx) * cap, n, token_domain,
+                                       cfg, sort_keys, cand_val, cand_idx, prob, &n_support, row_drafts, i);
+        if (cfg.gumbel_max) {
+            if (tid == 0) {
+                const int y = sampling_gumbel_pick([&](int j) { return cand_idx[j]; },
+                                                   [&](int j) { return prob[j]; }, n_support, cfg.seed, L_sh + i + 1);
+                if (i < extent && y == row_drafts[i]) {
+                    a_sh = i + 1;
+                } else {
+                    tstar_sh = y;
+                    done_sh  = 1;
+                }
+            }
+        } else if constexpr (SparseProposal) {
+            if (tid < 32) {
+                const int support   = n_support;
+                bool accepted_draft = false;
+                if (i < extent) {
+                    const int d        = row_drafts[i];
+                    const unsigned hit = __ballot_sync(0xffffffffU, tid < support && cand_idx[tid] == d);
+                    const float my_p   = tid < support ? prob[tid] : 0.0f;
+                    const float pd     = hit ? __shfl_sync(0xffffffffU, my_p, __ffs(hit) - 1) : 0.0f;
+                    const float qd     = q_of(i, d);
+                    const float u =
+                        sampling_uniform(cfg.seed, L_sh + i + 1, kSamplePurposeSpeculativeAccept, 0u);
+                    accepted_draft = (qd > 0.0f) && (pd >= qd || u * qd < pd);
+                }
+                if (accepted_draft) {
+                    if (tid == 0) { a_sh = i + 1; }
+                } else {
+                    int token    = 0;
+                    float weight = 0.0f;
+                    if (tid < support) {
+                        token  = cand_idx[tid];
+                        weight = prob[tid];
+                    }
+                    const bool residual = i < extent && q_of(i, row_drafts[i]) > 0.0f;
+                    if (residual && tid < support) { weight = fmaxf(weight - q_of(i, token), 0.0f); }
+                    const int terminal =
+                        speculative_sparse_warp_draw_terminal(token, weight, support, i, extent, L_sh, cfg);
+                    if (tid == 0) {
+                        tstar_sh = terminal;
+                        done_sh  = 1;
+                    }
+                }
+            }
+        } else {
+            if (tid == 0) {
+                const int support = n_support;
+                if (i < extent) {
+                    const int d = row_drafts[i];
+                    float pd    = 0.0f;
+                    for (int j = 0; j < support; ++j) {
+                        if (cand_idx[j] == d) {
+                            pd = prob[j];
+                            break;
+                        }
+                    }
+                    const float u =
+                        sampling_uniform(cfg.seed, L_sh + i + 1, kSamplePurposeSpeculativeAccept, 0u);
+                    if (u < pd) {
+                        a_sh = i + 1;
+                    } else {
+                        const float ur = sampling_uniform(cfg.seed, L_sh + i + 1,
+                                                          kSamplePurposeSpeculativeCorrection, 0u);
+                        tstar_sh       = sampling_pick_from_support(cand_idx, prob, support, d, ur);
+                        done_sh        = 1;
+                    }
+                } else {
+                    const float u = sampling_uniform(cfg.seed, L_sh + extent + 1,
+                                                     kSamplePurposeSpeculativeBonus, 0u);
+                    tstar_sh      = sampling_pick_from_support(cand_idx, prob, support, -1, u);
+                    done_sh       = 1;
+                }
+            }
+        }
+        __syncthreads();
+        if (done_sh) { break; }
+    }
+    if (tid == 0) {
+        speculative_store_accept_result<UpdateTokenCounts>(
+            row_drafts, k, row, a_sh, tstar_sh, lengths, anchors, row_tokens, licensed_counts, accepted, &cfg);
+    }
+}
+
 } // namespace infernix::ops

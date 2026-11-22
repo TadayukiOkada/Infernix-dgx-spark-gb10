@@ -1,6 +1,7 @@
 // infernix::ops - causal_conv1d wrapper: public api validation and launcher dispatch.
 #include "infernix/ops/causal_conv1d_silu.h"
 
+#include "infernix/ops/speculative_tree.h"
 #include "ops/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
 
 #include <cstdint>
@@ -471,26 +472,33 @@ void causal_conv1d_silu_snapshot_split(const Tensor& x, const Tensor& weight, Te
 
 void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
                                     const Tensor& conv_states, const Tensor& initial_state_slots,
-                                    Tensor& out, cudaStream_t stream) {
+                                    Tensor& out, cudaStream_t stream, const Tensor* tree_rows) {
     if (out.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: from-states operands must be BF16 with I32 slots");
     }
     validate_from_states_inputs(x, weight, conv_states, initial_state_slots);
+    if (tree_rows != nullptr && tree_rows->data != nullptr) {
+        validate_speculative_tree_rows(*tree_rows, x.ne[2], "causal_conv1d_silu_from_states");
+    }
     require_out_shape(x, out);
     require_accessible(out, "out");
-    detail::causal_conv1d_from_states_launch(x, weight, conv_states, initial_state_slots, out, stream);
+    detail::causal_conv1d_from_states_launch(x, weight, conv_states, initial_state_slots, out, stream, tree_rows);
 }
 
 void causal_conv1d_silu_from_states_split(const Tensor& x, const Tensor& weight,
                                           const Tensor& conv_states,
                                           const Tensor& initial_state_slots, Tensor& out0,
-                                          Tensor& out1, Tensor& out2, cudaStream_t stream) {
+                                          Tensor& out1, Tensor& out2, cudaStream_t stream,
+                                          const Tensor* tree_rows) {
     validate_from_states_inputs(x, weight, conv_states, initial_state_slots);
+    if (tree_rows != nullptr && tree_rows->data != nullptr) {
+        validate_speculative_tree_rows(*tree_rows, x.ne[2], "causal_conv1d_silu_from_states_split");
+    }
     const detail::CausalConvSplitGeometry geometry =
         resolve_split_geometry(x.ne[0], x.ne[1] * x.ne[2], out0, out1, out2);
     require_split_destinations({&x, &weight, &conv_states, &initial_state_slots}, out0, out1, out2);
     detail::causal_conv1d_from_states_split_launch(x, weight, conv_states, initial_state_slots, out0,
-                                                   out1, out2, geometry, stream);
+                                                   out1, out2, geometry, stream, tree_rows);
 }
 
 } // namespace infernix::ops

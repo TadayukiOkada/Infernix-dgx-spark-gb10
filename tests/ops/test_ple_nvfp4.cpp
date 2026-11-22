@@ -224,6 +224,137 @@ void gate_fp32_norms() {
     }
 }
 
+void hash_embed_exact() {
+    constexpr int kNgramSize     = 5;
+    constexpr int kHeadsPerNgram = 4;
+    constexpr int kHeads         = (kNgramSize - 1) * kHeadsPerNgram;
+    constexpr int kWidth         = 160;
+    constexpr int kRowBytes      = kWidth / 2 + kWidth / 16;
+    constexpr int kRowsPerBlock  = 4096 / kRowBytes;
+    constexpr int kBlockBytes    = 4096;
+    constexpr int kEos           = 248044;
+
+    const auto splitmix64 = [](std::uint64_t x) {
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    };
+    const auto is_prime = [](std::uint64_t v) {
+        if (v < 2) { return false; }
+        if (v % 2 == 0) { return v == 2; }
+        for (std::uint64_t d = 3; d * d <= v; d += 2) {
+            if (v % d == 0) { return false; }
+        }
+        return true;
+    };
+
+    std::vector<std::uint64_t> mults(kNgramSize), sizes(kHeads), offsets(kHeads);
+    for (int i = 0; i < kNgramSize; ++i) {
+        mults[i] = 2 * (splitmix64(1234ULL + 0x9E3779B97F4A7C15ULL * (i + 1)) % 1000000000ULL) + 1;
+    }
+    std::uint64_t prime = 16, total_rows = 0;
+    for (int i = 0; i < kHeads; ++i) {
+        do { ++prime; } while (!is_prime(prime));
+        sizes[i]   = prime;
+        offsets[i] = total_rows;
+        total_rows += prime;
+    }
+    const std::uint64_t blocks = (total_rows + kRowsPerBlock - 1) / kRowsPerBlock;
+    std::vector<std::uint8_t> table_blocks(static_cast<std::size_t>(blocks) * kBlockBytes, 0);
+    std::uint32_t state = 9001U;
+    for (std::uint64_t r = 0; r < total_rows; ++r) {
+        std::uint8_t* dst = table_blocks.data() + (r / kRowsPerBlock) * kBlockBytes + (r % kRowsPerBlock) * kRowBytes;
+        for (int b = 0; b < kRowBytes; ++b) {
+            auto byte = static_cast<std::uint8_t>(next(state) >> 24);
+            if (b >= kWidth / 2) { byte &= 0x7FU; }
+            if (b >= kWidth / 2 && byte == 0x7FU) { byte = 0x7EU; }
+            dst[b] = byte;
+        }
+    }
+
+    Device d_blocks(table_blocks.size()), d_mults(mults.size() * 8), d_sizes(sizes.size() * 8),
+        d_offsets(offsets.size() * 8), d_mult(4);
+    t::cuda_check(cudaMemcpy(d_blocks.p, table_blocks.data(), table_blocks.size(), cudaMemcpyHostToDevice), "blocks");
+    t::cuda_check(cudaMemcpy(d_mults.p, mults.data(), mults.size() * 8, cudaMemcpyHostToDevice), "mults");
+    t::cuda_check(cudaMemcpy(d_sizes.p, sizes.data(), sizes.size() * 8, cudaMemcpyHostToDevice), "sizes");
+    t::cuda_check(cudaMemcpy(d_offsets.p, offsets.data(), offsets.size() * 8, cudaMemcpyHostToDevice), "offsets");
+
+    const Tensor t_mults(d_mults.p, DType::I64, {kNgramSize});
+    const Tensor t_sizes(d_sizes.p, DType::I64, {kHeads});
+    const Tensor t_offsets(d_offsets.p, DType::I64, {kHeads});
+    const Tensor t_mult(d_mult.p, DType::FP32, {1});
+
+    for (const int columns : {1, 8, 37}) {
+        std::vector<std::int32_t> windows(static_cast<std::size_t>(kNgramSize) * columns);
+        for (int c = 0; c < columns; ++c) {
+            for (int s = 0; s < kNgramSize; ++s) {
+                std::int32_t tok = static_cast<std::int32_t>((next(state) >> 12) % 248000U);
+                if (c % 5 == 0 && s == 0) { tok = kEos; }     // EOS at s=0 must NOT close context
+                if (c % 5 == 2 && s == 2) { tok = kEos; }     // EOS at s>0 closes s>=2
+                if (c == 0 && s > 0) { tok = kEos; }          // BOS padding
+                windows[static_cast<std::size_t>(c) * kNgramSize + s] = tok;
+            }
+        }
+        Device d_win(windows.size() * 4), d_out(static_cast<std::size_t>(kHeads) * kWidth * columns * 2);
+        t::cuda_check(cudaMemcpy(d_win.p, windows.data(), windows.size() * 4, cudaMemcpyHostToDevice), "windows");
+        const Tensor t_win(d_win.p, DType::I32, {kNgramSize, columns});
+        Tensor t_out(d_out.p, DType::BF16, {kHeads * kWidth, columns});
+
+        for (const float multiplier : {3.324236240587197e-05F, 1.0F + 0x1p-7F}) {
+            t::cuda_check(cudaMemcpy(d_mult.p, &multiplier, 4, cudaMemcpyHostToDevice), "multiplier");
+            infernix::ops::PleNgramHashTable tbl{};
+            tbl.resident_blocks = d_blocks.p;
+            tbl.multipliers     = &t_mults;
+            tbl.sizes           = &t_sizes;
+            tbl.offsets         = &t_offsets;
+            tbl.multiplier      = &t_mult;
+            tbl.ngram_size      = kNgramSize;
+            tbl.heads_per_ngram = kHeadsPerNgram;
+            tbl.eos_token_id    = kEos;
+            tbl.head_width      = kWidth;
+            tbl.row_bytes       = kRowBytes;
+            tbl.rows_per_block  = kRowsPerBlock;
+            tbl.block_bytes     = kBlockBytes;
+            tbl.total_rows      = total_rows;
+            infernix::ops::ple_hash_embed_nvfp4(t_win, tbl, t_out, nullptr);
+
+            std::vector<std::uint16_t> got(static_cast<std::size_t>(kHeads) * kWidth * columns);
+            t::cuda_check(cudaMemcpy(got.data(), d_out.p, got.size() * 2, cudaMemcpyDeviceToHost), "read");
+
+            std::size_t bad = 0;
+            for (int c = 0; c < columns; ++c) {
+                const std::int32_t* w = windows.data() + static_cast<std::size_t>(c) * kNgramSize;
+                bool closed           = false;
+                std::uint64_t ctx[kNgramSize]{};
+                for (int s = 0; s < kNgramSize; ++s) {
+                    if (s > 0 && w[s] == kEos) { closed = true; }
+                    ctx[s] = static_cast<std::uint64_t>(closed ? kEos : w[s]);
+                }
+                std::uint64_t mixed = ctx[0] * mults[0];
+                for (int n = 2; n <= kNgramSize; ++n) {
+                    mixed ^= ctx[n - 1] * mults[n - 1];
+                    const int base = (n - 2) * kHeadsPerNgram;
+                    for (int h = base; h < base + kHeadsPerNgram; ++h) {
+                        const std::uint64_t row_id = mixed % sizes[h] + offsets[h];
+                        const std::uint8_t* row =
+                            table_blocks.data() + (row_id / kRowsPerBlock) * kBlockBytes +
+                            (row_id % kRowsPerBlock) * kRowBytes;
+                        for (int j = 0; j < kWidth; ++j) {
+                            const unsigned code = (row[j / 2] >> (4 * (j % 2))) & 15U;
+                            const double exact =
+                                e2m1(code) * e4m3fn(row[kWidth / 2 + j / 16]) * static_cast<double>(multiplier);
+                            bad += got[(static_cast<std::size_t>(c) * kHeads + h) * kWidth + j] != bf16_rne(exact);
+                        }
+                    }
+                }
+            }
+            check(bad == 0, "ple_hash_embed_nvfp4 T=" + std::to_string(columns) + " mult=" +
+                                std::to_string(multiplier) + ": " + std::to_string(bad) + " differ");
+        }
+    }
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(ple_nvfp4) {
@@ -233,6 +364,7 @@ INFERNIX_OP_TEST(ple_nvfp4) {
             return 77;
         }
         embed_exact();
+        hash_embed_exact();
         gate_fp32_norms();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

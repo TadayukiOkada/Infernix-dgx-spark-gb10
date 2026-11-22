@@ -955,7 +955,7 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
         const int tokens     = static_cast<int>(x.ne[1]);
         map_entries_kernel<<<map_blocks, kQuantizeThreads, 0, stream>>>(
             dispatch, workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map);
-        if (tokens <= 16) {
+        if (tokens <= 64) {
             quantize_token_small_kernel<<<dim3(tokens, top_k), kGateUpBlocks, 0, stream>>>(
                 static_cast<const std::uint16_t*>(x.data), top_k, source.scales,
                 workspace.pass_tiles, workspace.pass_narrow, call.passes, workspace.entry_map, workspace.x_plane);

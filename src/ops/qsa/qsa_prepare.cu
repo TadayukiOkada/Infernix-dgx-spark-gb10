@@ -11,6 +11,7 @@
 
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/rope.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include "core/dtype.h"
 #include "core/paged_kv_storage.h"
@@ -77,6 +78,7 @@ struct PrepareArgs {
     void* k_scales;
     void* v_scales;
     bf16* pooled;
+    const SpeculativeTreeRow* trees;
     QsaPageSpaces spaces;
     std::int32_t table_stride;
     std::int32_t columns;
@@ -407,10 +409,9 @@ __device__ __forceinline__ void pool_block(const PrepareArgs& a, int sequence, i
 
 // qsa_pool_keys's tail update of sequence `sequence`: slot q % R holds the raw key of every position
 // q of the latest block with q % R < R - 1 up to the call's last position.
-__device__ __forceinline__ void write_tails(const PrepareArgs& a, int sequence, int start, int lane) {
+__device__ __forceinline__ void write_tails(const PrepareArgs& a, int sequence, int start, int last, int lane) {
     const int ratio = a.ratio;
     const int tail  = a.tail_slots[sequence];
-    const int last  = a.positions[sequence * a.width + a.width - 1];
     const int base  = last - last % ratio;
     const int end   = min(last, base + ratio - 2);
     for (int q = max(base, start); q <= end; ++q) { // positions before the call are in the tail already
@@ -427,17 +428,22 @@ __device__ __forceinline__ void write_tails(const PrepareArgs& a, int sequence, 
 // only then rewrites the tails: no other task reads them.
 __device__ __forceinline__ void prepare_pool(const PrepareArgs& a, int column, int lane) {
     const int sequence = column / a.width;
+    const int local    = column % a.width;
     const int start    = a.positions[sequence * a.width];
-    if (column % a.width == 0) {
-        const int last  = a.positions[sequence * a.width + a.width - 1];
+    const int main_end =
+        (a.trees != nullptr && a.trees[sequence].tree != 0) ? static_cast<int>(a.trees[sequence].main_depth)
+                                                            : (a.width - 1);
+    if (local == 0) {
+        const int last  = a.positions[sequence * a.width + main_end];
         const int first = start - start % a.ratio;
         if (first < start && first + a.ratio - 1 <= last) { pool_block(a, sequence, start, first, lane); }
         if (a.update_tails) {
             __syncwarp(); // the carried block's tail reads precede the tail writes
-            write_tails(a, sequence, start, lane);
+            write_tails(a, sequence, start, last, lane);
         }
         return;
     }
+    if (local > main_end) { return; }
     const int position = a.positions[column];
     const int first    = position - a.ratio + 1;
     if ((position + 1) % a.ratio == 0 && first >= start) { pool_block(a, sequence, start, first, lane); }
@@ -567,7 +573,7 @@ bool qsa_prepare_supports(KvCacheStorage storage) noexcept {
 
 void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, Tensor& tails,
                  const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& geometry,
-                 Tensor& q_out, Tensor& index_q_out, cudaStream_t stream) {
+                 Tensor& q_out, Tensor& index_q_out, cudaStream_t stream, const Tensor* tree_rows) {
     require_geometry(geometry);
     const KvCacheStorage storage = layer.kv.storage;
     require(qsa_prepare_supports(storage),
@@ -575,6 +581,9 @@ void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, T
     const int heads = geometry.heads, kv_heads = geometry.kv_heads, index_heads = geometry.index_heads;
     const int columns = inputs.k.ne[2];
     require(batch.batch > 0 && batch.width > 0 && columns == batch.batch * batch.width, "T must be batch * width");
+    if (tree_rows != nullptr && tree_rows->data != nullptr) {
+        validate_speculative_tree_rows(*tree_rows, batch.batch, "qsa_prepare");
+    }
 
     // Outputs: both present (in place or disjoint from every input) or both empty (K/V only).
     const bool queries = q_out.data != nullptr;
@@ -669,6 +678,9 @@ void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, T
     args.k_scales         = layer.kv.k_scale_pages.data;
     args.v_scales         = layer.kv.v_scale_pages.data;
     args.pooled           = static_cast<bf16*>(layer.pooled_pages.data);
+    args.trees            = (tree_rows != nullptr && tree_rows->data != nullptr)
+                                ? reinterpret_cast<const SpeculativeTreeRow*>(tree_rows->data)
+                                : nullptr;
     args.spaces           = layer.spaces;
     args.table_stride     = batch.block_tables.ne[0];
     args.columns          = columns;

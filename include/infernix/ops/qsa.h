@@ -120,7 +120,7 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_po
 /// sequence are consecutive.
 void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& tails,
                    const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& geometry,
-                   cudaStream_t stream);
+                   cudaStream_t stream, const Tensor* tree_rows = nullptr);
 
 /// Commits verified columns to the raw-key tails of L layers at once. raw_keys: BF16
 /// [Di, W, B, L], the un-normalized index keys a verification call produced; positions: I32
@@ -217,7 +217,8 @@ struct QsaPrepareNorms {
 
 void qsa_prepare(const QsaPrepareInputs& inputs, const QsaPrepareNorms& norms, Tensor& tails,
                  const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& geometry,
-                 Tensor& q_out, Tensor& index_q_out, cudaStream_t stream);
+                 Tensor& q_out, Tensor& index_q_out, cudaStream_t stream,
+                 const Tensor* tree_rows = nullptr);
 
 /// Workspace of qsa_attention for `columns` columns of the given KV storage (the vector-quantized
 /// storages add the staging of a wide call's exact window rows).
@@ -248,6 +249,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
                    Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr,
-                   const Tensor* gate = nullptr, bool allow_fast_paths = false);
+                   const Tensor* gate = nullptr, bool allow_fast_paths = false,
+                   const Tensor* tree_rows = nullptr);
 
 } // namespace infernix::ops

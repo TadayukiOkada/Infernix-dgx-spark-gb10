@@ -10,7 +10,7 @@ using MmaR64T128B2 = Q4A16MmaSchedule<64, 128, 64, 32, 32, 2, 2, Q4MmaFragmentPi
 Q4Launch select_q4_n324_k10240(std::int32_t tokens) {
     // Selected with complete-Op cold-L2 route sweeps on GB10.
     if (tokens <= 1) return launch_q4_a16_simt_r4_t1_w2_g8_s2;
-    if (tokens <= 8) return launch_q4_a16_simt_r4_t4_w2_g8_s2;
+    if (tokens <= 4) return launch_q4_a16_simt_r4_t4_w2_g8_s2;
     if (tokens <= 16) return launch_q4_a16_sliced_r16_t8_w4_s2;
     if (tokens <= 32) return launch_q4_a16_sliced_r16_t16_w4_s2;
     if (tokens <= 64) return launch_q4_a16_sliced_r16_t32_w4_s2;

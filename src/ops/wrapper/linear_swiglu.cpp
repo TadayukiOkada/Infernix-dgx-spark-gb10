@@ -160,7 +160,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
-    const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
+    const bool shared_q4_shape = x.ne[0] == 2560 && out.ne[0] == 640 && gate_up_weight.n == 1280 &&
+                                 gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 1280 &&
+                                 gate_up_weight.padded_shape[1] == 2560;
+    const bool q4_weight = (large_shape || shared_q4_shape) && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
     const bool q8_weight =

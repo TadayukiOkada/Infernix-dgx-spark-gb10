@@ -7,6 +7,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
+#include "core/pdl.cuh"
 
 namespace infernix::ops::detail {
 
@@ -68,6 +69,22 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
         sample_batch(static_cast<const __nv_bfloat16*>(logits.data), out, token_domain, physical_rows, batch,
                      configs, positions, purpose, workspace, stream);
     }
+}
+
+void sample_compact_launch(const Tensor& compact_ids, const Tensor& compact_logits,
+                           const Tensor& compact_counts, Tensor& out, std::int32_t token_domain,
+                           const SamplingConfig* configs, const Tensor& logical_positions,
+                           std::int32_t purpose, cudaStream_t stream) {
+    const std::int32_t cap   = compact_ids.ne[0];
+    const std::int32_t batch = compact_ids.ne[1];
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned int>(batch)), dim3(64), 0, stream}, sample_compact_kernel,
+        static_cast<const std::int32_t*>(compact_ids.data),
+        static_cast<const float*>(compact_logits.data),
+        static_cast<const std::int32_t*>(compact_counts.data),
+        static_cast<std::int32_t*>(out.data), configs,
+        static_cast<const std::int32_t*>(logical_positions.data), purpose, token_domain, cap));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts,

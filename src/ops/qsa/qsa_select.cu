@@ -104,13 +104,25 @@ __device__ __forceinline__ float reduce_scatter_32(float (&v)[32], int lane) {
 // the row's blocks in steps of 8, one step per warp at a time. Each pooled key is read once per
 // tile and scored for every column of the tile that sees it. With `clear`, the CTAs first zero
 // `clear_words` words of selection state (histograms and arrival counters).
+__device__ __forceinline__ int qsa_logical_position(const std::int32_t* __restrict__ positions,
+                                                    const SpeculativeTreeRow* __restrict__ trees,
+                                                    int width, int t) {
+    if (trees == nullptr) { return positions[t]; }
+    const int seq                  = t / width;
+    const SpeculativeTreeRow& tree = trees[seq];
+    if (tree.tree == 0) { return positions[t]; }
+    const int local = t % width;
+    return local < tree.nodes ? (positions[seq * width] + static_cast<int>(tree.depth[local]))
+                              : positions[seq * width];
+}
+
 __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
     qsa_score_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
                      const std::int32_t* __restrict__ tables, int table_stride,
                      const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
-                     int width, int ratio, int top_blocks, int group_begin, const ScoreTiles tiles,
-                     float* __restrict__ scores, int score_stride, std::uint32_t* __restrict__ clear,
-                     int clear_words, QsaPageSpaces spaces) {
+                     const SpeculativeTreeRow* __restrict__ trees, int width, int ratio, int top_blocks,
+                     int group_begin, const ScoreTiles tiles, float* __restrict__ scores, int score_stride,
+                     std::uint32_t* __restrict__ clear, int clear_words, QsaPageSpaces spaces) {
     pdl::enter_streaming();
     if (clear != nullptr) {
         const int total_threads = static_cast<int>(gridDim.x * gridDim.y) * kScoreThreads;
@@ -124,7 +136,9 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
     const int c0 = tiles.first[tile], nc = tiles.columns[tile];
     const int t0 = group_begin + c0;
     int tile_blocks = 0;
-    for (int c = 0; c < nc; ++c) { tile_blocks = max(tile_blocks, (positions[t0 + c] + 1) / ratio); }
+    for (int c = 0; c < nc; ++c) {
+        tile_blocks = max(tile_blocks, (qsa_logical_position(positions, trees, width, t0 + c) + 1) / ratio);
+    }
     const int steps      = (tile_blocks + kScoreStepBlocks - 1) / kScoreStepBlocks;
     const int first_step = static_cast<int>(blockIdx.x) * kScoreWarps;
     if (tile_blocks <= top_blocks || first_step >= steps) {
@@ -132,7 +146,8 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
         return; // every column of the tile is dense, or this CTA has no step
     }
     if (static_cast<int>(threadIdx.x) < nc) {
-        column_blocks[threadIdx.x] = (positions[t0 + static_cast<int>(threadIdx.x)] + 1) / ratio;
+        column_blocks[threadIdx.x] =
+            (qsa_logical_position(positions, trees, width, t0 + static_cast<int>(threadIdx.x)) + 1) / ratio;
     }
     for (int i = static_cast<int>(threadIdx.x); i < nc * kScoreHeadSlots * kIndexDim; i += kScoreThreads) {
         const int c = i / (kScoreHeadSlots * kIndexDim), h = (i / kIndexDim) % kScoreHeadSlots, d = i % kIndexDim;
@@ -331,9 +346,9 @@ __global__ void __launch_bounds__(kWideThreads, kWideCtasPerSm)
     qsa_score_wide_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
                           const std::int32_t* __restrict__ tables, int table_stride,
                           const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
-                          int width, int ratio, int top_blocks, int group_begin, const ScoreTiles tiles,
-                          float* __restrict__ scores, int score_stride, std::uint32_t* __restrict__ clear,
-                          int clear_words, QsaPageSpaces spaces) {
+                          const SpeculativeTreeRow* __restrict__ trees, int width, int ratio, int top_blocks,
+                          int group_begin, const ScoreTiles tiles, float* __restrict__ scores, int score_stride,
+                          std::uint32_t* __restrict__ clear, int clear_words, QsaPageSpaces spaces) {
     pdl::enter_streaming();
     const int tid = static_cast<int>(threadIdx.x);
     if (clear != nullptr) {
@@ -351,13 +366,17 @@ __global__ void __launch_bounds__(kWideThreads, kWideCtasPerSm)
     const int c0 = tiles.first[tile], nc = tiles.columns[tile];
     const int t0 = group_begin + c0;
     int tile_blocks = 0;
-    for (int c = 0; c < nc; ++c) { tile_blocks = max(tile_blocks, (positions[t0 + c] + 1) / ratio); }
+    for (int c = 0; c < nc; ++c) {
+        tile_blocks = max(tile_blocks, (qsa_logical_position(positions, trees, width, t0 + c) + 1) / ratio);
+    }
     const int key_tiles = (tile_blocks + kWideBlocks - 1) / kWideBlocks;
     if (tile_blocks <= top_blocks || static_cast<int>(blockIdx.x) >= key_tiles) {
         pdl::trigger_dependents();
         return; // every column of the tile is dense, or this CTA has no key tile
     }
-    if (tid < kScoreTileColumns) { column_blocks[tid] = tid < nc ? (positions[t0 + tid] + 1) / ratio : 0; }
+    if (tid < kScoreTileColumns) {
+        column_blocks[tid] = tid < nc ? (qsa_logical_position(positions, trees, width, t0 + tid) + 1) / ratio : 0;
+    }
     for (int i = tid; i < kScoreTileColumns * kScoreHeadSlots * kIndexDim; i += kWideThreads) {
         const int c = i / (kScoreHeadSlots * kIndexDim), h = (i / kIndexDim) % kScoreHeadSlots, d = i % kIndexDim;
         const float value =
@@ -488,9 +507,9 @@ __global__ void __launch_bounds__(Tile > 16 ? Tile * 8 : 128)
     qsa_score_mma_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
                          const std::int32_t* __restrict__ tables, int table_stride,
                          const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
-                         int width, int ratio, int top_blocks, int group_begin, int group_columns,
-                         const ScoreTiles tiles, float* __restrict__ scores, int score_stride,
-                         std::uint32_t* __restrict__ clear, int clear_words, QsaPageSpaces spaces) {
+                         const SpeculativeTreeRow* __restrict__ trees, int width, int ratio, int top_blocks,
+                         int group_begin, int group_columns, const ScoreTiles tiles, float* __restrict__ scores,
+                         int score_stride, std::uint32_t* __restrict__ clear, int clear_words, QsaPageSpaces spaces) {
     constexpr int Threads   = Tile > 16 ? Tile * 8 : 128;
     constexpr int KeyGroups = Tile > 16 ? 1 : 16 / Tile;
     constexpr int WarpKeys  = kMmaKeyTile / KeyGroups;
@@ -512,7 +531,7 @@ __global__ void __launch_bounds__(Tile > 16 ? Tile * 8 : 128)
 
     int my_blocks = 0;
     if (tid < group_columns) {
-        my_blocks       = (positions[group_begin + tid] + 1) / ratio;
+        my_blocks       = (qsa_logical_position(positions, trees, width, group_begin + tid) + 1) / ratio;
         col_blocks[tid] = my_blocks;
     }
     if (!__syncthreads_or(my_blocks > top_blocks)) {
@@ -999,7 +1018,8 @@ __device__ void select_from_histogram(const float* column, int n, int top_blocks
 // the column's global histogram (zeroed by the score kernel); the last CTA to arrive selects the
 // column from it.
 __global__ void __launch_bounds__(kSelectThreads)
-    qsa_select_global_kernel(const std::int32_t* __restrict__ positions, int ratio, int top_blocks,
+    qsa_select_global_kernel(const std::int32_t* __restrict__ positions,
+                             const SpeculativeTreeRow* __restrict__ trees, int width, int ratio, int top_blocks,
                              int group_begin, const float* __restrict__ scores, int score_stride,
                              unsigned* __restrict__ histograms, unsigned* __restrict__ arrivals,
                              std::int32_t* __restrict__ selected, std::int32_t* __restrict__ counts) {
@@ -1008,7 +1028,7 @@ __global__ void __launch_bounds__(kSelectThreads)
     __shared__ SelectShared sh;
     const int c = static_cast<int>(blockIdx.y), t = group_begin + c;
     const int slice = static_cast<int>(blockIdx.x), slices = static_cast<int>(gridDim.x);
-    const int n = (positions[t] + 1) / ratio;
+    const int n = (qsa_logical_position(positions, trees, width, t) + 1) / ratio;
     if (n <= top_blocks) {
         if (slice == 0 && threadIdx.x == 0) { counts[t] = -1; }
         return;
@@ -1094,7 +1114,8 @@ ScoreTiles score_tiles(std::int32_t begin, std::int32_t columns, std::int32_t wi
 template <int Tile, bool Vector, int Stages, bool RetainKeys = false>
 void launch_mma_score_impl(int workers, cudaStream_t stream, const bf16* index, int index_heads,
                            const bf16* pooled, const std::int32_t* tables, int table_stride,
-                           const std::int32_t* rows, const std::int32_t* positions, int width, int ratio,
+                           const std::int32_t* rows, const std::int32_t* positions,
+                           const SpeculativeTreeRow* trees, int width, int ratio,
                            int top_blocks, int begin, int n, const ScoreTiles& tiles, float* scores,
                            int score_stride, std::uint32_t* pass_state, int pass_clear_words,
                            const QsaPageSpaces& spaces) {
@@ -1103,26 +1124,26 @@ void launch_mma_score_impl(int workers, cudaStream_t stream, const bf16* index, 
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(static_cast<unsigned>(workers)), dim3(Threads), SmemSize, stream},
         qsa_score_mma_kernel<Tile, Vector, Stages, RetainKeys>, index, index_heads, pooled, tables,
-        table_stride, rows, positions, width, ratio, top_blocks, begin, n, tiles, scores, score_stride,
+        table_stride, rows, positions, trees, width, ratio, top_blocks, begin, n, tiles, scores, score_stride,
         pass_state, pass_clear_words, spaces));
 }
 
 template <bool Vector>
 void launch_mma_score(int tile, int stages, bool retain_keys, int workers, cudaStream_t stream,
                       const bf16* index, int index_heads, const bf16* pooled, const std::int32_t* tables,
-                      int table_stride, const std::int32_t* rows, const std::int32_t* positions, int width,
-                      int ratio, int top_blocks, int begin, int n, const ScoreTiles& tiles, float* scores,
-                      int score_stride, std::uint32_t* pass_state, int pass_clear_words,
-                      const QsaPageSpaces& spaces) {
+                      int table_stride, const std::int32_t* rows, const std::int32_t* positions,
+                      const SpeculativeTreeRow* trees, int width, int ratio, int top_blocks, int begin, int n,
+                      const ScoreTiles& tiles, float* scores, int score_stride, std::uint32_t* pass_state,
+                      int pass_clear_words, const QsaPageSpaces& spaces) {
     const auto submit = [&]<int Tile>() {
         if (stages == 2) {
             launch_mma_score_impl<Tile, Vector, 2>(workers, stream, index, index_heads, pooled, tables,
-                                                   table_stride, rows, positions, width, ratio, top_blocks,
+                                                   table_stride, rows, positions, trees, width, ratio, top_blocks,
                                                    begin, n, tiles, scores, score_stride, pass_state,
                                                    pass_clear_words, spaces);
         } else {
             launch_mma_score_impl<Tile, Vector, 1>(workers, stream, index, index_heads, pooled, tables,
-                                                   table_stride, rows, positions, width, ratio, top_blocks,
+                                                   table_stride, rows, positions, trees, width, ratio, top_blocks,
                                                    begin, n, tiles, scores, score_stride, pass_state,
                                                    pass_clear_words, spaces);
         }
@@ -1147,14 +1168,14 @@ void launch_mma_score(int tile, int stages, bool retain_keys, int workers, cudaS
         if constexpr (Vector) {
             if (retain_keys) {
                 launch_mma_score_impl<64, true, 2, true>(workers, stream, index, index_heads, pooled, tables,
-                                                         table_stride, rows, positions, width, ratio,
+                                                         table_stride, rows, positions, trees, width, ratio,
                                                          top_blocks, begin, n, tiles, scores, score_stride,
                                                          pass_state, pass_clear_words, spaces);
                 break;
             }
         }
         launch_mma_score_impl<64, Vector, 2>(workers, stream, index, index_heads, pooled, tables,
-                                              table_stride, rows, positions, width, ratio, top_blocks, begin,
+                                              table_stride, rows, positions, trees, width, ratio, top_blocks, begin,
                                               n, tiles, scores, score_stride, pass_state, pass_clear_words,
                                               spaces);
         break;
@@ -1191,7 +1212,8 @@ QsaSelectScores qsa_select_scores(const void* scratch, const QsaGeometry& geomet
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
                 std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,
-                const QsaPageSpaces& spaces, bool allow_mma_score) {
+                const QsaPageSpaces& spaces, bool allow_mma_score,
+                const SpeculativeTreeRow* tree_rows) {
     const std::int32_t columns = batch.batch * batch.width;
     require(geometry.index_head_dim == kIndexDim && geometry.index_heads >= 1 &&
                 geometry.index_heads <= kScoreHeadSlots && geometry.ratio > 1 && kIndexDim % geometry.ratio == 0 &&
@@ -1269,12 +1291,12 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                 const bool retain     = tile == 128 && partitions >= 6 && partitions <= 9;
                 if (mma_vector) {
                     launch_mma_score<true>(tile, stages, retain, workers, stream, index, geometry.index_heads,
-                                           pooled, tables, table_stride, rows, positions, batch.width,
+                                           pooled, tables, table_stride, rows, positions, tree_rows, batch.width,
                                            geometry.ratio, top_blocks, begin, n, mma_tiles, scores, l.stride,
                                            pass_state, pass_clear_words, spaces);
                 } else {
                     launch_mma_score<false>(tile, stages, false, workers, stream, index, geometry.index_heads,
-                                            pooled, tables, table_stride, rows, positions, batch.width,
+                                            pooled, tables, table_stride, rows, positions, tree_rows, batch.width,
                                             geometry.ratio, top_blocks, begin, n, mma_tiles, scores, l.stride,
                                             pass_state, pass_clear_words, spaces);
                 }
@@ -1285,8 +1307,9 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                 CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)),
                                                  dim3(kScoreThreads), 0, stream},
                                                 qsa_score_kernel, index, geometry.index_heads, pooled, tables,
-                                                table_stride, rows, positions, batch.width, geometry.ratio, top_blocks,
-                                                begin, tiles, scores, l.stride, pass_state, pass_clear_words, spaces));
+                                                table_stride, rows, positions, tree_rows, batch.width, geometry.ratio,
+                                                top_blocks, begin, tiles, scores, l.stride, pass_state, pass_clear_words,
+                                                spaces));
             }
         } else if (wide) {
             const ScoreTiles tiles = score_tiles(begin, n, batch.width);
@@ -1296,8 +1319,8 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                 {dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)), dim3(kWideThreads),
                  kWideSharedBytes, stream},
                 qsa_score_wide_kernel, index, geometry.index_heads, pooled, tables, table_stride, rows, positions,
-                batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, pass_state, pass_clear_words,
-                spaces));
+                tree_rows, batch.width, geometry.ratio, top_blocks, begin, tiles, scores, l.stride, pass_state,
+                pass_clear_words, spaces));
         } else {
             const ScoreTiles tiles = score_tiles(begin, n, batch.width);
             const int ctas = std::clamp(ceil_div(std::int64_t{kScoreCtasPerSm} * sms, tiles.count), 1,
@@ -1305,14 +1328,15 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
             CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)),
                                              dim3(kScoreThreads), 0, stream},
                                             qsa_score_kernel, index, geometry.index_heads, pooled, tables,
-                                            table_stride, rows, positions, batch.width, geometry.ratio, top_blocks,
-                                            begin, tiles, scores, l.stride, pass_state, pass_clear_words, spaces));
+                                            table_stride, rows, positions, tree_rows, batch.width, geometry.ratio,
+                                            top_blocks, begin, tiles, scores, l.stride, pass_state, pass_clear_words,
+                                            spaces));
         }
         CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(slices), static_cast<unsigned>(n)),
                                          dim3(kSelectThreads), smem, stream},
-                                        qsa_select_global_kernel, positions, geometry.ratio, top_blocks, begin,
-                                        static_cast<const float*>(scores), l.stride, histograms, arrivals,
-                                        output.selected, output.counts));
+                                        qsa_select_global_kernel, positions, tree_rows, batch.width, geometry.ratio,
+                                        top_blocks, begin, static_cast<const float*>(scores), l.stride, histograms,
+                                        arrivals, output.selected, output.counts));
     }
 }
 

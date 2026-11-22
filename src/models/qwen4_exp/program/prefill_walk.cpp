@@ -282,6 +282,7 @@ bool ProgramImpl::walk_prefetched(std::uint32_t index, std::size_t first_call, s
 // walk_span_end would group them) into walk_host_'s slots. Only after the span's first device
 // synchronization: until then its own slots may still be uploading.
 void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_t chunks) {
+    if (use_direct_ple()) { return; }
     WalkPrefetch& f = walk_prefetch_;
     if (!f.valid || f.lane != index || f.first_call != walk_.end_call) {
         f            = WalkPrefetch{};

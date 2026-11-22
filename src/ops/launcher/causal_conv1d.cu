@@ -394,20 +394,24 @@ void snapshot_launch(const Tensor& x, const Tensor& weight, Tensor& conv_states,
 
 template <class Output>
 void from_states_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_states,
-                        const Tensor& initial_state_slots, Output out, cudaStream_t stream) {
+                        const Tensor& initial_state_slots, const Tensor* tree_rows, Output out,
+                        cudaStream_t stream) {
     const std::int32_t C     = x.ne[0];
     const std::int32_t width = x.ne[1];
     const std::int32_t batch = x.ne[2];
     const std::int64_t slot_stride =
         static_cast<std::int64_t>(conv_states.ne[0]) * static_cast<std::int64_t>(conv_states.ne[1]);
+    const auto* trees = (tree_rows != nullptr && tree_rows->data != nullptr)
+                            ? reinterpret_cast<const SpeculativeTreeRow*>(tree_rows->data)
+                            : nullptr;
     constexpr int kBlock = 128;
     const dim3 grid(grid_for(C, kBlock, "from-states"), static_cast<unsigned int>(batch));
     CUDA_CHECK(pdl::launch_consumer({grid, dim3(kBlock), 0, stream}, causal_conv1d_from_states_kernel<Output>,
                                     static_cast<const __nv_bfloat16*>(x.data),
                                     static_cast<const __nv_bfloat16*>(weight.data),
                                     static_cast<const __nv_bfloat16*>(conv_states.data),
-                                    static_cast<const std::int32_t*>(initial_state_slots.data), out, C, width,
-                                    slot_stride));
+                                    static_cast<const std::int32_t*>(initial_state_slots.data), trees, out, C,
+                                    width, slot_stride));
 }
 
 template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
@@ -460,8 +464,8 @@ void causal_conv1d_snapshot_split_launch(const Tensor& x, const Tensor& weight, 
 
 void causal_conv1d_from_states_launch(const Tensor& x, const Tensor& weight,
                                       const Tensor& conv_states, const Tensor& initial_state_slots,
-                                      Tensor& out, cudaStream_t stream) {
-    from_states_launch(x, weight, conv_states, initial_state_slots,
+                                      Tensor& out, cudaStream_t stream, const Tensor* tree_rows) {
+    from_states_launch(x, weight, conv_states, initial_state_slots, tree_rows,
                        CausalConvDisjointOutput<__nv_bfloat16>{static_cast<__nv_bfloat16*>(out.data),
                                                                x.ne[0]},
                        stream);
@@ -471,18 +475,19 @@ void causal_conv1d_from_states_split_launch(const Tensor& x, const Tensor& weigh
                                             const Tensor& conv_states,
                                             const Tensor& initial_state_slots, Tensor& out0,
                                             Tensor& out1, Tensor& out2,
-                                            CausalConvSplitGeometry geometry, cudaStream_t stream) {
+                                            CausalConvSplitGeometry geometry, cudaStream_t stream,
+                                            const Tensor* tree_rows) {
     switch (geometry) {
     case CausalConvSplitGeometry::Rows2048x2048x4096:
-        from_states_launch(x, weight, conv_states, initial_state_slots,
+        from_states_launch(x, weight, conv_states, initial_state_slots, tree_rows,
                            split_map<2048, 2048, 4096>(out0, out1, out2), stream);
         return;
     case CausalConvSplitGeometry::Rows2048x2048x6144:
-        from_states_launch(x, weight, conv_states, initial_state_slots,
+        from_states_launch(x, weight, conv_states, initial_state_slots, tree_rows,
                            split_map<2048, 2048, 6144>(out0, out1, out2), stream);
         return;
     case CausalConvSplitGeometry::Rows2048x2048x8192:
-        from_states_launch(x, weight, conv_states, initial_state_slots,
+        from_states_launch(x, weight, conv_states, initial_state_slots, tree_rows,
                            split_map<2048, 2048, 8192>(out0, out1, out2), stream);
         return;
     }

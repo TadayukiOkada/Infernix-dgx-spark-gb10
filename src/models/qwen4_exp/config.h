@@ -208,6 +208,7 @@ struct DFlash2Config {
     // proposal head or a Q8 text head), and whether it is a GGUF import's (ggml blocks).
     std::uint32_t head_rows = 0;
     bool fused_head         = false;
+    bool screened_head      = false;
     bool ggml_head          = false;
 
     // The feature width: the target hidden width per tapped layer.

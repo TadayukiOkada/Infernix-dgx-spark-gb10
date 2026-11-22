@@ -576,4 +576,65 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__ void sampling_group_finalize
     }
 }
 
+__launch_bounds__(64) __global__
+    void sample_compact_kernel(const std::int32_t* compact_ids, const float* compact_logits,
+                               const std::int32_t* compact_counts, std::int32_t* out,
+                               const SamplingConfig* configs, const std::int32_t* logical_positions,
+                               std::int32_t purpose, std::int32_t token_domain, std::int32_t cap) {
+    pdl::enter();
+    const int row            = static_cast<int>(blockIdx.x);
+    const int tid            = static_cast<int>(threadIdx.x);
+    const SamplingConfig cfg = configs[row];
+    const int n              = min(cap, max(0, compact_counts[row]));
+    const std::size_t base   = static_cast<std::size_t>(row) * cap;
+
+    __shared__ unsigned long long sort_keys[64];
+    __shared__ unsigned long long warp_keys[2];
+    __shared__ float cand_val[kSamplerCandidateCap];
+    __shared__ int cand_idx[kSamplerCandidateCap];
+    __shared__ float prob[kSamplerCandidateCap];
+    __shared__ int n_support;
+
+    if (!(cfg.temperature > 0.0f)) {
+        unsigned long long key = 0ull;
+        if (tid < n) {
+            const int id = compact_ids[base + tid];
+            if (id >= 0 && id < token_domain) {
+                const float x = sampling_adjusted_logit(compact_logits[base + tid], id, cfg);
+                key           = sampling_sort_key(x, id);
+            }
+        }
+        const unsigned long long best = sampling_compact_max_key(key, warp_keys);
+        if (tid == 0) {
+            const bool finite = (best != 0ull) && isfinite(sampling_key_float(best));
+            const int picked  = finite ? sampling_key_index(best) : sampling_report_nonfinite(cfg);
+            out[row]          = picked;
+            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+        }
+        return;
+    }
+
+    sampling_compact_build_support(compact_ids + base, compact_logits + base, n, token_domain, cfg, sort_keys,
+                                   cand_val, cand_idx, prob, &n_support);
+    if (tid != 0) { return; }
+    const int support = n_support;
+    int picked        = cand_idx[support - 1];
+    if (cfg.gumbel_max) {
+        picked = sampling_gumbel_pick([&](int j) { return cand_idx[j]; }, [&](int j) { return prob[j]; }, support,
+                                      cfg.seed, sampling_produced_position(logical_positions[row], purpose));
+    } else {
+        const float u = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
+        float acc     = 0.0f;
+        for (int j = 0; j < support; ++j) {
+            acc += prob[j];
+            if (u < acc) {
+                picked = cand_idx[j];
+                break;
+            }
+        }
+    }
+    out[row] = picked;
+    if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+}
+
 } // namespace infernix::ops

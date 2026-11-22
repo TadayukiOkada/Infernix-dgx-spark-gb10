@@ -689,6 +689,57 @@ void logits_case(LogitsHead& head, std::uint64_t seed) {
     }
 }
 
+void compact_case(const LogitsHead& head, std::uint64_t seed) {
+    const std::size_t bytes =
+        infernix::ops::screened_head_workspace_bytes(head.rows, infernix::ops::kScreenedHeadMaxColumns);
+    WorkspaceArena work(bytes);
+    const infernix::ops::ScreenedHeadPolicy policy{};
+    const auto columns = make_columns(head.values, head.rows, 24, seed, false);
+    for (const std::int32_t T : {1, 2, 4, 8, 12, 16, 24}) {
+        DeviceArray<std::uint16_t> dx(
+            std::vector<std::uint16_t>(columns.begin(), columns.begin() + static_cast<std::ptrdiff_t>(K) * T));
+        const Tensor x(dx.p, DType::BF16, {K, T});
+        const auto exact = exact_logits(x, head.bf16_rows ? nullptr : &head.q8_weight,
+                                        head.bf16_rows ? &head.bf16_tensor : nullptr, head.rows);
+
+        DeviceArray<std::int32_t> d_ids(static_cast<std::size_t>(policy.rescored) * T);
+        DeviceArray<float> d_logits(static_cast<std::size_t>(policy.rescored) * T);
+        DeviceArray<std::int32_t> d_counts(static_cast<std::size_t>(T));
+        Tensor t_ids(d_ids.p, DType::I32, {policy.rescored, T});
+        Tensor t_logits(d_logits.p, DType::FP32, {policy.rescored, T});
+        Tensor t_counts(d_counts.p, DType::I32, {T});
+        infernix::ops::screened_head_compact(x, head.bf16_rows ? head.bf16_tensor : Tensor{},
+                                             head.bf16_rows ? Weight{} : head.q8_weight, head.screen_weight,
+                                             head.valid, policy, t_ids, t_logits, t_counts, work, nullptr);
+        cuda(cudaDeviceSynchronize(), "screened_head_compact");
+        const auto ids    = d_ids.host();
+        const auto logits = d_logits.host();
+        const auto counts = d_counts.host();
+        const std::size_t R = static_cast<std::size_t>(head.rows);
+        const std::int32_t min_cnt = std::min<std::int32_t>(2, head.valid);
+        for (std::int32_t c = 0; c < T; ++c) {
+            const std::int32_t cnt = counts[static_cast<std::size_t>(c)];
+            check(cnt >= min_cnt && cnt <= policy.rescored,
+                  head.label + " compact T=" + std::to_string(T) + ": count within bounds");
+            std::vector<std::int32_t> seen(ids.begin() + static_cast<std::ptrdiff_t>(c) * policy.rescored,
+                                           ids.begin() + static_cast<std::ptrdiff_t>(c) * policy.rescored + cnt);
+            std::sort(seen.begin(), seen.end());
+            check(seen.front() >= 0 && seen.back() < head.valid &&
+                      std::adjacent_find(seen.begin(), seen.end()) == seen.end(),
+                  head.label + " compact T=" + std::to_string(T) + ": compact IDs unique and valid");
+            for (std::int32_t i = 0; i < cnt; ++i) {
+                const std::size_t off    = static_cast<std::size_t>(c) * policy.rescored + i;
+                const std::int32_t row   = ids[off];
+                const float got_logit    = logits[off];
+                const float exact_logit  = exact[static_cast<std::size_t>(c) * R + row];
+                check(std::memcmp(&got_logit, &exact_logit, sizeof(float)) == 0,
+                      head.label + " compact T=" + std::to_string(T) +
+                          ": rescored logit matches exact head bit-for-bit");
+            }
+        }
+    }
+}
+
 // ---- The top form (the proposal head)
 
 void top_case(std::uint64_t seed) {
@@ -972,6 +1023,7 @@ INFERNIX_OP_TEST(screened_head) {
             head.bf16_rows     = std::make_unique<DeviceArray<std::uint16_t>>(bits);
             head.bf16_tensor   = Tensor(head.bf16_rows->p, DType::BF16, {K, head.rows});
             logits_case(head, 303);
+            compact_case(head, 309);
         }
         {
             // Recipe B / C's 8-bit LM head; the screen fits its represented values.
@@ -997,6 +1049,7 @@ INFERNIX_OP_TEST(screened_head) {
             head.q8_device     = std::make_unique<DeviceMatrix>(head.q8);
             head.q8_weight     = row_split(QType::Q8_G32_FP16, head.rows, *head.q8_device);
             logits_case(head, 505);
+            compact_case(head, 509);
         }
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";

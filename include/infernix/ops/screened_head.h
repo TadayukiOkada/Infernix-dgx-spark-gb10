@@ -136,4 +136,15 @@ void screened_head_logits(const Tensor& x, const Tensor& bf16_head, const Weight
                           std::int32_t valid_rows, const ScreenedHeadPolicy& policy, Tensor& logits,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Screened LM head compact form: screens x and rescores the <= policy.rescored (64) candidates per
+ * column directly into compact [cap, T] IDs, compact FP32 logits [cap, T], and per-column counts [T]
+ * without writing or reading a full-vocabulary logits plane. Guaranteeing ranks >= min(2, valid_rows)
+ * keeps at least two distinct rows whenever possible (so single-forbidden-token fallback stays live).
+ */
+void screened_head_compact(const Tensor& x, const Tensor& bf16_head, const Weight& head, const Weight& screen,
+                           std::int32_t valid_rows, const ScreenedHeadPolicy& policy, Tensor& compact_ids,
+                           Tensor& compact_logits, Tensor& compact_counts, WorkspaceArena& workspace,
+                           cudaStream_t stream);
+
 } // namespace infernix::ops

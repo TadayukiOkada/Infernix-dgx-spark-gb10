@@ -118,6 +118,16 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Compact-candidate form of sample(): samples from compact_ids I32 [cap, B], compact_logits FP32
+ * [cap, B], and compact_counts I32 [B] (<= 64 candidates per column), matching sample()'s greedy,
+ * Gumbel-max, min-p, top-k, top-p, and nonfinite semantics with zero workspace.
+ */
+void sample_compact(const Tensor& compact_ids, const Tensor& compact_logits,
+                    const Tensor& compact_counts, Tensor& out, std::int32_t token_domain,
+                    const SamplingConfig* configs, const Tensor& logical_positions,
+                    std::int32_t purpose, cudaStream_t stream);
+
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);

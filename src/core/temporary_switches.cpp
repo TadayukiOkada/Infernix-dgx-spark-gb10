@@ -95,6 +95,8 @@ constexpr Registration kSwitches[] = {
     // Flash-Next dflash2: when set, draft stochastically and verify via sparse rejection sampling;
     // default (unset): draft argmax and verify via greedy speculative acceptance.
     {"INFERNIX_TMP_DFLASH_SAMPLED", Scope::Qwen4Exp, Kind::Flag},
+    // Flash-Next univer-trees: when set, suppresses root-fork tree verification for A/B attribution.
+    {"INFERNIX_TMP_NO_UNIVER_TREES", Scope::Qwen4Exp, Kind::Flag},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 

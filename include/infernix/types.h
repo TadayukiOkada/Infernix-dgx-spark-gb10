@@ -204,6 +204,8 @@ enum class FastPath : std::uint8_t {
     // expert engine alike, instead of the exact integer limb route. A column's result then depends on
     // its expert's column count in the call (wider experts follow expert-a4-residual or stay exact).
     ExpertA4ResidualDecode,
+    // Native sm_121a NVFP4 OMMA for 1..8 column narrow/medium W4A4 experts (Q8/NVFP4 artifacts with A4 experts).
+    ExpertA4OmmaNarrow,
     // Decode attention sizes each row's key partition from the round's batch. Without it a row's
     // partition depends only on its own keys.
     BatchSplitAttention,
@@ -303,7 +305,7 @@ enum class FastPath : std::uint8_t {
     GdnTreeClosedForm,
 };
 
-inline constexpr std::array<FastPath, 39> kFastPaths{
+inline constexpr std::array<FastPath, 40> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
@@ -315,7 +317,7 @@ inline constexpr std::array<FastPath, 39> kFastPaths{
     FastPath::BatchedA8ResidualDecode, FastPath::BatchedA8SubsetDecode,
     FastPath::SingleColumnDecode,
     FastPath::ExpertA4Residual,    FastPath::ExpertA4Residual3,
-    FastPath::ExpertA4ResidualDecode,
+    FastPath::ExpertA4ResidualDecode, FastPath::ExpertA4OmmaNarrow,
     FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
     FastPath::AdaptiveMtp,         FastPath::AdaptiveDFlash,
     FastPath::DFlash2Pairs,        FastPath::FreeCacheResume,
@@ -340,6 +342,7 @@ inline constexpr std::array<FastPath, 39> kFastPaths{
     case FastPath::ExpertA4Residual: return "expert-a4-residual";
     case FastPath::ExpertA4Residual3: return "expert-a4-residual-3";
     case FastPath::ExpertA4ResidualDecode: return "expert-a4-residual-decode";
+    case FastPath::ExpertA4OmmaNarrow: return "expert-a4-omma-narrow";
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
     case FastPath::AdaptiveMtp: return "adaptive-mtp";

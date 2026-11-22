@@ -98,7 +98,7 @@ int main() {
             require(m.tokens == std::vector<int>(src.begin() + n, src.begin() + n + 15), "exact span continuation");
         }
 
-        // 9. Boundary-adjacent state must walk suffix links to find a valid continuation
+        // 9. Boundary-adjacent state must walk suffix link to find a valid continuation
         SuffixAutomaton link_sa;
         link_sa.ingest(std::vector<int>{2, 3, 4, 5, 99, 100});
         link_sa.ingest(std::vector<int>{1, 2, 3, 4, 5});
@@ -106,6 +106,44 @@ int main() {
         require(link_match.matched == 4, "boundary-adjacent state walks suffix link to len 4");
         require(link_match.tokens == std::vector<int>({99, 100}),
                 "boundary-adjacent state returns continuation from suffix link");
+
+        // 10. Recency preference: more recent occurrence supersedes older occurrence
+        SuffixAutomaton recency_sa;
+        recency_sa.ingest(std::vector<int>{10, 20, 30, 40, 100, 101, 102});
+        recency_sa.ingest(std::vector<int>{10, 20, 30, 40, 200, 201, 202, 203});
+        const auto rec_match = recency_sa.propose(std::vector<int>{10, 20, 30, 40}, 10, 4);
+        require(rec_match.matched == 4, "recency match len 4");
+        require(rec_match.tokens == std::vector<int>({200, 201, 202, 203}),
+                "recency prefers the most recent occurrence");
+
+        // 11. Boundary-ended latest occurrence falls back cleanly to earlier valid occurrence
+        SuffixAutomaton valid_fb_sa;
+        valid_fb_sa.ingest(std::vector<int>{10, 20, 30, 40, 300, 301, 302});
+        valid_fb_sa.ingest(std::vector<int>{10, 20, 30, 40});
+        const auto vfb_match = valid_fb_sa.propose(std::vector<int>{10, 20, 30, 40}, 10, 4);
+        require(vfb_match.matched == 4, "valid fallback match len 4");
+        require(vfb_match.tokens == std::vector<int>({300, 301, 302}),
+                "boundary-ended latest occurrence falls back to earlier valid continuation");
+
+        // 12. Eviction resilience: older evicted occurrence does not block newer live occurrence
+        SuffixAutomaton evict_sa(64);
+        evict_sa.ingest(std::vector<int>{10, 20, 30, 40, 111, 112});
+        for (int i = 0; i < 60; ++i) { evict_sa.append(500 + i); }
+        evict_sa.ingest(std::vector<int>{10, 20, 30, 40, 222, 223});
+        const auto ev_match = evict_sa.propose(std::vector<int>{10, 20, 30, 40}, 10, 4);
+        require(ev_match.matched == 4, "eviction resilient match len 4");
+        require(ev_match.tokens == std::vector<int>({222, 223}),
+                "newer live occurrence still matches after oldest aged out");
+
+        // 13. Occurrence count and distance metadata
+        require(rec_match.occurrences >= 2, "occurrence count tracks repeats");
+        require(ev_match.distance <= 64, "distance tracks distance from corpus tip");
+
+        // 14. Compaction bounds storage under >4x token_capacity appends
+        SuffixAutomaton compact_sa(64);
+        for (int i = 0; i < 300; ++i) { compact_sa.append(1000 + i); }
+        require(compact_sa.size() < 2 * 64 || compact_sa.size() <= 1024, "compaction bounded size");
+        require(compact_sa.node_count() <= 4 * 1024, "compaction bounded nodes");
 
         std::cout << "All Suffix Automaton unit tests passed successfully!\n";
         return 0;

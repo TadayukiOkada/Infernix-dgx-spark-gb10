@@ -2765,6 +2765,382 @@ int sample_sparse_drafts_case() {
     return failures;
 }
 
+int compact_sample_and_accept_suite() {
+    int failures                  = 0;
+    constexpr int cap             = 64;
+    constexpr int kSparseDom      = kSparseTokenDomain; // 248077
+    constexpr int kSmallDom       = 128;
+    const float nan               = std::numeric_limits<float>::quiet_NaN();
+    const float neg_inf           = -std::numeric_limits<float>::infinity();
+    DeviceContext context;
+
+    // 1. ops::sample_compact bit-exact parity against ops::sample on full masked FP32 logits.
+    {
+        constexpr int B      = 6;
+        const int domain     = 128;
+        const std::vector<int> counts_per_row{2, 17, 64, 3, 2, 16};
+        std::vector<std::int32_t> c_ids(cap * B, 0);
+        std::vector<float> c_logits(cap * B, neg_inf);
+        std::vector<float> full_logits(domain * B, neg_inf);
+        std::vector<std::int32_t> initial_counts(domain * B, 0);
+
+        std::mt19937 rng(20261122);
+        std::uniform_real_distribution<float> dist(-2.0F, 6.0F);
+        for (int b = 0; b < B; ++b) {
+            std::vector<int> perm(domain);
+            for (int i = 0; i < domain; ++i) { perm[i] = i; }
+            std::shuffle(perm.begin(), perm.end(), rng);
+            const int cnt = counts_per_row[b];
+            for (int j = 0; j < cnt; ++j) {
+                const int id = perm[j];
+                c_ids[b * cap + j] = id;
+                if (b == 4) {
+                    c_logits[b * cap + j]    = j == 0 ? nan : neg_inf;
+                    full_logits[b * domain + id] = c_logits[b * cap + j];
+                } else {
+                    const float val              = dist(rng);
+                    c_logits[b * cap + j]        = val;
+                    full_logits[b * domain + id] = val;
+                }
+            }
+            initial_counts[b * domain + perm[0]] = 2;
+        }
+        // Row 5: tie break on top score between two IDs (verify lower ID wins).
+        c_logits[5 * cap + 0]                       = 12.0F;
+        c_logits[5 * cap + 1]                       = 12.0F;
+        full_logits[5 * domain + c_ids[5 * cap + 0]] = 12.0F;
+        full_logits[5 * domain + c_ids[5 * cap + 1]] = 12.0F;
+
+        for (const bool use_gumbel : {false, true}) {
+            GuardedDeviceBuffer d_counts_ref(initial_counts.size() * sizeof(std::int32_t));
+            GuardedDeviceBuffer d_counts_cmp(initial_counts.size() * sizeof(std::int32_t));
+            d_counts_ref.copy_from_host(initial_counts.data(), d_counts_ref.bytes());
+            d_counts_cmp.copy_from_host(initial_counts.data(), d_counts_cmp.bytes());
+            GuardedDeviceBuffer d_nf_ref(B * sizeof(std::int32_t)), d_nf_cmp(B * sizeof(std::int32_t));
+            d_nf_ref.fill(0);
+            d_nf_cmp.fill(0);
+
+            std::vector<ops::SamplingConfig> cfg_ref(B), cfg_cmp(B);
+            for (int b = 0; b < B; ++b) {
+                cfg_ref[b].token_counts      = static_cast<std::int32_t*>(d_counts_ref.data()) + b * domain;
+                cfg_ref[b].nonfinite         = static_cast<std::int32_t*>(d_nf_ref.data()) + b;
+                cfg_ref[b].seed              = 9911 + b;
+                cfg_ref[b].presence_penalty  = (b == 1 || b == 3) ? 0.5F : 0.0F;
+                cfg_ref[b].frequency_penalty = (b == 1 || b == 3) ? 0.25F : 0.0F;
+                if (b == 0) {
+                    cfg_ref[b].forbidden_token = c_ids[0];
+                } else if (b == 1 || b == 2) {
+                    cfg_ref[b].temperature = 0.8F;
+                    cfg_ref[b].top_k       = (b == 1) ? 12 : 20;
+                    cfg_ref[b].top_p       = 0.9F;
+                    cfg_ref[b].min_p       = 0.01F;
+                    cfg_ref[b].gumbel_max  = use_gumbel;
+                } else if (b == 3) {
+                    cfg_ref[b].temperature = 1.1F;
+                    cfg_ref[b].top_k       = 2;
+                    cfg_ref[b].gumbel_max  = use_gumbel;
+                }
+                cfg_cmp[b]              = cfg_ref[b];
+                cfg_cmp[b].token_counts = static_cast<std::int32_t*>(d_counts_cmp.data()) + b * domain;
+                cfg_cmp[b].nonfinite    = static_cast<std::int32_t*>(d_nf_cmp.data()) + b;
+            }
+            const std::vector<std::int32_t> positions{10, 21, 32, 43, 54, 65};
+            DeviceBuffer d_pos = to_device(positions);
+            DeviceBuffer d_cfg_ref = to_device(cfg_ref), d_cfg_cmp = to_device(cfg_cmp);
+            DeviceBuffer d_full = to_device(full_logits);
+            DeviceBuffer d_cid = to_device(c_ids), d_clog = to_device(c_logits), d_ccnt = to_device(counts_per_row);
+            GuardedDeviceBuffer d_out_ref(B * sizeof(std::int32_t)), d_out_cmp(B * sizeof(std::int32_t));
+            d_out_ref.fill(0xaa);
+            d_out_cmp.fill(0xbb);
+
+            Tensor t_full(d_full.p, DType::FP32, {domain, B});
+            Tensor t_out_ref(d_out_ref.data(), DType::I32, {B}), t_out_cmp(d_out_cmp.data(), DType::I32, {B});
+            Tensor t_pos(d_pos.p, DType::I32, {B});
+            Tensor t_cid(d_cid.p, DType::I32, {cap, B}), t_clog(d_clog.p, DType::FP32, {cap, B});
+            Tensor t_ccnt(d_ccnt.p, DType::I32, {B});
+            WorkspaceArena work(std::max<std::size_t>(256, ops::sampling_workspace_capacity_bytes(domain, B, B)));
+
+            ops::sample(t_full, t_out_ref, domain, static_cast<const ops::SamplingConfig*>(d_cfg_ref.p), t_pos,
+                        ops::kSamplePurposeDecode, work, context.stream);
+            ops::sample_compact(t_cid, t_clog, t_ccnt, t_out_cmp, domain,
+                                static_cast<const ops::SamplingConfig*>(d_cfg_cmp.p), t_pos,
+                                ops::kSamplePurposeDecode, context.stream);
+            context.synchronize();
+
+            const std::string tag = std::string("sample_compact parity gumbel=") + (use_gumbel ? "1" : "0");
+            failures += verify_exact(tag.c_str(), read<std::int32_t>(d_out_cmp, B), read<std::int32_t>(d_out_ref, B));
+            failures += verify_exact((tag + " nonfinite").c_str(), read<std::int32_t>(d_nf_cmp, B),
+                                     read<std::int32_t>(d_nf_ref, B));
+            failures += verify_exact((tag + " counts").c_str(), read<std::int32_t>(d_counts_cmp, initial_counts.size()),
+                                     read<std::int32_t>(d_counts_ref, initial_counts.size()));
+            failures += d_out_cmp.verify_guards("sample_compact out guards");
+        }
+    }
+
+    // 2. ops::speculative_accept_compact_drafts bit-exact parity against full greedy & sparse accept.
+    for (const int k : {1, 4, 8, 15}) {
+        for (const int batch : {1, 4}) {
+            const int cols       = k + 1;
+            const int domain     = kSmallDom;
+            std::mt19937 rng(7000 + k * 31 + batch);
+            std::uniform_real_distribution<float> dist(-1.5F, 5.5F);
+
+            std::vector<std::int32_t> c_ids(static_cast<std::size_t>(cap) * cols * batch, 0);
+            std::vector<float> c_logits(static_cast<std::size_t>(cap) * cols * batch, neg_inf);
+            std::vector<std::int32_t> c_counts(static_cast<std::size_t>(cols) * batch);
+            std::vector<float> full_logits(static_cast<std::size_t>(domain) * cols * batch, neg_inf);
+            std::vector<std::int32_t> drafts(static_cast<std::size_t>(k) * batch);
+            std::vector<std::int32_t> extents(batch);
+            std::vector<std::int32_t> lengths(batch);
+            std::vector<std::int32_t> cand_ids(static_cast<std::size_t>(ops::kSparseSpeculativeCandidates) * k * batch);
+            std::vector<float> prop_q(static_cast<std::size_t>(ops::kSparseSpeculativeCandidates) * k * batch);
+
+            for (int b = 0; b < batch; ++b) {
+                extents[b] = (b == batch - 1 && k > 2) ? (k - 1) : k;
+                lengths[b] = 100 + 19 * b;
+                std::vector<int> perm(domain);
+                for (int i = 0; i < domain; ++i) { perm[i] = i; }
+                for (int c = 0; c < cols; ++c) {
+                    const int col_idx = b * cols + c;
+                    const int cnt     = (c + b) % 3 == 0 ? 64 : ((c + b) % 3 == 1 ? 17 : 4);
+                    c_counts[col_idx] = cnt;
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    for (int j = 0; j < cnt; ++j) {
+                        const int id = perm[j];
+                        const float v = dist(rng);
+                        c_ids[col_idx * cap + j]                        = id;
+                        c_logits[col_idx * cap + j]                     = v;
+                        full_logits[col_idx * domain + id]              = v;
+                    }
+                    if (c < k) {
+                        // Force draft[c] to match candidate 0 on half the columns so both accepts & rejections trigger.
+                        const int picked_draft  = (c % 2 == 0) ? perm[0] : perm[cnt - 1];
+                        drafts[b * k + c]       = picked_draft;
+                        float sum_q             = 0.0F;
+                        for (int s = 0; s < ops::kSparseSpeculativeCandidates; ++s) {
+                            const int cid = s < cnt ? c_ids[col_idx * cap + s] : (picked_draft + s + 1) % domain;
+                            cand_ids[(b * k + c) * ops::kSparseSpeculativeCandidates + s] = cid;
+                            const float qv = s == 0 ? 0.45F : (s < 4 ? 0.15F : 0.01F);
+                            prop_q[(b * k + c) * ops::kSparseSpeculativeCandidates + s] = qv;
+                            sum_q += qv;
+                        }
+                        for (int s = 0; s < ops::kSparseSpeculativeCandidates; ++s) {
+                            prop_q[(b * k + c) * ops::kSparseSpeculativeCandidates + s] /= sum_q;
+                        }
+                    }
+                }
+            }
+
+            // Test chain greedy + chain sampled + chain gumbel against speculative_accept_greedy_drafts
+            for (const int mode : {0, 1, 2}) { // 0=greedy+forbidden, 1=sampled, 2=gumbel
+                std::vector<ops::SamplingConfig> cfgs(batch);
+                for (int b = 0; b < batch; ++b) {
+                    cfgs[b].seed = 5050 + b * 17;
+                    if (mode == 0) {
+                        cfgs[b].forbidden_token       = drafts[b * k];
+                        cfgs[b].forbidden_until_token = (k > 1) ? drafts[b * k + 1] : -1;
+                    } else {
+                        cfgs[b].temperature = 0.75F;
+                        cfgs[b].top_k       = 16;
+                        cfgs[b].top_p       = 0.92F;
+                        cfgs[b].min_p       = 0.02F;
+                        cfgs[b].gumbel_max  = (mode == 2);
+                    }
+                }
+                DeviceBuffer d_cid = to_device(c_ids), d_clog = to_device(c_logits), d_ccnt = to_device(c_counts);
+                DeviceBuffer d_full = to_device(full_logits);
+                DeviceBuffer d_drafts = to_device(drafts), d_extents = to_device(extents);
+                DeviceBuffer d_targets(static_cast<std::size_t>(cols) * batch * sizeof(std::int32_t));
+                Tensor t_full(d_full.p, DType::FP32, {domain, cols * batch});
+                Tensor t_tgt(d_targets.p, DType::I32, {cols * batch});
+                ops::argmax(t_full, t_tgt, domain, context.stream);
+
+                DeviceBuffer d_cfg = to_device(cfgs);
+                auto run_pair = [&](bool compact, std::vector<std::int32_t>& out_len, std::vector<std::int32_t>& out_anc,
+                                    std::vector<std::int32_t>& out_lic, std::vector<std::int32_t>& out_cnt,
+                                    std::vector<std::int32_t>& out_acc) {
+                    DeviceBuffer dl = to_device(lengths);
+                    DeviceBuffer da(batch * sizeof(std::int32_t));
+                    da.fill(0xff);
+                    GuardedDeviceBuffer dlic(static_cast<std::size_t>(cols) * batch * sizeof(std::int32_t));
+                    GuardedDeviceBuffer dcnt(batch * sizeof(std::int32_t)), dacc(batch * sizeof(std::int32_t));
+                    dlic.fill(0x55);
+                    dcnt.fill(0x55);
+                    dacc.fill(0x55);
+                    Tensor t_dr(d_drafts.p, DType::I32, {k, batch}), t_ex(d_extents.p, DType::I32, {batch});
+                    Tensor t_ln(dl.p, DType::I32, {batch}), t_an(da.p, DType::I32, {batch});
+                    Tensor t_li(dlic.data(), DType::I32, {cols, batch}), t_cn(dcnt.data(), DType::I32, {batch}),
+                        t_ac(dacc.data(), DType::I32, {batch});
+                    if (compact) {
+                        Tensor t_ci(d_cid.p, DType::I32, {cap, cols, batch}),
+                            t_cl(d_clog.p, DType::FP32, {cap, cols, batch}),
+                            t_cc(d_ccnt.p, DType::I32, {cols, batch});
+                        ops::speculative_accept_compact_drafts(
+                            t_ci, t_cl, t_cc, t_dr, t_ex, t_ln, t_an, t_li, t_cn, t_ac, domain,
+                            static_cast<const ops::SamplingConfig*>(d_cfg.p), context.stream,
+                            {.update_token_counts = true});
+                    } else {
+                        WorkspaceArena work(std::max<std::size_t>(
+                            256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(domain, k, k, batch,
+                                                                                               batch)));
+                        ops::speculative_accept_greedy_drafts(
+                            t_tgt.view({cols, batch}), t_full.view({domain, cols, batch}), t_dr, t_ex, t_ln, t_an,
+                            t_li, t_cn, t_ac, domain, static_cast<const ops::SamplingConfig*>(d_cfg.p), work,
+                            context.stream);
+                    }
+                    context.synchronize();
+                    out_len = from_device<std::int32_t>(dl, batch);
+                    out_anc = from_device<std::int32_t>(da, batch);
+                    out_lic = read<std::int32_t>(dlic, cols * batch);
+                    out_cnt = read<std::int32_t>(dcnt, batch);
+                    out_acc = read<std::int32_t>(dacc, batch);
+                };
+                std::vector<std::int32_t> l0, a0, t0, c0, ac0, l1, a1, t1, c1, ac1;
+                run_pair(false, l0, a0, t0, c0, ac0);
+                run_pair(true, l1, a1, t1, c1, ac1);
+                const std::string tag =
+                    "compact chain K=" + std::to_string(k) + " B=" + std::to_string(batch) + " m=" + std::to_string(mode);
+                failures += verify_exact((tag + " len").c_str(), l1, l0);
+                failures += verify_exact((tag + " anc").c_str(), a1, a0);
+                failures += verify_exact((tag + " lic").c_str(), t1, t0);
+                failures += verify_exact((tag + " cnt").c_str(), c1, c0);
+                failures += verify_exact((tag + " acc").c_str(), ac1, ac0);
+            }
+        }
+    }
+
+    // 3. ops::speculative_accept_compact_drafts sparse (token-wise + block_verification) vs sparse accept at 248077 domain.
+    for (const int k : {1, 4, 8, 15}) {
+        for (const bool block_ver : {false, true}) {
+            constexpr int batch = 2;
+            const int cols      = k + 1;
+            std::mt19937 rng(9100 + k * 13 + (block_ver ? 1 : 0));
+            std::uniform_real_distribution<float> dist(-1.0F, 5.0F);
+            std::vector<std::int32_t> c_ids(static_cast<std::size_t>(cap) * cols * batch, 0);
+            std::vector<float> c_logits(static_cast<std::size_t>(cap) * cols * batch, neg_inf);
+            std::vector<std::int32_t> c_counts(static_cast<std::size_t>(cols) * batch, 16);
+            std::vector<std::int32_t> drafts(static_cast<std::size_t>(k) * batch);
+            std::vector<std::int32_t> extents{k, std::max(0, k - 1)};
+            std::vector<std::int32_t> lengths{200, 350};
+            std::vector<std::int32_t> cand_ids(static_cast<std::size_t>(ops::kSparseSpeculativeCandidates) * k * batch);
+            std::vector<float> prop_q(static_cast<std::size_t>(ops::kSparseSpeculativeCandidates) * k * batch);
+
+            // Populate full [kSparsePhysicalRows, cols, batch] logits in BF16-exact values (wide-stride single buffer).
+            std::vector<float> full_logits(static_cast<std::size_t>(kSparsePhysicalRows) * cols * batch, -30.0F);
+            for (int b = 0; b < batch; ++b) {
+                for (int c = 0; c < cols; ++c) {
+                    const int col_idx = b * cols + c;
+                    for (int j = 0; j < 16; ++j) {
+                        const int id = (17 + b * 1009 + c * 257 + j * 977) % kSparseDom;
+                        const float bv = bf16_to_f32(f32_to_bf16(dist(rng)));
+                        c_ids[col_idx * cap + j]                                                 = id;
+                        c_logits[col_idx * cap + j]                                              = bv;
+                        full_logits[static_cast<std::size_t>(col_idx) * kSparsePhysicalRows + id] = bv;
+                    }
+                    if (c < k) {
+                        const int pd     = c_ids[col_idx * cap + (c % 2)];
+                        drafts[b * k + c] = pd;
+                        float sum_q      = 0.0F;
+                        for (int s = 0; s < ops::kSparseSpeculativeCandidates; ++s) {
+                            const int off = (b * k + c) * ops::kSparseSpeculativeCandidates + s;
+                            cand_ids[off] = c_ids[col_idx * cap + s];
+                            prop_q[off]   = (s == 0) ? 0.5F : 0.05F;
+                            sum_q += prop_q[off];
+                        }
+                        for (int s = 0; s < ops::kSparseSpeculativeCandidates; ++s) {
+                            prop_q[(b * k + c) * ops::kSparseSpeculativeCandidates + s] /= sum_q;
+                        }
+                    }
+                }
+            }
+
+            std::vector<ops::SamplingConfig> cfgs(batch);
+            std::vector<DeviceBuffer> d_counts;
+            for (int b = 0; b < batch; ++b) {
+                cfgs[b].temperature = 0.85F;
+                cfgs[b].top_k       = 16;
+                cfgs[b].top_p       = 0.95F;
+                cfgs[b].min_p       = 0.01F;
+                cfgs[b].seed        = 4242 + b;
+                d_counts.emplace_back(static_cast<std::size_t>(kSparseDom) * sizeof(std::int32_t));
+                d_counts.back().fill(0);
+                cfgs[b].token_counts = static_cast<std::int32_t*>(d_counts.back().p);
+            }
+            DeviceBuffer d_cid = to_device(c_ids), d_clog = to_device(c_logits), d_ccnt = to_device(c_counts);
+            DeviceBuffer d_full = to_device(full_logits);
+            DeviceBuffer d_drafts = to_device(drafts), d_extents = to_device(extents);
+            DeviceBuffer d_cand = to_device(cand_ids), d_q = to_device(prop_q), d_cfg = to_device(cfgs);
+            DeviceBuffer d_targets(static_cast<std::size_t>(cols) * batch * sizeof(std::int32_t));
+            Tensor t_full(d_full.p, DType::FP32, {kSparsePhysicalRows, cols * batch});
+            Tensor t_tgt(d_targets.p, DType::I32, {cols * batch});
+            ops::argmax(t_full, t_tgt, kSparseDom, context.stream);
+
+            auto run_sparse = [&](bool compact, std::vector<std::int32_t>& out_len,
+                                  std::vector<std::int32_t>& out_anc, std::vector<std::int32_t>& out_lic,
+                                  std::vector<std::int32_t>& out_cnt, std::vector<std::int32_t>& out_acc) {
+                for (auto& dc : d_counts) { dc.fill(0); }
+                DeviceBuffer dl = to_device(lengths);
+                DeviceBuffer da(batch * sizeof(std::int32_t));
+                da.fill(0xff);
+                GuardedDeviceBuffer dlic(static_cast<std::size_t>(cols) * batch * sizeof(std::int32_t));
+                GuardedDeviceBuffer dcnt(batch * sizeof(std::int32_t)), dacc(batch * sizeof(std::int32_t));
+                dlic.fill(0x55);
+                dcnt.fill(0x55);
+                dacc.fill(0x55);
+                Tensor t_dr(d_drafts.p, DType::I32, {k, batch}), t_ex(d_extents.p, DType::I32, {batch});
+                Tensor t_ca(d_cand.p, DType::I32, {ops::kSparseSpeculativeCandidates, k, batch});
+                Tensor t_pq(d_q.p, DType::FP32, {ops::kSparseSpeculativeCandidates, k, batch});
+                Tensor t_ln(dl.p, DType::I32, {batch}), t_an(da.p, DType::I32, {batch});
+                Tensor t_li(dlic.data(), DType::I32, {cols, batch}), t_cn(dcnt.data(), DType::I32, {batch}),
+                    t_ac(dacc.data(), DType::I32, {batch});
+                if (compact) {
+                    Tensor t_ci(d_cid.p, DType::I32, {cap, cols, batch}),
+                        t_cl(d_clog.p, DType::FP32, {cap, cols, batch}),
+                        t_cc(d_ccnt.p, DType::I32, {cols, batch});
+                    ops::speculative_accept_compact_drafts(
+                        t_ci, t_cl, t_cc, t_dr, t_ex, t_ln, t_an, t_li, t_cn, t_ac, kSparseDom,
+                        static_cast<const ops::SamplingConfig*>(d_cfg.p), context.stream,
+                        {.block_verification = block_ver, .update_token_counts = true}, t_ca, t_pq);
+                } else {
+                    WorkspaceArena work(ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+                        kSparseDom, {.block_verification = block_ver}, k, k, batch, batch));
+                    ops::speculative_accept_sparse_drafts(
+                        t_tgt.view({cols, batch}), t_full.view({kSparsePhysicalRows, cols, batch}), t_dr, t_ca, t_pq,
+                        t_ex, t_ln, t_an, t_li, t_cn, t_ac, kSparseDom,
+                        static_cast<const ops::SamplingConfig*>(d_cfg.p), {.block_verification = block_ver}, work,
+                        context.stream);
+                }
+                context.synchronize();
+                out_len = from_device<std::int32_t>(dl, batch);
+                out_anc = from_device<std::int32_t>(da, batch);
+                out_lic = read<std::int32_t>(dlic, cols * batch);
+                out_cnt = read<std::int32_t>(dcnt, batch);
+                out_acc = read<std::int32_t>(dacc, batch);
+            };
+            std::vector<std::int32_t> l0, a0, t0, c0, ac0, l1, a1, t1, c1, ac1;
+            run_sparse(false, l0, a0, t0, c0, ac0);
+            run_sparse(true, l1, a1, t1, c1, ac1);
+            const std::string tag =
+                "compact sparse K=" + std::to_string(k) + " blk=" + std::to_string(block_ver ? 1 : 0);
+            failures += verify_exact((tag + " len").c_str(), l1, l0);
+            failures += verify_exact((tag + " anc").c_str(), a1, a0);
+            failures += verify_exact((tag + " lic").c_str(), t1, t0);
+            failures += verify_exact((tag + " cnt").c_str(), c1, c0);
+            failures += verify_exact((tag + " acc").c_str(), ac1, ac0);
+            for (int b = 0; b < batch; ++b) {
+                std::vector<std::int32_t> expected_counts(kSparseDom, 0);
+                for (int j = 0; j < c1[b]; ++j) {
+                    const std::int32_t tok = t1[b * cols + j];
+                    if (tok >= 0 && tok < kSparseDom) { ++expected_counts[tok]; }
+                }
+                const auto got_counts = from_device<std::int32_t>(d_counts[b], kSparseDom);
+                failures += verify_exact((tag + " tokcnt b=" + std::to_string(b)).c_str(), got_counts, expected_counts);
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(speculative_round) {
@@ -2949,6 +3325,7 @@ INFERNIX_OP_TEST(speculative_round) {
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
     failures += sample_sparse_drafts_case();
+    failures += compact_sample_and_accept_suite();
     std::size_t sparse_peak = 0;
     // Each row is one warp whose K + 1 lanes are the draft columns, so K is swept over the lane-layout
     // boundaries (1-2, the power-of-two edges 7-9 and 15-17, a full warp at 30-31) and a spread between;

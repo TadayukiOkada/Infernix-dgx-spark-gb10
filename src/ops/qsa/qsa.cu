@@ -5,7 +5,7 @@
 #include "infernix/ops/qsa.h"
 #include "infernix/ops/sigmoid_mul.h"
 #include "infernix/ops/rope.h"
-#include "infernix/ops/sigmoid_mul.h"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/common/math.cuh"
 #include "ops/common/sincos_reduced.cuh"
 
@@ -208,17 +208,21 @@ __global__ void __launch_bounds__(kIndexDim)
                 const std::int32_t* __restrict__ tail_slots,
                 const std::int32_t* __restrict__ rope, const std::int32_t* __restrict__ block_rope,
                 int batch, int width, int ratio, int rotary, float theta, PreparedRope yarn, float eps,
-                bool update_tails, bf16* __restrict__ pooled, QsaPageSpaces spaces) {
+                bool update_tails, bf16* __restrict__ pooled, QsaPageSpaces spaces,
+                const SpeculativeTreeRow* __restrict__ trees) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     pdl::enter(); // launched as a programmatic dependent
     const int t = blockIdx.x, d = threadIdx.x;
+    const int sequence = t / width, local = t % width;
+    const int main_end =
+        (trees != nullptr && trees[sequence].tree != 0) ? static_cast<int>(trees[sequence].main_depth) : (width - 1);
+    if (local > main_end) { return; }
     const int p = positions[t];
     if ((p + 1) % ratio != 0) {
         if (update_tails) {
-            const int sequence = t / width;
             const int start    = positions[sequence * width];
-            const int last     = positions[sequence * width + width - 1];
+            const int last     = positions[sequence * width + main_end];
             const int shift    = start % ratio;
             const bool straddles = last >= 0 && shift != 0 && start + (ratio - 1 - shift) <= last;
             if (!straddles) {
@@ -232,7 +236,6 @@ __global__ void __launch_bounds__(kIndexDim)
         }
         return;
     }
-    const int sequence = t / width;
     const int start    = positions[sequence * width];
     const int first    = p - ratio + 1;
     float sum          = 0.0F;
@@ -245,7 +248,7 @@ __global__ void __launch_bounds__(kIndexDim)
     if (update_tails) {
         const int shift = start % ratio;
         if (shift != 0 && p == start + (ratio - 1 - shift)) { // this CTA straddles: it owns the writes
-            const int last = positions[sequence * width + width - 1];
+            const int last = positions[sequence * width + main_end];
             if (last >= 0) {
                 const int base = last - last % ratio;
                 const int end  = min(last, base + ratio - 2);
@@ -667,17 +670,24 @@ __global__ void __launch_bounds__(kAttentionThreads,
                      const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                      int width, int ratio, const std::int32_t* __restrict__ selected,
                      const std::int32_t* __restrict__ counts, int top_blocks, int splits, float scale,
-                     float* __restrict__ partial, bf16* __restrict__ out, detail::QsaVqWindow vq) {
+                     float* __restrict__ partial, bf16* __restrict__ out, detail::QsaVqWindow vq,
+                     const SpeculativeTreeRow* __restrict__ trees) {
     using Tile   = KVTile<Storage, Stages>;
     using Shared = AttentionShared<Storage, Group, Stages>;
     static_assert(Group % 2 == 0, "two threads per dimension split the heads");
     constexpr int Half = Group / 2;
     pdl::enter();
     const int split = blockIdx.x, kv_head = blockIdx.y, t = blockIdx.z;
-    const int group = Exact ? Group : heads / kv_heads;
-    const int p = positions[t];
-    const int count = counts[t];
-    const int total = attended_count(count, ratio, p);
+    const int group     = Exact ? Group : heads / kv_heads;
+    const int seq       = t / width, local = t % width;
+    const bool use_tree = trees != nullptr && trees[seq].tree != 0;
+    const int base_p    = use_tree ? positions[seq * width] : 0;
+    const bool is_live  = !use_tree || local < trees[seq].nodes;
+    const bool is_side  = use_tree && local > trees[seq].main_depth && local < trees[seq].nodes;
+    const int p         = !is_live ? base_p
+                                   : (is_side ? (base_p + static_cast<int>(trees[seq].depth[local])) : positions[t]);
+    const int count     = counts[t];
+    const int total     = attended_count(count, ratio, p);
     const int per_split = (total + splits - 1) / splits;
     const int begin = split * per_split, end = min(total, begin + per_split);
     const int tiles = begin < end ? (end - begin + kTokenTile - 1) / kTokenTile : 0;
@@ -715,7 +725,15 @@ __global__ void __launch_bounds__(kAttentionThreads,
     const auto prepare = [&](int i, int buf) {
         const int first = begin + i * kTokenTile;
         if (threadIdx.x < min(kTokenTile, end - first)) {
-            const int token          = attended_token(first + threadIdx.x, count, list, ratio, p);
+            int token = attended_token(first + threadIdx.x, count, list, ratio, p);
+            if (is_side && token > base_p) {
+                const int d = token - base_p;
+                int cur     = local;
+                while (cur > 0 && static_cast<int>(trees[seq].depth[cur]) > d) {
+                    cur = static_cast<int>(trees[seq].parent[cur]);
+                }
+                token = base_p + cur;
+            }
             tokens[buf][threadIdx.x] = token;
             ids[buf][threadIdx.x]    = table[token >> kPagedKVPageShift];
         }
@@ -1369,7 +1387,8 @@ __global__ void __launch_bounds__(Parts * 32)
                               const std::int32_t* __restrict__ positions, int width, int ratio,
                               const std::int32_t* __restrict__ selected, const std::int32_t* __restrict__ counts,
                               int top_blocks, int splits, float scale, const bf16* __restrict__ gate,
-                              std::int64_t gate_col_stride, float* __restrict__ partial, bf16* __restrict__ out) {
+                              std::int64_t gate_col_stride, float* __restrict__ partial, bf16* __restrict__ out,
+                              const SpeculativeTreeRow* __restrict__ trees) {
     static_assert((N == 16 || N == 32) && (Parts == 2 || Parts == 4));
     using Shape                 = ColumnsShape<Storage>;
     constexpr bool Quantized    = Storage != KvCacheStorage::BFloat16;
@@ -1388,9 +1407,15 @@ __global__ void __launch_bounds__(Parts * 32)
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
 
-    const int p     = positions[t];
-    const int count = counts[t];
-    const int total = attended_count(count, ratio, p);
+    const int seq       = t / width, local = t % width;
+    const bool use_tree = trees != nullptr && trees[seq].tree != 0;
+    const int base_p    = use_tree ? positions[seq * width] : 0;
+    const bool is_live  = !use_tree || local < trees[seq].nodes;
+    const bool is_side  = use_tree && local > trees[seq].main_depth && local < trees[seq].nodes;
+    const int p         = !is_live ? base_p
+                                   : (is_side ? (base_p + static_cast<int>(trees[seq].depth[local])) : positions[t]);
+    const int count     = counts[t];
+    const int total     = attended_count(count, ratio, p);
     if (total <= 0) {
         if (splits == 1) {
             for (int i = tid; i < GroupHeads * (kHeadDim / 2); i += Threads) {
@@ -1485,8 +1510,16 @@ __global__ void __launch_bounds__(Parts * 32)
         constexpr ColumnsCode C  = IsKey ? Shape::Key : Shape::Value;
         using R                  = ColumnsRow<C>;
         const bool own_valid     = lane < N && (k0 + lane) < end;
-        const int own_token      = own_valid ? attended_token(k0 + lane, count, list, ratio, p) : 0;
-        const int own_id         = own_valid ? table[own_token >> kPagedKVPageShift] : 0;
+        int own_token = own_valid ? attended_token(k0 + lane, count, list, ratio, p) : 0;
+        if (own_valid && is_side && own_token > base_p) {
+            const int d = own_token - base_p;
+            int cur     = local;
+            while (cur > 0 && static_cast<int>(trees[seq].depth[cur]) > d) {
+                cur = static_cast<int>(trees[seq].parent[cur]);
+            }
+            own_token = base_p + cur;
+        }
+        const int own_id = own_valid ? table[own_token >> kPagedKVPageShift] : 0;
         int own_page             = 0;
         const auto* data_plane   = static_cast<const unsigned char*>(
             IsKey ? detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k, own_id, own_page)
@@ -1986,10 +2019,15 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_po
 
 void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& tails,
                    const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& geometry,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, const Tensor* tree_rows) {
     require_geometry(geometry);
     const int columns = raw_keys.ne[1];
     require_batch(batch, columns);
+    const SpeculativeTreeRow* trees_p = nullptr;
+    if (tree_rows != nullptr) {
+        validate_speculative_tree_rows(*tree_rows, batch.batch, "qsa_pool_keys");
+        trees_p = static_cast<const SpeculativeTreeRow*>(tree_rows->data);
+    }
     require(contiguous(raw_keys, DType::BF16) && raw_keys.ne[0] == kIndexDim && contiguous(tails, DType::BF16) &&
                 tails.ne[0] == kIndexDim && tails.ne[1] == geometry.ratio - 1 &&
                 contiguous(layer.pooled_pages, DType::BF16) &&
@@ -2009,7 +2047,7 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
         static_cast<const std::int32_t*>(batch.rope_positions.data),
         static_cast<const std::int32_t*>(batch.block_start_rope.data), batch.batch, batch.width, geometry.ratio,
         geometry.rotary_dim, geometry.theta, index_rope(geometry), geometry.eps, batch.update_tails,
-        static_cast<bf16*>(layer.pooled_pages.data), layer.spaces) == cudaSuccess,
+        static_cast<bf16*>(layer.pooled_pages.data), layer.spaces, trees_p) == cudaSuccess,
             "pool launch failed");
     check_launch("pool");
 }
@@ -2059,7 +2097,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
                    Tensor& out, cudaStream_t stream, const QsaAppend* append, const Tensor* gate,
-                   bool allow_fast_paths) {
+                   bool allow_fast_paths, const Tensor* tree_rows) {
     require_geometry(geometry);
     const int columns = q.ne[2];
     require_batch(batch, columns);
@@ -2073,6 +2111,12 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     std::int64_t gate_col_stride = 0;
     resolve_qsa_gate(gate, geometry.heads, columns, gate_ptr, gate_col_stride);
     const bool vq     = vector_quantized(layer.kv.storage);
+    const SpeculativeTreeRow* trees_p = nullptr;
+    if (tree_rows != nullptr) {
+        require(!vq, "qsa attention: speculative trees require scalar KV cache storage");
+        validate_speculative_tree_rows(*tree_rows, batch.batch, "qsa_attention");
+        trees_p = static_cast<const SpeculativeTreeRow*>(tree_rows->data);
+    }
     const bool window = vq && layer.kv.window.present();
     const bool staged = staged_call(layer.kv.storage, window, columns);
     require(vq == (append != nullptr), "the vector-quantized storages, and only they, take the call's K and V");
@@ -2131,11 +2175,11 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     const auto* rows     = static_cast<const std::int32_t*>(batch.table_rows.data);
     const auto* pos      = static_cast<const std::int32_t*>(batch.positions.data);
     detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
-                       {ws.selected, ws.counts}, stream, layer.spaces, allow_fast_paths);
+                       {ws.selected, ws.counts}, stream, layer.spaces, allow_fast_paths, trees_p);
     // Calls this kernel would run unsplit take the Tensor Core prompt route (qsa_prompt.h): the same
     // width-invariance class, so a column's bits still do not depend on its call's width there.
     const int splits = attention_splits(columns, geometry);
-    if (splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
+    if (trees_p == nullptr && splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
         detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
                                      vq_args, gate, allow_fast_paths);
         commit();
@@ -2197,7 +2241,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
                 static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv, layer.spaces, tables,
                 stride, rows, pos, batch.width, geometry.ratio, static_cast<const std::int32_t*>(ws.selected),
                 static_cast<const std::int32_t*>(ws.counts), top_blocks, mma_splits, scale, gate_ptr, gate_col_stride,
-                ws.partial, static_cast<bf16*>(out.data));
+                ws.partial, static_cast<bf16*>(out.data), trees_p);
             if (error != cudaSuccess) {
                 throw std::runtime_error(std::string("qsa mma columns: ") + cudaGetErrorString(error));
             }
@@ -2267,7 +2311,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
             {grid, dim3(kAttentionThreads), bytes, stream}, kernel, static_cast<const bf16*>(q.data), geometry.heads,
             geometry.kv_heads, layer.kv, layer.spaces, tables, stride, rows, pos, batch.width, geometry.ratio,
             static_cast<const std::int32_t*>(ws.selected), static_cast<const std::int32_t*>(ws.counts), top_blocks,
-            splits, scale, ws.partial, static_cast<bf16*>(out.data), vq_args);
+            splits, scale, ws.partial, static_cast<bf16*>(out.data), vq_args, trees_p);
         if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa attention: ") + cudaGetErrorString(error)); }
     };
     // Two stages only where a split holds more than one tile and both fit; one stage otherwise

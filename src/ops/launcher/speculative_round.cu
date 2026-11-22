@@ -223,6 +223,54 @@ void speculative_accept_sparse_drafts_launch(
     }
 }
 
+void speculative_accept_compact_drafts_launch(
+    const Tensor& compact_ids, const Tensor& compact_logits, const Tensor& compact_counts,
+    const Tensor& drafts, const Tensor& candidate_ids, const Tensor& proposal_q,
+    const Tensor& current_extents, Tensor& round_lengths, Tensor& round_anchors,
+    Tensor& licensed_tokens, Tensor& licensed_counts, Tensor& accepted_drafts,
+    std::int32_t token_domain, const SamplingConfig* configs, bool raw_greedy,
+    bool block_verification, bool update_token_counts, cudaStream_t stream) {
+    const std::int32_t cap   = compact_ids.ne[0];
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    const bool sparse        = candidate_ids.data != nullptr;
+    const bool block_ver     = sparse && block_verification && !raw_greedy;
+    const auto launch        = [&](auto kernel) {
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(static_cast<unsigned int>(batch)), dim3(64), 0, stream}, kernel,
+            static_cast<const std::int32_t*>(compact_ids.data),
+            static_cast<const float*>(compact_logits.data),
+            static_cast<const std::int32_t*>(compact_counts.data),
+            static_cast<const std::int32_t*>(drafts.data),
+            sparse ? static_cast<const std::int32_t*>(candidate_ids.data) : nullptr,
+            sparse ? static_cast<const float*>(proposal_q.data) : nullptr,
+            static_cast<const std::int32_t*>(current_extents.data),
+            static_cast<std::int32_t*>(round_lengths.data),
+            static_cast<std::int32_t*>(round_anchors.data),
+            static_cast<std::int32_t*>(licensed_tokens.data),
+            static_cast<std::int32_t*>(licensed_counts.data),
+            static_cast<std::int32_t*>(accepted_drafts.data), configs, token_domain, cap, k));
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if (update_token_counts) {
+        if (!sparse) {
+            launch(speculative_accept_compact_kernel<true, false, false>);
+        } else if (block_ver) {
+            launch(speculative_accept_compact_kernel<true, true, true>);
+        } else {
+            launch(speculative_accept_compact_kernel<true, true, false>);
+        }
+    } else {
+        if (!sparse) {
+            launch(speculative_accept_compact_kernel<false, false, false>);
+        } else if (block_ver) {
+            launch(speculative_accept_compact_kernel<false, true, true>);
+        } else {
+            launch(speculative_accept_compact_kernel<false, true, false>);
+        }
+    }
+}
+
 void speculative_prepare_tree_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
                                                    const Tensor& base_positions,
                                                    const Tensor& tree_rows, Tensor& verify_ids,

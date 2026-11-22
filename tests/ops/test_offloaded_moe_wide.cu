@@ -1018,6 +1018,149 @@ void test_masked_w4a4_verify() {
     cudaFree(d_frame_base);
 }
 
+// OMMA narrow/medium W4A4 (ExpertA4OmmaNarrow) across decode, verification (T=1..8, 12), split_input
+// experts, masked columns and staging configs: checks FP64 relative L2 bound, rounding-order control
+// vs canonical DP4A, untouched masked sentinels, and staging/placement bit invariance.
+void test_omma_narrow_w4a4(const char* name, int experts, int columns, int top_k,
+                           const std::vector<int>& split_experts, std::uint32_t seed) {
+    std::printf("== OMMA narrow W4A4 %s: E=%d T=%d k=%d\n", name, experts, columns, top_k);
+    std::mt19937 rng(seed);
+    const std::size_t stride = moe::kRecordBytes;
+    std::vector<fixtures::Expert> bank;
+    std::vector<moe::ExpertScales> scales;
+    for (int e = 0; e < experts; ++e) {
+        const bool split =
+            std::find(split_experts.begin(), split_experts.end(), e) != split_experts.end();
+        bank.push_back(fixtures::random_expert(rng, split));
+        scales.push_back(bank.back().scales);
+    }
+    std::uint8_t* host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&host), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    for (int e = 0; e < experts; ++e) { std::memcpy(host + stride * e, bank[static_cast<std::size_t>(e)].record.data(), stride); }
+    std::uint8_t* host_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
+    std::vector<std::int32_t> frames(static_cast<std::size_t>(experts), -1);
+    std::vector<std::uint8_t> frame_bytes;
+    int resident = 0;
+    for (int e = 0; e < experts; e += 2) {
+        frames[static_cast<std::size_t>(e)] = resident++;
+        frame_bytes.insert(frame_bytes.end(), bank[static_cast<std::size_t>(e)].record.begin(),
+                           bank[static_cast<std::size_t>(e)].record.end());
+    }
+    auto* d_frame_base = device_copy(frame_bytes);
+    auto* d_frames     = device_copy(frames);
+    auto* d_scales     = device_copy(scales);
+    const std::vector<double> pop(static_cast<std::size_t>(experts), 1.0);
+    const auto logits = routing_logits(rng, experts, columns, top_k, pop);
+    auto* d_logits    = device_copy(logits);
+
+    const int entries = columns * top_k;
+    std::int32_t* d_ids  = nullptr;
+    float* d_weights     = nullptr;
+    float* d_shared_gate = nullptr;
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * entries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_weights, sizeof(float) * entries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_shared_gate, sizeof(float) * columns), "cudaMalloc");
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
+                                      Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                      Tensor(d_shared_gate, DType::FP32, {columns})};
+    infernix::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, columns}), top_k, routing, nullptr);
+    void* d_dispatch = nullptr;
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, entries)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, entries);
+    infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "dispatch");
+
+    const auto x       = fixtures::wide_range_activations(rng, columns);
+    auto* d_x          = device_copy(x);
+    const auto ids     = host_copy(d_ids, static_cast<std::size_t>(entries));
+    const auto offsets = host_copy(dispatch.offsets, static_cast<std::size_t>(experts) + 1);
+    std::vector<int> counts(static_cast<std::size_t>(experts));
+    for (int e = 0; e < experts; ++e) { counts[static_cast<std::size_t>(e)] = offsets[e + 1] - offsets[e]; }
+
+    const int max_jobs = std::min(experts, entries);
+    std::uint8_t* d_staging = nullptr;
+    cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
+    void* d_workspace = nullptr;
+    cuda_check(cudaMalloc(&d_workspace,
+                          infernix::ops::moe_experts_workspace_bytes(infernix::ops::offloaded_moe::kFlashNextShape,
+                                                                     max_jobs, entries, columns,
+                                                                     moe::ExpertActivation::kA4)),
+               "cudaMalloc");
+    const std::size_t out_elements = static_cast<std::size_t>(moe::kHidden) * entries;
+    std::uint16_t *d_out_omma = nullptr, *d_out_ctrl = nullptr;
+    cuda_check(cudaMalloc(&d_out_omma, out_elements * sizeof(std::uint16_t)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_out_ctrl, out_elements * sizeof(std::uint16_t)), "cudaMalloc");
+
+    infernix::ops::MoeExpertSource ctrl_src{.frame_base    = d_frame_base,
+                                            .frames        = d_frames,
+                                            .host_records  = host_device,
+                                            .record_stride = stride,
+                                            .scales        = d_scales,
+                                            .staging_base  = d_staging,
+                                            .staging_slots = 64};
+    cuda_check(cudaMemset(d_out_ctrl, 0xFF, out_elements * sizeof(std::uint16_t)), "cudaMemset");
+    Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+    Tensor out_ctrl(d_out_ctrl, DType::BF16, {moe::kHidden, entries});
+    infernix::ops::moe_experts(tx, dispatch, ctrl_src, top_k, max_jobs, d_workspace, out_ctrl, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "moe_experts ctrl");
+    const auto ctrl = host_copy(d_out_ctrl, out_elements);
+
+    std::vector<std::uint16_t> first_omma;
+    for (const int slots : {64, 3, 0, 64}) {
+        cuda_check(cudaMemset(d_out_omma, 0xFF, out_elements * sizeof(std::uint16_t)), "cudaMemset");
+        cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
+        infernix::ops::MoeExpertSource src = ctrl_src;
+        src.staging_base  = slots > 0 ? d_staging : nullptr;
+        src.staging_slots = slots;
+        src.omma_narrow   = true;
+        Tensor out_omma(d_out_omma, DType::BF16, {moe::kHidden, entries});
+        infernix::ops::moe_experts(tx, dispatch, src, top_k, max_jobs, d_workspace, out_omma, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "moe_experts omma");
+        const auto got = host_copy(d_out_omma, out_elements);
+        if (first_omma.empty()) {
+            first_omma = got;
+        } else {
+            long diff = 0;
+            for (std::size_t i = 0; i < out_elements; ++i) { diff += got[i] != first_omma[i]; }
+            check(diff == 0, "OMMA narrow invariance across staging slot configurations and rerun");
+        }
+    }
+
+    double sum_omma = 0.0, sum_ctrl = 0.0, worst_omma = 0.0;
+    long over = 0;
+    for (int entry = 0; entry < entries; ++entry) {
+        const int e   = ids[static_cast<std::size_t>(entry)];
+        const int col = entry / top_k;
+        const auto ref = fp64_expert(bank[static_cast<std::size_t>(e)], &x[static_cast<std::size_t>(col) * moe::kHidden]);
+        const double err_omma = error_against(&first_omma[static_cast<std::size_t>(entry) * moe::kHidden], ref).relative_l2;
+        const double err_ctrl = error_against(&ctrl[static_cast<std::size_t>(entry) * moe::kHidden], ref).relative_l2;
+        sum_omma += err_omma;
+        sum_ctrl += err_ctrl;
+        worst_omma = std::max(worst_omma, err_omma);
+        if (err_omma > 0x1p-4) { ++over; }
+    }
+    const double mean_omma = sum_omma / entries, mean_ctrl = sum_ctrl / entries;
+    std::printf("   OMMA mean=%.3e (ctrl=%.3e) worst=%.3e over2^-4=%ld\n", mean_omma, mean_ctrl, worst_omma, over);
+    check(over == 0, "OMMA narrow W4A4: every entry within 2^-4 relative L2 of FP64 oracle");
+    check(mean_omma <= 1.25 * mean_ctrl + 1e-4, "OMMA narrow W4A4: mean error within 1.25x canonical control");
+
+    cudaFree(d_out_omma);
+    cudaFree(d_out_ctrl);
+    cudaFree(d_workspace);
+    cudaFree(d_staging);
+    cudaFree(d_x);
+    cudaFree(d_dispatch);
+    cudaFree(d_shared_gate);
+    cudaFree(d_weights);
+    cudaFree(d_ids);
+    cudaFree(d_logits);
+    cudaFree(d_scales);
+    cudaFree(d_frames);
+    cudaFree(d_frame_base);
+    cudaFreeHost(host);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(offloaded_moe_wide) {
@@ -1042,6 +1185,13 @@ INFERNIX_OP_TEST(offloaded_moe_wide) {
         // A verification-width call: 10 columns at top-10 over 12 experts.
         test_layer("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), {}, 37);
         test_masked_w4a4_verify();
+        // Native OMMA narrow/medium W4A4 (ExpertA4OmmaNarrow) across decode, verification (T=1..8, 12),
+        // split input scales, and mixed wide+narrow calls (use_xplane=true at T=12):
+        for (const int t : {1, 2, 3, 4, 5, 7, 8}) {
+            const std::string label = "T=" + std::to_string(t);
+            test_omma_narrow_w4a4(label.c_str(), 12, t, t <= 2 ? 10 : 8, {0, 3}, 100U + static_cast<std::uint32_t>(t));
+        }
+        test_omma_narrow_w4a4("T=12 mixed wide+narrow", 12, 12, 6, {1, 5}, 112U);
         // The cases above run the 32-token warp tiles; two experts of 600 columns each (nine full tiles and
         // a partial one) run the 64-token ones (kWarpTile64MinColumns on average).
         static_assert(2 * 600 / 2 >= wide::kWarpTile64MinColumns && 4 * 300 / 20 < wide::kWarpTile64MinColumns);

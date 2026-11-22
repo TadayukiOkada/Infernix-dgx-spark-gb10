@@ -588,7 +588,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         }
         return true;
     };
-    if (options.proposal_head_screen && out->config.mtp && out->weights.proposal &&
+    if (options.proposal_head_screen && (out->config.mtp || out->config.dflash2) && out->weights.proposal &&
         binder.contains("screen/proposal_head") && screenable_proposal()) {
         out->weights.proposal->screen = bindings.parameter(
             "screen/proposal_head", {out->config.proposal_rows, out->config.text.hidden_size}, {}, QType::Q2_G64_FP16);
@@ -691,6 +691,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             auto& d               = *out->config.dflash2;
             d.head_rows           = proposal ? out->config.proposal_rows : out->config.text.vocab_size;
             d.ggml_head           = is_ggml_matrix_layout(layout);
+            d.screened_head       = proposal && out->weights.proposal && out->weights.proposal->screen.valid();
             d.fused_head          = !d.ggml_head && (proposal ? tensor.format == "q4_g64_fp16" && d.head_rows == 131072U
                                                               : tensor.format == "q8_g32_fp16");
         }

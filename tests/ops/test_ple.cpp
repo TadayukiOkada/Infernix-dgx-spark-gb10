@@ -16,6 +16,7 @@
 //     once-rounded gate outputs), and at any other width it takes the composed route exactly.
 
 #include "infernix/ops/ple.h"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/op_family.h"
 
 #include "core/arena.h"
@@ -464,6 +465,145 @@ void test_gate_conv(int streams, int hidden, int taps, int dilation, int sequenc
                                    want_residual, kOneRounding);
 }
 
+void test_conv_tree(int streams, int hidden, int dilation, bool fp32_norms, std::uint32_t seed) {
+    constexpr int kTaps = 4, kSequences = 2, kWidth = 6;
+    const int span      = (kTaps - 1) * dilation;
+    const int columns   = kSequences * kWidth;
+    const int slots     = 4;
+    const std::size_t W = static_cast<std::size_t>(streams) * hidden;
+    const std::string label =
+        "ple_conv_tree S=" + std::to_string(streams) + " H=" + std::to_string(hidden) +
+        " d=" + std::to_string(dilation) + (fp32_norms ? " f32" : " bf16");
+    std::mt19937 rng(seed);
+    const auto key             = random_bf16(W * columns, rng, -2.0F, 2.0F);
+    const auto value           = random_bf16(static_cast<std::size_t>(hidden) * columns, rng, -1.5F, 1.5F);
+    const auto residual        = random_bf16(W * columns, rng, -3.0F, 3.0F);
+    const auto weight          = random_bf16(W * kTaps, rng, -0.8F, 0.8F);
+    const auto states          = random_bf16(static_cast<std::size_t>(W) * span * slots, rng, -2.0F, 2.0F);
+    const auto key_norm_bits   = random_bf16(W, rng, -0.5F, 0.5F);
+    const auto query_norm_bits = random_bf16(W, rng, -0.5F, 0.5F);
+    const auto conv_norm_bits  = random_bf16(W, rng, -0.5F, 0.5F);
+    const auto next_norm_bits  = random_bf16(W, rng, -0.5F, 0.5F);
+    std::vector<std::int32_t> source{1, 3};
+
+    // Row 0: 2-branch root-fork tree: main 0->1->2->3, side 0->4->5. Row 1: sequential chain (tree=0).
+    std::vector<ops::SpeculativeTreeRow> trees(kSequences);
+    std::memset(trees.data(), 0, trees.size() * sizeof(ops::SpeculativeTreeRow));
+    std::fill(std::begin(trees[0].parent), std::end(trees[0].parent), std::int8_t{-1});
+    std::fill(std::begin(trees[1].parent), std::end(trees[1].parent), std::int8_t{-1});
+    trees[0].nodes      = kWidth;
+    trees[0].main_depth = 3;
+    trees[0].paths      = 2;
+    trees[0].tree       = 1;
+    trees[0].parent[1]  = 0;
+    trees[0].parent[2]  = 1;
+    trees[0].parent[3]  = 2;
+    trees[0].parent[4]  = 0;
+    trees[0].parent[5]  = 4;
+    trees[1].nodes      = kWidth;
+    trees[1].main_depth = kWidth - 1;
+    trees[1].paths      = 1;
+    trees[1].tree       = 0;
+
+    const auto as_float = [](const std::vector<std::uint16_t>& v) {
+        std::vector<float> f(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) { f[i] = bf16_to_f32(v[i]); }
+        return f;
+    };
+    const DType norm_type = fp32_norms ? DType::FP32 : DType::BF16;
+    DeviceBuffer d_key = to_device(key), d_value = to_device(value), d_weight = to_device(weight);
+    DeviceBuffer d_source = to_device(source), d_trees = to_device(trees);
+    DeviceBuffer d_key_norm   = fp32_norms ? to_device(as_float(key_norm_bits)) : to_device(key_norm_bits);
+    DeviceBuffer d_query_norm = fp32_norms ? to_device(as_float(query_norm_bits)) : to_device(query_norm_bits);
+    DeviceBuffer d_conv_norm  = fp32_norms ? to_device(as_float(conv_norm_bits)) : to_device(conv_norm_bits);
+    DeviceBuffer d_next_norm  = fp32_norms ? to_device(as_float(next_norm_bits)) : to_device(next_norm_bits);
+
+    GuardedDeviceBuffer d_res(residual.size() * 2), d_states(states.size() * 2), d_gated(W * columns * 2),
+        d_normalized(W * columns * 2), d_next_out(W * columns * 2);
+    d_res.copy_from_host(residual.data(), residual.size() * 2);
+    d_states.copy_from_host(states.data(), states.size() * 2);
+    d_gated.fill(0xFF);
+    d_normalized.fill(0xFF);
+    d_next_out.fill(0xFF);
+
+    const auto W32 = static_cast<std::int32_t>(W);
+    Tensor t_key(d_key.p, DType::BF16, {W32, columns});
+    Tensor t_value(d_value.p, DType::BF16, {static_cast<std::int32_t>(hidden), columns});
+    Tensor t_residual(d_res.data(), DType::BF16, {W32, columns});
+    Tensor t_key_norm(d_key_norm.p, norm_type, {W32});
+    Tensor t_query_norm(d_query_norm.p, norm_type, {W32});
+    Tensor t_conv_norm(d_conv_norm.p, norm_type, {W32});
+    Tensor t_next_norm(d_next_norm.p, norm_type, {W32});
+    Tensor t_next_out(d_next_out.data(), DType::BF16, {W32, columns});
+    Tensor t_weight(d_weight.p, DType::BF16, {W32, kTaps});
+    Tensor t_states(d_states.data(), DType::BF16, {W32, span, slots});
+    Tensor t_source(d_source.p, DType::I32, {kSequences});
+    Tensor t_trees(d_trees.p, DType::I32, {ops::kSpeculativeTreeRowWords, kSequences});
+    Tensor t_gated(d_gated.data(), DType::BF16, {W32, columns});
+    Tensor t_normalized(d_normalized.data(), DType::BF16, {W32, columns});
+    ops::ple_gate_conv_inject(t_key, t_value, t_residual, t_key_norm, t_query_norm, t_conv_norm, streams, 1.0e-6F,
+                              t_weight, dilation, t_states, t_source, Tensor{}, t_gated, t_normalized, nullptr,
+                              &t_next_norm, &t_next_out, 1.0e-6F, &t_trees);
+    cuda_synchronize();
+
+    g_failures += verify_exact((label + " states unchanged").c_str(),
+                               from_device<std::uint16_t>(d_states.data(), states.size()), states);
+
+    const auto gated_host = from_device<std::uint16_t>(d_gated.data(), W * columns);
+    const auto norm_host  = from_device<std::uint16_t>(d_normalized.data(), W * columns);
+    const auto ancestor = [&](int sequence, int local, int lag) -> int {
+        if (lag == 0) { return local; }
+        if (trees[sequence].tree == 0) { return local - lag; }
+        int col = local, steps = 0;
+        while (steps < lag && col > 0) {
+            col = trees[sequence].parent[col];
+            ++steps;
+        }
+        return steps == lag ? col : -(lag - steps);
+    };
+    std::vector<double> want_residual(residual.size()), want_next(residual.size());
+    for (int sequence = 0; sequence < kSequences; ++sequence) {
+        for (int local = 0; local < kWidth; ++local) {
+            const std::size_t col = static_cast<std::size_t>(sequence) * kWidth + local;
+            for (std::size_t c = 0; c < W; ++c) {
+                double acc = 0.0;
+                for (int j = 0; j < kTaps; ++j) {
+                    const int src = ancestor(sequence, local, (kTaps - 1 - j) * dilation);
+                    const double x =
+                        src >= 0
+                            ? bf16_value(norm_host[(static_cast<std::size_t>(sequence) * kWidth + src) * W + c])
+                            : bf16_value(
+                                  states[(static_cast<std::size_t>(source[sequence]) * span + (span + src)) * W + c]);
+                    acc += bf16_value(weight[static_cast<std::size_t>(j) * W + c]) * x;
+                }
+                const std::size_t i = col * W + c;
+                want_residual[i] = bf16_value(residual[i]) + bf16_value(gated_host[i]) + acc / (1.0 + std::exp(-acc));
+            }
+            for (int s = 0; s < streams; ++s) {
+                double sq = 0.0;
+                const std::size_t base = col * W + static_cast<std::size_t>(s) * hidden;
+                for (int d = 0; d < hidden; ++d) {
+                    const double r_val = bf16_value(bf16_of(want_residual[base + d]));
+                    sq += r_val * r_val;
+                }
+                const double inv = 1.0 / std::sqrt(sq / hidden + 1.0e-6);
+                for (int d = 0; d < hidden; ++d) {
+                    const std::size_t ch = static_cast<std::size_t>(s) * hidden + d;
+                    const double nw = fp32_norms ? static_cast<double>(bf16_to_f32(next_norm_bits[ch]))
+                                                 : bf16_value(next_norm_bits[ch]);
+                    want_next[base + d] = bf16_value(bf16_of(want_residual[base + d])) * inv * (1.0 + nw);
+                }
+            }
+        }
+    }
+    g_failures +=
+        verify_pointwise(label + " residual vs FP64", from_device_bf16(d_res.data(), residual.size()), want_residual,
+                         kOneRounding);
+    g_failures +=
+        verify_pointwise(label + " next_norm vs FP64", from_device_bf16(d_next_out.data(), residual.size()), want_next,
+                         kOneRounding);
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(ple) {
@@ -512,6 +652,8 @@ INFERNIX_OP_TEST(ple) {
         test_gate_conv(4, 2048, 6, 4, 1, 1, false, false, 305U);
         test_gate_conv(2, 300, 4, 3, 2, 1, false, false, 306U);
         test_gate_conv(4, 2048, 4, 3, 2, 2, false, true, 307U);
+        test_conv_tree(4, 2560, 3, true, 400U);
+        test_conv_tree(4, 2560, 1, false, 401U);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

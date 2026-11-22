@@ -468,6 +468,9 @@ struct ProgramOptions {
     // block-verification (FastPath::BlockVerification): sampled rows of DFlash2 and sampled-MTP chain
     // rounds accept by block verification (ops::speculative_accept_sparse_drafts).
     bool block_verification = false;
+    // univer-trees (FastPath::UniverTrees): sampled MTP and DFlash2 rounds fork a depth-1 alternative
+    // root branch when step 0 is uncertain and verify the 2-branch tree jointly.
+    bool univer_trees = false;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
     // 0 derives it from the measured link and CPU rates, design §19.3.12).

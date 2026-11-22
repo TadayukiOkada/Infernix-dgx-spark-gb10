@@ -52,6 +52,8 @@ std::string ProgramImpl::graph_label(const DecodeGraph& graph) const {
         {"screened decode", screened_graphs_, 1},
         {"verify", verify_graphs_, max_width_},
         {"screened verify", screened_verify_graphs_, max_width_},
+        {"tree verify", tree_verify_graphs_, max_width_},
+        {"screened tree verify", screened_tree_verify_graphs_, max_width_},
         {"commit", commit_graphs_, max_width_},
         {"MTP draft", mtp_draft_graphs_, mtp_k_},
         {"sampled MTP draft", mtp_sampled_graphs_, mtp_k_},
@@ -139,9 +141,16 @@ void ProgramImpl::capture_graph_set() {
         for (const auto& shape : verified) {
             const std::int32_t batch = shape.first, widest = shape.second;
             for (std::int32_t W = 2; W <= widest; ++W) {
+                if (W != bucket_verify_width(W, max_width_)) { continue; }
                 take(verify_graph(batch, W, false), [&] { verify_graph_body(batch, W, false); });
                 if (screened_head_ && batch * W <= ops::kScreenedHeadMaxColumns) {
                     take(verify_graph(batch, W, true), [&] { verify_graph_body(batch, W, true); });
+                }
+                if (options_.univer_trees && batch == 1 && W >= 3 && W <= ops::kSpeculativeTreeMaxNodes) {
+                    take(verify_graph(batch, W, false, true), [&] { verify_graph_body(batch, W, false, true); });
+                    if (screened_head_ && batch * W <= ops::kScreenedHeadMaxColumns) {
+                        take(verify_graph(batch, W, true, true), [&] { verify_graph_body(batch, W, true, true); });
+                    }
                 }
                 take(commit_graph(batch, W), [&] { commit_body(batch, W); });
                 if (mtp_ && dflash2_) {

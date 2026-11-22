@@ -65,6 +65,7 @@ struct FastPathConfiguration {
     case FastPath::ExpertA4Residual:
     case FastPath::ExpertA4Residual3:
     case FastPath::ExpertA4ResidualDecode:
+    case FastPath::ExpertA4OmmaNarrow:
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:

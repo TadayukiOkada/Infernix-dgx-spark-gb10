@@ -278,6 +278,26 @@ int main() {
         check(rows_match(pair, read(volume, pair)), "rows sharing a cache slot return their own bytes");
         check(rows_match(pair, read(volume, pair)), "and again after evicting each other");
 
+        // Clock eviction: a hot row accessed again retains its reference bit and survives when 3
+        // cold rows enter the same 4-way set (5 rows total would otherwise rotate out row 0 under
+        // strict round-robin).
+        std::vector<std::uint32_t> eight_set{0};
+        for (std::uint32_t r = 1; r < kRows && eight_set.size() < 6; ++r) {
+            if (set_of(r) == set_of(0)) { eight_set.push_back(r); }
+        }
+        check(eight_set.size() == 6, "the test found six rows sharing a 4-way cache set");
+        (void)read(volume, {eight_set[0], eight_set[1], eight_set[2], eight_set[3]});
+        // Re-reference way 0 after inserting 1..3 so Clock clears 1..3's ref bits before evicting 0.
+        (void)read(volume, {eight_set[0]});
+        // Insert a 5th row in the same set: Clock inspects and evicts a non-hot way, sparing eight_set[0].
+        (void)read(volume, {eight_set[4]});
+        check(volume.cached(std::vector<std::uint32_t>{eight_set[0]}),
+              "Clock preserves re-referenced hot row on collision");
+        (void)read(volume, {eight_set[0]});
+        (void)read(volume, {eight_set[5]});
+        check(volume.cached(std::vector<std::uint32_t>{eight_set[0]}),
+              "Clock continues sparing hot row across subsequent cold inserts");
+
         // A prefill-sized call (thousands of distinct blocks, duplicates and cache-slot collisions):
         // the multi-threaded route, then every row from the cache.
         std::vector<std::uint32_t> large(20000);

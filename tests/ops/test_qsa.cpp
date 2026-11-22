@@ -40,6 +40,7 @@
 #include "infernix/ops/attention_geometry.h"
 #include "infernix/ops/kv_cache_append.h"
 #include "infernix/ops/qsa.h"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "ops/qsa/qsa_prompt.h"
@@ -2203,7 +2204,422 @@ void run_index_part() {
     g_index_geometry = kGeometry;
 }
 
-// Attention over one scalar KV storage, and its fused prepare (qsa-prepare-fused).
+// Tree preparation and attention over scalar KV storage: covers both exact SIMT attention_kernel
+// bit-for-bit invariance (columns <= kSmallCallColumns, heads != 24, identical splits) and production
+// H24 GQA (both sparse_gqa_columns_kernel at columns <= 8 and attention_kernel at columns > 8)
+// against standalone chains under kAttentionCriterion.
+void run_tree_case(KvCacheStorage storage, int heads, int kv_heads, const std::vector<int>& base_p,
+                   int main_depth, int width, std::uint32_t seed, const std::string& tag,
+                   bool expect_exact_bits) {
+    const int rows         = static_cast<int>(base_p.size());
+    const int columns      = rows * width;
+    const bool allow_fast  = !expect_exact_bits;
+    const auto layout = infernix::paged_kv_storage_layout(storage, kD);
+    int max_p         = 0;
+    for (int p : base_p) { max_p = std::max(max_p, p); }
+    const int pages_per_row = (max_p + width + kPage - 1) / kPage + 1;
+    const int pages         = rows * pages_per_row;
+
+    std::mt19937 rng(seed);
+    std::vector<std::int32_t> tables(static_cast<std::size_t>(pages));
+    std::iota(tables.begin(), tables.end(), 0);
+    std::shuffle(tables.begin(), tables.end(), rng);
+    const DeviceBuffer dtables = upload(tables);
+
+    const auto plane_elems = [&](int lead) {
+        return static_cast<std::size_t>(lead) * kPage * kv_heads * pages;
+    };
+    const auto random_fp16 = [&](std::size_t n, double lo, double hi) {
+        std::uniform_real_distribution<double> d(lo, hi);
+        std::vector<std::uint16_t> out(n);
+        for (auto& x : out) { x = to_fp16(static_cast<float>(d(rng))); }
+        return out;
+    };
+    const auto random_int8 = [&](std::size_t n) {
+        std::uniform_int_distribution<int> d(-127, 127);
+        std::vector<std::uint8_t> out(n);
+        for (auto& x : out) { x = static_cast<std::uint8_t>(static_cast<std::int8_t>(d(rng))); }
+        return out;
+    };
+
+    std::vector<std::uint16_t> k0_16, v0_16, ks0_16, vs0_16;
+    std::vector<std::uint8_t> k0_8, v0_8;
+    if (storage == KvCacheStorage::BFloat16) {
+        k0_16 = random_bf16(rng, plane_elems(layout.key.data_leading_extent), 0.5);
+        v0_16 = random_fp16(plane_elems(layout.value.data_leading_extent), -0.5, 0.5);
+    } else {
+        k0_8   = random_int8(plane_elems(layout.key.data_leading_extent));
+        v0_8   = random_int8(plane_elems(layout.value.data_leading_extent));
+        ks0_16 = random_fp16(plane_elems(layout.key.scale_leading_extent), 0.004, 0.012);
+        vs0_16 = random_fp16(plane_elems(layout.value.scale_leading_extent), 0.004, 0.012);
+    }
+    const auto pooled0 = random_bf16(rng, static_cast<std::size_t>(kSlotWidth) * kPage * pages, 0.5);
+    const auto tails0  = random_bf16(rng, static_cast<std::size_t>(kDi) * (kR - 1) * rows, 0.5);
+
+    const auto wq  = random_bf16(rng, kD, 0.3);
+    const auto wk  = random_bf16(rng, kD, 0.3);
+    const auto wiq = random_bf16(rng, kDi, 0.3);
+    const auto wik = random_bf16(rng, kDi, 0.3);
+    const DeviceBuffer dwq = upload(wq), dwk = upload(wk), dwiq = upload(wiq), dwik = upload(wik);
+
+    const std::size_t q_stride  = static_cast<std::size_t>(kD) * heads;
+    const std::size_t kv_stride = static_cast<std::size_t>(kD) * kv_heads;
+    const std::size_t iq_stride = static_cast<std::size_t>(kDi) * kIndexHeads;
+    const auto in_q  = random_bf16(rng, q_stride * columns, 0.7);
+    const auto in_k  = random_bf16(rng, kv_stride * columns, 0.7);
+    const auto in_v  = random_bf16(rng, kv_stride * columns, 0.7);
+    const auto in_iq = random_bf16(rng, iq_stride * columns, 0.7);
+    const auto in_ik = random_bf16(rng, static_cast<std::size_t>(kDi) * columns, 0.7);
+
+    std::vector<ops::SpeculativeTreeRow> tree_rows_host(rows);
+    std::vector<Image> images(rows);
+    std::vector<std::int32_t> pos_h(columns), rows_h(rows), slots_h(rows), rope_h(3ULL * columns),
+        block_rope_h(3ULL * rows);
+    for (int r = 0; r < rows; ++r) {
+        images[r]    = {base_p[r] > 50 ? 20 : 0, 2, 2};
+        rows_h[r]    = r;
+        slots_h[r]   = rows - 1 - r;
+        const bool is_tree = (base_p[r] % kR) != (kR - 2);
+        auto& tr           = tree_rows_host[r];
+        std::memset(&tr, 0, sizeof(tr));
+        std::fill(std::begin(tr.parent), std::end(tr.parent), static_cast<std::int8_t>(-1));
+        std::fill(std::begin(tr.first_child), std::end(tr.first_child), static_cast<std::int8_t>(-1));
+        std::fill(std::begin(tr.next_sibling), std::end(tr.next_sibling), static_cast<std::int8_t>(-1));
+        if (is_tree) {
+            tr.tree       = 1;
+            tr.main_depth = main_depth;
+            tr.nodes      = main_depth + 2;
+            tr.paths      = 2;
+            for (int c = 1; c <= main_depth; ++c) {
+                tr.parent[c]          = static_cast<std::int8_t>(c - 1);
+                tr.depth[c]           = static_cast<std::int8_t>(c);
+                tr.first_child[c - 1] = static_cast<std::int8_t>(c);
+                tr.path_columns[0][c] = static_cast<std::int8_t>(c);
+            }
+            const int side          = main_depth + 1;
+            tr.parent[side]         = 0;
+            tr.depth[side]          = 1;
+            tr.next_sibling[1]      = static_cast<std::int8_t>(side);
+            tr.sibling_index[side]  = 1;
+            tr.path_length[0]       = static_cast<std::int8_t>(main_depth + 1);
+            tr.owned_from[0]        = 0;
+            tr.path_length[1]       = 2;
+            tr.owned_from[1]        = 1;
+            tr.path_columns[1][0]   = 0;
+            tr.path_columns[1][1]   = static_cast<std::int8_t>(side);
+        } else {
+            tr.tree       = 0;
+            tr.main_depth = width - 1;
+            tr.nodes      = width;
+            tr.paths      = 1;
+            for (int c = 1; c < width; ++c) {
+                tr.parent[c]          = static_cast<std::int8_t>(c - 1);
+                tr.depth[c]           = static_cast<std::int8_t>(c);
+                tr.first_child[c - 1] = static_cast<std::int8_t>(c);
+                tr.path_columns[0][c] = static_cast<std::int8_t>(c);
+            }
+            tr.path_length[0] = static_cast<std::int8_t>(width);
+        }
+        const Rope brope = rope_at(base_p[r] / kR * kR, images[r]);
+        for (int a = 0; a < 3; ++a) { block_rope_h[static_cast<std::size_t>(a) * rows + r] = brope[a]; }
+        for (int c = 0; c < width; ++c) {
+            const int col    = r * width + c;
+            pos_h[col]       = base_p[r] + c;
+            const int depth  = c < tr.nodes ? static_cast<int>(tr.depth[c]) : 0;
+            const Rope crope = rope_at(base_p[r] + depth, images[r]);
+            for (int a = 0; a < 3; ++a) { rope_h[static_cast<std::size_t>(a) * columns + col] = crope[a]; }
+        }
+    }
+
+    ops::QsaGeometry geom = g_index_geometry;
+    geom.heads            = heads;
+    geom.kv_heads         = kv_heads;
+    const int max_context = max_p + width + 4;
+    const float scale     = 1.0F / 16.0F;
+
+    const auto make_layer = [&](const DeviceBuffer& dk, const DeviceBuffer& dv, const DeviceBuffer& dks,
+                                const DeviceBuffer& dvs, const DeviceBuffer& dpooled) {
+        ops::QsaKVLayer l;
+        l.kv.storage      = storage;
+        l.kv.head_dim     = kD;
+        l.kv.num_kv_heads = kv_heads;
+        const auto plane  = [&](const DeviceBuffer& b, DType dt, int lead) {
+            return Tensor(b.p, dt, {lead, kPage, kv_heads, pages});
+        };
+        l.kv.k_pages = plane(dk, layout.key.data_dtype, layout.key.data_leading_extent);
+        l.kv.v_pages = plane(dv, layout.value.data_dtype, layout.value.data_leading_extent);
+        if (layout.key.has_scale()) {
+            l.kv.k_scale_pages = plane(dks, layout.key.scale_dtype, layout.key.scale_leading_extent);
+        }
+        if (layout.value.has_scale()) {
+            l.kv.v_scale_pages = plane(dvs, layout.value.scale_dtype, layout.value.scale_leading_extent);
+        }
+        l.pooled_pages = Tensor(dpooled.p, DType::BF16, {kSlotWidth, kPage, 1, pages});
+        return l;
+    };
+    const auto alloc_kv = [&] {
+        DeviceBuffer dk, dv, dks, dvs;
+        if (storage == KvCacheStorage::BFloat16) {
+            dk = upload(k0_16);
+            dv = upload(v0_16);
+        } else {
+            dk  = upload(k0_8);
+            dv  = upload(v0_8);
+            dks = upload(ks0_16);
+            dvs = upload(vs0_16);
+        }
+        return std::tuple{std::move(dk), std::move(dv), std::move(dks), std::move(dvs)};
+    };
+
+    auto [t_dk, t_dv, t_dks, t_dvs] = alloc_kv();
+    DeviceBuffer t_dpooled          = upload(pooled0);
+    DeviceBuffer t_dtails           = upload(tails0);
+    DeviceBuffer dq = upload(in_q), dk = upload(in_k), dv = upload(in_v), diq = upload(in_iq), dik = upload(in_ik);
+    DeviceBuffer dpos = upload(pos_h), drows = upload(rows_h), dslots = upload(slots_h), drope = upload(rope_h),
+                 dbrope = upload(block_rope_h);
+    std::vector<std::int32_t> tree_words(static_cast<std::size_t>(ops::kSpeculativeTreeRowWords) * rows);
+    std::memcpy(tree_words.data(), tree_rows_host.data(), sizeof(ops::SpeculativeTreeRow) * rows);
+    DeviceBuffer dtrees = upload(tree_words);
+    Tensor t_trees(dtrees.p, DType::I32, {ops::kSpeculativeTreeRowWords, rows});
+
+    DeviceBuffer t_qout(dq.bytes), t_iqout(diq.bytes), t_out(dq.bytes);
+    DeviceBuffer ws(ops::qsa_attention_workspace_bytes(geom, columns, max_context, storage));
+    {
+        const ops::QsaPrepareInputs inputs{.q       = Tensor(dq.p, DType::BF16, {kD, heads, columns}),
+                                           .k       = Tensor(dk.p, DType::BF16, {kD, kv_heads, columns}),
+                                           .v       = Tensor(dv.p, DType::BF16, {kD, kv_heads, columns}),
+                                           .index_q = Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}),
+                                           .index_k = Tensor(dik.p, DType::BF16, {kDi, columns})};
+        const ops::QsaPrepareNorms norms{.query       = Tensor(dwq.p, DType::BF16, {kD}),
+                                         .key         = Tensor(dwk.p, DType::BF16, {kD}),
+                                         .index_query = Tensor(dwiq.p, DType::BF16, {kDi}),
+                                         .index_key   = Tensor(dwik.p, DType::BF16, {kDi})};
+        Tensor tails(t_dtails.p, DType::BF16, {kDi, kR - 1, rows});
+        const ops::QsaKVLayer l = make_layer(t_dk, t_dv, t_dks, t_dvs, t_dpooled);
+        const ops::QsaBatch qb{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, rows}),
+                               .table_rows       = Tensor(drows.p, DType::I32, {rows}),
+                               .positions        = Tensor(dpos.p, DType::I32, {columns}),
+                               .tail_slots       = Tensor(dslots.p, DType::I32, {rows}),
+                               .rope_positions   = Tensor(drope.p, DType::I32, {columns, 3}),
+                               .block_start_rope = Tensor(dbrope.p, DType::I32, {rows, 3}),
+                               .batch            = rows,
+                               .width            = width,
+                               .update_tails     = false};
+        Tensor q_out(t_qout.p, DType::BF16, {kD, heads, columns});
+        Tensor iq_out(t_iqout.p, DType::BF16, {kDi, kIndexHeads, columns});
+        Tensor attn_out(t_out.p, DType::BF16, {kD, heads, columns});
+        ops::qsa_prepare(inputs, norms, tails, l, qb, geom, q_out, iq_out, nullptr, &t_trees);
+        ops::qsa_attention(q_out, iq_out, l, qb, geom, scale, max_context, ws.p, ws.bytes, attn_out, nullptr, nullptr,
+                           nullptr, allow_fast, &t_trees);
+        synchronize("tree prepare + attention");
+    }
+    const auto tree_out = download<std::uint16_t>(t_out, q_stride * columns);
+    const auto tree_pooled =
+        download<std::uint16_t>(t_dpooled, static_cast<std::size_t>(kSlotWidth) * kPage * pages);
+
+    // Standalone per-row chain oracles (main chain and side branch) using identical initial states.
+    const auto run_standalone = [&](int r, const std::vector<int>& cols, int w) {
+        auto [s_dk, s_dv, s_dks, s_dvs] = alloc_kv();
+        DeviceBuffer s_dpooled = upload(pooled0), s_dtails = upload(tails0);
+        std::vector<std::uint16_t> rq, rk, rv, riq, rik;
+        std::vector<std::int32_t> spos(w), srope(3ULL * w), srow{r}, sslot{slots_h[r]},
+            sbrope{block_rope_h[r], block_rope_h[rows + r], block_rope_h[2 * rows + r]};
+        for (int j = 0; j < w; ++j) {
+            const int src = r * width + cols[j];
+            spos[j]       = base_p[r] + j;
+            const Rope cr = rope_at(spos[j], images[r]);
+            for (int a = 0; a < 3; ++a) { srope[static_cast<std::size_t>(a) * w + j] = cr[a]; }
+            rq.insert(rq.end(), in_q.begin() + src * q_stride, in_q.begin() + (src + 1) * q_stride);
+            rk.insert(rk.end(), in_k.begin() + src * kv_stride, in_k.begin() + (src + 1) * kv_stride);
+            rv.insert(rv.end(), in_v.begin() + src * kv_stride, in_v.begin() + (src + 1) * kv_stride);
+            riq.insert(riq.end(), in_iq.begin() + src * iq_stride, in_iq.begin() + (src + 1) * iq_stride);
+            rik.insert(rik.end(), in_ik.begin() + src * kDi, in_ik.begin() + (src + 1) * kDi);
+        }
+        DeviceBuffer sdq = upload(rq), sdk = upload(rk), sdv = upload(rv), sdiq = upload(riq), sdik = upload(rik);
+        DeviceBuffer sdpos = upload(spos), sdrow = upload(srow), sdslot = upload(sslot), sdrope = upload(srope),
+                     sdbrope = upload(sbrope), sq_out(sdq.bytes), siq_out(sdiq.bytes), sout(sdq.bytes);
+        const ops::QsaPrepareInputs inputs{.q       = Tensor(sdq.p, DType::BF16, {kD, heads, w}),
+                                           .k       = Tensor(sdk.p, DType::BF16, {kD, kv_heads, w}),
+                                           .v       = Tensor(sdv.p, DType::BF16, {kD, kv_heads, w}),
+                                           .index_q = Tensor(sdiq.p, DType::BF16, {kDi, kIndexHeads, w}),
+                                           .index_k = Tensor(sdik.p, DType::BF16, {kDi, w})};
+        const ops::QsaPrepareNorms norms{.query       = Tensor(dwq.p, DType::BF16, {kD}),
+                                         .key         = Tensor(dwk.p, DType::BF16, {kD}),
+                                         .index_query = Tensor(dwiq.p, DType::BF16, {kDi}),
+                                         .index_key   = Tensor(dwik.p, DType::BF16, {kDi})};
+        Tensor tails(s_dtails.p, DType::BF16, {kDi, kR - 1, rows});
+        const ops::QsaKVLayer l = make_layer(s_dk, s_dv, s_dks, s_dvs, s_dpooled);
+        const ops::QsaBatch qb{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, rows}),
+                               .table_rows       = Tensor(sdrow.p, DType::I32, {1}),
+                               .positions        = Tensor(sdpos.p, DType::I32, {w}),
+                               .tail_slots       = Tensor(sdslot.p, DType::I32, {1}),
+                               .rope_positions   = Tensor(sdrope.p, DType::I32, {w, 3}),
+                               .block_start_rope = Tensor(sdbrope.p, DType::I32, {1, 3}),
+                               .batch            = 1,
+                               .width            = w,
+                               .update_tails     = false};
+        Tensor q_out(sq_out.p, DType::BF16, {kD, heads, w});
+        Tensor iq_out(siq_out.p, DType::BF16, {kDi, kIndexHeads, w});
+        Tensor attn_out(sout.p, DType::BF16, {kD, heads, w});
+        ops::qsa_prepare(inputs, norms, tails, l, qb, geom, q_out, iq_out, nullptr);
+        ops::qsa_attention(q_out, iq_out, l, qb, geom, scale, max_context, ws.p, ws.bytes, attn_out, nullptr, nullptr,
+                           nullptr, allow_fast);
+        synchronize("standalone chain");
+        return std::pair{download<std::uint16_t>(sout, q_stride * w),
+                         download<std::uint16_t>(s_dpooled, static_cast<std::size_t>(kSlotWidth) * kPage * pages)};
+    };
+
+    const auto to_doubles = [&](const std::vector<std::uint16_t>& src, std::size_t off, std::size_t len) {
+        std::vector<double> out(len);
+        for (std::size_t i = 0; i < len; ++i) { out[i] = from_bf16(src[off + i]); }
+        return out;
+    };
+    // Two independently BF16-rounded kernels (attention_kernel at columns > 8 vs sparse_gqa_columns_kernel
+    // at columns <= 4) can differ by 1 BF16 ULP (2^-7 = 7.8125e-3 relative within a binade) while each
+    // satisfies kAttentionCriterion against an unrounded FP64 oracle.
+    constexpr t::ReductionCriterion kTwoBf16AttentionCriterion{
+        /*relative_l2*/ 4.0e-3,
+        /*gross_absolute*/ 1.0e-3,
+        /*gross_relative_to_max_reference*/ 8.0e-3,
+    };
+    const t::ReductionCriterion& cmp_criterion = columns <= 8 ? kAttentionCriterion : kTwoBf16AttentionCriterion;
+    for (int r = 0; r < rows; ++r) {
+        const auto& tr     = tree_rows_host[r];
+        const int main_len = tr.main_depth + 1;
+        std::vector<int> main_cols(main_len);
+        std::iota(main_cols.begin(), main_cols.end(), 0);
+        const auto [main_out, main_pooled] = run_standalone(r, main_cols, main_len);
+        if (expect_exact_bits) {
+            bool main_same = true;
+            for (int c = 0; c < main_len && main_same; ++c) {
+                const std::size_t t0 = static_cast<std::size_t>(r * width + c) * q_stride;
+                const std::size_t m0 = static_cast<std::size_t>(c) * q_stride;
+                for (std::size_t i = 0; i < q_stride; ++i) { main_same &= (tree_out[t0 + i] == main_out[m0 + i]); }
+            }
+            expect(main_same, tag + " row " + std::to_string(r) + " main chain equals standalone chain bit for bit");
+        } else {
+            const std::size_t len = static_cast<std::size_t>(main_len) * q_stride;
+            g_failures += t::verify_reduction(tag + " row " + std::to_string(r) + " main chain",
+                                              to_doubles(tree_out, static_cast<std::size_t>(r * width) * q_stride, len),
+                                              to_doubles(main_out, 0, len), cmp_criterion);
+        }
+
+        // Compare every page owned by row r in pooled pages against standalone main_pooled.
+        bool pooled_same = true;
+        for (int lp = 0; lp < pages_per_row && pooled_same; ++lp) {
+            const int pg = tables[static_cast<std::size_t>(r) * pages_per_row + lp];
+            for (int pos_in_page = 0; pos_in_page < kPage; ++pos_in_page) {
+                const std::size_t base =
+                    (static_cast<std::size_t>(pg) * kPage + pos_in_page) * kSlotWidth;
+                for (int s = 0; s < kSlotWidth; ++s) { pooled_same &= (tree_pooled[base + s] == main_pooled[base + s]); }
+            }
+        }
+        expect(pooled_same, tag + " row " + std::to_string(r) + " pooled keys match main chain bit for bit");
+
+        if (tr.tree != 0) {
+            const int side_col          = tr.main_depth + 1;
+            const auto [side_out, _]    = run_standalone(r, {0, side_col}, 2);
+            const std::size_t t_side0   = static_cast<std::size_t>(r * width + side_col) * q_stride;
+            const std::size_t s_side0   = q_stride;
+            if (expect_exact_bits) {
+                bool side_same = true;
+                for (std::size_t i = 0; i < q_stride; ++i) {
+                    side_same &= (tree_out[t_side0 + i] == side_out[s_side0 + i]);
+                }
+                expect(side_same, tag + " row " + std::to_string(r) + " side branch equals standalone [0, side] bit for bit");
+            } else {
+                g_failures += t::verify_reduction(tag + " row " + std::to_string(r) + " side branch",
+                                                  to_doubles(tree_out, t_side0, q_stride),
+                                                  to_doubles(side_out, s_side0, q_stride), cmp_criterion);
+            }
+        }
+    }
+
+    // Verify qsa_pool_keys(update_tails = true, &t_trees) matches standalone per-row main chains in pooled & tails.
+    DeviceBuffer p_dpooled = upload(pooled0), p_dtails = upload(tails0);
+    {
+        const ops::QsaKVLayer pl = make_layer(t_dk, t_dv, t_dks, t_dvs, p_dpooled);
+        Tensor tails(p_dtails.p, DType::BF16, {kDi, kR - 1, rows});
+        const ops::QsaBatch pqb{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, rows}),
+                                .table_rows       = Tensor(drows.p, DType::I32, {rows}),
+                                .positions        = Tensor(dpos.p, DType::I32, {columns}),
+                                .tail_slots       = Tensor(dslots.p, DType::I32, {rows}),
+                                .rope_positions   = Tensor(drope.p, DType::I32, {columns, 3}),
+                                .block_start_rope = Tensor(dbrope.p, DType::I32, {rows, 3}),
+                                .batch            = rows,
+                                .width            = width,
+                                .update_tails     = true};
+        ops::qsa_pool_keys(Tensor(dik.p, DType::BF16, {kDi, columns}), Tensor(dwik.p, DType::BF16, {kDi}), tails, pl,
+                           pqb, geom, nullptr, &t_trees);
+        synchronize("tree qsa_pool_keys");
+    }
+    const auto got_tails  = download<std::uint16_t>(p_dtails, tails0.size());
+    const auto got_pooled = download<std::uint16_t>(p_dpooled, pooled0.size());
+    for (int r = 0; r < rows; ++r) {
+        const auto& tr     = tree_rows_host[r];
+        const int main_len = tr.main_depth + 1;
+        DeviceBuffer s_dpooled = upload(pooled0), s_dtails = upload(tails0);
+        std::vector<std::uint16_t> rik;
+        std::vector<std::int32_t> spos(main_len), srope(3ULL * main_len), srow{r}, sslot{slots_h[r]},
+            sbrope{block_rope_h[r], block_rope_h[rows + r], block_rope_h[2 * rows + r]};
+        for (int j = 0; j < main_len; ++j) {
+            const int src = r * width + j;
+            spos[j]       = base_p[r] + j;
+            const Rope cr = rope_at(spos[j], images[r]);
+            for (int a = 0; a < 3; ++a) { srope[static_cast<std::size_t>(a) * main_len + j] = cr[a]; }
+            rik.insert(rik.end(), in_ik.begin() + src * kDi, in_ik.begin() + (src + 1) * kDi);
+        }
+        DeviceBuffer sdik = upload(rik), sdpos = upload(spos), sdrow = upload(srow), sdslot = upload(sslot),
+                     sdrope = upload(srope), sdbrope = upload(sbrope);
+        Tensor tails(s_dtails.p, DType::BF16, {kDi, kR - 1, rows});
+        const ops::QsaKVLayer sl = make_layer(t_dk, t_dv, t_dks, t_dvs, s_dpooled);
+        const ops::QsaBatch sqb{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, rows}),
+                                .table_rows       = Tensor(sdrow.p, DType::I32, {1}),
+                                .positions        = Tensor(sdpos.p, DType::I32, {main_len}),
+                                .tail_slots       = Tensor(sdslot.p, DType::I32, {1}),
+                                .rope_positions   = Tensor(sdrope.p, DType::I32, {main_len, 3}),
+                                .block_start_rope = Tensor(sdbrope.p, DType::I32, {1, 3}),
+                                .batch            = 1,
+                                .width            = main_len,
+                                .update_tails     = true};
+        ops::qsa_pool_keys(Tensor(sdik.p, DType::BF16, {kDi, main_len}), Tensor(dwik.p, DType::BF16, {kDi}), tails, sl,
+                           sqb, geom, nullptr);
+        synchronize("standalone qsa_pool_keys");
+        const auto exp_tails  = download<std::uint16_t>(s_dtails, tails0.size());
+        const auto exp_pooled = download<std::uint16_t>(s_dpooled, pooled0.size());
+        const int slot        = slots_h[r];
+        const std::size_t t0  = static_cast<std::size_t>(slot) * (kR - 1) * kDi;
+        bool tails_same       = true;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(kR - 1) * kDi; ++i) {
+            tails_same &= (got_tails[t0 + i] == exp_tails[t0 + i]);
+        }
+        expect(tails_same, tag + " qsa_pool_keys row " + std::to_string(r) + " tails match main chain bit for bit");
+        bool pool_same = true;
+        for (int lp = 0; lp < pages_per_row && pool_same; ++lp) {
+            const int pg = tables[static_cast<std::size_t>(r) * pages_per_row + lp];
+            for (int pos_in_page = 0; pos_in_page < kPage; ++pos_in_page) {
+                const std::size_t base = (static_cast<std::size_t>(pg) * kPage + pos_in_page) * kSlotWidth;
+                for (int s = 0; s < kSlotWidth; ++s) { pool_same &= (got_pooled[base + s] == exp_pooled[base + s]); }
+            }
+        }
+        expect(pool_same, tag + " qsa_pool_keys row " + std::to_string(r) + " pooled match main chain bit for bit");
+    }
+}
+
+void test_tree_attention(KvCacheStorage storage, std::uint32_t seed) {
+    const std::string sname = storage_name(storage);
+    // B=1 (columns=5 <= 8): exercises sparse_gqa_columns_kernel directly.
+    run_tree_case(storage, 24, 2, {100}, 3, 5, seed, "tree dense B1 H24 " + sname, false);
+    run_tree_case(storage, 24, 2, {3000}, 3, 5, seed + 1, "tree sparse B1 H24 " + sname, false);
+    // B=4 (columns=20/24 > 8): exercises attention_kernel across dense, sparse, and padded batches.
+    run_tree_case(storage, 24, 2, {100, 101, 102, 103}, 3, 5, seed + 2, "tree dense H24 " + sname, false);
+    run_tree_case(storage, 24, 2, {100, 101, 102, 103}, 3, 6, seed + 3, "tree dense padded H24 " + sname, false);
+    run_tree_case(storage, 24, 2, {3000, 3001, 3002, 3003}, 3, 5, seed + 4, "tree sparse H24 " + sname, false);
+    // Bit-for-bit invariants on columns <= 8 attention_kernel (kv_heads=2 supported by qsa_prepare, heads=8 != 24).
+    run_tree_case(storage, 8, 2, {101, 102}, 2, 4, seed + 5, "tree dense H8 exact " + sname, true);
+    run_tree_case(storage, 8, 2, {3001, 3003}, 2, 4, seed + 6, "tree sparse H8 side%4==3 exact " + sname, true);
+}
+
 void run_storage_part(KvCacheStorage storage, std::uint32_t prepare_seed) {
     // Decode across the dense/selected boundary (2,051 visible tokens is the last dense one),
     // verification across a page boundary, prefill columns crossing the boundary inside one
@@ -2234,6 +2650,9 @@ void run_storage_part(KvCacheStorage storage, std::uint32_t prepare_seed) {
     test_prompt_variants(storage, 28672, 92);
     expect(ops::qsa_prepare_supports(storage), std::string("qsa_prepare supports ") + storage_name(storage));
     test_prepare(storage, prepare_seed);
+    if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64) {
+        test_tree_attention(storage, prepare_seed + 100U);
+    }
 }
 
 // Vector-quantized storages: the Op's own append; decode, verification and prefill with the

@@ -424,4 +424,54 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
+void speculative_accept_compact_drafts(const Tensor& compact_ids, const Tensor& compact_logits,
+                                       const Tensor& compact_counts, const Tensor& drafts,
+                                       const Tensor& current_extents, Tensor& lengths, Tensor& anchors,
+                                       Tensor& licensed_tokens, Tensor& licensed_counts,
+                                       Tensor& accepted, std::int32_t token_domain,
+                                       const SamplingConfig* configs, cudaStream_t stream,
+                                       const SpeculativeAcceptExecutionEnvelope& execution,
+                                       const Tensor& candidate_ids, const Tensor& proposal_q) {
+    constexpr const char* op = "speculative_accept_compact_drafts";
+    const std::int32_t cap   = compact_ids.ne[0];
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t cols  = k + 1;
+    const std::int32_t batch = drafts.ne[1];
+    if (token_domain <= 0) {
+        throw std::invalid_argument("speculative_accept_compact_drafts: token_domain must be positive");
+    }
+    if (cap < 1 || cap > 64 || k < 1 || k > kSparseMaxDrafts || batch < 1 ||
+        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument(
+            "speculative_accept_compact_drafts: cap must be in [1,64], K in [1,63], B in [1,8]");
+    }
+    require_tensor3(compact_ids, DType::I32, cap, cols, batch, op, "compact_ids");
+    require_tensor3(compact_logits, DType::FP32, cap, cols, batch, op, "compact_logits");
+    require_matrix(compact_counts, DType::I32, cols, batch, op, "compact_counts");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(lengths, DType::I32, batch, op, "lengths");
+    require_vector(anchors, DType::I32, batch, op, "anchors");
+    require_matrix(licensed_tokens, DType::I32, cols, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    const bool sparse = candidate_ids.data != nullptr;
+    if (sparse != (proposal_q.data != nullptr)) {
+        throw std::invalid_argument(
+            "speculative_accept_compact_drafts: candidate_ids and proposal_q must both be given or both empty");
+    }
+    if (sparse) {
+        require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
+        require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
+    }
+    if (configs == nullptr) {
+        throw std::invalid_argument("speculative_accept_compact_drafts: configs must be non-null");
+    }
+    detail::speculative_accept_compact_drafts_launch(
+        compact_ids, compact_logits, compact_counts, drafts, candidate_ids, proposal_q,
+        current_extents, lengths, anchors, licensed_tokens, licensed_counts, accepted,
+        token_domain, configs, execution.all_rows_greedy_without_penalties,
+        execution.block_verification, execution.update_token_counts, stream);
+}
+
 } // namespace infernix::ops
