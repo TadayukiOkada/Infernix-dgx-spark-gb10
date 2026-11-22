@@ -71,7 +71,7 @@ INFERNIX_EXPERTS_ON_GPU=1 \
   --spec mtp --draft-tokens auto \
   --ngram-volume /opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram \
   --ngram-residency volume \
-  --ngram-cache-mib 16384 \
+  --ngram-cache-mib 2048 \
   --kv-dtype int8 \
   --ngram-draft-tokens 31 \
   --ngram-min-match 8 \
