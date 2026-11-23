@@ -151,15 +151,15 @@ Model loading takes **8s**; full engine startup and graph initialization takes *
 
 \* `c = 1` prefill column is an estimator output, not wall-clock throughput — only `TTFT`-derived rates are meaningful at `c = 1`.
 
-### `tool-eval-bench` Results (`HC4-W4Dense`, `tool-eval-bench v3.0.1.dev15+gea2a77499`)
+### `tool-eval-bench` Results (`HC4-W4Dense`, `tool-eval-bench v3.0.1.dev10+g1cd7309e5`)
 
 | Metric | Value |
 |---|---|
-| **Score** | **96 / 100** (`133 / 138` points, ★★★★★ Excellent) |
-| **Scenarios** | **65 passed**, **3 partial**, **1 failed** |
-| **Quality** | **96 / 100** |
-| **Responsiveness** | **60 / 100** (median turn: **2.3s**) |
-| **Deployability** | **85 / 100** (`α = 0.7`) |
+| **Score** | **99 / 100** (`136 / 138` points, ★★★★★ Excellent) |
+| **Scenarios** | **68 passed**, **0 partial**, **1 failed** |
+| **Quality** | **99 / 100** |
+| **Responsiveness** | **67 / 100** (median turn: **1.9s**) |
+| **Deployability** | **89 / 100** (`α = 0.7`) |
 
 ---
 

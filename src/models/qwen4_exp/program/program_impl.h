@@ -5819,7 +5819,8 @@ private:
             c_logits = Tensor(compact_logits_.p, DType::FP32, {kCompactCap, W, batch});
             c_counts = Tensor(compact_counts_.p, DType::I32, {W, batch});
         }
-        auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
+        auto* configs        = static_cast<ops::SamplingConfig*>(host_configs_.data());
+        bool any_branch_gate = false;
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]      = lanes_[lanes[b]].sampling;
             configs[b].mask = grammar_mask(static_cast<std::size_t>(b), drafts_[b]);
@@ -5827,11 +5828,28 @@ private:
                 const auto ft                    = grammar_->forbidden_token(static_cast<std::size_t>(b));
                 configs[b].forbidden_token       = ft.token;
                 configs[b].forbidden_until_token = ft.until_token;
+                const std::int32_t branch_tool   = grammar_->branch_tool_token(static_cast<std::size_t>(b));
+                configs[b].branch_tool_token     = branch_tool;
+                configs[b].branch_mask_words     = branch_tool >= 0 ? const_cast<std::uint32_t*>(configs[b].mask.words) : nullptr;
+                any_branch_gate = any_branch_gate || branch_tool >= 0;
             }
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         Tensor drafts(spec_device(spec_layout_.drafts), DType::I32, {K, batch});
         Tensor extents(spec_device(spec_layout_.extents), DType::I32, {batch});
+        if (any_branch_gate) {
+            if (tree_round) {
+                Tensor tree_rows_dev(spec_device(spec_layout_.tree_rows), DType::I32,
+                                     {ops::kSpeculativeTreeRowWords, batch});
+                ops::filter_combined_branch_masks(logits.view({vocab_, W, batch}), token_domain_,
+                                                  static_cast<const ops::SamplingConfig*>(configs_.p), s,
+                                                  drafts, extents, tree_rows_dev);
+            } else {
+                ops::filter_combined_branch_masks(logits.view({vocab_, W, batch}), token_domain_,
+                                                  static_cast<const ops::SamplingConfig*>(configs_.p), s,
+                                                  drafts, extents);
+            }
+        }
         Tensor lengths(spec_device(spec_layout_.lengths), DType::I32, {batch});
         Tensor anchors(spec_device(spec_layout_.anchors), DType::I32, {batch});
         Tensor licensed(spec_device(spec_layout_.licensed), DType::I32, {W, batch});
@@ -7006,8 +7024,9 @@ private:
         // The sampler reads the FP32 logits, or BF16 (design §16.5); a constraint masks them in place (the prompt
         // readout has read them first).
         Tensor logits = read_logits(batch);
-        auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
+        auto* configs          = static_cast<ops::SamplingConfig*>(host_configs_.data());
         auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
+        bool any_branch_gate   = false;
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]          = lanes_[lanes[b]].sampling;
             configs[b].mask     = grammar_mask(static_cast<std::size_t>(b), {});
@@ -7015,6 +7034,10 @@ private:
                 const auto ft                    = grammar_->forbidden_token(static_cast<std::size_t>(b));
                 configs[b].forbidden_token       = ft.token;
                 configs[b].forbidden_until_token = ft.until_token;
+                const std::int32_t branch_tool   = grammar_->branch_tool_token(static_cast<std::size_t>(b));
+                configs[b].branch_tool_token     = branch_tool;
+                configs[b].branch_mask_words     = branch_tool >= 0 ? const_cast<std::uint32_t*>(configs[b].mask.words) : nullptr;
+                any_branch_gate = any_branch_gate || branch_tool >= 0;
             }
             sample_positions[b] = positions[b];
         }
@@ -7022,6 +7045,10 @@ private:
         upload_pinned(sample_pos_.p, sample_positions, 4ULL * batch, s);
         const bool constrained = stage_constraints(lanes, 1);
         if (constrained) { constrain(logits, nullptr); }
+        if (any_branch_gate) {
+            ops::filter_combined_branch_masks(logits, token_domain_,
+                                              static_cast<const ops::SamplingConfig*>(configs_.p), s);
+        }
         Tensor out(sampled_.p, DType::I32, {batch});
         Tensor logical(sample_pos_.p, DType::I32, {batch});
         if (compact && !constrained) {
