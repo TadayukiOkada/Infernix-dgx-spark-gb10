@@ -1261,8 +1261,9 @@ __device__ __forceinline__ uint4 pack_bf16x8(const float (&v)[8]) {
 
 template <int TCap>
 struct DownMmaShared {
-    static constexpr int kNT = TCap / 8;
-    alignas(16) bf16 rn[kDownMmaGroups][TCap][64];
+    static constexpr int kNT      = TCap / 8;
+    static constexpr int kRnSlots = TCap == 8 ? kDownMmaGroups : 4;
+    alignas(16) bf16 rn[kRnSlots][TCap][64];
     union {
         struct {
             alignas(16) std::uint8_t codes[2][kDownMmaRows][4][32];
@@ -1275,17 +1276,17 @@ struct DownMmaShared {
     alignas(16) float inv[TCap];
 };
 
-// K1a (HMMA.16816 + Cluster DSMEM): stages BF16 Rn once into swizzled SMEM, multiplies against
-// Q4_G64_FP16 down weights via mma_bf16 across 4 K-warps (scaling FP32 per 64-K group), reduces
-// across the 4 streams in DSMEM on cluster rank 0, and writes BF16 m = SiLU(z / 4) and FP32 inject.
+// K1a (HMMA.16816 + Cluster DSMEM): TCap == 8 stages full BF16 Rn once into swizzled SMEM (2 CTAs/SM),
+// while TCap == 16/32 tile Rn 4 K-groups at a time to fit <= 28 KB SMEM (single wave, single pass up to T=32).
 template <class Norm, bool Pending, int TCap>
-__global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_partials_q4_mma_kernel(
+__global__ __launch_bounds__(kDownMmaThreads, 2) void hc_down_partials_q4_mma_kernel(
     const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, Q4Codec::Params down, int rows, int rank,
     int columns, float eps, bf16* __restrict__ m_out, float* __restrict__ inject, float* __restrict__ inv_out,
     const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
-    static_assert(TCap == 8 || TCap == 16);
+    static_assert(TCap == 8 || TCap == 16 || TCap == 32);
     static_assert(kDownMmaGroups * 64 == kHidden && kDownMmaTiles * 4 == kDownMmaGroups);
     constexpr int kNT        = TCap / 8;
+    constexpr bool kFullRn   = (TCap == 8);
     constexpr int kNormOwned = 3; // (2560 / 8) = 320 chunks covered by 128 * 3 = 384 threads
     constexpr int width      = kStreams * kHidden;
 
@@ -1331,32 +1332,34 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
         }
     };
 
-    // 1. Weights & norm bias first, before blocking on producer dependency.
     stage_weights(0, 0);
     cp_commit();
     const Norm* w_ptr       = norm_weight + static_cast<std::int64_t>(s) * kHidden;
     const bool aligned_norm = (reinterpret_cast<std::uintptr_t>(w_ptr) & 15U) == 0U;
-    float w_bias[kNormOwned][8];
-    if (aligned_norm) {
+    float w_bias_full[kFullRn ? kNormOwned : 1][8];
+    if constexpr (kFullRn) {
+        if (aligned_norm) {
 #pragma unroll
-        for (int h = 0; h < kNormOwned; ++h) {
-            const int i            = (tid + kDownMmaThreads * h) * 8;
-            const NormGroup<Norm> ng = i < kHidden ? NormGroup<Norm>::load(w_ptr + i) : NormGroup<Norm>::zero();
-            ng.floats(w_bias[h]);
+            for (int h = 0; h < kNormOwned; ++h) {
+                const int i              = (tid + kDownMmaThreads * h) * 8;
+                const NormGroup<Norm> ng = i < kHidden ? NormGroup<Norm>::load(w_ptr + i) : NormGroup<Norm>::zero();
+                ng.floats(w_bias_full[h]);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { w_bias[h][j] = 1.0F + w_bias[h][j]; }
-        }
-    } else {
+                for (int j = 0; j < 8; ++j) { w_bias_full[h][j] = 1.0F + w_bias_full[h][j]; }
+            }
+        } else {
 #pragma unroll
-        for (int h = 0; h < kNormOwned; ++h) {
-            const int i = (tid + kDownMmaThreads * h) * 8;
+            for (int h = 0; h < kNormOwned; ++h) {
+                const int i = (tid + kDownMmaThreads * h) * 8;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { w_bias[h][j] = i < kHidden ? (1.0F + norm_value(w_ptr[i + j])) : 1.0F; }
+                for (int j = 0; j < 8; ++j) {
+                    w_bias_full[h][j] = i < kHidden ? (1.0F + norm_value(w_ptr[i + j])) : 1.0F;
+                }
+            }
         }
     }
     pdl::wait_for_dependencies();
 
-    // 2. Stage raw BF16 residual (or injected residual) into swizzled SMEM while computing sum_sq.
 #pragma unroll 1
     for (int c = 0; c < columns; ++c) {
         const bf16* r  = residual + static_cast<std::int64_t>(c) * width + static_cast<std::int64_t>(s) * kHidden;
@@ -1372,9 +1375,11 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
                     const uint4 yv = load_ldg<uint4>(pending_y + static_cast<std::int64_t>(c) * kHidden + i);
                     val            = injected8(val, yv, inject_c);
                 }
-                const int grp = i >> 6;
-                const int off = i & 63;
-                store_vec(&shared->rn[grp][c][hc_mma_swizzle64(c, off)], val);
+                if constexpr (kFullRn) {
+                    const int grp = i >> 6;
+                    const int off = i & 63;
+                    store_vec(&shared->rn[grp][c][hc_mma_swizzle64(c, off)], val);
+                }
                 float vf[8];
                 bf16x8_bits_to_floats(val, vf);
 #pragma unroll
@@ -1393,35 +1398,35 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
         if (blockIdx.x == 0) { inv_out[static_cast<std::int64_t>(s) * columns + tid] = iv; }
     }
     __syncthreads();
-
-    // Rescale Rn -> BF16 in-place and zero unused token columns [columns .. TCap - 1].
+    if constexpr (kFullRn) {
 #pragma unroll 1
-    for (int c = 0; c < TCap; ++c) {
-        if (c < columns) {
-            const float ic = shared->inv[c];
+        for (int c = 0; c < TCap; ++c) {
+            if (c < columns) {
+                const float ic = shared->inv[c];
 #pragma unroll
-            for (int h = 0; h < kNormOwned; ++h) {
-                const int i = (tid + kDownMmaThreads * h) * 8;
-                if (i < kHidden) {
-                    const int grp   = i >> 6;
-                    const int off   = i & 63;
-                    bf16* ptr       = &shared->rn[grp][c][hc_mma_swizzle64(c, off)];
-                    const uint4 val = load_vec<uint4>(ptr);
-                    float vf[8];
-                    bf16x8_bits_to_floats(val, vf);
+                for (int h = 0; h < kNormOwned; ++h) {
+                    const int i = (tid + kDownMmaThreads * h) * 8;
+                    if (i < kHidden) {
+                        const int grp   = i >> 6;
+                        const int off   = i & 63;
+                        bf16* ptr       = &shared->rn[grp][c][hc_mma_swizzle64(c, off)];
+                        const uint4 val = load_vec<uint4>(ptr);
+                        float vf[8];
+                        bf16x8_bits_to_floats(val, vf);
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) { vf[j] = vf[j] * ic * w_bias[h][j]; }
-                    store_vec(ptr, pack_bf16x8(vf));
+                        for (int j = 0; j < 8; ++j) { vf[j] = vf[j] * ic * w_bias_full[h][j]; }
+                        store_vec(ptr, pack_bf16x8(vf));
+                    }
                 }
-            }
-        } else {
+            } else {
 #pragma unroll
-            for (int h = 0; h < kNormOwned; ++h) {
-                const int i = (tid + kDownMmaThreads * h) * 8;
-                if (i < kHidden) {
-                    const int grp = i >> 6;
-                    const int off = i & 63;
-                    store_vec(&shared->rn[grp][c][hc_mma_swizzle64(c, off)], make_uint4(0U, 0U, 0U, 0U));
+                for (int h = 0; h < kNormOwned; ++h) {
+                    const int i = (tid + kDownMmaThreads * h) * 8;
+                    if (i < kHidden) {
+                        const int grp = i >> 6;
+                        const int off = i & 63;
+                        store_vec(&shared->rn[grp][c][hc_mma_swizzle64(c, off)], make_uint4(0U, 0U, 0U, 0U));
+                    }
                 }
             }
         }
@@ -1429,15 +1434,49 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
     stage_weights(1, 1);
     cp_commit();
 
-    // 3. Double-buffered K-loop over all 40 groups of 64 (10 tiles x 4 K-warps).
+    const int grp_local = lane >> 3;
+    const int lane_off  = (lane & 7) * 8;
     float acc[kNT][4];
 #pragma unroll
     for (int ni = 0; ni < kNT; ++ni) { acc[ni][0] = acc[ni][1] = acc[ni][2] = acc[ni][3] = 0.0F; }
     for (int tile = 0; tile < kDownMmaTiles; ++tile) {
+        if constexpr (!kFullRn) {
+            const int tile_off = tile * 256 + lane * 8;
+            float w_bias[8];
+            if (aligned_norm) {
+                const NormGroup<Norm> ng = NormGroup<Norm>::load(w_ptr + tile_off);
+                ng.floats(w_bias);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { w_bias[j] = 1.0F + w_bias[j]; }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { w_bias[j] = 1.0F + norm_value(w_ptr[tile_off + j]); }
+            }
+#pragma unroll 1
+            for (int c = warp; c < TCap; c += 4) {
+                if (c < columns) {
+                    const float ic = shared->inv[c];
+                    uint4 val = load_ldg<uint4>(
+                        residual + static_cast<std::int64_t>(c) * width + static_cast<std::int64_t>(s) * kHidden + tile_off);
+                    if constexpr (Pending) {
+                        const float inject_c = pending_inject[static_cast<std::int64_t>(c) * kStreams + s];
+                        const uint4 yv       = load_ldg<uint4>(pending_y + static_cast<std::int64_t>(c) * kHidden + tile_off);
+                        val                  = injected8(val, yv, inject_c);
+                    }
+                    float vf[8];
+                    bf16x8_bits_to_floats(val, vf);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { vf[j] = vf[j] * ic * w_bias[j]; }
+                    store_vec(&shared->rn[grp_local][c][hc_mma_swizzle64(c, lane_off)], pack_bf16x8(vf));
+                } else {
+                    store_vec(&shared->rn[grp_local][c][hc_mma_swizzle64(c, lane_off)], make_uint4(0U, 0U, 0U, 0U));
+                }
+            }
+        }
         const int slot = tile & 1;
         cp_wait<1>();
         __syncthreads();
-        const int group           = tile * 4 + warp;
+        const int rn_group        = kFullRn ? (tile * 4 + warp) : warp;
         float group_acc[kNT][4]   = {};
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
@@ -1452,7 +1491,7 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
             for (int ni = 0; ni < kNT; ++ni) {
                 const int br = ni * 8 + (lane & 7);
                 unsigned b0, b1;
-                ldmatrix_x2(b0, b1, smem_addr(&shared->rn[group][br][hc_mma_swizzle64(br, bk)]));
+                ldmatrix_x2(b0, b1, smem_addr(&shared->rn[rn_group][br][hc_mma_swizzle64(br, bk)]));
                 mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3], a0, a1, a2, a3, b0,
                          b1);
             }
@@ -1466,11 +1505,15 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
             acc[ni][2] = fmaf(group_acc[ni][2], bot, acc[ni][2]);
             acc[ni][3] = fmaf(group_acc[ni][3], bot, acc[ni][3]);
         }
-        if (tile + 2 < kDownMmaTiles) {
-            __syncthreads();
-            stage_weights(slot, tile + 2);
+        if constexpr (kFullRn) {
+            if (tile + 2 < kDownMmaTiles) {
+                __syncthreads();
+                stage_weights(slot, tile + 2);
+            }
             cp_commit();
         } else {
+            if (tile + 1 < kDownMmaTiles) { __syncthreads(); }
+            if (tile + 2 < kDownMmaTiles) { stage_weights(slot, tile + 2); }
             cp_commit();
         }
     }
@@ -1535,11 +1578,11 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
 // K1b (HMMA.16816): each of 160 CTAs covers 16 features x 4 streams (1 stream per warp), reads
 // W_up Q4 weights once into SMEM, computes u = W_up m_bf16 via mma_bf16, and collapses residual.
 template <class Norm, bool Pending, int TCap>
-__global__ __launch_bounds__(kUpMmaThreads, 4) void hc_up_collapse_q4_mma_kernel(
+__global__ __launch_bounds__(kUpMmaThreads, TCap <= 16 ? 4 : 3) void hc_up_collapse_q4_mma_kernel(
     const bf16* __restrict__ m_in, const float* __restrict__ inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, Q4Codec::Params up, int rank, int columns, bf16* __restrict__ x,
     const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
-    static_assert(TCap == 8 || TCap == 16);
+    static_assert(TCap == 8 || TCap == 16 || TCap == 32);
     static_assert(kUpMmaMaxGroups == kMaxRank / 64);
     constexpr int kNT   = TCap / 8;
     constexpr int width = kStreams * kHidden;
@@ -1765,8 +1808,8 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
             auto* x_base             = static_cast<bf16*>(x.data);
             float* inject_base       = inject != nullptr ? static_cast<float*>(inject->data) : nullptr;
             std::byte* scratch_cursor = static_cast<std::byte*>(partials);
-            for (int col0 = 0; col0 < columns; col0 += 16) {
-                const int slice_cols = std::min(16, columns - col0);
+            for (int col0 = 0; col0 < columns; col0 += 32) {
+                const int slice_cols = std::min(32, columns - col0);
                 const auto* res_ptr  = res_base + static_cast<std::int64_t>(col0) * streams * kHidden;
                 auto* x_ptr          = x_base + static_cast<std::int64_t>(col0) * kHidden;
                 float* inject_ptr    = inject_base != nullptr ? inject_base + static_cast<std::int64_t>(col0) * streams : nullptr;
@@ -1777,8 +1820,12 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
                     launch_q4_mma_slice<Norm, Fold, 8>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
                                                        slice_cols, x_ptr, inject_ptr, scratch_cursor, py_ptr, pi_ptr,
                                                        stream);
-                } else {
+                } else if (slice_cols <= 16) {
                     launch_q4_mma_slice<Norm, Fold, 16>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
+                                                        slice_cols, x_ptr, inject_ptr, scratch_cursor, py_ptr, pi_ptr,
+                                                        stream);
+                } else {
+                    launch_q4_mma_slice<Norm, Fold, 32>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
                                                         slice_cols, x_ptr, inject_ptr, scratch_cursor, py_ptr, pi_ptr,
                                                         stream);
                 }

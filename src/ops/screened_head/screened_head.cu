@@ -98,6 +98,7 @@ constexpr int screen_shared_bytes() {
 static_assert(screen_shared_bytes<1, true>() * 2 <= 102400, "two narrow-ring screen CTAs fit one SM's budget");
 static_assert(screen_shared_bytes<1, false>() <= 101376, "the deep-ring screen CTA fits one SM's opt-in");
 static_assert(screen_shared_bytes<2, false>() <= 101376, "the screen kernel's ring and columns fit one CTA");
+static_assert(screen_shared_bytes<3, true>() <= 101376, "the 24-column narrow-ring screen CTA fits one SM's opt-in");
 
 struct ScreenParams {
     const bf16* x;              // [K, T]
@@ -1028,15 +1029,20 @@ int run_screen(const ScreenParams& p, cudaStream_t stream) {
         launch_screen<1, false, Logits, Softmax>(p, grid, stream);
         return grid;
     }
-    const int grid = screen_grid<2, false>(items);
-    for (int col = 0; col < p.columns; col += 16) {
+    if (p.columns <= 16) {
+        const int grid = screen_grid<2, false>(items);
+        launch_screen<2, false, Logits, Softmax>(p, grid, stream);
+        return grid;
+    }
+    const int grid = screen_grid<3, true>(items);
+    for (int col = 0; col < p.columns; col += 24) {
         ScreenParams chunk = p;
         chunk.x            = p.x + static_cast<std::size_t>(col) * kHidden;
-        chunk.columns      = std::min(16, p.columns - col);
+        chunk.columns      = std::min(24, p.columns - col);
         chunk.logits       = p.logits != nullptr ? p.logits + static_cast<std::size_t>(col) * p.rows : nullptr;
         chunk.lists        = p.lists + static_cast<std::size_t>(col) * grid * kListLength;
         chunk.partials     = p.partials != nullptr ? p.partials + static_cast<std::size_t>(col) * grid : nullptr;
-        launch_screen<2, false, Logits, Softmax>(chunk, grid, stream);
+        launch_screen<3, true, Logits, Softmax>(chunk, grid, stream);
     }
     return grid;
 }
@@ -1107,6 +1113,7 @@ int screened_head_screen_grid(std::int32_t head_rows, std::int32_t columns) {
         throw std::invalid_argument("screened_head screen grid: invalid rows or column count");
     }
     const int items = head_rows / kItemRows;
+    if (columns > 16) { return screen_grid<3, true>(items); }
     if (columns > 8) { return screen_grid<2, false>(items); }
     return narrow_ring_device() ? screen_grid<1, true>(items) : screen_grid<1, false>(items);
 }

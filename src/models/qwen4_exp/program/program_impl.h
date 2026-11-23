@@ -6537,7 +6537,7 @@ private:
         std::int32_t best         = 0;
         double best_score         = static_cast<double>(batch);
         double tokens             = static_cast<double>(batch);
-        const bool fixed_override = replay_clock_ || kHasMultiRowWidthCostOverride;
+        const bool fixed_override = replay_clock_ || kHasMultiRowWidthCostOverride || options_.device_experts;
         const double tile_cost    = std::min(kMultiRowWidthCost, 0.10);
         const auto [dense_equiv, step_cost] = learned_round_costs();
         const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
@@ -6578,7 +6578,7 @@ private:
                                          std::int32_t batch, bool is_dflash2, bool step_sunk) const noexcept {
         const bool batch_override = !is_dflash2 && ((batch == 1 && kHasWidthCostOverride) ||
                                                     (batch == 2 && kHasPairWidthCostOverride) ||
-                                                    (batch >= 3 && kHasMultiRowWidthCostOverride));
+                                                    (batch >= 3 && (kHasMultiRowWidthCostOverride || options_.device_experts)));
         if (replay_clock_ || kHasNgramWidthCostOverride || batch_override) {
             const double chain_cost =
                 is_dflash2 ? kWidthCost
@@ -7946,7 +7946,7 @@ private:
     // pair width, INFERNIX_PAIR_DRAFT_COST below for one verified column of the round), each fitted
     // on this device; the draft cost replaced the 0.47 the 5090's cost model paid.
     static inline const double kPairWidthCost        = policy_double("INFERNIX_PAIR_WIDTH_COST", 0.16);
-    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.12);
+    static inline const double kMultiRowWidthCost    = policy_double("INFERNIX_MULTIROW_WIDTH_COST", 0.05);
     static inline const double kDFlashPairDraftCost =
         policy_double("INFERNIX_PAIR_DRAFT_COST", 0.12);
     static inline const double kDFlashPairProposalCost =
