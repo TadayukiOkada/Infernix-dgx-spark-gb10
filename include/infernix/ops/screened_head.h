@@ -30,8 +30,8 @@ struct ScreenedHeadPolicy {
     std::int32_t rescored  = 64; // a multiple of 32 in [32, 256]
 };
 
-// Columns a screened head serves in one call (1..32).
-inline constexpr std::int32_t kScreenedHeadMaxColumns = 32;
+// Columns a screened head serves in one call (1..64).
+inline constexpr std::int32_t kScreenedHeadMaxColumns = 64;
 // The ranks screened_head_top returns per column (1..16).
 inline constexpr std::int32_t kScreenedHeadMaxRanks = 16;
 
@@ -110,7 +110,7 @@ void screened_head_top(const Tensor& x, const Weight& head, const Weight& screen
  *     logits[r,t] = e[r,t] for r in P_t, s[r,t] otherwise.
  *
  * Logical shapes:
- *   x BF16 [K, T] with K = 2560 and T in [1, 32]; head [R, K] and screen [R, K] with R a positive
+ *   x BF16 [K, T] with K = 2560 and T in [1, 64]; head [R, K] and screen [R, K] with R a positive
  *   multiple of 16; logits FP32 [R, T]; 1 <= valid_rows <= R.
  *
  * Supported domain:

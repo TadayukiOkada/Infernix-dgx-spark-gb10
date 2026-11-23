@@ -627,6 +627,13 @@ void logits_case(LogitsHead& head, std::uint64_t seed) {
         }
         std::cout << head.label << ": wide argmax differs in " << wide_differs << " of 56 columns\n";
         check(wide_differs <= 2, head.label + ": wide screened argmax matches the full head on structured columns");
+        {
+            const auto cols48 = make_columns(head.values, head.rows, 48, seed + 23, false);
+            int differs48     = 0;
+            check_logits_call(head, cols48, 48, policy, work, head.label + " wide T=48", {0, 16, 32, 47},
+                              differs48);
+            check(differs48 <= 2, head.label + ": T=48 screened argmax matches the full head on structured columns");
+        }
         DeviceArray<std::uint16_t> dx32(wide_cols);
         const Tensor x32(dx32.p, DType::BF16, {K, 32});
         const Tensor x1_col16(dx32.p + static_cast<std::size_t>(16) * K, DType::BF16, {K, 1});
@@ -694,8 +701,8 @@ void compact_case(const LogitsHead& head, std::uint64_t seed) {
         infernix::ops::screened_head_workspace_bytes(head.rows, infernix::ops::kScreenedHeadMaxColumns);
     WorkspaceArena work(bytes);
     const infernix::ops::ScreenedHeadPolicy policy{};
-    const auto columns = make_columns(head.values, head.rows, 24, seed, false);
-    for (const std::int32_t T : {1, 2, 4, 8, 12, 16, 24}) {
+    const auto columns = make_columns(head.values, head.rows, 40, seed, false);
+    for (const std::int32_t T : {1, 2, 4, 8, 12, 16, 24, 40}) {
         DeviceArray<std::uint16_t> dx(
             std::vector<std::uint16_t>(columns.begin(), columns.begin() + static_cast<std::ptrdiff_t>(K) * T));
         const Tensor x(dx.p, DType::BF16, {K, T});

@@ -876,7 +876,7 @@ void validate_policy(const ScreenedHeadPolicy& policy) {
 void validate_x(const Tensor& x) {
     require(x.data != nullptr && x.dtype == DType::BF16 && x.is_contiguous() && x.ne[0] == kHidden && x.ne[2] == 1 &&
                 x.ne[3] == 1 && x.ne[1] >= 1 && x.ne[1] <= kScreenedHeadMaxColumns && aligned16(x.data),
-            "x must be contiguous, aligned BF16 [2560, T] with T in [1, 32]");
+            "x must be contiguous, aligned BF16 [2560, T] with T in [1, 64]");
 }
 
 void validate_screen(const Weight& screen) {
@@ -1029,20 +1029,15 @@ int run_screen(const ScreenParams& p, cudaStream_t stream) {
         return grid;
     }
     const int grid = screen_grid<2, false>(items);
-    if (p.columns <= 16) {
-        launch_screen<2, false, Logits, Softmax>(p, grid, stream);
-        return grid;
+    for (int col = 0; col < p.columns; col += 16) {
+        ScreenParams chunk = p;
+        chunk.x            = p.x + static_cast<std::size_t>(col) * kHidden;
+        chunk.columns      = std::min(16, p.columns - col);
+        chunk.logits       = p.logits != nullptr ? p.logits + static_cast<std::size_t>(col) * p.rows : nullptr;
+        chunk.lists        = p.lists + static_cast<std::size_t>(col) * grid * kListLength;
+        chunk.partials     = p.partials != nullptr ? p.partials + static_cast<std::size_t>(col) * grid : nullptr;
+        launch_screen<2, false, Logits, Softmax>(chunk, grid, stream);
     }
-    ScreenParams p0 = p;
-    p0.columns      = 16;
-    launch_screen<2, false, Logits, Softmax>(p0, grid, stream);
-    ScreenParams p1 = p;
-    p1.x            = p.x + static_cast<std::size_t>(16) * kHidden;
-    p1.columns      = p.columns - 16;
-    p1.logits       = p.logits != nullptr ? p.logits + static_cast<std::size_t>(16) * p.rows : nullptr;
-    p1.lists        = p.lists + static_cast<std::size_t>(16) * grid * kListLength;
-    p1.partials     = p.partials != nullptr ? p.partials + static_cast<std::size_t>(16) * grid : nullptr;
-    launch_screen<2, false, Logits, Softmax>(p1, grid, stream);
     return grid;
 }
 

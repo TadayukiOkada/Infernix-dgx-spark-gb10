@@ -147,7 +147,7 @@ void ProgramImpl::capture_graph_set() {
                 if (screened_head_ && batch * W <= ops::kScreenedHeadMaxColumns) {
                     take(verify_graph(batch, W, true), [&] { verify_graph_body(batch, W, true); });
                 }
-                if (options_.univer_trees && batch == 1 && W >= 3 && W <= ops::kSpeculativeTreeMaxNodes) {
+                if (options_.univer_trees && batch <= 2 && W >= 3 && W <= ops::kSpeculativeTreeMaxNodes) {
                     take(verify_graph(batch, W, false, true), [&] { verify_graph_body(batch, W, false, true); });
                     if (screened_head_ && batch * W <= ops::kScreenedHeadMaxColumns) {
                         take(verify_graph(batch, W, true, true), [&] { verify_graph_body(batch, W, true, true); });

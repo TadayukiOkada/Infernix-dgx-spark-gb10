@@ -845,7 +845,8 @@ public:
             for (std::int32_t tw = 3; tw <= max_tree_w; ++tw) {
                 if (tw == bucket_verify_width(tw, static_cast<std::int32_t>(W))) { ++tree_w; }
             }
-            b.graph_bound += tree_w * (o.screened_lm_head ? 2U : 1U);
+            b.graph_bound += std::min<std::uint32_t>(static_cast<std::uint32_t>(o.max_concurrency), 2U) * tree_w *
+                             (o.screened_lm_head ? 2U : 1U);
         }
         // A commit graph per batch size and bucketed width of the speculative rounds (commit_verified).
         if (W > 1) { b.graph_bound += o.max_concurrency * bucketed_w; }
@@ -5615,7 +5616,7 @@ private:
                 static_cast<std::int32_t>(lane.prefix.page_base + lane.pages.size()) * kPagedKVPageSize;
             const std::int32_t lane_limit =
                 std::min({model_limit, static_cast<std::int32_t>(lane.extent), allocated_kv});
-            if (positions[b] + candidate_W > lane_limit) { return width; }
+            if (positions[b] + candidate_W > lane_limit) { return floor_verify_width(width, max_width_); }
         }
         return candidate_W;
     }
@@ -5642,7 +5643,7 @@ private:
         }
         const std::int32_t model_limit =
             std::min(dim(c_.context_ceiling()), static_cast<std::int32_t>(options_.max_context));
-        if (options_.univer_trees && batch == 1 && !c_.lossless && sampled_preview && !any_constrained) {
+        if (options_.univer_trees && batch <= 2 && !c_.lossless && sampled_preview && !any_constrained) {
             constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
             for (std::int32_t b = 0; b < batch; ++b) {
                 const Lane& lane = lanes_[lanes[b]];
@@ -5683,6 +5684,19 @@ private:
             }
         }
         const std::int32_t W = verify_target_width(lanes, positions, width);
+        if (W < width) {
+            for (std::int32_t b = 0; b < batch; ++b) {
+                if (static_cast<std::int32_t>(drafts_[b].size()) > W - 1) {
+                    drafts_[b].resize(static_cast<std::size_t>(W - 1));
+                    if (stitched_ngram_[b]) {
+                        neural_draft_count_[b] = std::min<std::int32_t>(neural_draft_count_[b], W - 1);
+                        if (drafts_[b].size() <= static_cast<std::size_t>(neural_draft_count_[b])) {
+                            stitched_ngram_[b] = false;
+                        }
+                    }
+                }
+            }
+        }
         if (W < 3 || W > ops::kSpeculativeTreeMaxNodes) {
             row_is_tree_.fill(false);
         } else {

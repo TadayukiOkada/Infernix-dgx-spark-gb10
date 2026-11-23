@@ -17,16 +17,15 @@ namespace infernix::ops::detail {
 // infernix_hyper_connection_bench, interleaved against the composed route at every width): the fused
 // SIMT mix wins while its per-column dot-product loop amortizes under the MMA linear - for Q8
 // weights to 4 columns, for BF16 weights to 4. For Q4_G64_FP16 weights, T = 1..4 uses the FP32
-// SIMT fused route, while T = 5..16 (with rank % 64 == 0) uses the fused HMMA.16816 (mma_bf16) +
-// cluster DSMEM route (BF16 Rn and m, FP32 z and u) so B=4 verify widths avoid falling back to the
-// multi-launch composed Q4 route.
-inline constexpr std::int32_t kHcMixFusedMaxColumnsQ4   = 16;
+// SIMT fused route, while T = 5..16 uses one HMMA.16816 + cluster DSMEM pass and T = 17..32
+// slices into <=16-col passes.
+inline constexpr std::int32_t kHcMixFusedMaxColumnsQ4   = 32;
 inline constexpr std::int32_t kHcMixFusedMaxColumnsQ8   = 4;
 inline constexpr std::int32_t kHcMixFusedMaxColumnsBf16 = 4;
 
 // Upper bound of the fused band across the codecs: sizes the fused workspace and dispatch
 // bounds; SIMT-only arrays use kSimtMaxColumns internally.
-inline constexpr std::int32_t kHcMixFusedMaxColumns = 16;
+inline constexpr std::int32_t kHcMixFusedMaxColumns = 32;
 
 // Whether the fused route serves this problem: both weights Q8_G32_FP16 RowSplit or both BF16
 // contiguous, the registered geometry (4 streams of 2560, rank a multiple of 8 up to 512) and the

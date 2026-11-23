@@ -528,14 +528,14 @@ void check_root_fork_trees() {
     require(chain_row.tree == 0 && chain_row.nodes == 4 && chain_row.paths == 1,
             "non-fork row builds chain tree metadata");
 
-    // floor_verify_width maps all widths in [1, 20] below max_width down to supported buckets.
-    for (std::int32_t w = 1; w <= 20; ++w) {
-        const std::int32_t f = floor_verify_width(w, 20);
-        require(f <= w && (f <= 8 || f == bucket_verify_width(f, 20)),
-                "floor_verify_width returns a valid bucket <= w");
+    // floor_verify_width maps all widths in [1, 32] below max_width down to supported buckets.
+    for (std::int32_t w = 2; w <= 32; ++w) {
+        const std::int32_t f = floor_verify_width(w, 32);
+        require(f >= 2 && f <= w && f == bucket_verify_width(f, 32),
+                "floor_verify_width returns a valid startup-captured bucket <= w");
     }
-    require(floor_verify_width(13, 16) == 12 && floor_verify_width(17, 16) == 16 &&
-                floor_verify_width(9, 16) == 8,
+    require(floor_verify_width(11, 32) == 10 && floor_verify_width(13, 16) == 12 &&
+                floor_verify_width(17, 16) == 16 && floor_verify_width(9, 16) == 8,
             "floor_verify_width handles exact boundary buckets");
     (void)kSpeculativeTreeMaxNodes;
     (void)kSpeculativeTreeMaxPathLength;

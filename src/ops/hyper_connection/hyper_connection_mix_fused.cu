@@ -1696,9 +1696,10 @@ __global__ __launch_bounds__(kUpMmaThreads, 4) void hc_up_collapse_q4_mma_kernel
 }
 
 template <class Norm, bool Fold, int TCap>
-void launch_q4_mma(const Tensor& residual, const Tensor& norm_weight, Q4Codec::Params down, Q4Codec::Params up,
-                   int down_rows, int rank, int streams, float eps, Tensor& x, Tensor* inject, void* partials,
-                   const PendingInject& pending, cudaStream_t stream) {
+void launch_q4_mma_slice(const bf16* residual_ptr, const Norm* norm_ptr, Q4Codec::Params down, Q4Codec::Params up,
+                         int down_rows, int rank, int streams, float eps, int slice_cols, bf16* x_ptr,
+                         float* inject_ptr, void* slice_partials, const bf16* pending_y_ptr,
+                         const float* pending_inject_ptr, cudaStream_t stream) {
     static const bool configured = [] {
         const cudaError_t error = cudaFuncSetAttribute(
             hc_down_partials_q4_mma_kernel<Norm, Fold, TCap>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1710,11 +1711,10 @@ void launch_q4_mma(const Tensor& residual, const Tensor& norm_weight, Q4Codec::P
         return true;
     }();
     (void)configured;
-    const int columns               = residual.ne[1];
-    auto* m_buf                     = static_cast<bf16*>(partials);
-    const std::size_t partial_bytes =
-        (static_cast<std::size_t>(streams) * down_rows * columns * sizeof(float) + 255) / 256 * 256;
-    auto* inv = reinterpret_cast<float*>(static_cast<std::byte*>(partials) + partial_bytes);
+    auto* m_buf                   = static_cast<bf16*>(slice_partials);
+    const std::size_t m_buf_bytes =
+        (static_cast<std::size_t>(rank) * slice_cols * sizeof(bf16) + 255) / 256 * 256;
+    auto* inv = reinterpret_cast<float*>(static_cast<std::byte*>(slice_partials) + m_buf_bytes);
 
     cudaLaunchAttribute attributes[2]{};
     attributes[0].id               = cudaLaunchAttributeClusterDimension;
@@ -1734,11 +1734,9 @@ void launch_q4_mma(const Tensor& residual, const Tensor& norm_weight, Q4Codec::P
     config.stream           = stream;
     config.attrs            = attributes;
     config.numAttrs         = attr_count;
-    check_launch(cudaLaunchKernelEx(&config, hc_down_partials_q4_mma_kernel<Norm, Fold, TCap>,
-                                    static_cast<const bf16*>(residual.data), static_cast<const Norm*>(norm_weight.data),
-                                    down, down_rows, rank, columns, eps, m_buf,
-                                    inject != nullptr ? static_cast<float*>(inject->data) : nullptr, inv, pending.y,
-                                    pending.inject),
+    check_launch(cudaLaunchKernelEx(&config, hc_down_partials_q4_mma_kernel<Norm, Fold, TCap>, residual_ptr, norm_ptr,
+                                    down, down_rows, rank, slice_cols, eps, m_buf, inject_ptr, inv, pending_y_ptr,
+                                    pending_inject_ptr),
                  "down partials q4 mma");
 
     const int groups                = rank >> 6;
@@ -1750,9 +1748,8 @@ void launch_q4_mma(const Tensor& residual, const Tensor& norm_weight, Q4Codec::P
     const std::size_t up_smem_bytes = codes_bytes + m_bytes;
     check_launch(pdl::launch_consumer({dim3(kHidden / kUpMmaFeatures), dim3(kUpMmaThreads), up_smem_bytes, stream},
                                       hc_up_collapse_q4_mma_kernel<Norm, Fold, TCap>, static_cast<const bf16*>(m_buf),
-                                      static_cast<const float*>(inv), static_cast<bf16*>(residual.data),
-                                      static_cast<const Norm*>(norm_weight.data), up, rank, columns,
-                                      static_cast<bf16*>(x.data), pending.y, pending.inject),
+                                      static_cast<const float*>(inv), const_cast<bf16*>(residual_ptr), norm_ptr, up,
+                                      rank, slice_cols, x_ptr, pending_y_ptr, pending_inject_ptr),
                  "up collapse q4 mma");
 }
 
@@ -1763,12 +1760,32 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     const int columns = residual.ne[1];
     if constexpr (std::is_same_v<Codec, Q4Codec>) {
         if (columns >= 5) {
-            if (columns <= 8) {
-                launch_q4_mma<Norm, Fold, 8>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject,
-                                             partials, pending, stream);
-            } else {
-                launch_q4_mma<Norm, Fold, 16>(residual, norm_weight, down, up, down_rows, rank, streams, eps, x, inject,
-                                              partials, pending, stream);
+            const auto* norm_ptr     = static_cast<const Norm*>(norm_weight.data);
+            const auto* res_base     = static_cast<const bf16*>(residual.data);
+            auto* x_base             = static_cast<bf16*>(x.data);
+            float* inject_base       = inject != nullptr ? static_cast<float*>(inject->data) : nullptr;
+            std::byte* scratch_cursor = static_cast<std::byte*>(partials);
+            for (int col0 = 0; col0 < columns; col0 += 16) {
+                const int slice_cols = std::min(16, columns - col0);
+                const auto* res_ptr  = res_base + static_cast<std::int64_t>(col0) * streams * kHidden;
+                auto* x_ptr          = x_base + static_cast<std::int64_t>(col0) * kHidden;
+                float* inject_ptr    = inject_base != nullptr ? inject_base + static_cast<std::int64_t>(col0) * streams : nullptr;
+                const bf16* py_ptr   = pending.y != nullptr ? pending.y + static_cast<std::int64_t>(col0) * kHidden : nullptr;
+                const float* pi_ptr =
+                    pending.inject != nullptr ? pending.inject + static_cast<std::int64_t>(col0) * streams : nullptr;
+                if (slice_cols <= 8) {
+                    launch_q4_mma_slice<Norm, Fold, 8>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
+                                                       slice_cols, x_ptr, inject_ptr, scratch_cursor, py_ptr, pi_ptr,
+                                                       stream);
+                } else {
+                    launch_q4_mma_slice<Norm, Fold, 16>(res_ptr, norm_ptr, down, up, down_rows, rank, streams, eps,
+                                                        slice_cols, x_ptr, inject_ptr, scratch_cursor, py_ptr, pi_ptr,
+                                                        stream);
+                }
+                const std::size_t slice_bytes =
+                    (static_cast<std::size_t>(rank) * slice_cols * sizeof(bf16) + 255) / 256 * 256 +
+                    (static_cast<std::size_t>(streams) * slice_cols * sizeof(float) + 255) / 256 * 256;
+                scratch_cursor += slice_bytes;
             }
             return;
         }
