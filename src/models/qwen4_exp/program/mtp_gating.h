@@ -376,6 +376,16 @@ struct RoundCostModel {
     return max_width;
 }
 
+// Columns already staged at stride `width` remain valid for row 0 when `bucketed_width != width`,
+// but rows b > 0 were written at `b * width + j` instead of `b * bucketed_width + j` and must be
+// re-staged from column 0 to prevent cross-row / stale PLE n-gram leaks.
+[[nodiscard]] inline constexpr std::int32_t effective_staged_columns(
+    std::int32_t staged, std::int32_t row, std::int32_t width, std::int32_t bucketed_width,
+    bool tree_row) noexcept {
+    const std::int32_t s = (bucketed_width != width && row > 0) ? 0 : staged;
+    return tree_row ? std::min(s, 1) : std::min(s, bucketed_width);
+}
+
 [[nodiscard]] inline constexpr std::int32_t floor_verify_width(std::int32_t width,
                                                                std::int32_t max_width) noexcept {
     if (width <= 8) { return width; }

@@ -5697,7 +5697,8 @@ private:
             std::any_of(row_is_tree_.begin(), row_is_tree_.begin() + batch, [](bool t) { return t; });
         std::array<std::int32_t, kMaximumConcurrency> clamped_staged{};
         for (std::int32_t b = 0; b < batch; ++b) {
-            clamped_staged[b] = (tree_round && row_is_tree_[b]) ? std::min(staged[b], 1) : std::min(staged[b], W);
+            clamped_staged[b] =
+                effective_staged_columns(staged[b], b, width, W, tree_round && row_is_tree_[b]);
         }
         const std::int32_t K = W - 1;
         auto* ids     = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
@@ -6768,7 +6769,8 @@ private:
             mtp_cumulative_threshold_[static_cast<std::size_t>(b)] = lane.mtp_cumulative.threshold;
         }
         // The threshold words for gated chains (all active rows), plus samplers when sampled (single upload).
-        std::memcpy(mtp_host(mtp_io_.cumulative), mtp_cumulative_threshold_.data(), sizeof(float) * lanes.size());
+        const std::size_t threshold_count = std::min(lanes.size(), mtp_cumulative_threshold_.size());
+        std::memcpy(mtp_host(mtp_io_.cumulative), mtp_cumulative_threshold_.data(), sizeof(float) * threshold_count);
         if (sampled) {
             auto* configs = reinterpret_cast<ops::SamplingConfig*>(mtp_host(mtp_io_.configs));
             for (std::size_t b = 0; b < lanes.size(); ++b) {

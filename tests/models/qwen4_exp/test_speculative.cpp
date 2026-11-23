@@ -541,6 +541,93 @@ void check_root_fork_trees() {
     (void)kSpeculativeTreeMaxPathLength;
 }
 
+void check_concurrent_staged_width_bucketing() {
+    using infernix::models::qwen4_exp::bucket_verify_width;
+    using infernix::models::qwen4_exp::effective_staged_columns;
+
+    constexpr std::int32_t kMaxWidth = 32;
+
+    // For width <= 8, bucket_verify_width is identity so all rows retain staged columns.
+    for (std::int32_t width = 2; width <= 8; ++width) {
+        const std::int32_t W = bucket_verify_width(width, kMaxWidth);
+        require(W == width, "width <= 8 is unbucketed");
+        for (std::int32_t row = 0; row < 4; ++row) {
+            require(effective_staged_columns(1, row, width, W, false) == 1,
+                    "unbucketed neural row preserves anchor column");
+            require(effective_staged_columns(width, row, width, W, false) == width,
+                    "unbucketed ngram row preserves all staged columns");
+        }
+    }
+
+    // For width > 8 that widens (W > width), row 0 keeps staged columns while rows > 0 reset to 0.
+    for (const std::int32_t width : {9, 11, 13, 15, 17, 21, 25, 29, 31}) {
+        const std::int32_t W = bucket_verify_width(width, kMaxWidth);
+        require(W > width, "non-bucket width > 8 widens");
+        require(effective_staged_columns(1, 0, width, W, false) == 1,
+                "widened round preserves row 0 neural anchor");
+        require(effective_staged_columns(width, 0, width, W, false) == width,
+                "widened round preserves row 0 ngram columns");
+        require(effective_staged_columns(1, 0, width, W, true) == 1,
+                "widened tree round clamps row 0 to 1");
+        require(effective_staged_columns(width, 0, width, W, true) == 1,
+                "widened tree round clamps row 0 ngram to 1");
+        for (std::int32_t row = 1; row < 4; ++row) {
+            require(effective_staged_columns(1, row, width, W, false) == 0,
+                    "widened round resets row > 0 anchor staging to prevent stride leak");
+            require(effective_staged_columns(width, row, width, W, false) == 0,
+                    "widened round resets row > 0 ngram staging to prevent stride leak");
+            require(effective_staged_columns(width, row, width, W, true) == 0,
+                    "widened tree round resets row > 0 staging");
+        }
+    }
+
+    // Exact bucket widths keep W == width so rows > 0 retain staged columns.
+    for (const std::int32_t width : {10, 12, 16, 20, 24, 28, 32}) {
+        const std::int32_t W = bucket_verify_width(width, kMaxWidth);
+        require(W == width, "exact bucket width does not widen");
+        for (std::int32_t row = 0; row < 4; ++row) {
+            require(effective_staged_columns(1, row, width, W, false) == 1,
+                    "exact bucket preserves neural anchor");
+            require(effective_staged_columns(width, row, width, W, false) == width,
+                    "exact bucket preserves ngram columns");
+        }
+    }
+
+    // End-to-end stride simulation: batch = 2, pre-staged at width = 11 (row 0 neural anchor, row 1
+    // ngram copy), then verified at bucketed W = 12. Verify every slot (b, j) holds its own tag
+    // without stale or cross-row data.
+    constexpr std::int32_t kBatch = 2;
+    constexpr std::int32_t kWidth = 11;
+    const std::int32_t kBucketW   = bucket_verify_width(kWidth, kMaxWidth);
+    require(kBucketW == 12, "width 11 buckets to 12");
+
+    const auto tag = [](std::int32_t b, std::int32_t j) { return (b + 1) * 1000 + j; };
+    std::vector<std::int32_t> slots(static_cast<std::size_t>(kBatch * kBucketW), -1);
+    const std::array<std::int32_t, kBatch> staged{1, kWidth};
+
+    // Stage pre-verification at stride kWidth.
+    for (std::int32_t b = 0; b < kBatch; ++b) {
+        for (std::int32_t j = 0; j < staged[b]; ++j) {
+            slots[static_cast<std::size_t>(b * kWidth + j)] = tag(b, j);
+        }
+    }
+    // Complete staging for verification at stride kBucketW starting from effective_staged_columns.
+    for (std::int32_t b = 0; b < kBatch; ++b) {
+        const std::int32_t from = effective_staged_columns(staged[b], b, kWidth, kBucketW, false);
+        for (std::int32_t j = from; j < kBucketW; ++j) {
+            slots[static_cast<std::size_t>(b * kBucketW + j)] = tag(b, j);
+        }
+    }
+    for (std::int32_t b = 0; b < kBatch; ++b) {
+        for (std::int32_t j = 0; j < kBucketW; ++j) {
+            const std::int32_t got = slots[static_cast<std::size_t>(b * kBucketW + j)];
+            require(got == tag(b, j),
+                    "concurrent widened verify slot (" + std::to_string(b) + ", " + std::to_string(j) +
+                        ") must not leak across rows or keep stale staging");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -556,6 +643,7 @@ int main() {
         check_moe_round_cost_and_fit();
         check_ngram_buckets_and_moe_copy_stitch();
         check_root_fork_trees();
+        check_concurrent_staged_width_bucketing();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

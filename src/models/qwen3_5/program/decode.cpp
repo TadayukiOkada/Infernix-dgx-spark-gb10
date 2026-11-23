@@ -812,7 +812,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
                 const std::uint32_t sparse = tree_round ? neural_draft_window : verify_drafts;
                 for (std::uint32_t j = 0; j < sparse; ++j) {
                     const std::size_t base = (row * sparse + j) * kMtpSparseSlots;
-                    const bool proposed    = j < chain_extent && sequence.mtp_draft_proposals;
+                    const bool proposed    = !row_ngram && j < chain_extent && sequence.mtp_draft_proposals;
                     if (proposed) {
                         std::copy_n(sequence.mtp_draft_candidates[j].begin(), kMtpSparseSlots,
                                     mtp_host_ingress->current_candidates.begin() + static_cast<std::ptrdiff_t>(base));
