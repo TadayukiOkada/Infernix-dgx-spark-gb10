@@ -96,6 +96,25 @@ INFERNIX_EXPERTS_ON_GPU=1 \
   --port 8000
 ```
 
+#### Handling Concurrent Bursts (Agents & Proxies)
+
+`infernix-serve` runs at most `--max-concurrency` active requests at once (maximum `8`). Additional requests wait in a FIFO queue of size `--max-pending-requests` (default `16`, for `24` total in-flight requests at `--max-concurrency 8`; exceeding that returns HTTP `429` `server_overloaded`) and fail with **HTTP `503` (`request_queue_timeout`)** if they wait longer than `--pending-timeout-ms` (default **`30000` ms / 30 s**, covering preparation and queue wait before admission).
+
+For example, a burst of 16 simultaneous requests (`C16`) against `--max-concurrency 8` queues 8 requests behind the active lanes; if those lanes take more than 30 s to free up, the queued requests time out with HTTP `503`. When running `infernix-serve` behind agent harnesses or a proxy where bursts above 8 are normal, raise `--pending-timeout-ms` (and `--max-pending-requests` if bursts exceed `24` total requests):
+
+```bash
+--pending-timeout-ms 300000 \
+--max-pending-requests 32
+```
+
+Once a request is admitted to an active lane, `--pending-timeout-ms` no longer applies. See [HTTP Serving — Execution behavior](docs/serving.md#execution-behavior) for full queueing and scheduling details.
+
+#### Tuning the N-gram Row Cache (`--ngram-cache-mib`)
+
+When streaming the PLE n-gram table from NVMe (`--ngram-residency volume`), `--ngram-cache-mib` sets the budget for the 4-way set-associative host/UMA row cache (rounded down to the largest power-of-two slot count from `2^16` to `2^28` rows that fits in the budget; `0` uses the default `2^20` rows).
+
+The example command above uses `--ngram-cache-mib 2048` as a conservative starting point, which may be too small for workloads with diverse prompts, long contexts, or high multi-session concurrency. Raising `--ngram-cache-mib` in power-of-two steps (for example `4096`, `8192`, or `16384`, or via `NGRAM_CACHE_MIB=8192 ./tools/run_server.sh hc4`) reduces NVMe read misses at the cost of unified memory shared with `--kv-capacity` and `--host-context-mib` — tune it to find the performance sweet spot for your workload. Run with `--log-level debug` to inspect per-request `n-gram rows` cache hit rates and NVMe read time (see [Qwen3.8-Flash-Next Guide — N-gram table in RAM](docs/qwen3_8-flash-next.md#n-gram-table-in-ram)).
+
 ---
 
 ## Benchmarks on NVIDIA DGX Spark (`NVIDIA GB10`)
