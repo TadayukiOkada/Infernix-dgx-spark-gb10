@@ -50,6 +50,8 @@ cmake -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECT
 ninja -C build-native -j "$(nproc)" infernix-serve infernix_bench
 ```
 
+> **WARNING:** The repository [`Dockerfile`](Dockerfile) / Docker image has not been well tested yet and should **not** be used for production runs. Build and run natively on the host (Ubuntu 24.04 LTS, CUDA 13.0) instead.
+
 ### 3. Run the Server (`infernix-serve`)
 
 > **IMPORTANT:** The chat template [`tools/chat_templates/qwen3_8.jinja`](tools/chat_templates/qwen3_8.jinja) **must be used** (`--chat-template tools/chat_templates/qwen3_8.jinja`) for proper thinking, tool-calling, and structured JSON output behavior.
