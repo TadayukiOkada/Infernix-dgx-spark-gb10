@@ -140,7 +140,7 @@ void ProgramImpl::capture_graph_set() {
         // Verification rounds and their commits (commit_verified): the forward, the commit graph, the MTP
         // catch-up, and with both drafters bound DFlash2's context outside the commit graph.
         for (const auto& shape : verified) {
-            const std::int32_t batch = shape.first, widest = shape.second;
+            const std::int32_t batch = shape.first, widest = bucket_verify_width(shape.second, max_width_);
             for (std::int32_t W = 2; W <= widest; ++W) {
                 if (W != bucket_verify_width(W, max_width_)) { continue; }
                 take(verify_graph(batch, W, false), [&] { verify_graph_body(batch, W, false); });

@@ -2768,21 +2768,24 @@ public:
             if (!from_ngram_[b]) { steps = std::max(steps, extents[b]); }
         }
         // Columns of each verification row whose n-gram rows are already staged: the drafter's
-        // wait reads every committed-token column (the anchor's) and all of a copy row's.
+        // wait reads every committed-token column (the anchor's) and all of a copy row's at the
+        // bucketed verify width so b > 0 rows never need synchronous re-staging when W == staged_width.
         std::array<std::int32_t, kMaximumConcurrency> staged{};
+        std::int32_t staged_width = width;
         if (mtp_) {
+            staged_width = verify_target_width(std::span<const std::uint32_t>(lanes.data(), batch),
+                                               std::span<const std::int32_t>(positions.data(), batch), width);
             mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps, [&] {
                 if (width == 1 || use_direct_ple()) { return; }
                 std::array<std::int32_t, kMaximumConcurrency> zero{};
-                for (std::int32_t b = 0; b < batch; ++b) { staged[b] = from_ngram_[b] ? width : 1; }
+                for (std::int32_t b = 0; b < batch; ++b) { staged[b] = from_ngram_[b] ? staged_width : 1; }
                 stage_verify_ngram_batch(std::span<const std::uint32_t>(lanes.data(), batch),
-                                         std::span<const std::int32_t>(positions.data(), batch), width,
+                                         std::span<const std::int32_t>(positions.data(), batch), staged_width,
                                          std::span<const std::int32_t>(zero.data(), batch),
                                          std::span<const std::int32_t>(staged.data(), batch));
             });
             // Keep only confident drafts (before the cumulative/min-p cut), or take a sidelined
             // n-gram copy if the cut left fewer drafts; then stitch any SAM suffix onto neural tips.
-            const std::int32_t staged_width = width;
             for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
                 if (from_ngram_[b] || extents[b] <= 0) { continue; }
                 const std::int32_t chain_ext = std::min(extents[b], mtp_confident_[b]);
@@ -2809,27 +2812,25 @@ public:
                 std::int32_t widest = 1;
                 for (std::int32_t b = 0; b < batch; ++b) { widest = std::max(widest, 1 + extents[b]); }
                 width = widest;
-                if (width != staged_width) {
-                    for (std::int32_t b = 1; b < batch; ++b) { staged[b] = 0; }
-                }
             }
         } else if (dflash2_ && width > 1) {
             // One proposal for every row that takes the drafter's tokens (none when every speculating
             // row copies an n-gram), while the host stages the verification's n-gram rows.
             bool neural = false;
             for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
+            staged_width = verify_target_width(std::span<const std::uint32_t>(lanes.data(), batch),
+                                               std::span<const std::int32_t>(positions.data(), batch), width);
             const auto stage_rows = [&] {
                 if (use_direct_ple()) { return; }
                 std::array<std::int32_t, kMaximumConcurrency> zero{};
-                for (std::int32_t b = 0; b < batch; ++b) { staged[b] = from_ngram_[b] ? width : 1; }
+                for (std::int32_t b = 0; b < batch; ++b) { staged[b] = from_ngram_[b] ? staged_width : 1; }
                 stage_verify_ngram_batch(std::span<const std::uint32_t>(lanes.data(), batch),
-                                         std::span<const std::int32_t>(positions.data(), batch), width,
+                                         std::span<const std::int32_t>(positions.data(), batch), staged_width,
                                          std::span<const std::int32_t>(zero.data(), batch),
                                          std::span<const std::int32_t>(staged.data(), batch));
             };
             if (neural) {
                 dflash2_propose(std::span<const std::uint32_t>(lanes.data(), batch), stage_rows);
-                const std::int32_t staged_width = width;
                 for (std::int32_t b = 0; b < batch; ++b) {
                     if (!from_ngram_[b] && extents[b] > 0) {
                         extents[b] = std::min(extents[b], dflash_confident_[b]);
@@ -2899,11 +2900,6 @@ public:
                 std::int32_t widest = 1;
                 for (std::int32_t b = 0; b < batch; ++b) { widest = std::max(widest, 1 + extents[b]); }
                 width = widest;
-                // The proposal staged row b's columns at b x the earlier width: row 0's stay in
-                // place, rows 1..batch-1 are read again when the round's width changes.
-                if (width != staged_width) {
-                    for (std::int32_t b = 1; b < batch; ++b) { staged[b] = 0; }
-                }
                 neural = false;
                 for (std::int32_t b = 0; b < batch; ++b) { neural = neural || (!from_ngram_[b] && extents[b] > 0); }
             }
@@ -2916,7 +2912,7 @@ public:
         if (width > 1) {
             return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
                           std::span<const std::int32_t>(positions.data(), batch), width,
-                          std::span<const std::int32_t>(staged.data(), batch), start);
+                          std::span<const std::int32_t>(staged.data(), batch), staged_width, start);
         }
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].speculative.fallback_steps; }
         round_width_ = 1;
@@ -5605,9 +5601,28 @@ private:
     // ple_embed (design §12.3, n-gram S2). A round that captures or warms its graph reads them
     // first and releases the gate before the launch. Every call that writes the landing area
     // ends in a stream sync before the next round stages, so a gate never reads it across calls.
+    [[nodiscard]] std::int32_t verify_target_width(std::span<const std::uint32_t> lanes,
+                                                   std::span<const std::int32_t> positions,
+                                                   std::int32_t width) const noexcept {
+        const std::int32_t candidate_W = bucket_verify_width(width, max_width_);
+        if (candidate_W <= width) { return width; }
+        const std::int32_t model_limit =
+            std::min(dim(c_.context_ceiling()), static_cast<std::int32_t>(options_.max_context));
+        const auto batch = static_cast<std::int32_t>(lanes.size());
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const Lane& lane = lanes_[lanes[b]];
+            const std::int32_t allocated_kv =
+                static_cast<std::int32_t>(lane.prefix.page_base + lane.pages.size()) * kPagedKVPageSize;
+            const std::int32_t lane_limit =
+                std::min({model_limit, static_cast<std::int32_t>(lane.extent), allocated_kv});
+            if (positions[b] + candidate_W > lane_limit) { return width; }
+        }
+        return candidate_W;
+    }
+
     PendingBatch verify(std::span<const SequenceHandle> sequences, std::span<const std::uint32_t> lanes,
                         std::span<const std::int32_t> positions, std::int32_t width,
-                        std::span<const std::int32_t> staged, Clock::time_point start) {
+                        std::span<const std::int32_t> staged, std::int32_t staged_width, Clock::time_point start) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         row_is_tree_.fill(false);
@@ -5667,23 +5682,7 @@ private:
                 }
             }
         }
-        std::int32_t W                 = width;
-        const std::int32_t candidate_W = bucket_verify_width(width, max_width_);
-        if (candidate_W > width) {
-            bool fits = true;
-            for (std::int32_t b = 0; b < batch; ++b) {
-                const Lane& lane = lanes_[lanes[b]];
-                const std::int32_t allocated_kv =
-                    static_cast<std::int32_t>(lane.prefix.page_base + lane.pages.size()) * kPagedKVPageSize;
-                const std::int32_t lane_limit =
-                    std::min({model_limit, static_cast<std::int32_t>(lane.extent), allocated_kv});
-                if (positions[b] + candidate_W > lane_limit) {
-                    fits = false;
-                    break;
-                }
-            }
-            if (fits) { W = candidate_W; }
-        }
+        const std::int32_t W = verify_target_width(lanes, positions, width);
         if (W < 3 || W > ops::kSpeculativeTreeMaxNodes) {
             row_is_tree_.fill(false);
         } else {
@@ -5698,7 +5697,7 @@ private:
         std::array<std::int32_t, kMaximumConcurrency> clamped_staged{};
         for (std::int32_t b = 0; b < batch; ++b) {
             clamped_staged[b] =
-                effective_staged_columns(staged[b], b, width, W, tree_round && row_is_tree_[b]);
+                effective_staged_columns(staged[b], b, staged_width, W, tree_round && row_is_tree_[b]);
         }
         const std::int32_t K = W - 1;
         auto* ids     = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
@@ -7885,10 +7884,11 @@ private:
         std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_DFLASH_PAIR_MAX_DRAFTS", 8.0)), 0,
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kPairMaxDrafts =
-        std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_PAIR_MAX_DRAFTS", 3.0)), 0,
+        std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_PAIR_MAX_DRAFTS", 7.0)), 0,
                    kPairMaxDraftsCapacity);
     static inline const std::int32_t kMultiRowMaxDrafts =
-        static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 4.0));
+        std::clamp(static_cast<std::int32_t>(policy_double("INFERNIX_MULTIROW_MAX_DRAFTS", 5.0)), 0,
+                   kPairMaxDraftsCapacity);
     static constexpr std::int32_t kPairNgramMaxDrafts     = 31;
     static constexpr std::int32_t kMultiRowNgramMaxDrafts = 21;
     // The GDN prefill's sub-chunk: prefill calls starting on multiples of it give every position the

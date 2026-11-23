@@ -626,6 +626,17 @@ void check_concurrent_staged_width_bucketing() {
                         ") must not leak across rows or keep stale staging");
         }
     }
+
+    // Upfront-bucketed pre-staging (staged_width == W == 12): row 1 preserves all 12 pre-staged
+    // columns (zero re-staging); if post-draft stitching widens W further (12 -> 16), row 1 resets.
+    require(effective_staged_columns(kBucketW, 1, kBucketW, kBucketW, false) == kBucketW,
+            "upfront-bucketed pre-staging preserves row > 0 columns when W == staged_width");
+    const std::int32_t kStitchedW = bucket_verify_width(13, kMaxWidth);
+    require(kStitchedW == 16, "stitched width 13 buckets to 16");
+    require(effective_staged_columns(kBucketW, 0, kBucketW, kStitchedW, false) == kBucketW,
+            "post-draft stitching preserves row 0 columns");
+    require(effective_staged_columns(kBucketW, 1, kBucketW, kStitchedW, false) == 0,
+            "post-draft stitching resets row > 0 columns when W > staged_width");
 }
 
 } // namespace
