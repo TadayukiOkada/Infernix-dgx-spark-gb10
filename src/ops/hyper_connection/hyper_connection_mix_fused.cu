@@ -198,9 +198,9 @@ struct Bf16Codec {
 // every value read is hc_injected(R, pending_inject[t][s], pending_y[t][d]).
 template <class Codec, class Norm, bool Pending, int PassColumns = 1, int MinBlocks = 2>
 __global__ __launch_bounds__(kDownThreads, MinBlocks) void hc_down_partials_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     extern __shared__ __align__(16) float rn[]; // [PassColumns][kHidden]
     __shared__ float scratch[kDownThreads / 32][PassColumns];
     __shared__ float inv[PassColumns];
@@ -438,10 +438,10 @@ __global__ __launch_bounds__(kDownThreads, MinBlocks) void hc_down_partials_kern
 // the inject applied, as hyper_connection_inject would have left it. The residual is written only then.
 template <class Codec, class Norm, bool Pending, int Columns = 0, int MinBlocks = 1>
 __global__ __launch_bounds__(kUpThreads, MinBlocks) void hc_up_collapse_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
+    const float* partial, const float* inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
-    const float* __restrict__ pending_inject) {
+    float* __restrict__ inject, bf16* __restrict__ x, const bf16* pending_y,
+    const float* pending_inject) {
     // Dynamic shared memory: sized to actual rank x columns at launch time rather than the
     // worst-case compile-time bounds. For decode (rank=320, columns=1) this drops from 128 KB
     // to ~5 KB, raising CTAs-per-SM from 1 to ~18 and exposing enough warps to hide DRAM latency.
@@ -755,9 +755,9 @@ __device__ __forceinline__ float warp_sum8_transposed(const float (&v)[8], int l
 // (T = 2..3) and neutral at 4..8, so the pass loop stays.
 template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
 __global__ __launch_bounds__(kDownThreads, (ExactColumns >= 2 && ExactColumns <= 4) ? 2 : 1) void hc_down_partials_v4_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
+    const bf16* residual, const Norm* __restrict__ norm_weight, typename Codec::Params down, int rows,
     int columns, float eps, float* __restrict__ partial, float* __restrict__ inv_out,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     constexpr int RowsPerWarp = 2;
     constexpr int kColumns    = ExactColumns > 0 ? ExactColumns : kPassColumns; // columns per pass
     extern __shared__ __align__(16) float rn[]; // [kColumns][2][kHidden / 2]
@@ -961,10 +961,10 @@ template <class Codec, class Norm, bool Pending, int ExactColumns = 0>
 __global__ __launch_bounds__(
     kUpV4Threads,
     (std::is_same_v<Codec, Q8Codec> || std::is_same_v<Codec, Q4Codec>) && (ExactColumns >= 2 && ExactColumns <= 4) ? 2 : 1) void hc_up_collapse_v4_kernel(
-    const float* __restrict__ partial, const float* __restrict__ inv_in, bf16* __restrict__ residual,
+    const float* partial, const float* inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, typename Codec::Params up, int rank, int down_rows, int columns,
-    float* __restrict__ inject, bf16* __restrict__ x, const bf16* __restrict__ pending_y,
-    const float* __restrict__ pending_inject) {
+    float* __restrict__ inject, bf16* __restrict__ x, const bf16* pending_y,
+    const float* pending_inject) {
     static_assert(kUpFeatures == 2 * kUpV4Warps && kUpV4Rows == 2 * kStreams);
     static_assert(kUpFeatures * kSimtMaxColumns <= kUpV4Threads);
     const int n_cols = ExactColumns > 0 ? ExactColumns : columns;
@@ -1280,9 +1280,9 @@ struct DownMmaShared {
 // across the 4 streams in DSMEM on cluster rank 0, and writes BF16 m = SiLU(z / 4) and FP32 inject.
 template <class Norm, bool Pending, int TCap>
 __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_partials_q4_mma_kernel(
-    const bf16* __restrict__ residual, const Norm* __restrict__ norm_weight, Q4Codec::Params down, int rows, int rank,
+    const bf16* residual, const Norm* __restrict__ norm_weight, Q4Codec::Params down, int rows, int rank,
     int columns, float eps, bf16* __restrict__ m_out, float* __restrict__ inject, float* __restrict__ inv_out,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     static_assert(TCap == 8 || TCap == 16);
     static_assert(kDownMmaGroups * 64 == kHidden && kDownMmaTiles * 4 == kDownMmaGroups);
     constexpr int kNT        = TCap / 8;
@@ -1536,9 +1536,9 @@ __global__ __launch_bounds__(kDownMmaThreads, TCap == 8 ? 2 : 1) void hc_down_pa
 // W_up Q4 weights once into SMEM, computes u = W_up m_bf16 via mma_bf16, and collapses residual.
 template <class Norm, bool Pending, int TCap>
 __global__ __launch_bounds__(kUpMmaThreads, 4) void hc_up_collapse_q4_mma_kernel(
-    const bf16* __restrict__ m_in, const float* __restrict__ inv_in, bf16* __restrict__ residual,
+    const bf16* m_in, const float* inv_in, bf16* __restrict__ residual,
     const Norm* __restrict__ norm_weight, Q4Codec::Params up, int rank, int columns, bf16* __restrict__ x,
-    const bf16* __restrict__ pending_y, const float* __restrict__ pending_inject) {
+    const bf16* pending_y, const float* pending_inject) {
     static_assert(TCap == 8 || TCap == 16);
     static_assert(kUpMmaMaxGroups == kMaxRank / 64);
     constexpr int kNT   = TCap / 8;

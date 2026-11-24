@@ -553,8 +553,8 @@ __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, co
 
 template <class G>
 __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
-    gate_up_omma_kernel(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                        const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ flags,
+    gate_up_omma_kernel(const bf16* x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                        const std::uint8_t* const* job_records, const std::int32_t* flags,
                         int base, std::uint8_t* __restrict__ h_base, PassPhase phase) {
     __shared__ GateUpOmmaShared<G> sm;
     if (threadIdx.x == 0) {
@@ -584,8 +584,8 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
 
 template <class G>
 __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
-    down_omma_kernel(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
-                     const std::int32_t* __restrict__ flags, int base, const std::uint8_t* __restrict__ h_base,
+    down_omma_kernel(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* job_records,
+                     const std::int32_t* flags, int base, const std::uint8_t* h_base,
                      bf16* __restrict__ outputs, PassPhase phase) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
@@ -639,11 +639,11 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
 
 template <class G>
 __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
-    gate_up_omma_persistent_kernel(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                                   const std::uint8_t* const* __restrict__ job_records,
-                                   const std::int32_t* __restrict__ narrow_jobs,
-                                   const std::int32_t* __restrict__ pass_narrow, int pass_index,
-                                   const std::uint8_t* __restrict__ x_plane, std::uint8_t* __restrict__ h_base) {
+    gate_up_omma_persistent_kernel(const bf16* x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                                   const std::uint8_t* const* job_records,
+                                   const std::int32_t* narrow_jobs,
+                                   const std::int32_t* pass_narrow, int pass_index,
+                                   const std::uint8_t* x_plane, std::uint8_t* __restrict__ h_base) {
     using S = OmmaShape<G>;
     __shared__ GateUpOmmaShared<G> sm;
     if (threadIdx.x == 0) {
@@ -677,10 +677,10 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
 template <class G>
 __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
     down_omma_persistent_kernel(MoeDispatch dispatch, MoeExpertSource source,
-                                const std::uint8_t* const* __restrict__ job_records,
-                                const std::int32_t* __restrict__ narrow_jobs,
-                                const std::int32_t* __restrict__ pass_narrow, int pass_index,
-                                const std::uint8_t* __restrict__ h_base, bf16* __restrict__ outputs) {
+                                const std::uint8_t* const* job_records,
+                                const std::int32_t* narrow_jobs,
+                                const std::int32_t* pass_narrow, int pass_index,
+                                const std::uint8_t* h_base, bf16* __restrict__ outputs) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
     if (threadIdx.x == 0) {
