@@ -5134,7 +5134,15 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
+    const bool omma_xplane =
+        !use_wide && source.omma_narrow && !ggml && !nvfp4_a8 && source.activation == moe::ExpertActivation::kA4 &&
+        source.shape == moe::kFlashNextShape && x.ne[1] >= 2 && x.ne[1] <= moe::kMaxColumns &&
+        outputs.ne[1] == static_cast<int>(x.ne[1]) * top_k && layout.entry_map != nullptr &&
+        layout.narrow_jobs != nullptr && layout.pass_narrow != nullptr && layout.x_plane != nullptr;
     if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
+    if (omma_xplane) {
+        moe::wide::prepare_xplane(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, stream);
+    }
     MoeExpertSource unlanded = source; // landing is for forked calls only
     unlanded.landing         = nullptr;
     unlanded.landing_slots   = 0;
@@ -5149,9 +5157,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                                             stage_kernel, dispatch, unlanded, base, jobs, flags, job_records, fetch,
                                             StageBytes{}));
         }
-        const bool use_xplane = use_wide && (outputs.ne[1] == static_cast<int>(x.ne[1]) * top_k) &&
-                                layout.entry_map != nullptr && layout.narrow_jobs != nullptr &&
-                                layout.pass_narrow != nullptr && layout.x_plane != nullptr;
+        const bool use_xplane = omma_xplane || (use_wide && (outputs.ne[1] == static_cast<int>(x.ne[1]) * top_k) &&
+                                                layout.entry_map != nullptr && layout.narrow_jobs != nullptr &&
+                                                layout.pass_narrow != nullptr && layout.x_plane != nullptr);
         launch_pass(x.ne[1], static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base, jobs,
                     layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream, PassPhase::All,
                     PassPart::Both, base / pass_jobs, use_xplane);
