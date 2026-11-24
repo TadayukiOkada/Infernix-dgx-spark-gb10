@@ -66,13 +66,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     extern __shared__ __align__(16) std::int8_t dynamic_r_s[];
     std::int8_t* r_s     = DynamicArena ? dynamic_r_s : static_r_s;
     std::int8_t* q_i8    = q_s;
-    float* q_scale_tmp   = reinterpret_cast<float*>(r_s);
     std::int8_t* k_i8    = r_s;
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
     std::int8_t* v_i8    = r_s + Bc * D;
     __half* v_f16        = reinterpret_cast<__half*>(r_s + 2 * Bc * D);
     __shared__ __align__(16) __half p_s[Br * Bc];
+    __shared__ float q_scale_s[Br * Groups];
     __shared__ float alpha_s[Br];
     __shared__ __align__(16) __half k_scale_s[Bc * Groups];
     __shared__ __align__(16) __half v_scale_s[Bc * Groups];
@@ -212,7 +212,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     }
 
     for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
-    for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
+    for (int i = tid; i < Br * Groups; i += Threads) { q_scale_s[i] = 0.0f; }
     __syncthreads();
 
     for (int row = warp; row < RowCount; row += Wc) {
@@ -241,7 +241,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
             causal_store_query_code(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
             causal_store_query_code(q_i8, row, d1, kv_cache_int8_quant_code(x1, inv));
-            if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
+            if (lane == 0) { q_scale_s[row * Groups + grp] = qs; }
         }
     }
     __syncthreads();
@@ -255,24 +255,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int a_coloff = (a_mat >> 1) << 3;
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
-
-    float q_scale_r0[Groups];
-    float q_scale_r1[Groups];
-    if (warp < RowTiles) {
-        const int producer_row0 = warp * 16 + gid;
-#pragma unroll
-        for (int g = 0; g < Groups; ++g) {
-            float qs0     = (lid == 0 && producer_row0 < tile_tokens * Geometry::GroupSize)
-                                ? q_scale_tmp[producer_row0 * Groups + g]
-                                : 0.0f;
-            float qs1     = (lid == 0 && producer_row0 + 8 < RowCount)
-                                ? q_scale_tmp[(producer_row0 + 8) * Groups + g]
-                                : 0.0f;
-            q_scale_r0[g] = __shfl_sync(FullMask, qs0, gid * 4);
-            q_scale_r1[g] = __shfl_sync(FullMask, qs1, gid * 4);
-        }
-    }
-    __syncthreads();
 
     float acc[PVNtPerWarp][4];
 #pragma unroll
@@ -340,8 +322,18 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 score[nt][3] = 0.0f;
             }
 
-#pragma unroll
+#pragma unroll 1
             for (int g = 0; g < Groups; ++g) {
+                const int row0_q = producer_row_base + gid;
+                const int row1_q = row0_q + 8;
+                float qs0        = (lid == 0 && row0_q < tile_tokens * Geometry::GroupSize)
+                                       ? q_scale_s[row0_q * Groups + g]
+                                       : 0.0f;
+                float qs1        = (lid == 0 && row1_q < RowCount)
+                                       ? q_scale_s[row1_q * Groups + g]
+                                       : 0.0f;
+                qs0              = __shfl_sync(FullMask, qs0, gid * 4);
+                qs1              = __shfl_sync(FullMask, qs1, gid * 4);
                 unsigned af[GroupKc][4];
 #pragma unroll
                 for (int kk = 0; kk < GroupKc; ++kk) {
@@ -377,10 +369,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     }
                     ka  = __shfl_sync(FullMask, ka, lid);
                     kb2 = __shfl_sync(FullMask, kb2, lid);
-                    score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
-                    score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
-                    score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
-                    score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
+                    score[nt][0] += qs0 * ka * static_cast<float>(c0);
+                    score[nt][1] += qs0 * kb2 * static_cast<float>(c1);
+                    score[nt][2] += qs1 * ka * static_cast<float>(c2);
+                    score[nt][3] += qs1 * kb2 * static_cast<float>(c3);
                 }
             }
 
@@ -535,16 +527,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             acc[n][3] *= alpha1;
         }
 
+#pragma unroll 1
+        for (int k = 0; k < PVKs; ++k) {
+            unsigned pf[4];
+            const int pcol = k * 16 + a_coloff;
+            ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                        smem_addr(&p_consumer[a_rowoff * Bc +
+                                              causal_probability_swizzle<Bc>(a_rowoff, pcol)]));
 #pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            const int global_n = consumer_slice * PVNtPerWarp + n;
-#pragma unroll
-            for (int k = 0; k < PVKs; ++k) {
-                unsigned pf[4];
-                const int pcol = k * 16 + a_coloff;
-                ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
-                            smem_addr(&p_consumer[a_rowoff * Bc +
-                                                  causal_probability_swizzle<Bc>(a_rowoff, pcol)]));
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                const int global_n = consumer_slice * PVNtPerWarp + n;
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = global_n * 8;

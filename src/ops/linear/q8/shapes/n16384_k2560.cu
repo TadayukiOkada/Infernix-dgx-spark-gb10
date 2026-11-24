@@ -22,7 +22,7 @@ namespace {
 // multiply concurrent weight streams that contend the unified LPDDR5x fabric at model scale, outweighing
 // the per-kernel latency win. Kept at 2/8 pending a model-scale re-evaluation.
 template <int MaxCols, int ColsPerPass>
-using Stream = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
+using Stream = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 1>;
 
 // The routes of both tables up to 8 columns, where one call holds the one-position-per-sequence
 // columns of a decode round. The fused GDN convolution (launch_q8_n16384_k2560_conv_snapshot) runs

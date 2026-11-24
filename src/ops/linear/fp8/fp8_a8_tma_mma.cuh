@@ -150,28 +150,28 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
 #endif
     constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
-    const int k = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
-    int tile = blockIdx.x, partial = -1, k_begin = 0, tiles_k = k / BK;
-    if constexpr (SplitK) {
-        if (tile >= plan.full_tiles) {
-            partial          = tile - plan.full_tiles;
-            const int base   = plan.split_ctas / plan.tail_tiles;
-            const int extra  = plan.split_ctas % plan.tail_tiles;
-            const int longer = extra * (base + 1);
-            const int tail =
-                partial < longer ? partial / (base + 1) : extra + (partial - longer) / base;
-            const int part  = partial - plan.first_part(tail);
-            const int parts = plan.parts(tail);
-            tile            = plan.full_tiles + tail;
-            k_begin         = tiles_k * part / parts;
-            tiles_k         = tiles_k * (part + 1) / parts - k_begin;
+    const auto decode_tile = [&](int& out_tile, int& out_partial, int& out_k_begin, int& out_tiles_k) {
+        const int k = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
+        out_tile    = blockIdx.x;
+        out_partial = -1;
+        out_k_begin = 0;
+        out_tiles_k = k / BK;
+        if constexpr (SplitK) {
+            if (out_tile >= plan.full_tiles) {
+                out_partial      = out_tile - plan.full_tiles;
+                const int base   = plan.split_ctas / plan.tail_tiles;
+                const int extra  = plan.split_ctas % plan.tail_tiles;
+                const int longer = extra * (base + 1);
+                const int tail   = out_partial < longer ? out_partial / (base + 1)
+                                                        : extra + (out_partial - longer) / base;
+                const int part   = out_partial - plan.first_part(tail);
+                const int parts  = plan.parts(tail);
+                out_tile         = plan.full_tiles + tail;
+                out_k_begin      = out_tiles_k * part / parts;
+                out_tiles_k      = out_tiles_k * (part + 1) / parts - out_k_begin;
+            }
         }
-    }
-    const int row_tiles = operands.rows / BR, token_tiles = div_up(count, BT);
-    int row_tile, token_tile;
-    fp8_mma_tile_coordinates<Schedule>(tile, row_tiles, token_tiles, row_tile, token_tile);
-    const int row_begin   = row_tile * (BR / (RowPolicy::kPaired ? 2 : 1));
-    const int token_begin = token_offset + token_tile * BT;
+    };
 
     extern __shared__ __align__(128) unsigned char fp8_tma_shared[];
     auto* activation = fp8_tma_shared;
@@ -191,6 +191,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
 
     if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
+            int tile, partial, k_begin, tiles_k;
+            decode_tile(tile, partial, k_begin, tiles_k);
+            const int row_tiles = operands.rows / BR, token_tiles = div_up(count, BT);
+            int row_tile, token_tile;
+            fp8_mma_tile_coordinates<Schedule>(tile, row_tiles, token_tiles, row_tile, token_tile);
+            const int row_begin   = row_tile * (BR / (RowPolicy::kPaired ? 2 : 1));
+            const int token_begin = token_offset + token_tile * BT;
 #ifdef _WIN32
             // A staged tensor map was written through the generic proxy; each 128-byte map needs
             // its own acquire for the TMA (tensormap) proxy before its first use.
@@ -223,10 +230,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
         return;
     }
 
+    int consumer_tiles_k;
+    {
+        int t, p, kb;
+        decode_tile(t, p, kb, consumer_tiles_k);
+    }
     const int tid  = static_cast<int>(threadIdx.x) - Schedule::kProducerThreads;
     const int warp = tid >> 5, lane = tid & 31;
     float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
-    for (int kt = 0; kt < tiles_k; ++kt) {
+#pragma unroll 1
+    for (int kt = 0; kt < consumer_tiles_k; ++kt) {
         const int stage = kt % S;
         cta_mbarrier_wait(full + stage, (kt / S) & 1U);
         fp8_mma_compute_stage<Schedule>(activation + stage * BT * BK, weight + stage * BR * BK,
@@ -237,6 +250,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }
+    int tile, partial, k_begin, tiles_k;
+    decode_tile(tile, partial, k_begin, tiles_k);
     if constexpr (SplitK) {
         if (partial >= 0) {
             // Store raw FP32 accumulators. Scales, epilogue and the final BF16 cast
@@ -260,6 +275,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
             return;
         }
     }
+    const int row_tiles = operands.rows / BR, token_tiles = div_up(count, BT);
+    int row_tile, token_tile;
+    fp8_mma_tile_coordinates<Schedule>(tile, row_tiles, token_tiles, row_tile, token_tile);
+    const int row_begin   = row_tile * (BR / (RowPolicy::kPaired ? 2 : 1));
+    const int token_begin = token_offset + token_tile * BT;
     // All consumers must finish reading staged inputs before the epilogue reuses the storage.
     __syncthreads();
     fp8_finish_mma_tile<Schedule, FullTokens>(

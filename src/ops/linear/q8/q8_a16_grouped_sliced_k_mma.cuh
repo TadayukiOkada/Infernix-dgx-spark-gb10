@@ -125,9 +125,9 @@ __global__ __launch_bounds__(
     cp_wait<0>();
     __syncthreads();
 
-    // Bulk tiles keep the K loop compact; the small fixed callers retain their unrolling.
+    // Keep K-group loop rolled on wide tiles (>= 80 cols) so large accumulator arrays stay under 255 regs.
     constexpr int kGroupUnroll =
-        TiledColumns || Schedule::kStaticK == 0 ? 1 : Schedule::kStaticK / kGroupK;
+        TiledColumns || Schedule::kStaticK == 0 || TileCols >= 80 ? 1 : Schedule::kStaticK / kGroupK;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;

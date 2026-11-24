@@ -391,11 +391,12 @@ __global__ void __launch_bounds__(kNmmaThreads) down_nmma_ggml(NmmaPassArgs a) {
 
 constexpr int kGgmlPlanThreads = 512;
 constexpr int kGgmlTileColumns = ggml::tile::kTileColumns; // columns per planned tile (one CTA)
-// Threads of a gate/up or down tile CTA: sixteen warps of 16 x 16 outputs (one CTA per SM within 128
-// registers), against eight warps of 32 x 16 that needed 253 registers for one CTA per SM. Measured
-// on the RTX 5090: see docs/maintainer/qwen3_8-flash-next-design.md §19.3.25.
-constexpr int kGgmlTileThreads = 512;
-constexpr int kGgmlTileUnits   = ggml::tile::kTileRows / 2; // intermediates per gate/up tile
+// Down tiles use 16 warps (512 threads, one CTA per SM within 128 registers). Gate/up tiles run at
+// 8 warps (256 threads) so register-heavy IQ3_XXS/Q6_K tiles compile without local stack spills.
+// See docs/maintainer/qwen3_8-flash-next-design.md §19.3.25.
+constexpr int kGgmlTileThreads       = 512;
+constexpr int kGgmlGateUpTileThreads = 256;
+constexpr int kGgmlTileUnits         = ggml::tile::kTileRows / 2; // intermediates per gate/up tile
 static_assert(kGgmlTileColumns >= moe::wide::kTileColumns, "the workspace's tile list bounds the plan's tiles");
 static_assert(kGgmlHSlices * ggml::fast::kSliceWords * 4 == moe::wide::kA16HRowBytes,
               "a wide entry's h limbs fill its A16 h row exactly");
@@ -463,7 +464,7 @@ __device__ __forceinline__ bool ggml_tile_of(const MoeDispatch& dispatch, const 
 }
 
 template <QType GU>
-__global__ void __launch_bounds__(kGgmlTileThreads, 1)
+__global__ void __launch_bounds__(kGgmlGateUpTileThreads, 1)
     gate_up_tile_ggml(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
                       MoeDispatch dispatch, MoeExpertSource source, int top_k,
                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ tiles,
@@ -495,35 +496,42 @@ __global__ void __launch_bounds__(kGgmlTileThreads, 1)
     const auto limbs = [&](int c) {
         return reinterpret_cast<const std::int32_t*>(x_limbs + static_cast<std::size_t>(tile_token[c]) * moe::wide::kA16XRowBytes);
     };
-    ggml::tile::Accumulators<kGgmlTileThreads> acc;
-    ggml::tile::compute<GU, kGgmlTileThreads, 1, true>(sm, row_of, kGgmlXSlices, limbs, 0, columns, acc);
-    const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlTileThreads>(columns);
+    ggml::tile::Accumulators<kGgmlGateUpTileThreads> acc;
+    ggml::tile::compute<GU, kGgmlGateUpTileThreads, 1, true>(sm, row_of, kGgmlXSlices, limbs, 0, columns, acc);
+    const ggml::tile::WarpTile wt = ggml::tile::warp_tile<kGgmlGateUpTileThreads>(columns);
     const int lane = threadIdx.x % 32;
-    std::uint16_t gate_y[ggml::tile::kNTiles][4];
+    constexpr int kMT = ggml::tile::kMTilesOf<kGgmlGateUpTileThreads>;
+    std::uint16_t gate_y[kMT][ggml::tile::kNTiles][4];
 #pragma unroll
-    for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
+    for (int mi = 0; mi < kMT; ++mi) {
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const int r = ggml::tile::out_row(wt, lane, 0, q), c = ggml::tile::out_column(wt, lane, nt, q);
-            if (wt.mtiles > 0 && nt < wt.ntiles) {
-                const std::uint16_t val = ggml::output_bf16(acc.r[0][nt][q], x_emax[tile_token[c]], GU);
-                if (r >= kGgmlTileUnits) {
-                    up[r - kGgmlTileUnits][c] = val;
-                } else {
-                    gate_y[nt][q] = val;
+        for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int r = ggml::tile::out_row(wt, lane, mi, q), c = ggml::tile::out_column(wt, lane, nt, q);
+                if (mi < wt.mtiles && nt < wt.ntiles) {
+                    const std::uint16_t val = ggml::output_bf16(acc.r[mi][nt][q], x_emax[tile_token[c]], GU);
+                    if (r >= kGgmlTileUnits) {
+                        up[r - kGgmlTileUnits][c] = val;
+                    } else {
+                        gate_y[mi][nt][q] = val;
+                    }
                 }
             }
         }
     }
     __syncthreads();
 #pragma unroll
-    for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
+    for (int mi = 0; mi < kMT; ++mi) {
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const int r = ggml::tile::out_row(wt, lane, 0, q), c = ggml::tile::out_column(wt, lane, nt, q);
-            if (wt.mtiles > 0 && nt < wt.ntiles && r < kGgmlTileUnits && col0 + c < h_count) {
-                h_plane[static_cast<std::size_t>(h_base + c) * moe::wide::kA16HRowElements + i0 + r] =
-                    canon::swiglu_bf16(gate_y[nt][q], up[r][c]);
+        for (int nt = 0; nt < ggml::tile::kNTiles; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int r = ggml::tile::out_row(wt, lane, mi, q), c = ggml::tile::out_column(wt, lane, nt, q);
+                if (mi < wt.mtiles && nt < wt.ntiles && r < kGgmlTileUnits && col0 + c < h_count) {
+                    h_plane[static_cast<std::size_t>(h_base + c) * moe::wide::kA16HRowElements + i0 + r] =
+                        canon::swiglu_bf16(gate_y[mi][nt][q], up[r][c]);
+                }
             }
         }
     }
@@ -978,7 +986,7 @@ void launch_expert_pass_ggml(const bf16* x, const MoeDispatch& dispatch, const M
                    cudaSuccess;
     }();
     if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the ggml tiles' shared memory exceeds the device's"); }
-    gate_up_tile_ggml<GU><<<dim3(moe::kIntermediate / kGgmlTileUnits, tile_bound), kGgmlTileThreads, kTileShared, stream>>>(
+    gate_up_tile_ggml<GU><<<dim3(moe::kIntermediate / kGgmlTileUnits, tile_bound), kGgmlGateUpTileThreads, kTileShared, stream>>>(
         layout.x_limbs, layout.x_emax, dispatch, source, top_k, job_records, layout.tiles, layout.pass_tiles, base, jobs,
         h_plane);
     check_launch("ggml gate/up tiles");

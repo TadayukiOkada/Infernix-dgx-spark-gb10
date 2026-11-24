@@ -5,12 +5,12 @@
 namespace infernix::ops::detail {
 template <int TileTokens, int ActiveTokens>
 using Q8SlicedKDefault = Q8A16SlicedKMmaSchedule<
-    TileTokens, 8, 1, TileTokens == 8 ? 5 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
+    TileTokens, 8, 1, TileTokens == 8 ? 4 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
     (ActiveTokens > 4 ? Q8ScaleAccess::Shared : Q8ScaleAccess::Direct)>;
 
 template <int TileTokens, Q8ScaleAccess ScaleAccess>
 using Q8SlicedKRuntimeDefault = Q8A16SlicedKMmaSchedule<
-    TileTokens, 8, 1, TileTokens == 8 ? 5 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
+    TileTokens, 8, 1, TileTokens == 8 ? 4 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
     ScaleAccess, Cache::ca, Cache::cg, Q8ActivationStage::RuntimeActive>;
 
 namespace q8_instances {

@@ -27,9 +27,9 @@ __global__ void __launch_bounds__(ggml::tile::kThreads)
 }
 
 template <QType F>
-inline constexpr int kPlaneTileThreads = F == QType::GGML_IQ4_NL ? 256 : 512;
+inline constexpr int kPlaneTileThreads = 256;
 template <QType F>
-inline constexpr int kPlaneTileBlocks = kPlaneTileThreads<F> == 512 ? 1 : 2;
+inline constexpr int kPlaneTileBlocks = 1;
 
 template <QType F, bool OutF32, bool Tiled>
 __global__ void __launch_bounds__(kPlaneTileThreads<F>, kPlaneTileBlocks<F>)
@@ -81,7 +81,7 @@ __global__ void __launch_bounds__(kPlaneTileThreads<F>, kPlaneTileBlocks<F>)
 }
 
 template <QType F>
-inline constexpr int kDecodeTileThreads = 512;
+inline constexpr int kDecodeTileThreads = 256;
 
 template <QType F, bool OutF32, bool Tiled>
 __global__ void __launch_bounds__(kDecodeTileThreads<F>, 1)

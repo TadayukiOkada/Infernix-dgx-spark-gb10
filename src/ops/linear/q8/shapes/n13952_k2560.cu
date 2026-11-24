@@ -25,7 +25,7 @@ namespace {
 // Qwen3.8-Flash-Next MTP attention group: the register-streamed route up to 8 columns (4-28 % faster than
 // SIMT), the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per pass.
 template <int MaxCols, int ColsPerPass>
-using Stream     = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 2>;
+using Stream     = Q8A16StreamSchedule<2560, 2, 1, 8, MaxCols, ColsPerPass, Q8StreamX::Global, 1>;
 using TmaHot96   = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 2560>;
 using TmaBulk128 = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 2560>;
 using TmaK32     = Q8A16TmaK32Schedule<8, 2560>;

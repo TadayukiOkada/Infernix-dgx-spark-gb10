@@ -53,6 +53,7 @@ template <class G, class S>
 struct alignas(16) Bf16KvGroupedStorage {
     static constexpr int kStateRows = S::kWarpsKV > 1 ? S::kWarpsKV* S::kQueryRows : 1;
 
+    alignas(16) std::uint16_t q[S::kQueryRows * G::kHeadDim];
     union {
         std::uint16_t qkv[2 * S::kKeyRows * G::kHeadDim];
         float reduction[S::kWarpsKV > 1 ? kStateRows* G::kHeadDim : 1];

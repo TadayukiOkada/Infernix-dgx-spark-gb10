@@ -146,7 +146,8 @@ void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
 template <int Cols>
 void launch_q5_split4(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
                       cudaStream_t stream) {
-    using Schedule = Q5A16DirectSimtSchedule<1, Cols, 4, 4, 10, kHidden, true>;
+    using Schedule =
+        Q5A16DirectSimtSchedule<1, Cols, 4, 4, Cols >= 10 ? 5 : (Cols >= 9 ? 6 : 10), kHidden, true>;
     launch_q5_a16_direct_simt<Schedule>(q5_linear_operands(x, weight),
                                         q5_projection_output(gate, value), LinearIdentityEpilogue{},
                                         stream);

@@ -208,27 +208,25 @@ __device__ __forceinline__ void mma_rows_body(const GroupSlot& seg, int row_byte
     }
 }
 
-// Four resident CTAs (128 threads) are intentional where the staged-row arena fits: on the 23.5 KiB
-// formats, four blocks fit in 102,400 B (1,024 B driver-reserved per block) and the register cap
-// 65536 / (128 * 4) = 128 binds at the same count, so ptxas keeps an 8-32 B live-set frame instead
-// of dropping to three CTAs (the sibling int8 grouped-attention schedule measured a +15% regression
-// from that relaxation). Q6_K stages 37.9 KiB per CTA, capping physical residency at two CTAs/SM;
-// clamping the hint to the shared-memory fit raises Q6_K's register budget to 255 and empties its
-// frame without losing occupancy.
+// Four resident CTAs (128 threads) fit the 23.5 KiB shared arena in 102,400 B, capping
+// registers at 65536 / (128 * 4) = 128. Q6_K stages 37.9 KiB per CTA (two CTAs/SM max), and
+// IQ3_XXS overflows 128 registers by a 32 B frame at four CTAs/SM; clamping both to max_blocks = 3
+// lifts their ceiling to 168 registers/thread and removes their spills without affecting other formats.
 constexpr std::size_t kSmSharedBytes        = 102400;
 constexpr std::size_t kDriverSharedPerBlock = 1024;
 
-constexpr int mma_rows_min_blocks(std::size_t staged_bytes) {
+constexpr int mma_rows_min_blocks(std::size_t staged_bytes, int max_blocks = 4) {
     const std::size_t block_smem =
         ((sizeof(MmaPartial) + staged_bytes + 127) & ~std::size_t{127}) + kDriverSharedPerBlock;
     const int max_by_smem = static_cast<int>(kSmSharedBytes / block_smem);
-    return max_by_smem < 4 ? max_by_smem : 4;
+    return max_by_smem < max_blocks ? max_by_smem : max_blocks;
 }
 
 template <QType F, bool OutF32, int Stage = kStaged>
 __global__ void __launch_bounds__(
     kMmaWarps * 32,
-    mma_rows_min_blocks(Stage == kStaged ? sizeof(ggml::mma_rows::StagedRows<F>) * kMmaWarps : 0))
+    mma_rows_min_blocks(Stage == kStaged ? sizeof(ggml::mma_rows::StagedRows<F>) * kMmaWarps : 0,
+                        (F == QType::GGML_Q6_K || F == QType::GGML_IQ3_XXS) ? 3 : 4))
     mma_rows_kernel(RowsGroup grp, int row_bytes, int slices, const std::int32_t* encoded,
                     const std::int32_t* emax, int columns) {
     __shared__ MmaPartial partial;

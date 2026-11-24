@@ -29,9 +29,11 @@ std::size_t tiled_shared_bytes(int warps, int split, int stages, int slot_bytes)
 }
 
 template <QType F, bool OutF32>
-__device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices, const std::int32_t* __restrict__ encoded,
-                                               const std::int32_t* __restrict__ emax, int columns, int split, int stages,
-                                               int slot_bytes, unsigned char* shared) {
+__device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices,
+                                               const std::int32_t* __restrict__ encoded,
+                                               const std::int32_t* __restrict__ emax, int columns,
+                                               int split, int stages, int slot_bytes,
+                                               unsigned char* shared) {
     static_assert(kGgmlTiledFormat<F>, "tiled rows: formats of 256-element blocks");
     constexpr int kBlockBytes = static_cast<int>(ggml_block_bytes(F));
     constexpr int kRun        = kGgmlTiledRun<F>;
@@ -112,17 +114,19 @@ __device__ __forceinline__ void tiled_mma_body(const GroupSlot& seg, int slices,
 }
 
 template <QType F, bool OutF32>
-__global__ void __launch_bounds__(kTiledMaxThreads, 2)
+__global__ void __launch_bounds__(kTiledMaxThreads, 1)
     tiled_mma_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
-                     const std::int32_t* __restrict__ emax, int columns, int split, int stages, int slot_bytes) {
+                     const std::int32_t* __restrict__ emax, int columns, int split, int stages,
+                     int slot_bytes) {
     extern __shared__ __align__(16) unsigned char tiled_shared[];
     tiled_mma_body<F, OutF32>(group_slot(grp), slices, encoded, emax, columns, split, stages, slot_bytes, tiled_shared);
 }
 
 template <QType F0, QType F1, bool OutF32>
-__global__ void __launch_bounds__(kTiledMaxThreads, 2)
+__global__ void __launch_bounds__(kTiledMaxThreads, 1)
     tiled_mma_mixed_kernel(RowsGroup grp, int slices, const std::int32_t* __restrict__ encoded,
-                           const std::int32_t* __restrict__ emax, int columns, int split, int stages, int slot_bytes) {
+                           const std::int32_t* __restrict__ emax, int columns, int split,
+                           int stages, int slot_bytes) {
     extern __shared__ __align__(16) unsigned char tiled_shared[];
     const GroupSlot seg = group_slot(grp);
     if (seg.format == 0) {

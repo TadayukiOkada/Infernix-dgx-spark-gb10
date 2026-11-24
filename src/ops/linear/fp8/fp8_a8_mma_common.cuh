@@ -94,35 +94,43 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
 
     if constexpr (Schedule::kMmaTokens * Schedule::kMmaRows >= 32) {
         // 128+ accumulator registers leave at most 40 registers under the 9-warp (168-reg) SM
-        // sub-partition ceiling; stream B per row tile so all accumulators stay in registers
-        // with zero local-memory stack spills.
-#pragma unroll
+        // sub-partition ceiling; tile A fragments in pairs and keep k_step rolled so all
+        // accumulators and staging state fit cleanly within 168 registers without stack spills.
+        constexpr int kATile = Schedule::kMmaTokens % 2 == 0 ? 2 : 1;
+#pragma unroll 1
         for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
-            unsigned a_fragments[Schedule::kMmaTokens][4];
 #pragma unroll
-            for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-                const int row =
-                    warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
-                const int logical_byte  = k_step * 32 + a_column_byte;
-                const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
-                ldmatrix_x4(a_fragments[mma_token][0], a_fragments[mma_token][1],
-                            a_fragments[mma_token][2], a_fragments[mma_token][3],
-                            smem_addr(activation_stage + row * BK + physical_byte));
-            }
+            for (int token_base = 0; token_base < Schedule::kMmaTokens; token_base += kATile) {
+                unsigned a_fragments[kATile][4];
 #pragma unroll
-            for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
-                const int row          = warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
-                const int logical_byte = k_step * 32 + b_column_byte;
-                const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
-                unsigned b0, b1;
-                ldmatrix_x2(b0, b1, smem_addr(weight_stage + row * BK + physical_byte));
+                for (int t = 0; t < kATile; ++t) {
+                    const int mma_token = token_base + t;
+                    const int row =
+                        warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;
+                    const int logical_byte  = k_step * 32 + a_column_byte;
+                    const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
+                    ldmatrix_x4(a_fragments[t][0], a_fragments[t][1], a_fragments[t][2],
+                                a_fragments[t][3],
+                                smem_addr(activation_stage + row * BK + physical_byte));
+                }
 #pragma unroll
-                for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
-                    mma_fp8_e4m3(
-                        accumulators[mma_token][mma_row][0], accumulators[mma_token][mma_row][1],
-                        accumulators[mma_token][mma_row][2], accumulators[mma_token][mma_row][3],
-                        a_fragments[mma_token][0], a_fragments[mma_token][1],
-                        a_fragments[mma_token][2], a_fragments[mma_token][3], b0, b1);
+                for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
+                    const int row =
+                        warp_row * Schedule::kWarpRows + mma_row * 8 + b_row_offset;
+                    const int logical_byte  = k_step * 32 + b_column_byte;
+                    const int physical_byte = fp8_mma_shared_byte<Schedule>(row, logical_byte);
+                    unsigned b0, b1;
+                    ldmatrix_x2(b0, b1, smem_addr(weight_stage + row * BK + physical_byte));
+#pragma unroll
+                    for (int t = 0; t < kATile; ++t) {
+                        const int mma_token = token_base + t;
+                        mma_fp8_e4m3(accumulators[mma_token][mma_row][0],
+                                     accumulators[mma_token][mma_row][1],
+                                     accumulators[mma_token][mma_row][2],
+                                     accumulators[mma_token][mma_row][3], a_fragments[t][0],
+                                     a_fragments[t][1], a_fragments[t][2], a_fragments[t][3], b0,
+                                     b1);
+                    }
                 }
             }
         }
@@ -279,6 +287,9 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                 *destination0 = __floats2bfloat162_rn(value00, value01);
                 *destination1 = __floats2bfloat162_rn(value10, value11);
             }
+        }
+        if constexpr (Schedule::kMmaTokens * Schedule::kMmaRows >= 32 && !collective) {
+            __syncwarp();
         }
     }
     __syncthreads();

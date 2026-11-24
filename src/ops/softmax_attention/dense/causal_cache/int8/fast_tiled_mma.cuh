@@ -71,10 +71,11 @@ inline constexpr int kCausalPromptI8FastStageBytes =
 template <int Warps>
 struct CausalPromptI8FastShape {
     static_assert(Warps == 4 || Warps == 8);
-    static constexpr int Threads   = Warps * 32;
-    static constexpr int Br        = Warps * 16;
-    static constexpr int QBytes    = Br * kCausalPromptHeadDim;
-    static constexpr int SmemBytes = QBytes + 2 * kCausalPromptI8FastStageBytes;
+    static constexpr int Threads     = Warps * 32;
+    static constexpr int Br          = Warps * 16;
+    static constexpr int QBytes      = Br * kCausalPromptHeadDim;
+    static constexpr int QScaleBytes = Warps == 4 ? Br * kCausalPromptI8FastGroups * 4 : 0;
+    static constexpr int SmemBytes   = QBytes + 2 * kCausalPromptI8FastStageBytes + QScaleBytes;
 };
 
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
@@ -133,22 +134,17 @@ __global__ __launch_bounds__(
     const int kv_head    = q_head / Geometry::GroupSize;
     const int tokens     = metadata.valid_tokens(width);
 
-    // Rows past the valid token count are inactive columns and publish zeros.
-    const auto store_row = [&](int row, int d0, float v0, float v1, float v2, float v3) {
-        const int token = q0 + row;
-        if (token >= width) { return; }
-        const bool valid   = token < tokens;
-        const uint2 packed = make_uint2(pack_bf16x2(valid ? v0 : 0.0f, valid ? v1 : 0.0f),
-                                        pack_bf16x2(valid ? v2 : 0.0f, valid ? v3 : 0.0f));
-        store_vec(&out[causal_prompt_q_index<Geometry>(q_head, d0, token)], packed);
-    };
-
     if (q0 >= tokens) {
         // The merge publishes a split launch's inactive columns.
         if constexpr (!Split) {
+            const uint2 zero = make_uint2(pack_bf16x2(0.0f, 0.0f), pack_bf16x2(0.0f, 0.0f));
             for (int element = tid; element < Br * (D / 4); element += Threads) {
-                const int row = element / (D / 4);
-                store_row(row, (element - row * (D / 4)) * 4, 0.0f, 0.0f, 0.0f, 0.0f);
+                const int row   = element / (D / 4);
+                const int token = q0 + row;
+                if (token < width) {
+                    const int d0 = (element - row * (D / 4)) * 4;
+                    store_vec(&out[causal_prompt_q_index<Geometry>(q_head, d0, token)], zero);
+                }
             }
         }
         return;
@@ -165,35 +161,47 @@ __global__ __launch_bounds__(
     const int kb_begin        = Split ? min(key_blocks, split * pages_per_split) : 0;
     const int kb_end          = Split ? min(key_blocks, kb_begin + pages_per_split) : key_blocks;
 
-    // Each warp rotates and encodes its own 16 rows, keeping the two rows each lane owns in the
-    // MMA C layout as register scales.
-    float q_scale_r[2][Groups];
+    // Each warp rotates and encodes its own 16 rows. Eight-warp CTAs shard each row's 4 group
+    // scales across the 4 lanes of a quad (2 regs/thread) via __shfl_sync; four-warp CTAs store
+    // them in slack shared memory to keep register pressure inside 255 with zero spills.
+    constexpr bool kQScaleShared = (Warps == 4);
+    float* q_scale_s = reinterpret_cast<float*>(smem_raw + Shape::QBytes +
+                                                2 * kCausalPromptI8FastStageBytes);
+    float q_scale_lane[kQScaleShared ? 1 : 2] = {};
 #pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        const int row    = warp * 16 + r;
-        const int token  = q0 + row;
-        const bool valid = row < rows;
-        float q_values[8];
+    for (int half = 0; half < 2; ++half) {
+#pragma unroll 1
+        for (int r8 = 0; r8 < 8; ++r8) {
+            const int r      = half * 8 + r8;
+            const int row    = warp * 16 + r;
+            const int token  = q0 + row;
+            const bool valid = row < rows;
+            float q_values[8];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            q_values[k] =
-                valid ? __bfloat162float(
-                            q[causal_prompt_q_index<Geometry>(q_head, lane + 32 * k, token)])
-                      : 0.0f;
-        }
-        normalized_hadamard_d256_inplace(q_values, lane);
+            for (int k = 0; k < 8; ++k) {
+                q_values[k] =
+                    valid ? __bfloat162float(
+                                q[causal_prompt_q_index<Geometry>(q_head, lane + 32 * k, token)])
+                          : 0.0f;
+            }
+            normalized_hadamard_d256_inplace(q_values, lane);
 #pragma unroll
-        for (int grp = 0; grp < Groups; ++grp) {
-            const int d0    = grp * kKVCacheInt8Group + lane;
-            const float x0  = q_values[2 * grp];
-            const float x1  = q_values[2 * grp + 1];
-            const float mx  = warp_max(fmaxf(fabsf(x0), fabsf(x1)), FullMask);
-            const float qs  = mx > 0.0f ? mx / 127.0f : 0.0f;
-            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-            causal_prompt_store_byte_swizzled(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
-            causal_prompt_store_byte_swizzled(q_i8, row, d0 + 32,
-                                              kv_cache_int8_quant_code(x1, inv));
-            if (gid == (r & 7)) { q_scale_r[r >> 3][grp] = qs; }
+            for (int grp = 0; grp < Groups; ++grp) {
+                const int d0    = grp * kKVCacheInt8Group + lane;
+                const float x0  = q_values[2 * grp];
+                const float x1  = q_values[2 * grp + 1];
+                const float mx  = warp_max(fmaxf(fabsf(x0), fabsf(x1)), FullMask);
+                const float qs  = mx > 0.0f ? mx / 127.0f : 0.0f;
+                const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
+                causal_prompt_store_byte_swizzled(q_i8, row, d0, kv_cache_int8_quant_code(x0, inv));
+                causal_prompt_store_byte_swizzled(q_i8, row, d0 + 32,
+                                                  kv_cache_int8_quant_code(x1, inv));
+                if constexpr (kQScaleShared) {
+                    if (lane == 0) { q_scale_s[row * Groups + grp] = qs; }
+                } else {
+                    if (gid == r8 && lid == grp) { q_scale_lane[half] = qs; }
+                }
+            }
         }
     }
 
@@ -214,7 +222,7 @@ __global__ __launch_bounds__(
         const int valid     = min(Bc, max_query_abs + 1 - kb * Bc);
         const std::int64_t code_base =
             kv_cache_int8_quant_code_index<Geometry>(page, kv_head, 0, 0);
-#pragma unroll
+#pragma unroll 1
         for (int i = 0; i < kCausalPromptI8FastTileBytes / 16 / Threads; ++i) {
             const int chunk        = tid + i * Threads;
             const int key          = chunk >> 4;
@@ -223,6 +231,15 @@ __global__ __launch_bounds__(
             const int bytes        = key < valid ? 16 : 0;
             const std::int64_t src = code_base + key * D + c * 16;
             cp_async_zfill<16, Cache::cg>(k_s + dst, cache_k + src, bytes);
+        }
+#pragma unroll 1
+        for (int i = 0; i < kCausalPromptI8FastTileBytes / 16 / Threads; ++i) {
+            const int chunk        = tid + i * Threads;
+            const int key          = chunk >> 4;
+            const int c            = chunk & 15;
+            const int dst          = key * D + ((c ^ (key & 7)) << 4);
+            const int bytes        = key < valid ? 16 : 0;
+            const std::int64_t src = code_base + key * D + c * 16;
             cp_async_zfill<16, Cache::cg>(v_s + dst, cache_v + src, bytes);
         }
         if (tid < 2 * Bc) {
@@ -245,12 +262,7 @@ __global__ __launch_bounds__(
 
     // Rows this warp owns, for warp-uniform tile skipping and mask elision.
     const bool warp_active  = row_base < rows;
-    const int warp_min_qabs = base_pos + q0 + row_base;
     const int warp_max_qabs = base_pos + q0 + min(row_base + 15, rows - 1);
-    const int row0          = row_base + gid;
-    const int row1          = row0 + 8;
-    const int qabs0         = row0 < rows ? base_pos + q0 + row0 : -1;
-    const int qabs1         = row1 < rows ? base_pos + q0 + row1 : -1;
 
     float acc[DBlocks][2][4];
 #pragma unroll
@@ -292,6 +304,12 @@ __global__ __launch_bounds__(
         }
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
+            const float qs0 = kQScaleShared
+                                  ? q_scale_s[(row_base + gid) * Groups + grp]
+                                  : __shfl_sync(FullMask, q_scale_lane[0], gid * 4 + grp);
+            const float qs1 = kQScaleShared
+                                  ? q_scale_s[(row_base + gid + 8) * Groups + grp]
+                                  : __shfl_sync(FullMask, q_scale_lane[1], gid * 4 + grp);
             unsigned af[GroupKc][4];
 #pragma unroll
             for (int kk = 0; kk < GroupKc; ++kk) {
@@ -316,8 +334,6 @@ __global__ __launch_bounds__(
                 const int keya  = nt * 8 + 2 * lid;
                 const float ks0 = __half2float(ks_s[keya * Groups + grp]);
                 const float ks1 = __half2float(ks_s[(keya + 1) * Groups + grp]);
-                const float qs0 = q_scale_r[0][grp];
-                const float qs1 = q_scale_r[1][grp];
                 score[nt][0]    = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
                 score[nt][1]    = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
                 score[nt][2]    = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
@@ -325,7 +341,12 @@ __global__ __launch_bounds__(
             }
         }
 
-        const bool full_tile = k0 + Bc - 1 <= warp_min_qabs;
+        const int warp_min_qabs = base_pos + q0 + row_base;
+        const int row0          = row_base + gid;
+        const int row1          = row0 + 8;
+        const int qabs0         = row0 < rows ? base_pos + q0 + row0 : -1;
+        const int qabs1         = row1 < rows ? base_pos + q0 + row1 : -1;
+        const bool full_tile    = k0 + Bc - 1 <= warp_min_qabs;
         float bm0            = -CUDART_INF_F;
         float bm1            = -CUDART_INF_F;
 #pragma unroll
@@ -412,7 +433,6 @@ __global__ __launch_bounds__(
         const __half2 code_origin = __float2half2_rn(1024.0f);
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
-            __half2 product[PVKs][4];
             __half2 max0 = __float2half2_rn(0.0f);
             __half2 max1 = max0;
 #pragma unroll
@@ -422,12 +442,12 @@ __global__ __launch_bounds__(
                     __halves2half2(vs_s[key * Groups + grp], vs_s[(key + 1) * Groups + grp]);
                 const __half2 hi =
                     __halves2half2(vs_s[(key + 8) * Groups + grp], vs_s[(key + 9) * Groups + grp]);
-                product[j][0] = __hmul2(load_vec<__half2>(&pa[j][0]), lo);
-                product[j][1] = __hmul2(load_vec<__half2>(&pa[j][1]), lo);
-                product[j][2] = __hmul2(load_vec<__half2>(&pa[j][2]), hi);
-                product[j][3] = __hmul2(load_vec<__half2>(&pa[j][3]), hi);
-                max0          = __hmax2(max0, __hmax2(product[j][0], product[j][2]));
-                max1          = __hmax2(max1, __hmax2(product[j][1], product[j][3]));
+                const __half2 p0 = __hmul2(load_vec<__half2>(&pa[j][0]), lo);
+                const __half2 p1 = __hmul2(load_vec<__half2>(&pa[j][1]), lo);
+                const __half2 p2 = __hmul2(load_vec<__half2>(&pa[j][2]), hi);
+                const __half2 p3 = __hmul2(load_vec<__half2>(&pa[j][3]), hi);
+                max0             = __hmax2(max0, __hmax2(p0, p2));
+                max1             = __hmax2(max1, __hmax2(p1, p3));
             }
             const float row_max0 =
                 warp_max<4>(fmaxf(__low2float(max0), __high2float(max0)), FullMask);
@@ -447,23 +467,29 @@ __global__ __launch_bounds__(
             unsigned a[2][4];
 #pragma unroll
             for (int s = 0; s < 2; ++s) {
-                unsigned q[2][4];
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int j = 2 * s + h;
-                    const __half2 c0 = __hfma2(product[j][0], inv0, code_origin);
-                    const __half2 c1 = __hfma2(product[j][1], inv1, code_origin);
-                    const __half2 c2 = __hfma2(product[j][2], inv0, code_origin);
-                    const __half2 c3 = __hfma2(product[j][3], inv1, code_origin);
-                    q[h][0]          = load_vec<unsigned>(&c0);
-                    q[h][1]          = load_vec<unsigned>(&c1);
-                    q[h][2]          = load_vec<unsigned>(&c2);
-                    q[h][3]          = load_vec<unsigned>(&c3);
+                    const int j   = 2 * s + h;
+                    const int key = j * 16 + 2 * lid;
+                    const __half2 lo =
+                        __halves2half2(vs_s[key * Groups + grp], vs_s[(key + 1) * Groups + grp]);
+                    const __half2 hi = __halves2half2(vs_s[(key + 8) * Groups + grp],
+                                                      vs_s[(key + 9) * Groups + grp]);
+                    const __half2 p0 = __hmul2(load_vec<__half2>(&pa[j][0]), lo);
+                    const __half2 p1 = __hmul2(load_vec<__half2>(&pa[j][1]), lo);
+                    const __half2 p2 = __hmul2(load_vec<__half2>(&pa[j][2]), hi);
+                    const __half2 p3 = __hmul2(load_vec<__half2>(&pa[j][3]), hi);
+                    const __half2 c0 = __hfma2(p0, inv0, code_origin);
+                    const __half2 c1 = __hfma2(p1, inv1, code_origin);
+                    const __half2 c2 = __hfma2(p2, inv0, code_origin);
+                    const __half2 c3 = __hfma2(p3, inv1, code_origin);
+                    const unsigned u0 = load_vec<unsigned>(&c0);
+                    const unsigned u1 = load_vec<unsigned>(&c1);
+                    const unsigned u2 = load_vec<unsigned>(&c2);
+                    const unsigned u3 = load_vec<unsigned>(&c3);
+                    a[s][2 * h + 0]   = __byte_perm(u0, u2, 0x6420);
+                    a[s][2 * h + 1]   = __byte_perm(u1, u3, 0x6420);
                 }
-                a[s][0] = __byte_perm(q[0][0], q[0][2], 0x6420);
-                a[s][1] = __byte_perm(q[0][1], q[0][3], 0x6420);
-                a[s][2] = __byte_perm(q[1][0], q[1][2], 0x6420);
-                a[s][3] = __byte_perm(q[1][1], q[1][3], 0x6420);
             }
 #pragma unroll
             for (int b = 0; b < GroupDBlocks; ++b) {
@@ -522,22 +548,6 @@ __global__ __launch_bounds__(
             const float a_scale1 = tile_shift != 0 ? ldexpf(tile_alpha1, -tile_shift) : tile_alpha1;
 #pragma unroll
             for (int grp = 0; grp < Groups; ++grp) {
-                // Group scales of the keys each lane supplies: (2t, 2t+1) and (8+2t, 9+2t) per k-step.
-                unsigned vsc[PVKs][2];
-#pragma unroll
-                for (int j = 0; j < PVKs; ++j) {
-                    const int key = j * 16 + 2 * lid;
-                    __half2 lo =
-                        __halves2half2(vs_s[key * Groups + grp], vs_s[(key + 1) * Groups + grp]);
-                    __half2 hi =
-                        __halves2half2(vs_s[(key + 8) * Groups + grp], vs_s[(key + 9) * Groups + grp]);
-                    if (tile_shift != 0) {
-                        lo = __hmul2(lo, mul);
-                        hi = __hmul2(hi, mul);
-                    }
-                    vsc[j][0] = load_vec<unsigned>(&lo);
-                    vsc[j][1] = load_vec<unsigned>(&hi);
-                }
 #pragma unroll
                 for (int pass = 0; pass < GroupDBlocks / PassDBlocks; ++pass) {
                     const int db0 = grp * GroupDBlocks + pass * PassDBlocks;
@@ -554,21 +564,32 @@ __global__ __launch_bounds__(
                     }
 #pragma unroll
                     for (int j = 0; j < PVKs; ++j) {
+                        const int key = j * 16 + 2 * lid;
+                        __half2 lo =
+                            __halves2half2(vs_s[key * Groups + grp], vs_s[(key + 1) * Groups + grp]);
+                        __half2 hi = __halves2half2(vs_s[(key + 8) * Groups + grp],
+                                                    vs_s[(key + 9) * Groups + grp]);
+                        if (tile_shift != 0) {
+                            lo = __hmul2(lo, mul);
+                            hi = __hmul2(hi, mul);
+                        }
+                        const unsigned vsc0 = load_vec<unsigned>(&lo);
+                        const unsigned vsc1 = load_vec<unsigned>(&hi);
 #pragma unroll
                         for (int q2 = 0; q2 < PassDBlocks / 2; ++q2) {
                             // Matrices: keys 16j+0..7 and 16j+8..15 of d-block db, then of db + 1.
                             const int db    = db0 + 2 * q2;
-                            const int key   = j * 16 + ((a_mat & 1) << 3) + a_rin;
+                            const int vkey  = j * 16 + ((a_mat & 1) << 3) + a_rin;
                             const int chunk = db + (a_mat >> 1);
                             unsigned r[4];
                             ldmatrix_x4_t(r[0], r[1], r[2], r[3],
-                                          smem_addr(&v_s[key * D + ((chunk ^ (key & 7)) << 4)]));
+                                          smem_addr(&v_s[vkey * D + ((chunk ^ (vkey & 7)) << 4)]));
 #pragma unroll
                             for (int b = 0; b < 2; ++b) {
                                 unsigned even_lo, odd_lo, even_hi, odd_hi;
-                                causal_prompt_i8_fast_decode_v_pair(r[2 * b], vsc[j][0], even_lo,
+                                causal_prompt_i8_fast_decode_v_pair(r[2 * b], vsc0, even_lo,
                                                                     odd_lo);
-                                causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc[j][1], even_hi,
+                                causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc1, even_hi,
                                                                     odd_hi);
                                 float (&ae)[4] = acc[db + b][0];
                                 float (&ao)[4] = acc[db + b][1];
@@ -627,6 +648,8 @@ __global__ __launch_bounds__(
     const float inv_l1 = running_l1 > 0.0f ? __frcp_rn(running_l1) : 0.0f;
     // Even n8 tiles hold dimensions 16b + 2n and odd tiles 16b + 2n + 1, so lane (g, t) owns the
     // four contiguous dimensions 16b + 4t .. 16b + 4t + 3 of its two rows.
+    const int row0_epilog = row_base + gid;
+    const int row1_epilog = row0_epilog + 8;
     if constexpr (Split) {
         // Each split row is normalized by its own sum; the merge weights the splits.
         const auto publish = [&](int row, int e, float maximum, float sum, float inv) {
@@ -642,16 +665,25 @@ __global__ __launch_bounds__(
                                       acc[b][0][e + 1] * inv, acc[b][1][e + 1] * inv));
             }
         };
-        publish(row0, 0, running_m0, running_l0, inv_l0);
-        publish(row1, 2, running_m1, running_l1, inv_l1);
+        publish(row0_epilog, 0, running_m0, running_l0, inv_l0);
+        publish(row1_epilog, 2, running_m1, running_l1, inv_l1);
     } else {
+        // Rows past the valid token count are inactive columns and publish zeros.
+        const auto store_row = [&](int row, int d0, float v0, float v1, float v2, float v3) {
+            const int token = q0 + row;
+            if (token >= width) { return; }
+            const bool valid   = token < tokens;
+            const uint2 packed = make_uint2(pack_bf16x2(valid ? v0 : 0.0f, valid ? v1 : 0.0f),
+                                            pack_bf16x2(valid ? v2 : 0.0f, valid ? v3 : 0.0f));
+            store_vec(&out[causal_prompt_q_index<Geometry>(q_head, d0, token)], packed);
+        };
 #pragma unroll
         for (int b = 0; b < DBlocks; ++b) {
             const int d0 = b * 16 + 4 * lid;
-            store_row(row0, d0, acc[b][0][0] * inv_l0, acc[b][1][0] * inv_l0, acc[b][0][1] * inv_l0,
-                      acc[b][1][1] * inv_l0);
-            store_row(row1, d0, acc[b][0][2] * inv_l1, acc[b][1][2] * inv_l1, acc[b][0][3] * inv_l1,
-                      acc[b][1][3] * inv_l1);
+            store_row(row0_epilog, d0, acc[b][0][0] * inv_l0, acc[b][1][0] * inv_l0,
+                      acc[b][0][1] * inv_l0, acc[b][1][1] * inv_l0);
+            store_row(row1_epilog, d0, acc[b][0][2] * inv_l1, acc[b][1][2] * inv_l1,
+                      acc[b][0][3] * inv_l1, acc[b][1][3] * inv_l1);
         }
     }
 }

@@ -149,20 +149,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    // Keep two group scales live; reload the other groups from the shared Q tile.
-    float q_scale_r0[Groups - 2];
-    float q_scale_r1[Groups - 2];
-    if (warp < ProducerWarps) {
-        const int scale_row0 = warp * 16 + gid;
-        const int scale_row1 = scale_row0 + 8;
-#pragma unroll
-        for (int grp = 0; grp < Groups - 2; ++grp) {
-            float qs0       = lid == 0 ? q_scale[scale_row0 * Groups + grp] : 0.0f;
-            float qs1       = lid == 0 ? q_scale[scale_row1 * Groups + grp] : 0.0f;
-            q_scale_r0[grp] = __shfl_sync(FullMask, qs0, gid * 4);
-            q_scale_r1[grp] = __shfl_sync(FullMask, qs1, gid * 4);
-        }
-    }
+    // Load group query scales on demand inside each group iteration to keep live registers under
+    // 128/thread across the outer K-tile loop.
 
     float acc[PVNtPerWarp][4];
 #pragma unroll
@@ -185,21 +173,14 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                 score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
             }
 
-#pragma unroll
+#pragma unroll 1
             for (int grp = 0; grp < Groups; ++grp) {
-                float qs0;
-                float qs1;
-                if (grp < Groups - 2) {
-                    qs0 = q_scale_r0[grp];
-                    qs1 = q_scale_r1[grp];
-                } else {
-                    const int scale_row0 = row_base + gid;
-                    const int scale_row1 = scale_row0 + 8;
-                    qs0                  = lid == 0 ? q_scale[scale_row0 * Groups + grp] : 0.0f;
-                    qs1                  = lid == 0 ? q_scale[scale_row1 * Groups + grp] : 0.0f;
-                    qs0                  = __shfl_sync(FullMask, qs0, gid * 4);
-                    qs1                  = __shfl_sync(FullMask, qs1, gid * 4);
-                }
+                const int scale_row0 = row_base + gid;
+                const int scale_row1 = scale_row0 + 8;
+                float qs0            = lid == 0 ? q_scale[scale_row0 * Groups + grp] : 0.0f;
+                float qs1            = lid == 0 ? q_scale[scale_row1 * Groups + grp] : 0.0f;
+                qs0                  = __shfl_sync(FullMask, qs0, gid * 4);
+                qs1                  = __shfl_sync(FullMask, qs1, gid * 4);
 
                 unsigned af[GroupKc][4];
 #pragma unroll
@@ -348,7 +329,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             acc[n][3] *= alpha1;
         }
 
-#pragma unroll
+#pragma unroll 1
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
             const int pcol = k * 16 + a_coloff;

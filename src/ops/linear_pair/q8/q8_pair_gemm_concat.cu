@@ -108,7 +108,7 @@ void q8_pair_concat_mma_launch(Q8PairScheduleId schedule, const Tensor& x,
                                                                      second_out, stream);
         return;
     case Q8PairScheduleId::ConcatMmaR96C112:
-        dispatch_variant<Q8A16MmaSchedule<96, 112, 64, 48, 16, 2, 2>>(x, first_weight, first_out,
+        dispatch_variant<Q8A16MmaSchedule<96, 112, 64, 48, 16, 2, 1>>(x, first_weight, first_out,
                                                                       second_out, stream);
         return;
     case Q8PairScheduleId::ConcatMmaR128C64:

@@ -68,6 +68,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         extern __shared__ __align__(16) unsigned char dynamic[];
         storage = reinterpret_cast<Storage*>(dynamic);
     }
+    auto* q_s     = reinterpret_cast<__nv_bfloat16*>(storage->q);
     auto* k_s     = reinterpret_cast<__nv_bfloat16*>(storage->qkv);
     auto* v_s     = reinterpret_cast<__half*>(storage->qkv + N * D);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -136,7 +137,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     for (int i = tid; i < M * (D / 8); i += S::kThreads) {
         const int row = i / (D / 8), d = i % (D / 8) * 8, packed = row_begin + row;
         const int token = packed / G::GroupSize, h = head * G::GroupSize + packed % G::GroupSize;
-        auto* dst = k_s + row * D + causal_swizzle(row, d);
+        auto* dst = q_s + row * D + causal_swizzle(row, d);
         if (token < live)
             cp_async<16>(dst, q + causal_q_index<G>(h, d, token));
         else
@@ -145,15 +146,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     cp_commit();
     cp_wait<0>();
     __syncthreads();
-    unsigned q_frag[QKKs][4];
     const int a_row = warp_q * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
-#pragma unroll
-    for (int k = 0; k < QKKs; ++k) {
-        const int d = k * 16 + (lane >> 4) * 8;
-        ldmatrix_x4(q_frag[k][0], q_frag[k][1], q_frag[k][2], q_frag[k][3],
-                    smem_addr(k_s + a_row * D + causal_swizzle(a_row, d)));
-    }
-    __syncthreads();
     float acc[PVNt][4] = {};
     Bf16KvSoftmaxRow state[2];
     const float scale_log2 = scale * kLog2E;
@@ -183,18 +176,22 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         cp_wait<0>();
         __syncthreads();
         float score[QKNt][4] = {};
-        // Q and O already occupy 192 registers per lane at D=256. Keep one
-        // K fragment live at a time; double buffering all N fragments spills.
+        // Reload one Q K-slice at a time from storage->q instead of holding all 64 q_frag
+        // registers live alongside 128 acc registers across the entire KV loop.
+#pragma unroll 1
+        for (int k = 0; k < QKKs; ++k) {
+            unsigned qf[4];
+            const int qd = k * 16 + (lane >> 4) * 8;
+            ldmatrix_x4(qf[0], qf[1], qf[2], qf[3],
+                        smem_addr(q_s + a_row * D + causal_swizzle(a_row, qd)));
 #pragma unroll
-        for (int n = 0; n < QKNt; ++n) {
-#pragma unroll
-            for (int k = 0; k < QKKs; ++k) {
+            for (int n = 0; n < QKNt; ++n) {
                 unsigned bf[2];
                 const int row = warp_kv * NK + n * 8 + (lane & 7);
                 const int d   = k * 16 + ((lane >> 3) & 1) * 8;
                 ldmatrix_x2(bf[0], bf[1], smem_addr(k_s + row * D + causal_swizzle(row, d)));
-                mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], q_frag[k][0],
-                         q_frag[k][1], q_frag[k][2], q_frag[k][3], bf[0], bf[1]);
+                mma_bf16(score[n][0], score[n][1], score[n][2], score[n][3], qf[0], qf[1], qf[2],
+                         qf[3], bf[0], bf[1]);
             }
         }
         float maximum[2] = {-CUDART_INF_F, -CUDART_INF_F};

@@ -638,8 +638,7 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, 1) __global__
             for (int j = 0; j < WarpRowTiles; ++j) {
                 score[j][0] = score[j][1] = score[j][2] = score[j][3] = 0.0f;
             }
-#pragma unroll
-            for (int g = 0; g < Groups; ++g) {
+            const auto qk_group = [&](int g) {
                 const float ks0 = __half2float(tile_ks[(nt * 8 + 2 * lid) * Groups + g]);
                 const float ks1 = __half2float(tile_ks[(nt * 8 + 2 * lid + 1) * Groups + g]);
                 unsigned bf[GroupKc][2];
@@ -675,6 +674,13 @@ __launch_bounds__(kVqGroupedWarps<Geometry, TokenTile> * 32, 1) __global__
                     score[j][2] += qs1 * ks0 * static_cast<float>(c2);
                     score[j][3] += qs1 * ks1 * static_cast<float>(c3);
                 }
+            };
+            if constexpr (kQScaleShared) {
+#pragma unroll 1
+                for (int g = 0; g < Groups; ++g) { qk_group(g); }
+            } else {
+#pragma unroll
+                for (int g = 0; g < Groups; ++g) { qk_group(g); }
             }
 #pragma unroll
             for (int j = 0; j < WarpRowTiles; ++j) {
