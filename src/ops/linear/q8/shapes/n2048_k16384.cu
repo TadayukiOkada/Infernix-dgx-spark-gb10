@@ -30,15 +30,6 @@ using C40 = Q8A16SlicedKMmaSchedule<40, 16, 1, 1, Access::Shared, Cache::cg, Cac
                                     Stage::RuntimeActive>;
 using C48 =
     Q8A16SlicedKMmaSchedule<48, 8, 1, 2, Access::Shared, Cache::cg, Cache::cg, Stage::ActiveOnly>;
-
-void launch_grouped(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Schedule =
-        Q8A16GroupedSlicedKMmaSchedule<128, 2, 4, 2, 1, 0, Cache::cg, Cache::cg, true, false>;
-    launch_q8_a16_grouped_sliced_k_mma<Schedule>(
-        q8_linear_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows},
-        LinearIdentityEpilogue{}, stream);
-}
 } // namespace
 
 // GB10 (sm_121a) decode/verify retune 2026-10-31 (T2): bench/ops/q8_route_sweep.cu over
@@ -53,8 +44,8 @@ Q8Launch select_q8_n2048_k16384(std::int32_t tokens) {
     if (tokens <= 8) return launch_q8_a16_sliced<Geometry, 8, C8>;
     if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w16_s1_m2;
     if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w4_s1;
-    if (tokens <= 64) return launch_q8_a16_mma_r16_t32_k128_a1;
-    if (tokens <= 128) return launch_grouped;
+    if (tokens <= 128) return launch_q8_a16_mma_r32_t32_k128_a1;
+    if (tokens <= 192) return launch_q8_a16_mma_r64x32_t64_k128_a1;
     if (tokens <= 448) return launch_q8_a16_mma_r64_t128;
     // T1 2026-10-31: 128x128 Grouped-8 tile from T = 449. N = 2048 gives 16 M-tiles, so the
     // grid only reaches the 48 SMs x 2 CTAs wave from ~T = 449: the sweep measured r64_t128

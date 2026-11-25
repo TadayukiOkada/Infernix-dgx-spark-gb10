@@ -29,7 +29,7 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 2) return nvfp4_linear_a16_simt<Geometry, 2, C2, true>;
     if (tokens <= 4) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
-    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<24, 8, 2>>;
+    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2>>;
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2>>;
     if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 8, 2>>;
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 16, 128, 16, 8, 2, 3>>;

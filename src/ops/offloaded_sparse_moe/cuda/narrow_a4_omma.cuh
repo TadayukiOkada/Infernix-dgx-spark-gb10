@@ -65,7 +65,7 @@ __device__ __forceinline__ void omma_load_x_f32_amax(const bf16* x, int token_co
     const auto* src = reinterpret_cast<const uint4*>(
         reinterpret_cast<const std::uint16_t*>(x) + static_cast<std::size_t>(token_col) * G::kHidden +
         static_cast<std::size_t>(chunk * 16 + b_local) * 16);
-    const uint4 s0 = src[0], s1 = src[1];
+    const uint4 s0 = __ldg(src), s1 = __ldg(src + 1);
     const unsigned words[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
     amax = 0.0F;
 #pragma unroll
@@ -259,11 +259,12 @@ __device__ __forceinline__ void omma_stage_xplane_chunk(const std::uint8_t* x_pl
 }
 
 template <class G, bool UseXPlane = false>
-__device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, const bf16* x,
+__device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, const bf16* __restrict__ x,
                                                      const MoeDispatch& dispatch, int top_k,
-                                                     const std::uint8_t* record, const moe::ExpertScales& scales,
-                                                     int first, int count, int slice, const std::uint8_t* x_plane,
-                                                     std::uint8_t* h_base, std::uint32_t& phase_bits) {
+                                                     const std::uint8_t* __restrict__ record,
+                                                     const moe::ExpertScales& scales, int first, int count, int slice,
+                                                     const std::uint8_t* __restrict__ x_plane,
+                                                     std::uint8_t* __restrict__ h_base, std::uint32_t& phase_bits) {
     using S              = OmmaShape<G>;
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;
@@ -464,9 +465,10 @@ __device__ __forceinline__ void gate_up_omma_slice(GateUpOmmaShared<G>& sm, cons
 
 template <class G>
 __device__ __forceinline__ void down_omma_tile_compute(DownOmmaShared<G>& sm, const MoeDispatch& dispatch,
-                                                       const std::uint8_t* record, const moe::ExpertScales& scales,
-                                                       int first, int count, int tile, const std::uint8_t* h_base,
-                                                       bf16* outputs, bool preloaded_stage0,
+                                                       const std::uint8_t* __restrict__ record,
+                                                       const moe::ExpertScales& scales, int first, int count, int tile,
+                                                       const std::uint8_t* __restrict__ h_base,
+                                                       bf16* __restrict__ outputs, bool preloaded_stage0,
                                                        std::uint32_t& phase_bits) {
     using S        = OmmaShape<G>;
     const int tid  = static_cast<int>(threadIdx.x);
@@ -565,16 +567,19 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
     __syncthreads();
     std::uint32_t mbar_phase = 0U;
     pdl::wait_for_dependencies();
+    const auto* __restrict__ x_r           = pdl::after_wait_restrict(x);
+    const auto* const* __restrict__ jrec_r = pdl::after_wait_restrict(job_records);
+    const auto* __restrict__ flags_r       = pdl::after_wait_restrict(flags);
     const int job   = base + static_cast<int>(blockIdx.y);
     const int slice = static_cast<int>(blockIdx.x);
-    if (job < *dispatch.job_count && (flags == nullptr || flags[job] == 0)) {
+    if (job < *dispatch.job_count && (flags_r == nullptr || flags_r[job] == 0)) {
         const int expert           = dispatch.jobs[job];
-        const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+        const std::uint8_t* record = pass_record(phase, source, expert, jrec_r, job);
         if (record != nullptr) {
             const moe::ExpertScales scales = source.scales[expert];
             const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
             if (count > 0 && !moe::wide_route(count, scales)) {
-                gate_up_omma_slice<G, false>(sm, x, dispatch, top_k, record, scales, first, count, slice, nullptr,
+                gate_up_omma_slice<G, false>(sm, x_r, dispatch, top_k, record, scales, first, count, slice, nullptr,
                                              h_base, mbar_phase);
             }
         }
@@ -584,8 +589,8 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
 
 template <class G>
 __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
-    down_omma_kernel(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* job_records,
-                     const std::int32_t* flags, int base, const std::uint8_t* h_base,
+    down_omma_kernel(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
+                     const std::int32_t* __restrict__ flags, int base, const std::uint8_t* h_base,
                      bf16* __restrict__ outputs, PassPhase phase) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
@@ -634,15 +639,16 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
-    down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_base, outputs, preloaded, mbar_phase);
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_base);
+    down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_r, outputs, preloaded, mbar_phase);
 }
 
 template <class G>
 __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
-    gate_up_omma_persistent_kernel(const bf16* x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                                   const std::uint8_t* const* job_records,
-                                   const std::int32_t* narrow_jobs,
-                                   const std::int32_t* pass_narrow, int pass_index,
+    gate_up_omma_persistent_kernel(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                                   const std::uint8_t* const* __restrict__ job_records,
+                                   const std::int32_t* __restrict__ narrow_jobs,
+                                   const std::int32_t* __restrict__ pass_narrow, int pass_index,
                                    const std::uint8_t* x_plane, std::uint8_t* __restrict__ h_base) {
     using S = OmmaShape<G>;
     __shared__ GateUpOmmaShared<G> sm;
@@ -654,9 +660,10 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
     __syncthreads();
     std::uint32_t mbar_phase = 0U;
     pdl::wait_for_dependencies();
-    const int n_begin     = pass_narrow[pass_index];
-    const int n_count     = pass_narrow[pass_index + 1] - n_begin;
-    const int total_tasks = n_count * S::kGateUpSlices;
+    const auto* __restrict__ xp_r = pdl::after_wait_restrict(x_plane);
+    const int n_begin             = pass_narrow[pass_index];
+    const int n_count             = pass_narrow[pass_index + 1] - n_begin;
+    const int total_tasks         = n_count * S::kGateUpSlices;
     for (int task = static_cast<int>(blockIdx.x); task < total_tasks; task += static_cast<int>(gridDim.x)) {
         const int job              = narrow_jobs[n_begin + task / S::kGateUpSlices];
         const int slice            = task % S::kGateUpSlices;
@@ -666,7 +673,7 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
         const moe::ExpertScales scales = source.scales[expert];
         const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
         if (count <= 0 || moe::wide_route(count, scales)) { continue; }
-        gate_up_omma_slice<G, true>(sm, x, dispatch, top_k, record, scales, first, count, slice, x_plane, h_base,
+        gate_up_omma_slice<G, true>(sm, x, dispatch, top_k, record, scales, first, count, slice, xp_r, h_base,
                                     mbar_phase);
         fence_reads_before_async_refill();
         __syncthreads();
@@ -677,9 +684,9 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
 template <class G>
 __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
     down_omma_persistent_kernel(MoeDispatch dispatch, MoeExpertSource source,
-                                const std::uint8_t* const* job_records,
-                                const std::int32_t* narrow_jobs,
-                                const std::int32_t* pass_narrow, int pass_index,
+                                const std::uint8_t* const* __restrict__ job_records,
+                                const std::int32_t* __restrict__ narrow_jobs,
+                                const std::int32_t* __restrict__ pass_narrow, int pass_index,
                                 const std::uint8_t* h_base, bf16* __restrict__ outputs) {
     using S = OmmaShape<G>;
     __shared__ DownOmmaShared<G> sm;
@@ -729,8 +736,9 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
         }
     }
     pdl::wait_for_dependencies();
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_base);
     if (task0 < total_tasks && rec0 != nullptr) {
-        down_omma_tile_compute<G>(sm, dispatch, rec0, scales0, first0, count0, tile0, h_base, outputs, preloaded0,
+        down_omma_tile_compute<G>(sm, dispatch, rec0, scales0, first0, count0, tile0, h_r, outputs, preloaded0,
                                   mbar_phase);
         fence_reads_before_async_refill();
         __syncthreads();
@@ -744,7 +752,7 @@ __global__ void __launch_bounds__(OmmaShape<G>::kThreads, 7)
         const moe::ExpertScales scales = source.scales[expert];
         const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
         if (count <= 0 || moe::wide_route(count, scales)) { continue; }
-        down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_base, outputs, false, mbar_phase);
+        down_omma_tile_compute<G>(sm, dispatch, record, scales, first, count, tile, h_r, outputs, false, mbar_phase);
         fence_reads_before_async_refill();
         __syncthreads();
     }

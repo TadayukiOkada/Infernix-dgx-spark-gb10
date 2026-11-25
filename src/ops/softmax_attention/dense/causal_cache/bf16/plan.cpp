@@ -6,7 +6,11 @@
 
 namespace infernix::ops::detail {
 namespace {
-constexpr int kGroupedPrefillMaxWidth = 192;
+constexpr int grouped_prefill_max_width(int kv_heads) noexcept {
+    // On GB10 (48 SMs), Grouped64 loses wave fill with 4 KV heads past W = 64 (W = 65..80 hits
+    // ~506-524 us while Tiled64 runs ~375 us); 2 KV heads stay ahead on Grouped64 through W = 128.
+    return kv_heads >= 4 ? 64 : 128;
+}
 } // namespace
 
 Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
@@ -20,7 +24,7 @@ Bf16KvCausalPlan make_bf16_kv_causal_plan(int heads, int width, int batch,
     const int kv_heads = causal_kv_heads(heads), group = heads / kv_heads;
     const auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
     const int visible   = envelope.max_visible_keys;
-    if (width > kGroupedPrefillMaxWidth) {
+    if (width > grouped_prefill_max_width(kv_heads)) {
         // The two-KV-head geometries (16/2 measured; 32/2 by the same KV-traffic rule, swept in M3).
         const auto instance =
             kv_heads == 2 && width >= 1024 && width % 128 == 0 && visible - width >= 8192
@@ -89,10 +93,11 @@ int bf16_kv_prompt_splits(int query_heads, int width, int query_rows, std::uint3
 std::size_t bf16_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
                                     CausalAttentionExecutionEnvelope envelope,
                                     int multiprocessor_count) {
-    std::size_t maximum = 0;
+    std::size_t maximum   = 0;
+    const int max_grouped = grouped_prefill_max_width(causal_kv_heads(heads));
     // bf16-prompt-split: the split partials of the widest-reaching prompt-route launch.
     if (envelope.bf16_prompt_split && batch == 1) {
-        for (int width = std::max(min_width, kGroupedPrefillMaxWidth + 1); width <= max_width; ++width) {
+        for (int width = std::max(min_width, max_grouped + 1); width <= max_width; ++width) {
             const auto plan = make_bf16_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
             if (plan.prompt_splits < 2) { continue; }
             WorkspaceLayoutBuilder layout;
@@ -100,7 +105,7 @@ std::size_t bf16_kv_workspace_bytes(int heads, int batch, int min_width, int max
             maximum = std::max(maximum, layout.peak_bytes(1));
         }
     }
-    for (int width = min_width; width <= std::min(max_width, kGroupedPrefillMaxWidth); ++width) {
+    for (int width = min_width; width <= std::min(max_width, max_grouped); ++width) {
         const auto plan =
             make_bf16_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
         WorkspaceLayoutBuilder layout;

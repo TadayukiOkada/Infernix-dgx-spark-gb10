@@ -31,11 +31,12 @@ struct Q8PairRouteSpec {
 // a coin flip between the tiles (r128 leads by 3-6% at 512/640/704/960 and trails by the same at
 // 576/832/896/1024, i.e. wave quantisation on 48 SMs rather than a schedule property), so it keeps
 // the incumbent 32x128 tile instead of freezing an unstable argmin.
-constexpr std::array<Q8PairRouteSpec, 6> kK5120Routes{{
+constexpr std::array<Q8PairRouteSpec, 7> kK5120Routes{{
     {1, 4, Q8PairScheduleId::TwoSimtR8C4},
     {5, 16, Q8PairScheduleId::TwoSlicedR16T16W8S2},
     {17, 64, Q8PairScheduleId::TwoSlicedR16T32W4S1},
-    {65, 256, Q8PairScheduleId::TwoMmaR32T32K128A1},
+    {65, 192, Q8PairScheduleId::TwoMmaR32T32K128A1},
+    {193, 256, Q8PairScheduleId::DualMmaR32C64},
     {257, 1535, Q8PairScheduleId::DualMmaR32C128},
     {1536, kAnyCols, Q8PairScheduleId::DualMmaR128C128},
 }};

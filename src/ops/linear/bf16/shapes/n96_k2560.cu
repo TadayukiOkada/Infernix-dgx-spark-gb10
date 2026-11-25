@@ -24,7 +24,7 @@ using S5 = Bf16ScheduleInstance<
 Bf16Launch ninfer_route(std::int32_t tokens) {
     if (tokens <= 1) return launch_bf16_gemv<S0>;
     if (tokens <= 4) return launch_bf16_simt<S1>;
-    if (tokens <= 16) return launch_bf16_simt<S2>;
+    if (tokens <= 8) return launch_bf16_simt<S2>;
     if (tokens <= 128) return launch_bf16_sliced_k_mma<S3>;
     if (tokens <= 512) return launch_bf16_sliced_k_mma<S4>;
     return launch_bf16_mma<S5>;

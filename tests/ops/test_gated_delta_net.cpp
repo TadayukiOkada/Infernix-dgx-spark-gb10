@@ -68,8 +68,8 @@ constexpr std::array<Criteria, 4> kCriteria{{
 }};
 
 PrecisionProfile prefill_profile(int tokens, bool normalize_qk) {
-    // Qualify the current public prefill boundary explicitly, including T=15/16/17.
-    if (tokens < 16) return PrecisionProfile::Recurrent;
+    // Qualify the current public prefill boundary explicitly, including T=7/8/15/16/17.
+    if (tokens < 8) return PrecisionProfile::Recurrent;
     return normalize_qk ? PrecisionProfile::ChunkedNormalized : PrecisionProfile::ChunkedRaw;
 }
 

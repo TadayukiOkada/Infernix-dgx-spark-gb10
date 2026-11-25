@@ -12,6 +12,7 @@ Q4Launch select_q4_n34816_k5120(std::int32_t tokens) {
     if (tokens <= 80) return launch_q4_a16_mma_r64_t80;
     if (tokens <= 96) return launch_q4_a16_mma_r64_t96;
     if (tokens <= 112) return launch_q4_a16_mma_r64_t112;
+    if (tokens <= 128) return launch_q4_a16_mma_r64_t64_k128_s2_a1;
     if (tokens <= 192) return launch_q4_a16_mma_r64_t96;
     if (tokens <= 224) return launch_q4_a16_mma_r64_t112;
     if (tokens <= 288) return launch_q4_a16_mma_r64_t96;

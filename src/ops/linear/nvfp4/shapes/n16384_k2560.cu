@@ -38,6 +38,8 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
     if (tokens <= 96) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>;
     if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
+    if (tokens <= 160) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 80, 128, 32, 16, 1, 2>>;
+    if (tokens <= 192) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>>;
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
 }
 
@@ -95,6 +97,18 @@ void launch_routes(const Nvfp4A16Operands& operands, Output output, cudaStream_t
             operands, output, epilogue, stream);
         return;
     }
+    if (tokens <= 160) {
+        launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<
+            Nvfp4A16MmaSchedule<64, 80, 128, 32, 16, 1, 2>, Geometry::kInputRows>>(
+            operands, output, epilogue, stream);
+        return;
+    }
+    if (tokens <= 192) {
+        launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<
+            Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>, Geometry::kInputRows>>(
+            operands, output, epilogue, stream);
+        return;
+    }
     launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<
         Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, Geometry::kInputRows>>(
         operands, output, epilogue, stream);
@@ -106,7 +120,7 @@ void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream
 
 using T16R64  = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 2, 2>;
 using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
-using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using T64R64  = Nvfp4A4MmaSchedule<64, 64, 256, 2, 4, 2, 1>;
 using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
@@ -118,7 +132,7 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
     if (tokens >= 129) return nvfp4_a4_tma_route<Nvfp4ScaleLayout::Tiled128>();
     if (tokens <= 16) return nvfp4_a4_mma_route<Geometry, T16R64>();
     if (tokens <= 32) return nvfp4_a4_mma_route<Geometry, T32R64>();
-    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R128>();
+    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T64R64>();
     return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
 }
 

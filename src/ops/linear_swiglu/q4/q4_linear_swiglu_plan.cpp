@@ -46,18 +46,17 @@ bool is_shared_shape(std::int32_t gate_up_rows, std::int32_t output_rows, std::i
            k == kSharedShape.k && padded_k == kSharedShape.padded_k;
 }
 
-// GB10 (48 SM) retune. Cold-cache candidate sweeps show the split-half-pair MMA tiles dominate the
-// whole prefill range: the materialized [gate_up_rows,cols] scratch route loses 5-19% to them almost
-// everywhere except a narrow 25-32 window and the exact 64-column sweet spot. The narrow-tail variant
-// wins only for the small remainder right after each 128-token block (cols mod 128 <= 24, matching the
-// kernel's own kExactTailCols), where a near-empty wide tile would otherwise be launched.
-constexpr std::array<RouteSpec, 15> kRoutes{{
+// GB10 (48 SM) retune. Cold-cache candidate sweeps show Materialized ([gate_up_rows, cols] BF16
+// scratch) beats MmaSplitHalfPairR32C128 by 23-37% across 33..112 and 129..152 (480..642 us vs
+// 770..833 us for 33..112, and 970..994 us vs 1212..1235 us for 129..152), while the split-half
+// MMA tile keeps 113..128 (792..832 us vs 947..970 us) and 153+ (where narrow-tail wins right
+// after each 128-token boundary, cols mod 128 <= 24).
+constexpr std::array<RouteSpec, 14> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
-    {{33, 63}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
-    {{64, 64}, Q4LinearSwiGluScheduleId::Materialized},
-    {{65, 128}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
-    {{129, 152}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
+    {{33, 112}, Q4LinearSwiGluScheduleId::Materialized},
+    {{113, 128}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{129, 152}, Q4LinearSwiGluScheduleId::Materialized},
     {{153, 256}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
     {{257, 280}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128Tail},
     {{281, 384}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},

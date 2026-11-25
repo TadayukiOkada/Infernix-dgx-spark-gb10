@@ -28,10 +28,9 @@ Q8Launch select_q8_n2560_k6144(std::int32_t tokens) {
     if (tokens <= 16) return launch_q8_a16_sliced_r16_t16_w8_s2;
     if (tokens <= 32) return launch_q8_a16_sliced_r16_t32_w8_s1_m2;
     if (tokens <= 64) return launch_q8_a16_mma_r64x16_t48_k128_a1;
-    if (tokens <= 96) return launch_q8_a16_mma_r64_t96;
     if (tokens <= 128) return launch_q8_a16_mma_r64x16_t128_k128_a2;
-    if (tokens <= 192) return launch_q8_a16_mma_r64x32_t96_k128_a1;
-    if (tokens <= 256) return launch_q8_a16_mma_r64_t128;
+    if (tokens <= 320) return launch_q8_a16_mma_r64x32_t96_k128_a1;
+    if (tokens <= 448) return launch_q8_a16_mma_r64x32_t64_k64_a2;
     if (tokens <= 512) return launch_q8_a16_mma_r128x64_t128_k64_a1;
     if (tokens <= 1024) return launch_q8_a16_mma_r64x32_t128_k64_a2;
     return launch_q8_a16_mma_r128x64_t128_k64_a1;

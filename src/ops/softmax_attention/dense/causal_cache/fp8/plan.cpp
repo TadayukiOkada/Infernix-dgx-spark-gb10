@@ -6,7 +6,7 @@
 
 namespace infernix::ops::detail {
 namespace {
-constexpr int kGroupedPrefillMaxWidth = 80;
+constexpr int kGroupedPrefillMaxWidth = 64;
 } // namespace
 
 Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,

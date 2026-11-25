@@ -299,6 +299,31 @@ __device__ __forceinline__ int limb_columns(int columns) {
     return columns > 32 ? kTileColumns : (columns > 16 ? 32 : 16);
 }
 
+// Zeros shared-memory limb/xsum slots in [active_columns, layout_columns) so inactive padded
+// lanes read deterministic zeros without issuing redundant clamped cp.async global reads.
+template <QType F, int Threads, class Sm>
+__device__ __forceinline__ void zero_padded_limbs(Sm& sm, int active_columns, int layout_columns) {
+    if (active_columns >= layout_columns) { return; }
+    const int pad_cols   = layout_columns - active_columns;
+    const int total_vecs = Sm::kBufs * kStageSlices * pad_cols * 6;
+    for (int i = static_cast<int>(threadIdx.x); i < total_vecs; i += Threads) {
+        const int u   = i % 6;
+        const int col = active_columns + (i / 6) % pad_cols;
+        const int j   = (i / (6 * pad_cols)) % kStageSlices;
+        const int buf = i / (6 * pad_cols * kStageSlices);
+        *reinterpret_cast<int4*>(&sm.b[buf][j][col][4 * u]) = int4{0, 0, 0, 0};
+    }
+    if constexpr (fast::kMin<F>) {
+        const int total_xsum = Sm::kBufs * kStageSlices * pad_cols;
+        for (int i = static_cast<int>(threadIdx.x); i < total_xsum; i += Threads) {
+            const int col = active_columns + i % pad_cols;
+            const int j   = (i / pad_cols) % kStageSlices;
+            const int buf = i / (pad_cols * kStageSlices);
+            sm.xsum[buf][j][col] = 0;
+        }
+    }
+}
+
 template <QType F, int Threads, class ColumnLimbs>
 __device__ __forceinline__ LimbCopies<Threads> limb_copies(ColumnLimbs limbs, int xsum_offset, int copy_columns) {
     LimbCopies<Threads> lc{};
@@ -908,7 +933,9 @@ __device__ __forceinline__ void dispatch_loop(Sm& sm, RowOf row_of, int slices, 
 template <QType F, int Threads = kThreads, int Stride = 1, bool RollSlices = false, class RowOf, class ColumnLimbs, int RawChunks = kRawChunksOf<F>, class Codebook = fast::DeviceCodebook<F>>
 __device__ __forceinline__ void compute(SharedT<RawChunks>& sm, RowOf row_of, int slices, ColumnLimbs limbs, int xsum_offset,
                                         int columns, Accumulators<Threads>& acc, const Codebook& cb = Codebook{}) {
-    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, limb_columns(columns));
+    const int active_columns = columns < kTileColumns ? columns : kTileColumns;
+    zero_padded_limbs<F, Threads>(sm, active_columns, limb_columns(columns));
+    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, active_columns);
     issue_unit<F, Threads, Stride>(sm, 0, 0, slices, row_of);
     issue_limbs<F>(sm, 0, 0, copies);
     cp_async_commit();
@@ -923,7 +950,9 @@ __device__ __forceinline__ void compute(SharedT<RawChunks>& sm, RowOf row_of, in
 template <QType F, int Threads = kThreads, int Stride = 1, class RowOf, class ColumnLimbs>
 __device__ __forceinline__ void compute_plane(PlaneShared& sm, RowOf row_of, const std::uint8_t* plane, int slices,
                                               ColumnLimbs limbs, int xsum_offset, int columns, Accumulators<Threads>& acc) {
-    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, limb_columns(columns));
+    const int active_columns = columns < kTileColumns ? columns : kTileColumns;
+    zero_padded_limbs<F, Threads>(sm, active_columns, limb_columns(columns));
+    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, active_columns);
     const int stages = slices / kStageSlices;
 #pragma unroll
     for (int k = 0; k < PlaneShared::kBufs - 1; ++k) { // the first kBufs - 1 stages, one group each
@@ -983,7 +1012,9 @@ template <QType F, int Stages, int Threads = kThreads, class Stage, class Column
 __device__ __forceinline__ void compute_resident(ResidentShared<Stages, Stage>& sm, Accum mode, ColumnLimbs limbs,
                                                  int xsum_offset, int columns, Accumulators<Threads>& acc) {
     using Sm = ResidentShared<Stages, Stage>;
-    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, limb_columns(columns));
+    const int active_columns = columns < kTileColumns ? columns : kTileColumns;
+    zero_padded_limbs<F, Threads>(sm, active_columns, limb_columns(columns));
+    const LimbCopies<Threads> copies = limb_copies<F, Threads>(limbs, xsum_offset, active_columns);
 #pragma unroll
     for (int k = 0; k < Sm::kBufs - 1; ++k) { // the first kBufs - 1 stages' limbs, one group each
         if (k < Stages) { issue_limbs<F>(sm, k, k * kStageSlices, copies); }

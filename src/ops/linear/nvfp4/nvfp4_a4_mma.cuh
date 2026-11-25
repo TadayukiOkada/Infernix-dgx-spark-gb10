@@ -44,8 +44,8 @@ __device__ __forceinline__ int nvfp4_a4_swizzled_byte(int row, int logical_byte)
 // code bytes and p * scale_plane scale bytes into the activation planes.
 template <class Schedule>
 __device__ __forceinline__ void
-stage_nvfp4_a4_activation(const std::uint8_t* x,
-                          const std::uint8_t* x_scales, int input_rows,
+stage_nvfp4_a4_activation(const std::uint8_t* __restrict__ x,
+                          const std::uint8_t* __restrict__ x_scales, int input_rows,
                           std::int64_t code_plane, std::int64_t scale_plane,
                           Nvfp4A4SharedStorage<Schedule>& shared, int stage, int k_tile,
                           int token_begin, int active_tokens) {
@@ -199,8 +199,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                                         row_policy, rows, k);
     }
     pdl::wait_for_dependencies();
+    const auto* __restrict__ x_r        = pdl::after_wait_restrict(x);
+    const auto* __restrict__ x_scales_r = pdl::after_wait_restrict(x_scales);
     if (0 < kKTiles) {
-        stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, code_plane, scale_plane, shared, 0, 0,
+        stage_nvfp4_a4_activation<Schedule>(x_r, x_scales_r, k, code_plane, scale_plane, shared, 0, 0,
                                             token_begin, tokens);
         cp_commit();
     }
@@ -208,7 +210,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
 #pragma unroll
     for (int stage = 1; stage < Schedule::kStages; ++stage) {
         if (stage < kKTiles) {
-            stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, code_plane, scale_plane, shared,
+            stage_nvfp4_a4_activation<Schedule>(x_r, x_scales_r, k, code_plane, scale_plane, shared,
                                                 stage, stage, token_begin, tokens);
             stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, stage,
                                             row_begin, row_policy, rows, k);
@@ -314,7 +316,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
         __syncthreads();
         const int next_k_tile = k_tile + Schedule::kStages;
         if (next_k_tile < kKTiles) {
-            stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, code_plane, scale_plane, shared,
+            stage_nvfp4_a4_activation<Schedule>(x_r, x_scales_r, k, code_plane, scale_plane, shared,
                                                 stage, next_k_tile, token_begin, tokens);
             stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, next_k_tile,
                                             row_begin, row_policy, rows, k);

@@ -35,6 +35,11 @@ VqKvCausalPlan make_vq_kv_causal_plan(int heads, int width, int batch,
         make_int8_kv_causal_plan(heads, width, batch, envelope, fast_prompt_multiprocessors()), 0};
     out.prompt_split_workspace_bytes = envelope.prompt_split_workspace_bytes;
     out.prompt_pv8                   = envelope.fast_prompt_pv8;
+    // Two-KV-head calls above W=128 collapse to 1 code-split on ParallelGrouped (900-952 us)
+    // whereas Tiled runs ~581-627 us (-35%) for single-sequence calls.
+    if (batch == 1 && causal_kv_heads(heads) == 2 && width > 128) {
+        out.plan.family = Int8KvFamily::Tiled;
+    }
     if (out.plan.family == Int8KvFamily::Tiled) return out;
     const bool parallel = out.plan.family == Int8KvFamily::ParallelGrouped;
     const int narrow    = causal_grouped_tokens(heads);
@@ -126,28 +131,23 @@ void vq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scal
 
 std::size_t vq_kv_workspace_bytes(int heads, int kv_heads, int batch, int min_width,
                                   int max_width, CausalAttentionExecutionEnvelope envelope) {
-    constexpr int kGroupedMaxWidth = 256;
-    std::size_t maximum            = 0;
-    for (int width = min_width; width <= std::min(max_width, kGroupedMaxWidth); ++width) {
+    std::size_t maximum = 0;
+    for (int width = min_width; width <= max_width; ++width) {
         const auto vq = make_vq_kv_causal_plan(heads, width, batch, envelope);
-        if (vq.plan.family == Int8KvFamily::Tiled) continue;
         WorkspaceLayoutBuilder layout;
-        (void)allocate_causal_partials(layout, heads, width, vq.splits, batch);
-        maximum = std::max(maximum, layout.peak_bytes(1));
-    }
-    if (batch == 1 && max_width > kGroupedMaxWidth) {
-        // A wide call holds its staging while the prompt kernel allocates split partials. The
-        // split plan at max_visible_keys bounds every launch (int8_fast_prompt_workspace_bytes).
-        for (int width = std::max(min_width, kGroupedMaxWidth + 1); width <= max_width; ++width) {
+        if (vq.plan.family != Int8KvFamily::Tiled) {
+            (void)allocate_causal_partials(layout, heads, width, vq.splits, batch);
+        } else if (batch == 1) {
+            // A wide call holds its staging while the prompt kernel allocates split partials. The
+            // split plan at max_visible_keys bounds every launch (int8_fast_prompt_workspace_bytes).
             const FastPromptPlan plan =
                 int8_fast_prompt_plan(heads, width, envelope.max_visible_keys,
                                       envelope.prompt_split_workspace_bytes);
-            WorkspaceLayoutBuilder layout;
             (void)allocate_vq_staging(layout, width, kv_heads);
             if (plan.splits > 1)
                 (void)allocate_fast_prompt_partials(layout, heads, width, plan.splits);
-            maximum = std::max(maximum, layout.peak_bytes(1));
         }
+        maximum = std::max(maximum, layout.peak_bytes(1));
     }
     return maximum;
 }

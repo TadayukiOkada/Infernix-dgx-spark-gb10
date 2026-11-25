@@ -15,8 +15,10 @@ Q6Launch select_q6_n1152_k1536(std::int32_t tokens) {
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 32) return launch_q6_a16_sliced_r16_t32_w4_s2;
     if (tokens <= 64) return launch_q6_a16_sliced_r32_t32_w4_s2;
-    if (tokens <= 128) return launch_q6_a16_mma_r32_t64_k128_s2_a1;
+    if (tokens <= 96) return launch_q6_a16_sliced_r32_t16_w4_s2;
+    if (tokens <= 160) return launch_q6_a16_sliced_r16_t32_w4_s2;
     if (tokens <= 256) return launch_q6_a16_mma_r32_t128_k64_s2_a2;
+    if (tokens <= 320) return launch_q6_a16_mma_r64_t72_k128;
     return launch_q6_a16_mma_r64_t128;
 }
 

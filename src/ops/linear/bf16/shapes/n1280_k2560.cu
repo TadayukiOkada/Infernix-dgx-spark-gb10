@@ -10,8 +10,8 @@ namespace infernix::ops::detail {
 // warmup 8 / repeat 40, 2 % tolerance, seams at the last measured T).
 Bf16Launch select_bf16_n1280_k2560(std::int32_t tokens) {
     if (tokens <= 8) return select_bf16_general_launch(tokens); // skinny GEMV (equal to registered over T = 1..8)
-    if (tokens <= 32) return launch_bf16_sliced_k_mma<Bf16A16SlicedR32T16W4>; // sliced_r32t16w4 (HEAD wins 9..32 on GB10)
-    if (tokens <= 64) return launch_bf16_mma<Bf16A16MmaR32T32K128S3>; // mma_r32t32k128s3 (1.13-1.26x at 48..64)
+    if (tokens <= 16) return launch_bf16_sliced_k_mma<Bf16A16SlicedR32T16W4>; // sliced_r32t16w4
+    if (tokens <= 64) return launch_bf16_mma<Bf16A16MmaR32T32K128S3>; // mma_r32t32k128s3 (1.13-1.26x at 48..64, faster from T=17 on GB10)
     if (tokens <= 96) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<64, 32, 32, 16, 3>>; // tail_r64t32s3 (1.06x at 96)
     if (tokens <= 128) return launch_bf16_tma_mma<Bf16A16TmaMmaSchedule<64, 64, 128, 32, 32, 2>>; // tma_r64t64k128s2 (1.17-1.26x at 100..128)
     if (tokens <= 192) return launch_bf16_tma_mma<Bf16A16TmaTailMmaSchedule<128, 64, 32, 32, 4, 1, Bf16MmaRaster::RowFast>>; // tail_r128t64s4_rows (1.10x at 192)

@@ -130,8 +130,8 @@ __global__ void __launch_bounds__(kNvfp4A8EncodeThreads)
 template <class G>
 __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
     gate_up_kernel_nvfp4_a8(const std::uint8_t* __restrict__ x_rows, MoeDispatch dispatch, MoeExpertSource source,
-                            int top_k, const std::uint8_t* const* job_records,
-                            const std::int32_t* cpu_flags, int job_base,
+                            int top_k, const std::uint8_t* const* __restrict__ job_records,
+                            const std::int32_t* __restrict__ cpu_flags, int job_base,
                             std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
     using S         = Nvfp4A8Shape<G>;
     constexpr int C = kA8Columns;
@@ -238,8 +238,8 @@ __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
 
 template <class G>
 __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
-    down_kernel_nvfp4_a8(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* job_records,
-                         const std::int32_t* cpu_flags, int job_base,
+    down_kernel_nvfp4_a8(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
+                         const std::int32_t* __restrict__ cpu_flags, int job_base,
                          const std::uint16_t* h_plane, bf16* __restrict__ outputs, PassPhase phase,
                          int narrow_max) {
     using S         = Nvfp4A8Shape<G>;
@@ -269,6 +269,7 @@ __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr || count > narrow_max) { return; }
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_plane);
     const int lane = static_cast<int>(threadIdx.x) % 32, warp = static_cast<int>(threadIdx.x) / 32;
     const int i = lane & 7, part = lane >> 3;
     const int group          = kNvfp4A8Warps * tile + warp; // output rows 16 group .. 16 group + 15
@@ -277,7 +278,7 @@ __global__ void __launch_bounds__(kNvfp4A8Threads, kNvfp4A8MinBlocks)
         const int n = min(C, count - pass);
         for (int item = static_cast<int>(threadIdx.x); item < n * S::kHSlices; item += kNvfp4A8Threads) {
             const int c = item / S::kHSlices, s = item % S::kHSlices;
-            const std::uint16_t* h = h_plane +
+            const std::uint16_t* __restrict__ h = h_r +
                                      static_cast<std::size_t>(first + pass + c) * moe::wide::A16Planes<G>::kHRowElements +
                                      32 * s;
             const A8SliceOut o = a8_quantize_slice(h);

@@ -29,7 +29,7 @@ using S6 = Bf16RowTailSchedule<
 Bf16Launch ninfer_route(std::int32_t tokens) {
     if (tokens <= 1) return launch_bf16_gemv<S0>;
     if (tokens <= 8) return launch_bf16_simt<S1>;
-    if (tokens <= 48) return launch_bf16_sliced_k_mma<S2>;
+    if (tokens <= 32) return launch_bf16_sliced_k_mma<S2>;
     if (tokens <= 96) return launch_bf16_sliced_k_mma<S3>;
     if (tokens <= 128) return launch_bf16_sliced_k_mma<S4>;
     if (tokens <= 512) return launch_bf16_tma_mma<S5>;

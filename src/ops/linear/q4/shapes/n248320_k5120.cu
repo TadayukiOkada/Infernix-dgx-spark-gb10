@@ -81,7 +81,6 @@ Q4Launch select_q4_n248320_k5120(std::int32_t tokens) {
     if (tokens <= 8) return launch_small<8>;
     if (tokens <= 16) return launch_q4_a16_sliced_r32_t16_w4_s1;
     if (tokens <= 32) return launch_q4_a16_sliced_r32_t32_w4_s1;
-    if (tokens <= 64) return launch_q4_a16_sliced_r32_t64_w2_s1;
     if (tokens <= 80) return launch_tma<Tma96, Fallback80>;
     if (tokens <= 96) return launch_tma<Tma96, Fallback96>;
     if (tokens <= 640) return launch_tma<Tma128, Fallback128>;

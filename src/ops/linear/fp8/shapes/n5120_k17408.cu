@@ -14,6 +14,7 @@ namespace {
 using Geometry   = Fp8Geometry<5120, 17408>;
 using Gemv       = Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 using TmaT64R256  = Fp8A16TmaMmaSchedule<64, 256, 2, 8, 2, 1>;
+using TmaT64R64S4 = Fp8A16TmaMmaSchedule<64, 64, 2, 2, 4, 1>;
 using TmaT128R128 = Fp8A16TmaMmaSchedule<128, 128, 4, 4, 2, 1>;
 using Tma32x64   = Fp8A8TmaMmaSchedule<32, 64, 128, 1, 2, 3, 2>;
 using Small = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>, kGb10SplitWaveCtas, 4, 8>;
@@ -32,7 +33,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     if (tokens <= 32) return fp8_linear_a16_sliced_k<Geometry, Fp8SlicedInstance<32, 8, 2>>(x, weight, out, stream);
     if (tokens <= 64) return fp8_linear_a16_tma<Geometry, Fp8A16TmaT64R128>(x, weight, out, stream);
     if (tokens <= 128) return fp8_linear_a16_tma<Geometry, TmaT64R256>(x, weight, out, stream);
-    if (tokens <= 192) return fp8_linear_a16_tma<Geometry, Fp8A16TmaT32R128>(x, weight, out, stream);
+    if (tokens <= 192) return fp8_linear_a16_tma<Geometry, TmaT64R64S4>(x, weight, out, stream);
     if (tokens <= 1024) return fp8_linear_a16_tma<Geometry, TmaT128R128>(x, weight, out, stream);
     if (tokens <= 1537) return fp8_linear_a16_tma<Geometry, Fp8A16TmaT64R256G8>(x, weight, out, stream);
     if (tokens <= 2048) return fp8_linear_a16_tma<Geometry, Fp8A16TmaT128R128G8>(x, weight, out, stream);

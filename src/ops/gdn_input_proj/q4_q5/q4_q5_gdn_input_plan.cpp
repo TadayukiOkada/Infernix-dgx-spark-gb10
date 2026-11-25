@@ -32,8 +32,8 @@ struct RouteSpec {
 // on GB10 it moves left to 10. Grouped sub-band boundaries (32/33, 64/65) are unchanged: the
 // tiles spill one wave-step at exactly those token counts.
 constexpr std::array<RouteSpec, 4> kRoutes{{
-    {{1, 12}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{13, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2},
+    {{1, 10}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+    {{11, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4},
     {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2},
 }};

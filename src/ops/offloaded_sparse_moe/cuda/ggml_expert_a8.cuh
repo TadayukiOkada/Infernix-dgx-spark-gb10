@@ -138,8 +138,8 @@ __device__ __forceinline__ int stage_row_run(const std::uint8_t* record, int beg
 template <QType GU>
 __global__ void __launch_bounds__(kGgmlThreads)
     gate_up_kernel_ggml_a8(const std::uint8_t* __restrict__ x_rows, MoeDispatch dispatch, MoeExpertSource source,
-                           int top_k, const std::uint8_t* const* job_records,
-                           const std::int32_t* cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
+                           int top_k, const std::uint8_t* const* __restrict__ job_records,
+                           const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
                            PassPhase phase, int narrow_max) {
     constexpr int C = kA8Columns;
     extern __shared__ __align__(16) std::uint8_t weights[];
@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
 template <QType D>
 __global__ void __launch_bounds__(kGgmlThreads)
     down_kernel_ggml_a8(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                        const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                        const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                         int job_base, const std::uint16_t* h_plane, bf16* __restrict__ outputs,
                         PassPhase phase, int narrow_max) {
     constexpr int C = kA8Columns;
@@ -232,6 +232,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr || count > narrow_max) { return; }
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_plane);
     const int part = threadIdx.x % kGgmlDownLanes;
     const int row  = blockIdx.x * kGgmlDownRows + threadIdx.x / kGgmlDownLanes;
     const int row_bytes = static_cast<int>(source.ggml.down_row_bytes);
@@ -246,8 +247,8 @@ __global__ void __launch_bounds__(kGgmlThreads)
         const int n = min(C, count - pass);
         for (int item = threadIdx.x; item < n * kGgmlHSlices; item += kGgmlThreads) {
             const int c = item / kGgmlHSlices, s = item % kGgmlHSlices;
-            const std::uint16_t* h =
-                h_plane + static_cast<std::size_t>(first + pass + c) * moe::wide::kA16HRowElements + 32 * s;
+            const std::uint16_t* __restrict__ h =
+                h_r + static_cast<std::size_t>(first + pass + c) * moe::wide::kA16HRowElements + 32 * s;
             const A8SliceOut o = a8_quantize_slice(h);
             auto* dst          = reinterpret_cast<int4*>(&codes[c][s * a8::kSliceWords]);
             dst[0]             = make_int4(o.q[0], o.q[1], o.q[2], o.q[3]);

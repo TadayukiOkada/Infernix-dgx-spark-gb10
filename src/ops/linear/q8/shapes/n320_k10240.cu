@@ -29,8 +29,8 @@ namespace infernix::ops::detail {
 Q8Launch select_q8_n320_k10240(std::int32_t tokens) {
     if (tokens <= 16) return launch_q8_a16_sliced_r16_t8_w8_s2_m3;
     if (tokens <= 80) return launch_q8_a16_sliced_r16_t16_w8_s2_m1;
-    if (tokens <= 112) return launch_q8_a16_sliced_r16_t48_w4_s2;
-    if (tokens <= 129) return launch_q8_a16_sliced_r16_t48_w4_s1;
+    if (tokens <= 128) return launch_q8_a16_sliced_r16_t32_w4_s2;
+    if (tokens <= 256) return launch_q8_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 384) return launch_q8_a16_sliced_r32_t48_w4_s1;
     if (tokens <= 640) return launch_q8_a16_mma_r32_t32_k128_a1;
     if (tokens <= 1024) return launch_q8_a16_mma_r64x32_t64_k128_a1;

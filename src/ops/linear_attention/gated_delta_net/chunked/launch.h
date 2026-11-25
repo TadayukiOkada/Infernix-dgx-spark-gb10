@@ -12,7 +12,7 @@
 namespace infernix::ops::detail::gated_delta_net::chunked {
 
 inline constexpr int kChunkSize = 16;
-inline constexpr int kMinTokens = 16;
+inline constexpr int kMinTokens = 8;
 inline constexpr float kNormEps = 1.0e-6F;
 
 struct Arguments {

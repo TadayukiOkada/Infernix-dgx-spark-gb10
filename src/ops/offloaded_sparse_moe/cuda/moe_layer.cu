@@ -1175,7 +1175,7 @@ __device__ __forceinline__ void quantize_a4_words_from_bf16(const uint4* src, fl
 // reading them as sixteen 2-byte loads cost one 32-byte sector each (ncu: 59% of this kernel's
 // global sectors were excessive), which is what exposed the fabric latency on `stall_long_sb`.
 // The unpacked values are identical, so every quantized block keeps its bits.
-__device__ void quantize_column_codes(const bf16* x, int hidden, const std::int32_t* entries, int first,
+__device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
                                       int top_k, float scale, ActCodes* acts, int blocks, int b0 = 0) {
     const int t = entries[first] / top_k;
     for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
@@ -1194,7 +1194,7 @@ __device__ void quantize_column_codes(const bf16* x, int hidden, const std::int3
 }
 
 template <int B0, int BLen>
-__device__ __forceinline__ void quantize_pair_half_codes(const bf16* x, int hidden, int t0, int t1,
+__device__ __forceinline__ void quantize_pair_half_codes(const bf16* __restrict__ x, int hidden, int t0, int t1,
                                                          float scale, ActCodes* __restrict__ acts) {
     static_assert(2 * BLen <= kThreads && (2 * BLen) % 32 == 0);
     const int idx = static_cast<int>(threadIdx.x);
@@ -1277,7 +1277,7 @@ __device__ __forceinline__ void quantize_split_words_from_bf16(const uint4* src,
 // Quantizes blocks [0, blocks) of one column of entry `first` under both `gate_scale` (low nibbles)
 // and `up_scale` (high nibbles) into `acts`. Each thread `b < blocks` loads its 16 BF16 elements once
 // and encodes both scales together via `quantize_split_words_from_bf16`.
-__device__ void quantize_split_codes(const bf16* x, int hidden, const std::int32_t* entries, int first,
+__device__ void quantize_split_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
                                      int top_k, float gate_scale, float up_scale, ActCodes* acts, int blocks,
                                      int b0 = 0) {
     const int t = entries[first] / top_k;
@@ -1297,7 +1297,7 @@ __device__ void quantize_split_codes(const bf16* x, int hidden, const std::int32
 // and transposes with its partner lane `tid ^ 1` so `col = 0` writes `(col0_gate, col1_gate)` to
 // `acts[2 * db + 0]` and `col = 1` writes `(col0_up, col1_up)` to `acts[2 * db + 1]`.
 template <int B0, int BLen>
-__device__ __forceinline__ void quantize_split_pair_half(const bf16* x, int hidden, int t0, int t1,
+__device__ __forceinline__ void quantize_split_pair_half(const bf16* __restrict__ x, int hidden, int t0, int t1,
                                                          float gate_scale, float up_scale, ActCodes* acts) {
     static_assert(2 * BLen <= kThreads && (2 * BLen) % 32 == 0);
     const int tid = static_cast<int>(threadIdx.x);
@@ -1409,7 +1409,7 @@ struct DownActCodes {
 };
 
 template <int B0, int BLen>
-__device__ __forceinline__ void quantize_quad_half_codes(const bf16* x, int hidden, int t0, int t1, int t2,
+__device__ __forceinline__ void quantize_quad_half_codes(const bf16* __restrict__ x, int hidden, int t0, int t1, int t2,
                                                          int t3, float scale, DownActCodes* __restrict__ acts) {
     static_assert(4 * BLen % 32 == 0);
     for (int idx = static_cast<int>(threadIdx.x); idx < 4 * BLen; idx += kThreads) {
@@ -1604,7 +1604,7 @@ struct XPlaneChunk {
 };
 static_assert(sizeof(XPlaneChunk::Row) == kGateUpStageBlocks * 8 + kGateUpStageBlocks);
 
-__device__ __forceinline__ void stage_xplane_chunk(const std::uint8_t* x_plane, int first, int count, int chunk,
+__device__ __forceinline__ void stage_xplane_chunk(const std::uint8_t* __restrict__ x_plane, int first, int count, int chunk,
                                                    XPlaneChunk& dst) {
     const int total_vec16 = count * (kGateUpStageBlocks / 2); // 8 * count <= 64
     for (int idx = static_cast<int>(threadIdx.x); idx < total_vec16; idx += static_cast<int>(blockDim.x)) {
@@ -1624,7 +1624,7 @@ __device__ __forceinline__ void stage_xplane_chunk(const std::uint8_t* x_plane, 
     }
 }
 
-__device__ __forceinline__ void quantize_split_chunk_xplane(const bf16* x, int hidden,
+__device__ __forceinline__ void quantize_split_chunk_xplane(const bf16* __restrict__ x, int hidden,
                                                           const MoeDispatch& dispatch, int first, int count, int top_k,
                                                           const moe::ExpertScales& scales, int chunk,
                                                           XPlaneChunk& gate_dst, XPlaneChunk& up_dst) {
@@ -1803,9 +1803,12 @@ __global__ void __launch_bounds__(kThreads, 3)
     if (source.staging_slots == 0 && source.fetch.request == nullptr && phase == PassPhase::All) {
         pdl::enter();
     }
-    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
+    const auto* __restrict__ x_r           = pdl::after_wait_restrict(x);
+    const auto* const* __restrict__ jrec_r = pdl::after_wait_restrict(job_records);
+    const auto* __restrict__ flags_r       = pdl::after_wait_restrict(cpu_flags);
+    if (job >= *dispatch.job_count || (flags_r != nullptr && flags_r[job] != 0)) { return; }
     const int expert           = dispatch.jobs[job];
-    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    const std::uint8_t* record = pass_record(phase, source, expert, jrec_r, job);
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
@@ -1817,10 +1820,10 @@ __global__ void __launch_bounds__(kThreads, 3)
     const bool split_input = scales.input_up != scales.input_gate;
     constexpr int kHalf    = moe::kGateUpBlocks / 2;
     if (split_input) {
-        quantize_split_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, scales.input_up, sm.acts,
+        quantize_split_codes(x_r, hidden, dispatch.entries, first, top_k, scales.input_gate, scales.input_up, sm.acts,
                              kHalf, 0);
     } else {
-        quantize_column_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, sm.acts, kHalf, 0);
+        quantize_column_codes(x_r, hidden, dispatch.entries, first, top_k, scales.input_gate, sm.acts, kHalf, 0);
     }
     stage_wait();
     __syncthreads();
@@ -1833,10 +1836,10 @@ __global__ void __launch_bounds__(kThreads, 3)
     __syncthreads();
     stage_gate_up_half(record_slice, sm.stage, 1);
     if (split_input) {
-        quantize_split_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, scales.input_up, sm.acts,
+        quantize_split_codes(x_r, hidden, dispatch.entries, first, top_k, scales.input_gate, scales.input_up, sm.acts,
                              kHalf, kHalf);
     } else {
-        quantize_column_codes(x, hidden, dispatch.entries, first, top_k, scales.input_gate, sm.acts, kHalf, kHalf);
+        quantize_column_codes(x_r, hidden, dispatch.entries, first, top_k, scales.input_gate, sm.acts, kHalf, kHalf);
     }
     stage_wait();
     __syncthreads();
@@ -1879,9 +1882,12 @@ __global__ void __launch_bounds__(kThreads, 3)
     if (source.staging_slots == 0 && source.fetch.request == nullptr && phase == PassPhase::All) {
         pdl::enter();
     }
-    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
+    const auto* __restrict__ x_r           = pdl::after_wait_restrict(x);
+    const auto* const* __restrict__ jrec_r = pdl::after_wait_restrict(job_records);
+    const auto* __restrict__ flags_r       = pdl::after_wait_restrict(cpu_flags);
+    if (job >= *dispatch.job_count || (flags_r != nullptr && flags_r[job] != 0)) { return; }
     const int expert           = dispatch.jobs[job];
-    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    const std::uint8_t* record = pass_record(phase, source, expert, jrec_r, job);
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
@@ -1904,14 +1910,14 @@ __global__ void __launch_bounds__(kThreads, 3)
             const int t1 = dispatch.entries[first + c + 1] / top_k;
             const int t2 = dispatch.entries[first + c + 2] / top_k;
             const int t3 = cols == 4 ? dispatch.entries[first + c + 3] / top_k : t2;
-            quantize_quad_half_codes<0, kHalf>(x, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
+            quantize_quad_half_codes<0, kHalf>(x_r, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
             stage_wait();
             __syncthreads();
             std::int64_t s0[4] = {};
             unit_sums_quad_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts_quad, s0);
             __syncthreads();
             stage_gate_up_half(record_slice, sm.stage, 1);
-            quantize_quad_half_codes<kHalf, kHalf>(x, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
+            quantize_quad_half_codes<kHalf, kHalf>(x_r, hidden, t0, t1, t2, t3, scales.input_gate, sm.acts_quad);
             stage_wait();
             __syncthreads();
             std::int64_t s1[4] = {};
@@ -1925,13 +1931,13 @@ __global__ void __launch_bounds__(kThreads, 3)
             const int t0 = dispatch.entries[first + c] / top_k;
             const int t1 = dispatch.entries[first + c + 1] / top_k;
             std::int64_t s0[kGateUpGroups], s1[kGateUpGroups];
-            quantize_pair_half_codes<0, kHalf>(x, hidden, t0, t1, scales.input_gate, sm.acts);
+            quantize_pair_half_codes<0, kHalf>(x_r, hidden, t0, t1, scales.input_gate, sm.acts);
             stage_wait();
             __syncthreads();
             unit_sums_pair<kGateUpGroups, false>(sm.stage, kHalf, sm.acts, s0, s1);
             __syncthreads();
             stage_gate_up_half(record_slice, sm.stage, 1);
-            quantize_pair_half_codes<kHalf, kHalf>(x, hidden, t0, t1, scales.input_gate, sm.acts);
+            quantize_pair_half_codes<kHalf, kHalf>(x_r, hidden, t0, t1, scales.input_gate, sm.acts);
             stage_wait();
             __syncthreads();
             unit_sums_pair<kGateUpGroups, true>(sm.stage, kHalf, sm.acts, s0, s1);
@@ -1945,13 +1951,13 @@ __global__ void __launch_bounds__(kThreads, 3)
             const int t0 = dispatch.entries[first + c] / top_k;
             const int t1 = dispatch.entries[first + c + 1] / top_k;
             std::int64_t lo[kGateUpGroups][2] = {}, hi[kGateUpGroups][2] = {};
-            quantize_split_pair_half<0, kHalf>(x, hidden, t0, t1, scales.input_gate, scales.input_up, sm.acts);
+            quantize_split_pair_half<0, kHalf>(x_r, hidden, t0, t1, scales.input_gate, scales.input_up, sm.acts);
             stage_wait();
             __syncthreads();
             unit_sums_split_pair_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts, lo, hi);
             __syncthreads();
             stage_gate_up_half(record_slice, sm.stage, 1);
-            quantize_split_pair_half<kHalf, kHalf>(x, hidden, t0, t1, scales.input_gate, scales.input_up, sm.acts);
+            quantize_split_pair_half<kHalf, kHalf>(x_r, hidden, t0, t1, scales.input_gate, scales.input_up, sm.acts);
             stage_wait();
             __syncthreads();
             unit_sums_split_pair_half<kGateUpGroups, 0, kHalf>(sm.stage, kHalf, sm.acts, lo, hi);
@@ -1965,10 +1971,10 @@ __global__ void __launch_bounds__(kThreads, 3)
         __syncthreads();
         if (c > 0) { stage_gate_up_half(record_slice, sm.stage, 0); }
         if (split_input) {
-            quantize_split_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, scales.input_up,
+            quantize_split_codes(x_r, hidden, dispatch.entries, first + c, top_k, scales.input_gate, scales.input_up,
                                  sm.acts, kHalf, 0);
         } else {
-            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts, kHalf, 0);
+            quantize_column_codes(x_r, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts, kHalf, 0);
         }
         stage_wait();
         __syncthreads();
@@ -1981,10 +1987,10 @@ __global__ void __launch_bounds__(kThreads, 3)
         __syncthreads();
         stage_gate_up_half(record_slice, sm.stage, 1);
         if (split_input) {
-            quantize_split_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, scales.input_up,
+            quantize_split_codes(x_r, hidden, dispatch.entries, first + c, top_k, scales.input_gate, scales.input_up,
                                  sm.acts, kHalf, kHalf);
         } else {
-            quantize_column_codes(x, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts, kHalf,
+            quantize_column_codes(x_r, hidden, dispatch.entries, first + c, top_k, scales.input_gate, sm.acts, kHalf,
                                   kHalf);
         }
         stage_wait();
@@ -2047,8 +2053,8 @@ __device__ __forceinline__ void emit_gate_up_cols_xplane(
 
 __global__ void __launch_bounds__(kThreads, 4)
     gate_up_xplane_kernel(const bf16* x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
-                          int top_k, const std::uint8_t* const* job_records,
-                          const std::int32_t* narrow_jobs, const std::int32_t* pass_narrow,
+                          int top_k, const std::uint8_t* const* __restrict__ job_records,
+                          const std::int32_t* __restrict__ narrow_jobs, const std::int32_t* __restrict__ pass_narrow,
                           int pass, const std::uint8_t* x_plane, canon::A4Block* __restrict__ h_blocks) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm = *reinterpret_cast<GateUpXPlaneShared*>(smem_raw);
@@ -2229,7 +2235,7 @@ static_assert(3 * (sizeof(DownShared) + 1024) <= 101376, "three down CTAs must f
 
 __global__ void __launch_bounds__(kThreads, 3)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                 int job_base, const canon::A4Block* h_blocks, bf16* __restrict__ outputs,
                 PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -2263,6 +2269,7 @@ __global__ void __launch_bounds__(kThreads, 3)
     }
     stage_async(record_slice, sm.stage, kDownSliceBytes);
     pdl::wait_for_dependencies();
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_blocks);
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int c = 0;
     for (; c + 2 < count; c += 4) {
@@ -2270,11 +2277,11 @@ __global__ void __launch_bounds__(kThreads, 3)
         __syncthreads();
         for (int idx = threadIdx.x; idx < 4 * kHBlocks; idx += blockDim.x) {
             const int i = idx >> 2, q = idx & 3;
-            const canon::A4Block& b0 = h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + i];
-            const canon::A4Block& b1 = h_blocks[static_cast<std::size_t>(first + c + 1) * kHBlocks + i];
-            const canon::A4Block& b2 = h_blocks[static_cast<std::size_t>(first + c + 2) * kHBlocks + i];
+            const canon::A4Block& b0 = h_r[static_cast<std::size_t>(first + c) * kHBlocks + i];
+            const canon::A4Block& b1 = h_r[static_cast<std::size_t>(first + c + 1) * kHBlocks + i];
+            const canon::A4Block& b2 = h_r[static_cast<std::size_t>(first + c + 2) * kHBlocks + i];
             const canon::A4Block& b3 =
-                cols == 4 ? h_blocks[static_cast<std::size_t>(first + c + 3) * kHBlocks + i] : b2;
+                cols == 4 ? h_r[static_cast<std::size_t>(first + c + 3) * kHBlocks + i] : b2;
             act_codes_quad_word_into(b0, b1, b2, b3, q, sm.acts_quad[i]);
         }
         stage_wait();
@@ -2301,8 +2308,8 @@ __global__ void __launch_bounds__(kThreads, 3)
         __syncthreads();
         for (int idx = threadIdx.x; idx < 4 * kHBlocks; idx += blockDim.x) {
             const int i = idx >> 2, q = idx & 3;
-            act_codes_pair_word_into(h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + i],
-                                     h_blocks[static_cast<std::size_t>(first + c + 1) * kHBlocks + i], q, sm.acts[i]);
+            act_codes_pair_word_into(h_r[static_cast<std::size_t>(first + c) * kHBlocks + i],
+                                     h_r[static_cast<std::size_t>(first + c + 1) * kHBlocks + i], q, sm.acts[i]);
         }
         stage_wait();
         __syncthreads();
@@ -2332,7 +2339,7 @@ __global__ void __launch_bounds__(kThreads, 3)
         __syncthreads();
         for (int idx = threadIdx.x; idx < 4 * kHBlocks; idx += blockDim.x) {
             const int i = idx >> 2, q = idx & 3;
-            act_codes_word_into(h_blocks[static_cast<std::size_t>(first + c) * kHBlocks + i], q, sm.acts[i]);
+            act_codes_word_into(h_r[static_cast<std::size_t>(first + c) * kHBlocks + i], q, sm.acts[i]);
         }
         stage_wait();
         __syncthreads();
@@ -2368,7 +2375,7 @@ __device__ __forceinline__ void stage_down_chunk(const std::uint8_t* record_slic
     }
 }
 
-__device__ __forceinline__ void stage_packed_h(const canon::A4Block* h_blocks, int first_col, int count,
+__device__ __forceinline__ void stage_packed_h(const canon::A4Block* __restrict__ h_blocks, int first_col, int count,
                                                PackedHRow (&dst)[moe::kMaxColumns]) {
     constexpr int kVecsPerRow = kPackedHRowBytes / 16; // 23
     const int total_vecs      = count * kVecsPerRow;
@@ -2440,8 +2447,8 @@ static_assert(4 * (sizeof(DownPrefillShared) + 1024) <= 101376, "four prefill do
 
 __global__ void __launch_bounds__(kThreads, 4)
     down_prefill_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                        const std::uint8_t* const* job_records,
-                        const std::int32_t* narrow_jobs, const std::int32_t* pass_narrow,
+                        const std::uint8_t* const* __restrict__ job_records,
+                        const std::int32_t* __restrict__ narrow_jobs, const std::int32_t* __restrict__ pass_narrow,
                         int pass, const canon::A4Block* h_blocks, bf16* __restrict__ outputs) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm              = *reinterpret_cast<DownPrefillShared*>(smem_raw);
@@ -2483,6 +2490,7 @@ __global__ void __launch_bounds__(kThreads, 4)
         commit_stage();
     }
     pdl::wait_for_dependencies();
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_blocks);
 
     for (int idx = item0; idx < total_items; idx += static_cast<int>(gridDim.x)) {
         const std::uint8_t* nxt_slice = nullptr;
@@ -2509,7 +2517,7 @@ __global__ void __launch_bounds__(kThreads, 4)
                 stage_down_chunk(cur_slice, sm.stage[buf], 0);
                 commit_stage();
             }
-            stage_packed_h(h_blocks, cur_first + c_outer, rem, sm.epi.h);
+            stage_packed_h(h_r, cur_first + c_outer, rem, sm.epi.h);
             commit_stage();
 
             std::int64_t acc_lo0[kDownGroups] = {}, acc_lo1[kDownGroups] = {};
@@ -2928,10 +2936,10 @@ static_assert(kGateUpMinBlocksOf<moe::FlashNextExperts, kA16PassColumns> == 2,
               "two Flash-Next A16 gate/up CTAs must fit an SM");
 
 template <class G, int Columns>
-__device__ __forceinline__ void gate_up_a16_body(const bf16* x, int hidden, const MoeDispatch& dispatch,
+__device__ __forceinline__ void gate_up_a16_body(const bf16* __restrict__ x, int hidden, const MoeDispatch& dispatch,
                                                  const MoeExpertSource& source, int top_k,
-                                                 const std::uint8_t* const* job_records,
-                                                 const std::int32_t* cpu_flags, int job_base,
+                                                 const std::uint8_t* const* __restrict__ job_records,
+                                                 const std::int32_t* __restrict__ cpu_flags, int job_base,
                                                  std::uint16_t* __restrict__ h_plane, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<GateUpShared16<G, Columns>*>(smem_raw);
@@ -2991,9 +2999,9 @@ __device__ __forceinline__ void gate_up_a16_body(const bf16* x, int hidden, cons
 
 template <class G, int Columns>
 __global__ void __launch_bounds__(kThreads, kGateUpMinBlocksOf<G, Columns>)
-    gate_up_kernel_a16(const bf16* x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
-                       int top_k, const std::uint8_t* const* job_records,
-                       const std::int32_t* cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
+    gate_up_kernel_a16(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
+                       int top_k, const std::uint8_t* const* __restrict__ job_records,
+                       const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
                        PassPhase phase) {
     gate_up_a16_body<G, Columns>(x, hidden, dispatch, source, top_k, job_records, cpu_flags, job_base, h_plane, phase);
 }
@@ -3014,7 +3022,7 @@ static_assert(kDownMinBlocksOf<moe::FlashNextExperts, kA16PassColumns> == 3,
 template <class G, int Columns>
 __global__ void __launch_bounds__(kThreads, kDownMinBlocksOf<G, Columns>)
     down_kernel_a16(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                    const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                    const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                     int job_base, const std::uint16_t* h_plane, bf16* __restrict__ outputs,
                     PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -3043,12 +3051,13 @@ __global__ void __launch_bounds__(kThreads, kDownMinBlocksOf<G, Columns>)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_plane);
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int pass = 0; pass < count; pass += Columns) {
         const int n = min(Columns, count - pass);
         __syncthreads();
         const auto column = [&](int c) {
-            return h_plane + static_cast<std::size_t>(first + pass + c) * moe::wide::A16Planes<G>::kHRowElements;
+            return h_r + static_cast<std::size_t>(first + pass + c) * moe::wide::A16Planes<G>::kHRowElements;
         };
         encode_a16_emax<Columns, static_cast<int>(G::kHBlocks)>(column, n, sm.emax, sm.key);
         stage_wait();
@@ -3346,7 +3355,7 @@ static_assert(sizeof(GateUpSharedA4r) + 1024 <= 102400 / 2, "two two-term gate/u
 
 // The column pairs of a two-term gate/up CTA's job (count >= 2 columns), as the one-column loop below
 // computes each column.
-__device__ void gate_up_pairs_a4r(const bf16* x, const MoeDispatch& dispatch, int top_k,
+__device__ void gate_up_pairs_a4r(const bf16* __restrict__ x, const MoeDispatch& dispatch, int top_k,
                                   const moe::ExpertScales& scales, int first, int count, int slice,
                                   std::uint16_t* __restrict__ h_plane, GateUpSharedA4r& sm) {
     constexpr int kHalf = moe::kGateUpBlocks / 2;
@@ -3405,8 +3414,8 @@ __device__ void gate_up_pairs_a4r(const bf16* x, const MoeDispatch& dispatch, in
 
 template <bool Pairs>
 __global__ void __launch_bounds__(kThreads, 2)
-    gate_up_kernel_a4r(const bf16* x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                       const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+    gate_up_kernel_a4r(const bf16* __restrict__ x, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                        int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<GateUpSharedA4r*>(smem_raw);
@@ -3474,7 +3483,7 @@ struct DownSharedA4r {
 // The column pairs of a two-term down CTA's job (count >= 2 columns), as the one-column loop below
 // computes each column.
 __device__ void down_pairs_a4r(const MoeDispatch& dispatch, const moe::ExpertScales& scales, int first, int count,
-                               int tile, const std::uint16_t* h_plane, bf16* __restrict__ outputs,
+                               int tile, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs,
                                DownSharedA4r& sm) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int c0 = 0; c0 < count; c0 += 2) {
@@ -3517,8 +3526,8 @@ static_assert(3 * (sizeof(DownSharedA4r) + 1024) <= 101376, "three two-term down
 
 template <bool Pairs>
 __global__ void __launch_bounds__(kThreads, Pairs ? 2 : 3)
-    down_kernel_a4r(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* job_records,
-                    const std::int32_t* cpu_flags, int job_base, const std::uint16_t* h_plane,
+    down_kernel_a4r(MoeDispatch dispatch, MoeExpertSource source, const std::uint8_t* const* __restrict__ job_records,
+                    const std::int32_t* __restrict__ cpu_flags, int job_base, const std::uint16_t* h_plane,
                     bf16* __restrict__ outputs, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm       = *reinterpret_cast<DownSharedA4r*>(smem_raw);
@@ -3546,16 +3555,17 @@ __global__ void __launch_bounds__(kThreads, Pairs ? 2 : 3)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_plane);
     if constexpr (Pairs) {
         if (count > 1) {
-            down_pairs_a4r(dispatch, scales, first, count, tile, h_plane, outputs, sm);
+            down_pairs_a4r(dispatch, scales, first, count, tile, h_r, outputs, sm);
             return;
         }
     }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int c = 0; c < count; ++c) { // one pass per column of the job
         __syncthreads();
-        encode_a4r_row<kHBlocks>(h_plane + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements, sm.acts,
+        encode_a4r_row<kHBlocks>(h_r + static_cast<std::size_t>(first + c) * moe::wide::kA16HRowElements, sm.acts,
                                  &sm.keys[0][0], &sm.row_scale[0]);
         stage_wait();
         __syncthreads();

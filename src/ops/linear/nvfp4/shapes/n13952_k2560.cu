@@ -39,6 +39,8 @@ Nvfp4Launch select_a16(int tokens) {
     if (tokens <= 64) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>;
     if (tokens <= 96) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;
     if (tokens <= 128) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
+    if (tokens <= 160) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 80, 128, 32, 16, 1, 2>>;
+    if (tokens <= 192) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>>;
     if (tokens <= 256) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
     if (tokens <= 512) return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>>;
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
@@ -97,6 +99,18 @@ void launch_routes(const Nvfp4A16Operands& operands, Output output, cudaStream_t
     if (tokens <= 128) {
         launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<
             Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>, Geometry::kInputRows>>(
+            operands, output, epilogue, stream);
+        return;
+    }
+    if (tokens <= 160) {
+        launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<
+            Nvfp4A16MmaSchedule<64, 80, 128, 32, 16, 1, 2>, Geometry::kInputRows>>(
+            operands, output, epilogue, stream);
+        return;
+    }
+    if (tokens <= 192) {
+        launch_nvfp4_a16_mma<Nvfp4ScheduleInstance<
+            Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>, Geometry::kInputRows>>(
             operands, output, epilogue, stream);
         return;
     }

@@ -98,7 +98,7 @@ constexpr int kFp8GateTiles = (moe::kIntermediate / kFp8Tile) * (moe::kHidden / 
 __global__ void __launch_bounds__(kGgmlThreads)
     gate_up_kernel_fp8(const std::uint8_t* __restrict__ x_limbs, const std::int32_t* __restrict__ x_emax,
                        MoeDispatch dispatch, MoeExpertSource source, int top_k,
-                       const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                       const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                        int job_base, std::uint16_t* __restrict__ h_plane, PassPhase phase, int narrow_max) {
     constexpr int C     = kGgmlColumns;
     constexpr int kTiles = moe::kHidden / kFp8Tile; // 20 per row
@@ -157,7 +157,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
 
 __global__ void __launch_bounds__(kGgmlThreads)
     down_kernel_fp8(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                    const std::uint8_t* const* job_records, const std::int32_t* cpu_flags,
+                    const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                     int job_base, const std::uint16_t* h_plane, bf16* __restrict__ outputs, PassPhase phase,
                     int narrow_max) {
     constexpr int C      = kGgmlColumns;
@@ -179,6 +179,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
     }
     pdl::wait_for_dependencies();
     if (record == nullptr || count > narrow_max) { return; }
+    const auto* __restrict__ h_r = pdl::after_wait_restrict(h_plane);
     __shared__ std::uint32_t digits[256];
     load_fp8_digits(digits); // the first pass's barrier orders it before any read
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -192,7 +193,7 @@ __global__ void __launch_bounds__(kGgmlThreads)
         const int n = min(C, count - pass);
         // Warp c encodes column c's h: its exponent (a warp maximum), then its limbs.
         if (warp < n) {
-            const std::uint16_t* h = h_plane + static_cast<std::size_t>(first + pass + warp) * moe::wide::kA16HRowElements;
+            const std::uint16_t* __restrict__ h = h_r + static_cast<std::size_t>(first + pass + warp) * moe::wide::kA16HRowElements;
             unsigned key = 0;
             for (int j = lane; j < moe::kIntermediate; j += 32) { key = max(key, static_cast<unsigned>(h[j] & 0x7FFFU)); }
             key = __reduce_max_sync(0xFFFFFFFFU, key);

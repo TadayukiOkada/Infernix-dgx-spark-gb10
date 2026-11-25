@@ -733,17 +733,20 @@ void ggml_linear(const Tensor& x, std::span<const GgmlSegment> segments, std::sp
     Tensor emax                 = workspace.alloc(DType::I32, {batch});
     const Columns in{.encoded = static_cast<const std::int32_t*>(encoded.data),
                      .emax    = static_cast<const std::int32_t*>(emax.data)};
+    constexpr int kDecodeTileMinColumns = 17;
+    constexpr int kUsePlanesMinColumns  = 385;
     int total_rows = 0;
     for (const auto& s : segments) { total_rows += s.rows; }
-    const int mma_batch_limit = total_rows >= 2560 ? kTileMinColumns : (kMmaBatchColumns + 1);
+    const int mma_batch_limit = total_rows >= 2560 ? kDecodeTileMinColumns : (kMmaBatchColumns + 1);
     const bool mma_batched_call =
         columns < mma_batch_limit && std::all_of(segments.begin(), segments.end(), [](const GgmlSegment& s) {
             return s.layout == GgmlLayout::Rows && mma_batched_format(s.format);
         });
-    const int wide_min_cols = total_rows >= 2560 ? kTileMinColumns : (ggml::tile::kTileColumns);
+    const int wide_min_cols = total_rows >= 2560 ? kDecodeTileMinColumns : (ggml::tile::kTileColumns);
     const bool wide =
         columns >= wide_min_cols && (k / 32) % ggml::tile::kStageSlices == 0 && !mma_batched_call;
-    const bool use_planes = wide && (columns > ggml::tile::kTileColumns || total_rows < 2560);
+    const bool use_planes =
+        wide && columns >= kTileMinColumns && (columns >= kUsePlanesMinColumns || total_rows < 2560);
     std::vector<std::vector<Slab>> passes;
     std::uint8_t* planes = nullptr;
     if (use_planes) {

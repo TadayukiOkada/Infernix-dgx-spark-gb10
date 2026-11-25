@@ -91,8 +91,18 @@ __device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLa
 // Producer-written input pointers must NOT be qualified `const __restrict__`: in PTX, that lowers
 // loads to `ld.global.nc` (read-only for the whole kernel), which ptxas 13.2+ can hoist above
 // `griddepcontrol.wait` (ACQBULK) into weight-staging prologues. Keep `const __restrict__` for
-// immutable weights only.
+// immutable weights only, and launder producer-written pointers via after_wait_restrict() strictly
+// after wait_for_dependencies() / enter() / enter_streaming().
 __device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
+
+// Launders a producer-written pointer strictly AFTER wait_for_dependencies() / enter() /
+// enter_streaming(). The compiler memory barrier prevents ptxas from hoisting any subsequent
+// read-only / __restrict__ loads above griddepcontrol.wait (ACQBULK).
+template <class T>
+__device__ __forceinline__ const T* __restrict__ after_wait_restrict(const T* p) {
+    asm volatile("" : "+l"(p) :: "memory");
+    return p;
+}
 
 // Consumer protocol for launch_consumer(). Call one of these in every thread, before any access
 // other than reading immutable weights; a CTA that returns early must still have called it, so

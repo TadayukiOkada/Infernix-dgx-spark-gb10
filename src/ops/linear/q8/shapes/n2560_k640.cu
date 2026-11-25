@@ -20,9 +20,7 @@ namespace infernix::ops::detail {
 // argmin: the 16-token tile to 48, the new 32x64 K128 tile to 64, then the pre-existing K128/K64
 // ladder.
 Q8Launch select_q8_n2560_k640(std::int32_t tokens) {
-    if (tokens <= 32) return launch_q8_a16_mma_r32_t32_k128_a1;
-    if (tokens <= 48) return launch_q8_a16_mma_r32_t16;
-    if (tokens <= 64) return launch_q8_a16_mma_r32_t64_k128_a1;
+    if (tokens <= 64) return launch_q8_a16_mma_r32_t32_k128_a1;
     if (tokens <= 96) return launch_q8_a16_mma_r64x16_t48_k128_a1;
     if (tokens <= 128) return launch_q8_a16_mma_r64x32_t64_k64_a2;
     return launch_q8_a16_mma_r64_t128;

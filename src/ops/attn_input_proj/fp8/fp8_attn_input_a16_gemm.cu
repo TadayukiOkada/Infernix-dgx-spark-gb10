@@ -27,8 +27,6 @@ void fp8_attn_input_a16_gemm_launch(const Tensor& x, const Weight& weight, Tenso
         run<Fp8A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>(x, weight, q, gate, k, v, stream);
     else if (x.ne[1] <= 80 || (x.ne[1] >= 129 && x.ne[1] <= 160))
         run<Fp8A16MmaSchedule<32, 80, 128, 32, 16, 1, 3>>(x, weight, q, gate, k, v, stream);
-    else if (x.ne[1] <= 96)
-        run<Fp8A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>(x, weight, q, gate, k, v, stream);
     else
         run<Fp8A16MmaSchedule<64, 128, 64, 32, 16, 2, 2>>(x, weight, q, gate, k, v, stream);
 }

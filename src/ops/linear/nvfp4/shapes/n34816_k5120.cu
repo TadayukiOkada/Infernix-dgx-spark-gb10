@@ -45,7 +45,9 @@ Nvfp4Launch select_a16(int tokens) {
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 32, 16, 1, 2>>;
     if (tokens <= 128)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>>;
-    if (tokens <= 384)
+    if (tokens <= 160)
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 80, 128, 32, 16, 1, 2>>;
+    if (tokens <= 448)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>>;
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
 }

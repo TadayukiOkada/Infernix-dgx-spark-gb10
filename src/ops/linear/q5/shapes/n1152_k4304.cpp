@@ -12,7 +12,7 @@ Q5Launch select_q5_n1152_k4304(std::int32_t tokens) {
     if (tokens <= 48) return launch_q5_a16_sliced_r16_t24_w4_s2;
     if (tokens <= 128) return launch_q5_a16_mma_r32_t32_k128_s2_a2;
     if (tokens <= 160) return launch_q5_a16_mma_r64_t80_k128_s1_a1;
-    if (tokens <= 256) return launch_q5_a16_mma_r32_t64_k128_s2_a1;
+    if (tokens <= 256) return launch_q5_a16_mma_r64_t64_k128_s1_a1;
     if (tokens <= 384) return launch_q5_a16_mma_r64_t80_k128_s1_a1;
     if (tokens <= 512) return launch_q5_a16_mma_r64_t128;
     if (tokens <= 1024) return launch_q5_a16_mma_r64_t80_k128_s1_a1;

@@ -20,8 +20,7 @@ using Prefill128 = Bf16ScheduleInstance<
 
 Bf16Launch ninfer_route(std::int32_t tokens) {
     if (tokens <= 1) return launch_bf16_gemv<S0>;
-    if (tokens <= 16) return launch_bf16_mma<S1>;
-    if (tokens <= 48) return launch_bf16_mma<S2>;
+    if (tokens <= 8) return launch_bf16_mma<S1>;
     if (tokens <= 64) return launch_bf16_tma_mma<S3, Bf16MmaWarpStoreEpilogue>;
     if (tokens <= 128) return launch_bf16_tma_mma<Hot, Bf16MmaWarpStoreEpilogue>;
     const auto token_tiles64 = (static_cast<std::int64_t>(tokens) + 63) / 64;
