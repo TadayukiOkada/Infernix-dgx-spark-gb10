@@ -51,6 +51,7 @@ QTYPE_TO_WORKLOAD_DTYPE: dict[str, str] = {
     "q6": "q6_g64",
     "q8": "q8_g32",
     "fp8": "fp8_e4m3",
+    "mxfp8": "mxfp8",
     "nvfp4": "nvfp4",
     "bf16": "bf16",
 }
@@ -61,6 +62,7 @@ QTYPE_TO_COMPUTE_DTYPE: dict[str, dict[str, str]] = {
     "q6": {"a16": "bf16"},
     "q8": {"a16": "bf16"},
     "fp8": {"a16": "bf16", "a8": "fp8"},
+    "mxfp8": {"a16": "bf16", "a8": "mxfp8"},
     "nvfp4": {"a16": "bf16", "a4": "nvfp4"},
     "bf16": {"a16": "bf16"},
 }
@@ -121,10 +123,13 @@ class ShapeSpec:
 
 _FILENAME_RE = re.compile(r"^n(\d+)_k(\d+)\.(cu|cpp)$")
 _USING_RE = re.compile(r"using\s+([A-Za-z0-9_]+)\s*=\s*([^;]+);")
-_IF_LE_RE = re.compile(
-    r"if\s*\(\s*(?:tokens|x\.ne\[1\])\s*(<=|==|<|>=|>)\s*(\d+)\s*\)\s*return\s+([^;]+);",
-    re.S,
+_FN_HEADER_RE = re.compile(
+    r"\b(select_[a-z0-9_]+|launch_a16|launch_a8|select_a16|select_a4|"
+    r"launch_routes|launch_decode_routes|launch_fast_routes|launch_fast_decode_routes|"
+    r"ninfer_route|launch_f16|select_f16|select)\s*\("
 )
+_IF_COND_RE = re.compile(r"if\s*\((.+?)\)\s*\{?\s*(?:return\s+)?([^;{}]+);", re.S)
+_TOK_CMP_RE = re.compile(r"\b(?:operands\.tokens|tokens|x\.ne\[1\])\s*(<=|==|<|>=|>)\s*(\d+)\b")
 _RETURN_RE = re.compile(r"^\s*(?:return\s+)?([A-Za-z0-9_<>:,\s]+?)(?:\([^;]*\))?\s*;\s*$")
 
 
@@ -329,11 +334,23 @@ def parse_shape_file(path: Path, dev: DeviceInfo | None = None) -> ShapeSpec | N
         stripped = line.strip()
         lineno = i + 1
 
-        # Detect function header
-        if re.search(r"\b(select_[a-z0-9_]+|launch_a16|launch_a8|select_a16|select_a4)\s*\(", stripped):
-            if "a8" in stripped:
+        # Detect function header only at outer scope (never mistake `return select_foo(tokens);` for a new function)
+        is_call_or_stmt = (
+            stripped.startswith(("if ", "if(", "return ", "//", "using "))
+            or (";" in stripped and "{" not in stripped)
+        )
+        fn_m = _FN_HEADER_RE.search(stripped) if (not in_function and not is_call_or_stmt) else None
+        if fn_m:
+            fn_name = fn_m.group(1).lower()
+            if "fast" in fn_name:
+                current_policy = "fast"
+            elif "invariant" in fn_name:
+                current_policy = "invariant"
+            elif re.search(r"(?:^|_)f16(?:_|$)", fn_name):
+                current_policy = "f16"
+            elif re.search(r"(?:^|_)a8(?:_|$)", fn_name):
                 current_policy = "a8"
-            elif "a4" in stripped:
+            elif re.search(r"(?:^|_)a4(?:_|$)", fn_name):
                 current_policy = "a4"
             else:
                 current_policy = "a16"
@@ -358,40 +375,44 @@ def parse_shape_file(path: Path, dev: DeviceInfo | None = None) -> ShapeSpec | N
                 end_i += 1
                 stmt += " " + lines[end_i].strip()
 
-            if_m = _IF_LE_RE.search(stmt)
-            if if_m:
-                op, val_s, route = if_m.group(1), if_m.group(2), " ".join(if_m.group(3).split())
-                val = int(val_s)
-                if op in ("<=", "=="):
-                    min_t = current_min_t if op == "<=" else val
-                    max_t = val
-                    current_min_t = val + token_step
-                elif op == "<":
-                    min_t = current_min_t
-                    max_t = max(current_min_t, val - token_step)
-                    current_min_t = val
-                else:
-                    # >= or > (e.g. nvfp4 select_a4 large-token check at top)
-                    min_t = val if op == ">=" else val + token_step
-                    max_t = None
+            if_m = _IF_COND_RE.search(stmt)
+            tok_cmps = _TOK_CMP_RE.findall(if_m.group(1)) if if_m else []
+            if if_m and tok_cmps:
+                route = " ".join(if_m.group(2).split())
                 t_rows, t_toks, t_k = _extract_tile_dims(route, aliases)
                 sig_info = extract_route_signature(route, aliases, policy=current_policy)
-                bands.append(
-                    DispatchBand(
-                        policy=current_policy,
-                        condition=f"tokens {op} {val}",
-                        min_tokens=min_t,
-                        max_tokens=max_t,
-                        route_expr=route,
-                        line_number=lineno,
-                        tile_rows=t_rows,
-                        tile_tokens=t_toks,
-                        tile_k=t_k,
-                        threads_per_block=sig_info["threads_per_block"],
-                        k_slices=sig_info["k_slices"],
-                        reduction_signature=sig_info["reduction_signature"],
+                for cmp_idx, (op, val_s) in enumerate(tok_cmps):
+                    val = int(val_s)
+                    if op in ("<=", "=="):
+                        min_t = current_min_t if op == "<=" else val
+                        max_t = val
+                        if cmp_idx == len(tok_cmps) - 1:
+                            current_min_t = val + token_step
+                    elif op == "<":
+                        min_t = current_min_t
+                        max_t = max(current_min_t, val - token_step)
+                        if cmp_idx == len(tok_cmps) - 1:
+                            current_min_t = val
+                    else:
+                        # >= or > (e.g. nvfp4 select_a4 large-token check or `(tokens > 128 && tokens <= 192)`)
+                        min_t = val if op == ">=" else val + token_step
+                        max_t = val if (op == ">" and val >= token_step and len(tok_cmps) > 1) else None
+                    bands.append(
+                        DispatchBand(
+                            policy=current_policy,
+                            condition=f"tokens {op} {val}",
+                            min_tokens=min_t,
+                            max_tokens=max_t,
+                            route_expr=route,
+                            line_number=lineno,
+                            tile_rows=t_rows,
+                            tile_tokens=t_toks,
+                            tile_k=t_k,
+                            threads_per_block=sig_info["threads_per_block"],
+                            k_slices=sig_info["k_slices"],
+                            reduction_signature=sig_info["reduction_signature"],
+                        )
                     )
-                )
                 brace_depth += sum(lines[j].count("{") - lines[j].count("}") for j in range(i, end_i + 1))
                 i = end_i + 1
                 if brace_depth <= 0:
@@ -546,28 +567,59 @@ def discover_shapes(
     return specs
 
 
+_DEFAULT_BOUNDARY_PROBE: tuple[int, ...] = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    8,
+    9,
+    16,
+    17,
+    32,
+    33,
+    64,
+    65,
+    96,
+    97,
+    128,
+    129,
+    192,
+    193,
+    256,
+    257,
+    384,
+    385,
+    512,
+)
+
+
 def boundary_tokens_for_shape(spec: ShapeSpec, policy: str = "a16", max_t: int | None = None) -> list[int]:
     """Return the minimal set of token counts ``T`` that test every dispatch boundary in ``spec``.
 
     For each ``tokens <= B`` branch, we test both ``B`` (the top of that branch)
     and ``B + token_step`` (the first valid token count of the next branch).
+    If the parser found ``<= 1`` policy band (or ``<= 2`` boundary points), falls back
+    to standard power-of-two +/- 1 probe points so no dispatch cliff is silently skipped.
     """
     t_step = max(1, spec.token_step)
+    policy_bands = [b for b in spec.bands if b.policy == policy]
     if max_t is None:
-        highest_band = max((b.max_tokens or 0 for b in spec.bands if b.policy == policy), default=256)
+        highest_band = max((b.max_tokens or 0 for b in policy_bands), default=256)
         max_t = max(512, highest_band + t_step)
     pts: set[int] = {t_step}
-    for b in spec.bands:
-        if b.policy != policy:
-            continue
+    for b in policy_bands:
         if b.min_tokens and t_step <= b.min_tokens <= max_t and b.min_tokens % t_step == 0:
             pts.add(b.min_tokens)
         if b.max_tokens and t_step <= b.max_tokens <= max_t and b.max_tokens % t_step == 0:
             pts.add(b.max_tokens)
             if b.max_tokens + t_step <= max_t:
                 pts.add(b.max_tokens + t_step)
-    if not pts:
-        pts = {t_step * x for x in (1, 2, 4, 8, 16, 32, 64)}
+    if len(policy_bands) <= 1 or len(pts) <= 2:
+        pts.update(
+            x for x in _DEFAULT_BOUNDARY_PROBE if t_step <= x <= max_t and x % t_step == 0
+        )
     return sorted(pts)
 
 
@@ -635,6 +687,7 @@ def benchmark_shape(
     n: int,
     k: int,
     policy: str = "a16",
+    routes: str | None = None,
     mode: str = "boundaries",  # "boundaries", "sweep", "single", "list"
     tokens: int = 1,
     token_list: list[int] | None = None,
@@ -676,6 +729,7 @@ def benchmark_shape(
             qtype,
             "--policy",
             policy,
+            *(["--routes", routes] if routes else []),
             "--n",
             str(n),
             "--k",
@@ -737,14 +791,17 @@ def benchmark_shape(
                 b_set = set(b_tokens)
                 rows_raw = [r for r in all_rows if int(r.get("T", 0) or 0) in b_set]
             else:
-                # Group contiguous pairs (e.g. [8, 9], [16, 17], or [8, 12] when t_step=4) into tiny
-                # `--sweep a:b:step` ranges so pairs share weight allocation and compute `delta_pct` directly!
+                # Group nearby points (e.g. gap <= 32 for T <= 256, or contiguous [B, B+step]) into
+                # `--sweep a:b:step` ranges to amortize process startup & weight setup on GB10, then
+                # filter back to exact requested `b_tokens`.
                 groups: list[tuple[int, int]] = []
                 for t_pt in b_tokens:
-                    if groups and t_pt == groups[-1][1] + t_step:
+                    max_gap = 32 if (t_step == 1 and t_pt <= 256) else t_step
+                    if groups and (t_pt - groups[-1][1]) <= max_gap:
                         groups[-1] = (groups[-1][0], t_pt)
                     else:
                         groups.append((t_pt, t_pt))
+                b_set = set(b_tokens)
                 for idx, (t_start, t_end) in enumerate(groups):
                     part_csv = Path(tmpdir) / f"part_{idx}.csv"
                     if t_start == t_end:
@@ -756,7 +813,7 @@ def benchmark_shape(
                     if res.returncode != 0:
                         raise ToolError(f"infernix_linear_bench failed ({res.returncode}): {res.stderr.strip()}")
                     with part_csv.open(newline="") as f:
-                        rows_raw.extend(list(csv.DictReader(f)))
+                        rows_raw.extend(r for r in csv.DictReader(f) if int(r.get("T", 0) or 0) in b_set)
                 if csv_out and rows_raw:
                     with Path(csv_out).open("w", newline="") as f:
                         writer = csv.DictWriter(f, fieldnames=list(rows_raw[0].keys()))

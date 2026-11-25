@@ -38,6 +38,7 @@ FORMAT_SPECS: dict[str, tuple[int, int, str]] = {
     "f16": (1, 2, "IEEE 754 float16 (2 B/elem)"),
     "bf16": (1, 2, "bfloat16 (2 B/elem)"),
     "fp8": (1, 1, "FP8 E4M3/E5M2 (1 B/elem)"),
+    "mxfp8": (32, 33, "OCP MXFP8 (32 elems + 1 E8M0 scale = 33 B / 32 elems, 8.25 bpw)"),
     "int8": (1, 1, "signed 8-bit integer (1 B/elem)"),
     "i8": (1, 1, "signed 8-bit integer (1 B/elem)"),
     "int32": (1, 4, "signed 32-bit integer (4 B/elem)"),

@@ -49,6 +49,14 @@ from .performance_model import (
 )
 from .profiler import Profiler, baseline_timing, ncu_base_name, verify_harness
 from .ab_runner import compare_shape_csvs, run_interleaved_ab
+from .cliffs import (
+    ALL_FAMILIES,
+    format_cli_summary,
+    merge_reports,
+    parse_family_list,
+    render_markdown_report,
+    run_cliffs_analysis,
+)
 from .recommendations import recommend
 from .reporting import environment_section, report_from_analysis
 from .shapes import benchmark_shape, discover_shapes, parse_shape_file
@@ -1916,6 +1924,57 @@ def cmd_nsys(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cliffs(args: argparse.Namespace) -> int:
+    """Scan all requested Infernix kernel families for remaining latency cliffs."""
+    if getattr(args, "list_families", False):
+        for fam in ALL_FAMILIES:
+            print(fam)
+        return 0
+
+    families = parse_family_list(getattr(args, "families", "all"))
+    env = _open_env(args)
+    dev = env.device
+    progress_cb = None if getattr(args, "quiet", False) or getattr(args, "json", False) else (lambda msg: print(msg, flush=True))
+
+    report = run_cliffs_analysis(
+        dev=dev,
+        repo_root=getattr(args, "repo_root", "."),
+        families=families,
+        max_tokens=args.max_tokens,
+        warmup=args.warmup,
+        repeat=args.repeat,
+        flush_mib=args.flush_mib,
+        upward_threshold_pct=args.upward_pct,
+        inverted_threshold_pct=args.inverted_pct,
+        min_delta_us=args.min_delta_us,
+        progress=progress_cb,
+    )
+
+    if getattr(args, "merge_report", None):
+        merge_path = Path(args.merge_report)
+        if not merge_path.exists():
+            raise SystemExit(f"--merge-report file not found: {merge_path}")
+        report = merge_reports(read_json(merge_path), report)
+
+    if getattr(args, "output", None):
+        write_json(args.output, report.to_dict())
+    if getattr(args, "markdown_out", None):
+        md_path = Path(args.markdown_out)
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(render_markdown_report(report))
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2))
+        return 0
+
+    format_cli_summary(report)
+    if getattr(args, "output", None):
+        print(f"\nSaved JSON report: {args.output}")
+    if getattr(args, "markdown_out", None):
+        print(f"Saved Markdown report: {args.markdown_out}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Parser
 # --------------------------------------------------------------------------- #
@@ -2228,6 +2287,25 @@ def build_parser() -> argparse.ArgumentParser:
     ns.add_argument("--run", action="store_true", help="execute the nsys profile command directly")
     ns.add_argument("target", nargs=argparse.REMAINDER, help="target executable and arguments to profile")
     ns.set_defaults(func=cmd_nsys)
+
+    # ---- ckt cliffs: unified cross-family cliff analysis ----------------- #
+    cl_p = sub.add_parser("cliffs", help="scan all kernel families for remaining latency cliffs and generate a unified report")
+    _add_common(cl_p)
+    cl_p.add_argument("--families", default="all", help="comma-separated kernel families or 'all' (default: all)")
+    cl_p.add_argument("--list-families", action="store_true", help="list registered kernel families and exit")
+    cl_p.add_argument("--max-tokens", type=int, default=512, help="maximum token width T to probe (default: 512)")
+    cl_p.add_argument("--warmup", type=int, default=2, help="warmup iterations per point (default: 2)")
+    cl_p.add_argument("--repeat", type=int, default=8, help="measured iterations per point (default: 8)")
+    cl_p.add_argument("--flush-mib", type=int, help="override L2 flush buffer size in MiB (default: GB10 32 MiB)")
+    cl_p.add_argument("--upward-pct", type=float, default=15.0, help="upward step threshold pct (default: 15.0)")
+    cl_p.add_argument("--inverted-pct", type=float, default=-8.0, help="inverted cliff threshold pct (default: -8.0)")
+    cl_p.add_argument("--min-delta-us", type=float, default=0.5, help="minimum absolute step change in us to flag (default: 0.5)")
+    cl_p.add_argument("--repo-root", default=".", help="repository root directory")
+    cl_p.add_argument("--merge-report", help="merge newly scanned families into an existing JSON cliff report")
+    cl_p.add_argument("--output", help="write consolidated JSON cliff report to path")
+    cl_p.add_argument("--markdown-out", help="write consolidated Markdown cliff report to path")
+    cl_p.add_argument("--json", action="store_true")
+    cl_p.set_defaults(func=cmd_cliffs)
 
     # ---- ckt autotune: offline benchmark-driven CUDA autotuning ---------- #
     register_autotune_subparsers(sub, _add_common)

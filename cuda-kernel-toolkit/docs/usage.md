@@ -193,6 +193,21 @@ PYTHONPATH=cuda-kernel-toolkit /opt/etc/Infernix/.venv-convert/bin/python3 -m ck
     --qtype q4 --n 4096 --k 5120 --mode sweep --sweep 1:64:1
 ```
 
+### Cross-Family Cliff Report (`ckt cliffs`)
+Scans all 23 Infernix kernel families (`linear:*`, `linear_add`, `linear_swiglu`, `attn_input_proj`, `gdn_input_proj`, `linear_pair`, `ggml_linear`, `causal_softmax_attention`, `gated_delta_net`, `sparse_moe`, `hyper_connection`, `qsa_attention`, `rmsnorm_rope`, `offloaded_sparse_moe`, `candidate_selector`, `dynamic_grouped_conv`) with cold-L2 (`32 MiB` on GB10) boundary probing and emits one consolidated JSON and Markdown report:
+
+```bash
+PYTHONPATH=cuda-kernel-toolkit /opt/etc/Infernix/.venv-convert/bin/python3 -m ckt cliffs \
+    --families all --max-tokens 512 --warmup 2 --repeat 8 \
+    --output cuda-kernel-toolkit/results/cliffs_report.json \
+    --markdown-out cuda-kernel-toolkit/results/cliffs_report.md
+
+# Or incrementally re-scan selected families and merge into an existing JSON report:
+PYTHONPATH=cuda-kernel-toolkit /opt/etc/Infernix/.venv-convert/bin/python3 -m ckt cliffs \
+    --families linear:q8,qsa_attention --merge-report cuda-kernel-toolkit/results/cliffs_report.json \
+    --output cuda-kernel-toolkit/results/cliffs_report.json --markdown-out cuda-kernel-toolkit/results/cliffs_report.md
+```
+
 ---
 
 ## Step 6: A/B Testing Inside `cuda-kernel-toolkit` (`ckt ab`)
