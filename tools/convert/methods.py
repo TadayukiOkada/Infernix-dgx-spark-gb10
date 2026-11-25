@@ -506,11 +506,41 @@ def import_ggml_rows(request: PrepareRequest) -> PreparedMethod:
 # The MSE divisor maps the parent's largest magnitude to 4 at the largest scale, so its largest
 # group may still take scales up to 1.5x its max-magnitude scale.
 _NVFP4_MSE_DIVISOR_TARGET = 4.0
+_RHT16_MATRIX: dict[str, torch.Tensor] = {}
 
 
-def _nvfp4_quantized(request: PrepareRequest, quantize, divisor_target: float) -> PreparedMethod:
+def _rht16_transform(values: torch.Tensor) -> torch.Tensor:
+    if values.dim() != 2 or values.shape[1] % 16:
+        raise ValueError("RHT-16 requires rank-two matrices with K divisible by 16")
+    device_key = str(values.device)
+    q = _RHT16_MATRIX.get(device_key)
+    if q is None:
+        s = torch.tensor(
+            [1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0],
+            dtype=torch.float32,
+            device=values.device,
+        )
+        h = torch.tensor([[1.0]], dtype=torch.float32, device=values.device)
+        for _ in range(4):
+            h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+        q = (s[:, None] * h) * 0.25
+        _RHT16_MATRIX[device_key] = q
+    rows, k = values.shape
+    return (values.to(torch.float32).reshape(rows, k // 16, 16) @ q).reshape(rows, k)
+
+
+def _nvfp4_quantized(
+    request: PrepareRequest,
+    quantize,
+    divisor_target: float,
+    *,
+    rht16: bool = False,
+) -> PreparedMethod:
     if request.target.format != "nvfp4" or len(request.target.shape) != 2:
         raise ValueError("NVFP4 quantization requires an nvfp4 matrix target")
+    expected_layout = "block_scale_k16_m128x4_rht16_v1" if rht16 else "block_scale_k16_m128x4_v1"
+    if request.target.layout != expected_layout:
+        raise ValueError(f"NVFP4 quantization method requires layout {expected_layout!r}")
     _preflight(request)
     n, k = request.target.shape
     auxiliaries = {}
@@ -533,12 +563,16 @@ def _nvfp4_quantized(request: PrepareRequest, quantize, divisor_target: float) -
             values = request.values(begin * k, end * k)
             if not values.dtype.is_floating_point:
                 raise TypeError("NVFP4 quantization source must be floating point")
+            if rht16:
+                values = _rht16_transform(values.reshape(end - begin, k).to(request.device))
             amax = max(amax, float(values.abs().max()))
         divisor = weight_divisor(amax, divisor_target)
         for begin in range(0, n, rows):
             end = min(n, begin + rows)
-            values = request.values(begin * k, end * k).reshape(end - begin, k)
-            words = quantize(values.to(request.device), divisor)
+            values = request.values(begin * k, end * k).reshape(end - begin, k).to(request.device)
+            if rht16:
+                values = _rht16_transform(values)
+            words = quantize(values, divisor)
             output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
@@ -554,6 +588,11 @@ def nvfp4_mse(request: PrepareRequest) -> PreparedMethod:
     return _nvfp4_quantized(request, quantize_nvfp4_mse, _NVFP4_MSE_DIVISOR_TARGET)
 
 
+def nvfp4_rht16_mse(request: PrepareRequest) -> PreparedMethod:
+    """NVFP4 with block-16 signed Walsh-Hadamard transform and MSE group scales."""
+    return _nvfp4_quantized(request, quantize_nvfp4_mse, _NVFP4_MSE_DIVISOR_TARGET, rht16=True)
+
+
 METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
@@ -564,4 +603,5 @@ METHODS: dict[str, Method] = {
     "import_ggml_rows": import_ggml_rows,
     "nvfp4_absmax": nvfp4_absmax,
     "nvfp4_mse": nvfp4_mse,
+    "nvfp4_rht16_mse": nvfp4_rht16_mse,
 }

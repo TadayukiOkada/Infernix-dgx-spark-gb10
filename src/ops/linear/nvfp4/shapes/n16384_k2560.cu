@@ -43,11 +43,12 @@ Nvfp4Launch select_a16(int tokens) {
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
 }
 
-template <class Output, class Epilogue>
+template <bool Rht16 = false, class Output, class Epilogue>
 void launch_decode_routes(const Nvfp4A16Operands& operands, Output output, Epilogue epilogue,
                           cudaStream_t stream) {
     if (operands.tokens == 1) {
-        launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Gemv, Geometry::kInputRows>>(
+        launch_nvfp4_a16_gemv<Nvfp4ScheduleInstance<Gemv, Geometry::kInputRows>, Output,
+                              Epilogue, Nvfp4IdentityRows, Rht16>(
             operands, output, epilogue, stream);
         return;
     }
@@ -186,6 +187,20 @@ void launch_nvfp4_n16384_k2560_split(const Tensor& x, const Weight& weight, Tens
         }
         return;
     }
+    if (weight.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
+        if (x.ne[1] == 1) {
+            launch_decode_routes<true>(nvfp4_a16_operands(x, weight), output,
+                                       LinearIdentityEpilogue{}, stream);
+            return;
+        }
+        if (workspace == nullptr)
+            throw std::invalid_argument("nvfp4 RHT-16 A16 split linear requires caller workspace");
+        auto scope   = workspace->scope();
+        Tensor x_rot = workspace->alloc(DType::BF16, {weight.k, x.ne[1]});
+        launch_nvfp4_rht16_bf16(x, static_cast<__nv_bfloat16*>(x_rot.data), stream);
+        launch_routes(nvfp4_a16_operands(x_rot, weight), output, stream);
+        return;
+    }
     launch_routes(nvfp4_a16_operands(x, weight), output, stream);
 }
 
@@ -194,9 +209,8 @@ void launch_nvfp4_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weig
                                              const Tensor& initial_state_slots,
                                              const Tensor& snapshot_base_slots, Tensor& query,
                                              Tensor& key, Tensor& value, Tensor& z,
-                                             cudaStream_t stream) {
-    const Nvfp4A16Operands operands = nvfp4_a16_operands(x, weight);
-    if (operands.tokens < 1 || operands.tokens > 8) {
+                                             cudaStream_t stream, WorkspaceArena* workspace) {
+    if (x.ne[1] < 1 || x.ne[1] > 8) {
         throw std::invalid_argument(
             "NVFP4 [16384,2560] fused GDN convolution covers 1..8 sequences");
     }
@@ -211,6 +225,22 @@ void launch_nvfp4_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weig
         static_cast<__nv_bfloat16*>(z.data),
     };
     const GdnConvSnapshotPrefetchedRowEpilogue epilogue{};
+    if (weight.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
+        if (x.ne[1] == 1) {
+            launch_decode_routes<true>(nvfp4_a16_operands(x, weight), output, epilogue, stream);
+            return;
+        }
+        if (workspace == nullptr) {
+            throw std::invalid_argument(
+                "nvfp4 RHT-16 fused GDN snapshot (B>1) requires caller workspace");
+        }
+        auto scope   = workspace->scope();
+        Tensor x_rot = workspace->alloc(DType::BF16, {weight.k, x.ne[1]});
+        launch_nvfp4_rht16_bf16(x, static_cast<__nv_bfloat16*>(x_rot.data), stream);
+        launch_decode_routes(nvfp4_a16_operands(x_rot, weight), output, epilogue, stream);
+        return;
+    }
+    const Nvfp4A16Operands operands = nvfp4_a16_operands(x, weight);
     launch_decode_routes(operands, output, epilogue, stream);
 }
 } // namespace infernix::ops::detail

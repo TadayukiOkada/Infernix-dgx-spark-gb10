@@ -37,6 +37,8 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::RowSplit, std::string_view{"row_split_k128_v1"}},
     std::pair{QuantLayout::RowScale, std::string_view{"row_scale_v1"}},
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
+    std::pair{QuantLayout::BlockScaleK16M128x4Rht16,
+              std::string_view{"block_scale_k16_m128x4_rht16_v1"}},
     std::pair{QuantLayout::ExpertRg16, std::string_view{"nvfp4_expert_rg16_v1"}},
     std::pair{QuantLayout::GgmlRows, std::string_view{"ggml_rows_v1"}},
     std::pair{QuantLayout::GgmlExpertIq4Nl, std::string_view{"ggml_expert_iq4_nl_v1"}},

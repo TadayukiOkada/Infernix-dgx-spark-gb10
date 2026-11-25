@@ -834,7 +834,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         Tensor q_rows = q.view({KW, 1, T}), k_rows = k.view({KW, 1, T}), v_rows = v.view({VW, 1, T}),
                z_rows = z.view({VW, 1, T});
         ops::gdn_input_proj_conv_snapshot(x_rows, p.projection.weight, p.convolution, layer.conv, batch.slots,
-                                          batch.slots, q_rows, k_rows, v_rows, z_rows, dense_routes(), s);
+                                          batch.slots, q_rows, k_rows, v_rows, z_rows, dense_routes(), s, &work_);
         project(x, p.control, ab, work_, s, dense_routes());
     } else if (ggml && p.control.is_ggml() && p.control.input_perm == nullptr) {
         // A GGUF import's two projections of x in one call (one encoding of x), each part written to

@@ -277,6 +277,12 @@ int main() {
                 failures += check(q::fast_path_qualified(path, {DenseKernels::Mxfp8, a4, kv}),
                                   "the coupling paths are qualified on NVIDIA FP4-Local");
             }
+            const FastPathConfiguration mxfp8{DenseKernels::Mxfp8, a4, kv};
+            for (const FastPath path : {FastPath::Nvfp4A4Pair, FastPath::Q8SlicedK}) {
+                failures += check(q::fast_path_applies(path, mxfp8, options) &&
+                                      q::fast_path_qualified(path, mxfp8),
+                                  "mixed MXFP8/NVFP4/Q8 paths apply and are qualified on NVIDIA FP4-Local");
+            }
         }
         failures += check(q::fast_path_applies(FastPath::Nvfp4A4Pair, nvfp4, options) &&
                               q::fast_path_qualified(FastPath::Nvfp4A4Pair, nvfp4),

@@ -45,7 +45,8 @@ void launch_nvfp4_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weig
                                              const Tensor& initial_state_slots,
                                              const Tensor& snapshot_base_slots, Tensor& query,
                                              Tensor& key, Tensor& value, Tensor& z,
-                                             cudaStream_t stream);
+                                             cudaStream_t stream,
+                                             WorkspaceArena* workspace = nullptr);
 // Qwen3.8-Flash-Next W4-dense tier (recipe `qwen3_8_flash_next_nvfp4_w4dense`).
 extern const Nvfp4LinearShape kNvfp4N2048K2560;
 extern const Nvfp4LinearShape kNvfp4N6144K2560;
@@ -53,4 +54,6 @@ extern const Nvfp4LinearShape kNvfp4N512K2560;
 extern const Nvfp4LinearShape kNvfp4N128K2560;
 extern const Nvfp4LinearShape kNvfp4N10240K2560;
 extern const Nvfp4LinearShape kNvfp4N2560K2560;
+extern const Nvfp4LinearShape kNvfp4N1280K2560;
+extern const Nvfp4LinearShape kNvfp4N2560K640;
 } // namespace infernix::ops::detail

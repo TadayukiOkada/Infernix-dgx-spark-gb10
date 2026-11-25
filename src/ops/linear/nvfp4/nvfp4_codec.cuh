@@ -238,12 +238,62 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
 }
 
+// Canonical signed block-16 Walsh-Hadamard transform: Q = diag(s) * H_16 / 4, where bit i
+// (0..15) of kNvfp4Rht16SignMask = 0xB4D2U marks s[i] = -1. Calling rht16_inplace on both W
+// offline and x online preserves x * W^T while spreading block outliers across the 16 lanes.
+inline constexpr std::uint32_t kNvfp4Rht16SignMask = 0xB4D2U;
+
+__device__ __forceinline__ void rht16_inplace(float2 (&pairs)[8]) {
+    float v[16];
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const float s0 = ((kNvfp4Rht16SignMask >> (2 * p)) & 1U) ? -1.0F : 1.0F;
+        const float s1 = ((kNvfp4Rht16SignMask >> (2 * p + 1)) & 1U) ? -1.0F : 1.0F;
+        v[2 * p]       = pairs[p].x * s0;
+        v[2 * p + 1]   = pairs[p].y * s1;
+    }
+#pragma unroll
+    for (int stride = 1; stride < 16; stride <<= 1) {
+#pragma unroll
+        for (int base = 0; base < 16; base += 2 * stride) {
+#pragma unroll
+            for (int offset = 0; offset < stride; ++offset) {
+                const float a              = v[base + offset];
+                const float b              = v[base + offset + stride];
+                v[base + offset]           = a + b;
+                v[base + offset + stride]  = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        pairs[p].x = v[2 * p] * 0.25F;
+        pairs[p].y = v[2 * p + 1] * 0.25F;
+    }
+}
+
+__device__ __forceinline__ void rht16_bf16_packed(uint4& p0, uint4& p1) {
+    const std::uint32_t raw[8] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+    float2 pairs[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { pairs[i] = bf16x2_bits_to_float2(raw[i]); }
+    rht16_inplace(pairs);
+    union {
+        std::uint32_t word;
+        __nv_bfloat162 pair;
+    } out[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { out[i].pair = __float22bfloat162_rn(pairs[i]); }
+    p0 = make_uint4(out[0].word, out[1].word, out[2].word, out[3].word);
+    p1 = make_uint4(out[4].word, out[5].word, out[6].word, out[7].word);
+}
+
 // Reciprocal replaces the sixteen per-value divisions with one reciprocal plus multiplies.
 // Measured faster on latency-bound small grids (linear MMA route, T < 1024) and measurably
 // slower on the throughput-bound TMA route, so callers select it explicitly; the default keeps
 // historical behavior. The two formulations are algebraically identical and differ only in
 // floating-point rounding (~1 ulp); the resulting output error stays within the A4 allowance.
-template <bool Reciprocal = false>
+template <bool Reciprocal = false, bool Rht16 = false>
 __device__ __forceinline__ Nvfp4QuantizedK16
 quantize_nvfp4_k16_packed(const uint4 packed0, const uint4 packed1, float input_scale_divisor) {
     const std::uint32_t represented[8] = {
@@ -251,12 +301,16 @@ quantize_nvfp4_k16_packed(const uint4 packed0, const uint4 packed1, float input_
     };
 
     float2 values[8];
-    float max_abs = 0.0F;
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
         values[pair] = bf16x2_bits_to_float2(represented[pair]);
-        max_abs      = fmaxf(max_abs, fabsf(values[pair].x));
-        max_abs      = fmaxf(max_abs, fabsf(values[pair].y));
+    }
+    if constexpr (Rht16) { rht16_inplace(values); }
+    float max_abs = 0.0F;
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        max_abs = fmaxf(max_abs, fabsf(values[pair].x));
+        max_abs = fmaxf(max_abs, fabsf(values[pair].y));
     }
 
     Nvfp4QuantizedK16 result{};
@@ -283,12 +337,12 @@ quantize_nvfp4_k16_packed(const uint4 packed0, const uint4 packed1, float input_
     return result;
 }
 
-template <bool Reciprocal = false>
+template <bool Reciprocal = false, bool Rht16 = false>
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
                                                                 float input_scale_divisor) {
     const uint4 packed0 = load_vec<uint4>(source);
     const uint4 packed1 = load_vec<uint4>(source + 8);
-    return quantize_nvfp4_k16_packed<Reciprocal>(packed0, packed1, input_scale_divisor);
+    return quantize_nvfp4_k16_packed<Reciprocal, Rht16>(packed0, packed1, input_scale_divisor);
 }
 
 // The A4 residual profile: one K16 group as a sum of NVFP4 terms. The remainder starts at the
@@ -296,7 +350,7 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
 // E4M3 scale of max/6, E2M1 codes of value/scale), and the next term encodes what that term's
 // decoded code * scale left. Term 0 is therefore bit-identical to quantize_nvfp4_k16, and every term
 // shares its divisor, so the MMA sums the terms' products into one accumulator under the same alpha.
-template <int Terms, bool Reciprocal = false>
+template <int Terms, bool Reciprocal = false, bool Rht16 = false>
 __device__ __forceinline__ void
 quantize_nvfp4_terms_k16_packed(const uint4 packed0, const uint4 packed1, float input_scale_divisor,
                                 Nvfp4QuantizedK16 (&terms)[Terms]) {
@@ -304,12 +358,16 @@ quantize_nvfp4_terms_k16_packed(const uint4 packed0, const uint4 packed1, float 
         packed0.x, packed0.y, packed0.z, packed0.w, packed1.x, packed1.y, packed1.z, packed1.w,
     };
 
+    float2 values[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) { values[pair] = bf16x2_bits_to_float2(represented[pair]); }
+    if constexpr (Rht16) { rht16_inplace(values); }
+
     float2 remainder[8];
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
-        const float2 value = bf16x2_bits_to_float2(represented[pair]);
-        remainder[pair]    = make_float2(__fmul_rn(value.x, input_scale_divisor),
-                                         __fmul_rn(value.y, input_scale_divisor));
+        remainder[pair] = make_float2(__fmul_rn(values[pair].x, input_scale_divisor),
+                                      __fmul_rn(values[pair].y, input_scale_divisor));
     }
 
 #pragma unroll
@@ -360,14 +418,14 @@ quantize_nvfp4_terms_k16_packed(const uint4 packed0, const uint4 packed1, float 
     }
 }
 
-template <int Terms, bool Reciprocal = false>
+template <int Terms, bool Reciprocal = false, bool Rht16 = false>
 __device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* source,
                                                          float input_scale_divisor,
                                                          Nvfp4QuantizedK16 (&terms)[Terms]) {
     const uint4 packed0 = load_vec<uint4>(source);
     const uint4 packed1 = load_vec<uint4>(source + 8);
-    quantize_nvfp4_terms_k16_packed<Terms, Reciprocal>(packed0, packed1, input_scale_divisor,
-                                                       terms);
+    quantize_nvfp4_terms_k16_packed<Terms, Reciprocal, Rht16>(packed0, packed1,
+                                                               input_scale_divisor, terms);
 }
 
 } // namespace infernix::ops::detail

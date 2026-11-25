@@ -59,11 +59,30 @@ int run_nvfp4_a16() {
                           {10240, 2560, 739U, Comparison::Sampled, true, decode_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {2560, 2560, 743U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {1280, 2560, 751U, Comparison::Sampled, true, decode_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2560, 640, 757U, Comparison::Sampled, true, decode_invocations});
+    const std::vector<Invocation> rht16_a16_invocations{
+        {1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        {2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        {4, CallForm::Policy, ops::LinearPolicy::A16Only, true},
+        {8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        {16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        {32, CallForm::Policy, ops::LinearPolicy::A16Only},
+        {33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        {65, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("NVFP4_RHT16_A16", ActivationCompute::A16, make_nvfp4_rht16_weight,
+                          {16384, 2560, 761U, Comparison::Sampled, true, rht16_a16_invocations});
+    failures += run_shape("NVFP4_RHT16_A16", ActivationCompute::A16, make_nvfp4_rht16_weight,
+                          {2560, 6144, 769U, Comparison::Sampled, true, rht16_a16_invocations});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{5120, 6144}, std::pair{5120, 17408}, std::pair{16384, 2560},
                         std::pair{13952, 2560}, std::pair{12800, 2560}, std::pair{2560, 6144},
                         std::pair{2048, 2560}, std::pair{6144, 2560}, std::pair{512, 2560},
-                        std::pair{128, 2560}, std::pair{10240, 2560}, std::pair{2560, 2560}}) {
+                        std::pair{128, 2560}, std::pair{10240, 2560}, std::pair{2560, 2560},
+                        std::pair{1280, 2560}, std::pair{2560, 640}}) {
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
     return failures;

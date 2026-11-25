@@ -258,7 +258,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearRoutes routes,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream, WorkspaceArena* workspace = nullptr);
 
 /**
  * Returns the transient capacity for the registered Q4/Q5 or Q8 record-producing profile.

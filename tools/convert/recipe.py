@@ -36,6 +36,7 @@ from .methods import (
     import_ggml_rows,
     nvfp4_absmax,
     nvfp4_mse,
+    nvfp4_rht16_mse,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -417,6 +418,7 @@ class Recipe:
             import_ggml_rows,
             nvfp4_absmax,
             nvfp4_mse,
+            nvfp4_rht16_mse,
         )
         for names in self.model.packing_groups:
             if any(

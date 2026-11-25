@@ -9,6 +9,7 @@
 // =============================================================================
 
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
+#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
@@ -195,6 +196,15 @@ void launch_nvfp4_n13952_k2560_split(const Tensor& x, const Weight& weight, Tens
                                                  Nvfp4IdentityRows{},
                                                  pdl::Dependency::Programmatic);
         }
+        return;
+    }
+    if (weight.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
+        if (workspace == nullptr)
+            throw std::invalid_argument("nvfp4 RHT-16 A16 split linear requires caller workspace");
+        auto scope   = workspace->scope();
+        Tensor x_rot = workspace->alloc(DType::BF16, {weight.k, x.ne[1]});
+        launch_nvfp4_rht16_bf16(x, static_cast<__nv_bfloat16*>(x_rot.data), stream);
+        launch_routes(nvfp4_a16_operands(x_rot, weight), output, stream);
         return;
     }
     launch_routes(nvfp4_a16_operands(x, weight), output, stream);

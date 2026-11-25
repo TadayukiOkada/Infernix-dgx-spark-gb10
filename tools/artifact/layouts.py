@@ -196,6 +196,11 @@ BLOCK_SCALE_K16_M128X4_V1 = Layout(
     256,
     frozenset(("nvfp4",)),
 )
+BLOCK_SCALE_K16_M128X4_RHT16_V1 = Layout(
+    "block_scale_k16_m128x4_rht16_v1",
+    256,
+    frozenset(("nvfp4",)),
+)
 ROW_SCALE_V1 = Layout(
     "row_scale_v1",
     256,
@@ -238,6 +243,7 @@ LAYOUTS = MappingProxyType(
             CONTIGUOUS_LE_V1,
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
+            BLOCK_SCALE_K16_M128X4_RHT16_V1,
             ROW_SCALE_V1,
             G32_SCALE_ROWS16_V1,
             NVFP4_EXPERT_RG16_V1,
@@ -568,9 +574,9 @@ def encoded_size(
         if not isinstance(numeric_spec, QuantFormat):
             raise ValueError("row_split_k128_v1 requires a grouped quantized format")
         return row_split_geometry(numeric_spec, shape).payload_bytes
-    if layout_spec is BLOCK_SCALE_K16_M128X4_V1:
+    if layout_spec in (BLOCK_SCALE_K16_M128X4_V1, BLOCK_SCALE_K16_M128X4_RHT16_V1):
         if not isinstance(numeric_spec, Nvfp4Format):
-            raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
+            raise ValueError(f"{layout_spec.name} requires NVFP4")
         return block_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is ROW_SCALE_V1:
         if not isinstance(numeric_spec, Fp8RowFormat):

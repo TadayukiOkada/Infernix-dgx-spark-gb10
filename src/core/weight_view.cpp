@@ -236,7 +236,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 32;
         out.code_bytes          = out.elements;
         out.scale_offset        = aligned(out.code_bytes, 256);
-    } else if (layout == QuantLayout::BlockScaleK16M128x4) {
+    } else if (is_nvfp4_block_scale_layout(layout)) {
         if (format != QType::NVFP4 || n % 128 || k % 64) {
             throw std::invalid_argument("NVFP4 BlockScale requires N%128=0 and K%64=0");
         }
@@ -293,7 +293,7 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
         group >= geometry.padded_columns / geometry.group_size) {
         throw std::invalid_argument("weight scale coordinate exceeds its parent");
     }
-    if (geometry.layout == QuantLayout::BlockScaleK16M128x4) {
+    if (is_nvfp4_block_scale_layout(geometry.layout)) {
         const auto inner = row % 128;
         return geometry.scale_offset + (row / 128 * (geometry.shape[1] / 64) + group / 4) * 512 +
                inner % 32 * 16 + inner / 32 * 4 + group % 4;
@@ -322,7 +322,7 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     if (g.high_bytes) {
         out.high = parent.data + g.high_offset + out.row_begin * out.high_row_bytes;
     }
-    out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4;
+    out.swizzled_scales = is_nvfp4_block_scale_layout(g.layout);
     if (g.scale_bytes) {
         out.scales = parent.data + g.scale_offset +
                      (out.swizzled_scales ? 0 : out.row_begin * out.scale_row_bytes);
@@ -383,7 +383,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         return out;
     }
     const auto planes = weight_row_planes(region);
-    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4 ||
+    if ((g.layout == QuantLayout::RowScale || is_nvfp4_block_scale_layout(g.layout) ||
          g.layout == QuantLayout::G32ScaleRows16) &&
         !is_complete_weight(view)) {
         throw std::invalid_argument(
@@ -410,7 +410,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = word;
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * word;
-    } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
+    } else if (is_nvfp4_block_scale_layout(g.layout)) {
         out.scale_dtype = DType::FP8_E4M3FN;
     } else if (g.layout == QuantLayout::G32ScaleRows16) {
         // UE8M0 words: [n / 16][k / 32][16] (the layout's tile order).

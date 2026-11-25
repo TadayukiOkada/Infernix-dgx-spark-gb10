@@ -10,6 +10,11 @@
 #   ./tools/run_server.sh [options] <model_alias>
 #
 # Model aliases:
+#   fastq       Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-FastQ-RHT16 (FastQ-v5 + GdnInRHT16, default; alias: fastq-rht16)
+#   fastq-v5    Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-FastQ-v5 (FastQ-v4 + OutputHeadQ8)
+#   fastq-v4    Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-FastQ-v4 (HC8 + SharedNVFP4 + GdnOutNVFP4 + MidGdnNVFP4)
+#   fastq-v3    Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-FastQ-v3 (HC8 + SharedNVFP4 + GdnOutNVFP4)
+#   fastq-v2    Qwen3.8-Flash-Next NVIDIA FP4-Local-Infernix-FastQ (HC8 + SharedNVFP4)
 #   dense8      Qwen3.8-Flash-Next NVIDIA NVFP4 Dense8-Infernix
 #   nvfp4       Qwen3.8-Flash-Next Local NVFP4-W4Dense (F4-Local-NVPF4-Dense)
 #   iqs_3       Qwen3.8-Flash-Next GSQ-RCO IQ3_S-Infernix  (aliases: iq3s, iq3_s)
@@ -52,7 +57,7 @@ DRAFT_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-DFlash2-Head/Qwen3.8-Flash-Next-DFl
 KV_DTYPE="${KV_DTYPE:-int8}"
 NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-31}"
 NGRAM_MIN_MATCH="${NGRAM_MIN_MATCH:-8}"
-NGRAM_CACHE_MIB="${NGRAM_CACHE_MIB:-2048}"
+NGRAM_CACHE_MIB="${NGRAM_CACHE_MIB:-16384}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-12288}"
 KV_CAPACITY="${KV_CAPACITY:-524288}"
 HOST_CONTEXT_MIB="${HOST_CONTEXT_MIB:-4096}"
@@ -110,11 +115,56 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${MODEL_ALIAS}" ]]; then
-    MODEL_ALIAS="hc4"
+    MODEL_ALIAS="fastq"
 fi
 
 # Resolve model alias -> weights, n-gram volume, residency
 case "${MODEL_ALIAS}" in
+    fastq|fastq-rht16)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-RHT16"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-RHT16.infernix"
+        NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
+        EXPERT_A4_DEFAULT=1
+        VISION_DEFAULT=1
+        ;;
+    fastq-v5)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5.infernix"
+        NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
+        EXPERT_A4_DEFAULT=1
+        VISION_DEFAULT=1
+        ;;
+    fastq-v4)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v4"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v4.infernix"
+        NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
+        EXPERT_A4_DEFAULT=1
+        VISION_DEFAULT=1
+        ;;
+    fastq-v3)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v3"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v3.infernix"
+        NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
+        EXPERT_A4_DEFAULT=1
+        VISION_DEFAULT=1
+        ;;
+    fastq-v2)
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ"
+        MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ.infernix"
+        NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
+        SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
+        EXPERT_A4_DEFAULT=1
+        VISION_DEFAULT=1
+        ;;
     dense8)
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-Nvidia-Dense8-Infernix"
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix"
@@ -140,17 +190,17 @@ case "${MODEL_ALIAS}" in
         VISION_DEFAULT=0
         ;;
     local-f4)
-        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-New"
+        MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix"
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix"
-        NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-00001-of-00003.infernix.ngram"
-        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-auto}"
+        NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
         EXPERT_A4_DEFAULT=1
         VISION_DEFAULT=1
         ;;
     hc4-w4dense|hc4)
         MODEL_DIR="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense"
         MODEL_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-HC4-W4Dense.infernix"
-        NGRAM_PATH="${MODELS_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
+        NGRAM_PATH="${MODEL_DIR}/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram"
         NGRAM_RESIDENCY="${NGRAM_RESIDENCY:-volume}"
         SPEC_BACKEND="${SPEC_BACKEND:-mtp}"
         EXPERT_A4_DEFAULT=1
@@ -158,7 +208,7 @@ case "${MODEL_ALIAS}" in
         ;;
     *)
         echo "Error: Unknown model alias '${MODEL_ALIAS}'." >&2
-        echo "Available aliases: dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4, hc4-w4dense (hc4)" >&2
+        echo "Available aliases: fastq (fastq-rht16), fastq-v5, fastq-v4, fastq-v3, fastq-v2, dense8, nvfp4, iqs_3 (iq3s/iq3_s), local-f4, hc4-w4dense (hc4)" >&2
         exit 1
         ;;
 esac

@@ -149,7 +149,7 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
     }
 }
 
-template <class Geometry, class Schedule>
+template <class Geometry, class Schedule, bool Rht16 = false>
 __device__ __forceinline__ void
 compute_nvfp4_rows(const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
                    const std::uint8_t* __restrict__ scales,
@@ -180,11 +180,35 @@ compute_nvfp4_rows(const __nv_bfloat16* x, const std::uint8_t* __restrict__ code
                 codes + code_offset);
         }
 
+        std::uint32_t rht_words[8];
+        if constexpr (Rht16) {
+            static_assert(Schedule::kValuesPerLane == 16);
+            const int act_base =
+                phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane;
+            uint4 p0 = *reinterpret_cast<const uint4*>(activation_pairs + act_base);
+            uint4 p1 = *reinterpret_cast<const uint4*>(activation_pairs + act_base + 4);
+            rht16_bf16_packed(p0, p1);
+            rht_words[0] = p0.x;
+            rht_words[1] = p0.y;
+            rht_words[2] = p0.z;
+            rht_words[3] = p0.w;
+            rht_words[4] = p1.x;
+            rht_words[5] = p1.y;
+            rht_words[6] = p1.z;
+            rht_words[7] = p1.w;
+        }
+
 #pragma unroll
         for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
-            const int activation_index =
-                phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
-            const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
+            std::uint32_t act_bits;
+            if constexpr (Rht16) {
+                act_bits = rht_words[pair];
+            } else {
+                const int activation_index =
+                    phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
+                act_bits = activation_pairs[activation_index];
+            }
+            const float2 activation = bf16x2_bits_to_float2(act_bits);
             const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
 #pragma unroll
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
@@ -247,7 +271,7 @@ nvfp4_stage_a16_scales(const std::uint8_t* scales,
     }
 }
 
-template <class Schedule, class Output, class Epilogue, class Rows>
+template <class Schedule, class Output, class Epilogue, class Rows, bool Rht16 = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_gemv_kernel(
     const __nv_bfloat16* x, const std::uint8_t* __restrict__ codes,
@@ -286,8 +310,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     }
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent, local0, lane,
-                                           accumulators);
+    compute_nvfp4_rows<Geometry, Schedule, Rht16>(x, codes, scales, shared, alpha, parent, local0,
+                                                  lane, accumulators);
     pdl::trigger_dependents();
     float totals[Schedule::kRowsPerWarp];
 #pragma unroll

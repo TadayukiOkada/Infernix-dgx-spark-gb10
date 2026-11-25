@@ -291,7 +291,8 @@ struct PackedWeight {
                                           static_cast<std::size_t>(row_begin) * high_row;
             w.scales = static_cast<const std::uint8_t*>(w.scales) +
                        static_cast<std::size_t>(row_begin) * scale_row;
-        } else if (w.layout == QuantLayout::BlockScaleK16M128x4) {
+        } else if (w.layout == QuantLayout::BlockScaleK16M128x4 ||
+                   w.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
             if ((row_begin % 128) != 0 || (row_count % 128) != 0) {
                 throw std::invalid_argument(
                     "quantized-weight fixture: NVFP4 row view must align to 128 rows");
@@ -784,7 +785,8 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     }
 
     if (weight.qtype == QType::NVFP4) {
-        if (weight.layout != QuantLayout::BlockScaleK16M128x4 ||
+        if ((weight.layout != QuantLayout::BlockScaleK16M128x4 &&
+             weight.layout != QuantLayout::BlockScaleK16M128x4Rht16) ||
             weight.scale_dtype != DType::FP8_E4M3FN || weight.group != 16 ||
             !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F) {
             throw std::invalid_argument("quantized-weight fixture: invalid NVFP4 metadata");
@@ -834,6 +836,27 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     return static_cast<double>(signed_code) * exact_stored_fp16_scale;
 }
 
+namespace detail {
+inline void inverse_rht16_block_fp64(double* values) {
+    // Forward transform Q = diag(s) * H16 / 4; inverse transpose Q^T = (H16 / 4) * diag(s).
+    constexpr std::uint32_t kSignMask = 0xB4D2U;
+    for (int stride = 1; stride < 16; stride <<= 1) {
+        for (int base = 0; base < 16; base += 2 * stride) {
+            for (int offset = 0; offset < stride; ++offset) {
+                const double a            = values[base + offset];
+                const double b            = values[base + offset + stride];
+                values[base + offset]     = a + b;
+                values[base + offset + stride] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < 16; ++i) {
+        const double s = ((kSignMask >> i) & 1U) ? -1.0 : 1.0;
+        values[i] *= 0.25 * s;
+    }
+}
+} // namespace detail
+
 inline double dot_fp64(const PackedWeight& packed, std::int32_t row, const float* logical_input,
                        std::int32_t k) {
     if (logical_input == nullptr) {
@@ -843,6 +866,17 @@ inline double dot_fp64(const PackedWeight& packed, std::int32_t row, const float
         throw std::invalid_argument("quantized-weight fixture: logical K mismatch");
     }
     double acc = 0.0;
+    if (packed.weight.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
+        for (std::int32_t base = 0; base < k; base += 16) {
+            double block[16];
+            for (int i = 0; i < 16; ++i) { block[i] = logical_weight_fp64(packed, row, base + i); }
+            detail::inverse_rht16_block_fp64(block);
+            for (int i = 0; i < 16; ++i) {
+                acc += block[i] * static_cast<double>(logical_input[base + i]);
+            }
+        }
+        return acc;
+    }
     for (std::int32_t column = 0; column < k; ++column) {
         acc +=
             logical_weight_fp64(packed, row, column) * static_cast<double>(logical_input[column]);
@@ -858,6 +892,20 @@ inline std::vector<float> materialize_rows_fp32(const PackedWeight& packed,
     std::vector<float> result(static_cast<std::size_t>(packed.weight.k) * rows.size());
     for (std::size_t selected = 0; selected < rows.size(); ++selected) {
         const std::int32_t row = rows[selected];
+        if (packed.weight.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
+            for (std::int32_t base = 0; base < packed.weight.k; base += 16) {
+                double block[16];
+                for (int i = 0; i < 16; ++i) {
+                    block[i] = logical_weight_fp64(packed, row, base + i);
+                }
+                detail::inverse_rht16_block_fp64(block);
+                for (int i = 0; i < 16; ++i) {
+                    result[selected * static_cast<std::size_t>(packed.weight.k) +
+                           static_cast<std::size_t>(base + i)] = static_cast<float>(block[i]);
+                }
+            }
+            continue;
+        }
         for (std::int32_t column = 0; column < packed.weight.k; ++column) {
             result[selected * static_cast<std::size_t>(packed.weight.k) +
                    static_cast<std::size_t>(column)] =

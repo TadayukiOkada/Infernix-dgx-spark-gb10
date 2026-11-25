@@ -894,10 +894,14 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     }
     if (parent_qtype == QType::NVFP4) {
         if (parent_rows == 16384 && input_rows == 2560 && !column_invariant(policy)) {
-            return max_tokens >= 65
-                       ? detail::nvfp4_a4_workspace_capacity_bytes(
-                             max_tokens, 2560, detail::kNvfp4A4ResidualTerms, true)
-                       : 0;
+            const std::size_t pair =
+                max_tokens >= 52
+                    ? detail::nvfp4_a4_workspace_capacity_bytes(
+                          max_tokens, 2560, detail::kNvfp4A4ResidualTerms, true)
+                    : 0;
+            const std::size_t rht16_a16 =
+                static_cast<std::size_t>(max_tokens) * 2560U * sizeof(std::uint16_t);
+            return std::max(pair, rht16_a16);
         }
         if (parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
             input_rows != detail::Nvfp4N16384K5120::kInputRows) {
@@ -1265,7 +1269,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
                                   const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearRoutes routes,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, WorkspaceArena* workspace) {
     static constexpr char kOperation[] = "gdn_input_proj_conv_snapshot";
     constexpr std::int32_t kHidden     = 2560;
     constexpr std::int32_t kQueryRows  = 2048;
@@ -1326,7 +1330,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     if (parent.qtype == QType::NVFP4) {
         detail::launch_nvfp4_n16384_k2560_conv_snapshot(
             x_columns, parent, conv_weight, conv_states, initial_state_slots, snapshot_base_slots,
-            query, key, value, z, stream);
+            query, key, value, z, stream, workspace);
         return;
     }
     detail::launch_q8_n16384_k2560_conv_snapshot(x_columns, parent, conv_weight, conv_states,

@@ -14,9 +14,9 @@
 namespace infernix::ops::detail {
 namespace {
 
-template <class ActivationGeometry>
-void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
-                           Nvfp4ScaleLayout layout, cudaStream_t stream, bool reciprocal) {
+template <class ActivationGeometry, bool Rht16>
+void launch_quantize_exact_rht16(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
+                                 Nvfp4ScaleLayout layout, cudaStream_t stream, bool reciprocal) {
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
     const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
@@ -32,12 +32,14 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
     if constexpr (ActivationGeometry::kGroupsPerRow % kNvfp4ScaleTileGroups == 0) {
         if (layout != Nvfp4ScaleLayout::RowMajor) {
             if (layout == Nvfp4ScaleLayout::Tiled128) {
-                nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled128>
+                nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled128,
+                                         false, Rht16>
                     <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales,
                                                       tokens, written_tokens,
                                                       weight.input_scale_divisor);
             } else {
-                nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled256>
+                nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled256,
+                                         false, Rht16>
                     <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales,
                                                       tokens, written_tokens,
                                                       weight.input_scale_divisor);
@@ -53,20 +55,34 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
         CUDA_CHECK(pdl::launch_consumer(
             {dim3(blocks), dim3(kThreads), 0, stream},
             nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor,
-                                     true>,
+                                     true, Rht16>,
             input, workspace.codes, workspace.scales, tokens, written_tokens,
             weight.input_scale_divisor));
         return;
     }
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(blocks), dim3(kThreads), 0, stream},
-        nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>, input,
-        workspace.codes, workspace.scales, tokens, written_tokens, weight.input_scale_divisor));
+        nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor, false,
+                                 Rht16>,
+        input, workspace.codes, workspace.scales, tokens, written_tokens,
+        weight.input_scale_divisor));
 }
 
-template <class ActivationGeometry, int Terms, Nvfp4ScaleLayout Layout>
-void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
-                           cudaStream_t stream) {
+template <class ActivationGeometry>
+void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
+                           Nvfp4ScaleLayout layout, cudaStream_t stream, bool reciprocal) {
+    if (weight.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
+        launch_quantize_exact_rht16<ActivationGeometry, true>(x, weight, workspace, layout, stream,
+                                                            reciprocal);
+    } else {
+        launch_quantize_exact_rht16<ActivationGeometry, false>(x, weight, workspace, layout, stream,
+                                                             reciprocal);
+    }
+}
+
+template <class ActivationGeometry, int Terms, Nvfp4ScaleLayout Layout, bool Rht16>
+void launch_residual_exact_rht16(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
+                                 cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
     const std::int32_t written_tokens =
@@ -82,7 +98,7 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
         CUDA_CHECK(pdl::launch_with(
             dep, {dim3(written_tokens), dim3(kRowScaleThreads), 0, stream},
             nvfp4_a4_row_scaled_residual_quantize_kernel<ActivationGeometry, kRowScaleThreads, Terms,
-                                                         Layout>,
+                                                         Layout, Rht16>,
             static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales,
             workspace.row_scales, tokens, static_cast<std::int64_t>(workspace.code_plane),
             static_cast<std::int64_t>(workspace.scale_plane)));
@@ -92,11 +108,23 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
         (written_tokens * ActivationGeometry::kGroupsPerRow + kThreads - 1) / kThreads;
     CUDA_CHECK(pdl::launch_with(
         dep, {dim3(blocks), dim3(kThreads), 0, stream},
-        nvfp4_a4_residual_quantize_kernel<ActivationGeometry, kThreads, Terms, Layout>,
+        nvfp4_a4_residual_quantize_kernel<ActivationGeometry, kThreads, Terms, Layout, Rht16>,
         static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
         written_tokens, weight.input_scale_divisor,
         static_cast<std::int64_t>(workspace.code_plane),
         static_cast<std::int64_t>(workspace.scale_plane)));
+}
+
+template <class ActivationGeometry, int Terms, Nvfp4ScaleLayout Layout>
+void launch_residual_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
+                           cudaStream_t stream) {
+    if (weight.layout == QuantLayout::BlockScaleK16M128x4Rht16) {
+        launch_residual_exact_rht16<ActivationGeometry, Terms, Layout, true>(x, weight, workspace,
+                                                                           stream);
+    } else {
+        launch_residual_exact_rht16<ActivationGeometry, Terms, Layout, false>(x, weight, workspace,
+                                                                            stream);
+    }
 }
 
 template <class ActivationGeometry>
@@ -203,6 +231,20 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
     default:
         throw std::invalid_argument("nvfp4 A4 quantize: unsupported K");
     }
+}
+
+void launch_nvfp4_rht16_bf16(const Tensor& x, __nv_bfloat16* output, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || x.ne[0] <= 0 || (x.ne[0] % 16) != 0 || x.ne[1] <= 0 ||
+        output == nullptr) {
+        throw std::invalid_argument("nvfp4 RHT-16 BF16 transform: invalid tensor geometry");
+    }
+    const std::int64_t groups =
+        static_cast<std::int64_t>(x.ne[1]) * (static_cast<std::int64_t>(x.ne[0]) / 16);
+    constexpr int kThreads = 256;
+    const int blocks       = static_cast<int>((groups + kThreads - 1) / kThreads);
+    nvfp4_rht16_bf16_kernel<kThreads><<<blocks, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), output, groups);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace infernix::ops::detail

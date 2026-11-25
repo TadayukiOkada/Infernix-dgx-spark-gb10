@@ -94,6 +94,30 @@ int run_nvfp4_a4() {
         failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight,
                               {n, k, seed, Comparison::Sampled, true, dense_a4_invocations});
     }
+    const std::vector<Invocation> rht16_pair_invocations{
+        {33, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {52, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {65, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {128, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {129, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {256, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+        {512, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Nvfp4A4Pair},
+    };
+    const std::vector<Invocation> rht16_a4_invocations{
+        {1, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
+        {17, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {33, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
+        {64, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {129, CallForm::Policy, ops::LinearPolicy::AllowA4, true},
+        {256, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        {512, CallForm::Policy, ops::LinearPolicy::AllowA4},
+    };
+    for (auto [n, k, seed] : {std::tuple{16384, 2560, 883U}, std::tuple{2560, 6144, 887U}}) {
+        failures += run_shape("NVFP4_RHT16_A4_PAIR", ActivationCompute::A4, make_nvfp4_rht16_weight,
+                              {n, k, seed, Comparison::Sampled, true, rht16_pair_invocations});
+        failures += run_shape("NVFP4_RHT16_A4", ActivationCompute::A4, make_nvfp4_rht16_weight,
+                              {n, k, seed + 100U, Comparison::Sampled, true, rht16_a4_invocations});
+    }
     return failures;
 }
 

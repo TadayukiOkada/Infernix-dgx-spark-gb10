@@ -76,7 +76,17 @@ enum class QuantLayout : std::uint16_t {
     // groups of 144-byte units, row-group major, block ascending), then (256-byte aligned) its FP32
     // multiplier: the Qwen3.5 NVFP4 output head.
     Rg16 = 11,
+    // block_scale_k16_m128x4_rht16_v1: BlockScaleK16M128x4 payload where every 16-element K group
+    // of W is transformed by the canonical signed block-16 Hadamard matrix Q = diag(s) * H16 / 4;
+    // linear consumers apply the identical transform to activations x before GEMM/quantization.
+    BlockScaleK16M128x4Rht16 = 12,
 };
+
+// Whether `layout` stores a matrix in BlockScaleK16M128x4 geometry (standard or RHT-16).
+[[nodiscard]] constexpr bool is_nvfp4_block_scale_layout(QuantLayout layout) noexcept {
+    return layout == QuantLayout::BlockScaleK16M128x4 ||
+           layout == QuantLayout::BlockScaleK16M128x4Rht16;
+}
 
 // Whether `layout` stores a matrix of GGUF blocks (ggml_rows_v1 or ggml_tiles16_v1).
 [[nodiscard]] constexpr bool is_ggml_matrix_layout(QuantLayout layout) noexcept {

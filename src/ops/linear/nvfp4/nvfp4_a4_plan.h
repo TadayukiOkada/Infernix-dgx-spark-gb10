@@ -6,6 +6,7 @@
 #include "core/tensor.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -131,6 +132,8 @@ constexpr bool nvfp4_a4_prefer_narrow_token_tile(std::int32_t rows, std::int32_t
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
                               Nvfp4ScaleLayout layout, cudaStream_t stream,
                               bool reciprocal_quotient = false);
+
+void launch_nvfp4_rht16_bf16(const Tensor& x, __nv_bfloat16* output, cudaStream_t stream);
 
 
 } // namespace infernix::ops::detail
